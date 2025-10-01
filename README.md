@@ -114,8 +114,12 @@ sudo rm /etc/apt/trusted.gpg.d/kitware.gpg
 sudo apt update
 sudo apt install cmake	
 
+# Create ROS2 workspace
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+source /opt/ros/humble/setup.bash
+
 # Build Livox-SDK2
-cd ~/
 git clone https://github.com/Livox-SDK/Livox-SDK2.git
 cd ./Livox-SDK2/
 mkdir build
@@ -127,7 +131,7 @@ add include  /usr/local/lib
 sudo ldconfig
 
 # Firmware Update using LivoxViewer2
-cd ~/
+cd ~/ros2_ws/src
 wget https://terra-1-g.djicdn.com/65c028cd298f4669a7f0e40e50ba1131/Mid360/LivoxViewer2%20for%20Ubuntu%20v2.3.0.zip
 unzip "LivoxViewer2 for Ubuntu v2.3.0.zip"
 cd "LivoxViewer2 for Ubuntu v2.3.0.zip"
@@ -136,7 +140,7 @@ wget https://terra-1-g.djicdn.com/65c028cd298f4669a7f0e40e50ba1131/Mid360/202411
 ./LivoxViewer2.sh (select the .bin file above to update the firmware)
 
 # Build and Install Insta360 SDK
-cd ~/
+cd ~/ros2_ws/src
 git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
 # Then, the Insta360 libraries need to be installed as follows:
     # - add the camera and stream header files inside the include directory
@@ -148,12 +152,8 @@ git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
 # Replace {your-home-path} with your home path
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib:{your-home-path}
 
-# Create ROS2 workspace
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws/src
-source /opt/ros/humble/setup.bash
-
 # Copy source files/folders into ~/ros2_ws/src
+cd ~/ros2_ws/src
 git clone https://github.com/Eecornwell/atlas-scanner.git
 
 # Create new ROS dependency package
@@ -404,4 +404,4 @@ python3 fusion_gui.py
 ```
 
 ##### Sample Output
-TODO
+![Point Cloud Result](assets/media/room-pointcloud.png "Result")
