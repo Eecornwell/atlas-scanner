@@ -36,17 +36,17 @@
     - 8" wide x 8" tall x 14" deep
     - 7lb
 
-### OS
+#### OS
 - Linux Ubuntu Jammy 22.04
-
-### Software
 
 #### TODO
 - [x] Release v1.0.0 hardware build
-- [ ] Release v1.0.0 code
 - [x] Enable terrestrial mode
-- [ ] Replace direct_visual_lidar_calibration feature matcher with [OpenCV 2D matcher](https://docs.opencv.org/4.x/db/dd9/group__xfeatures2d__match.html)
+- [ ] Release v1.0.0 code
+- [ ] Release sample dataset
 - [ ] Enable SLAM mode
+- [ ] Replace direct_visual_lidar_calibration feature matcher with [OpenCV 2D matcher](https://docs.opencv.org/4.x/db/dd9/group__xfeatures2d__match.html)
+- [ ] Implement remote capture capability
 - [ ] Implement scanning progress gui
 
 #### Overview
@@ -96,7 +96,7 @@
     - dual_fisheye_to_equirectangular_projection
         - Handled in camera driver, uses intrinsic calibration obtained during calibration step
 
-#### Software Installation
+### Software Installation
 Please review [Software Installation documentation](docs/software-install.md)
 
 ### Hardware Build
@@ -106,8 +106,8 @@ Please review [Hardware Build documentation](docs/atlas-hw-build-v1.pdf)
 #### Important Notes
 - The system bottleneck is currently in the image acquisition and so the video frame rate and resolution was adjusted to account for this. The system acquisition is triggered when an image is acquired and ready to use, then the lidar data is captured. The color projection onto the point cloud happens in post processing. Rosbags are recorded during acquisition as a redundency capture mechanism.
 
-#### Calibration
-##### Intrinsic
+### Calibration
+#### Intrinsic
 - This calibration will transform the dual fisheye lens to equirectangular frames
 - Calibration file location
     - `~/ros2_ws/src/insta360_ros_driver/config/equirectangular_calibration.yaml`
@@ -116,7 +116,7 @@ Please review [Hardware Build documentation](docs/atlas-hw-build-v1.pdf)
 ros2 run insta360_ros_driver equirectangular.py --calibrate --ros-args --params-file ~/ros2_ws/src/insta360_ros_driver/config/equirectangular_calibration.yaml
 ```
 
-##### Extrinsic
+#### Extrinsic
 - This calibration will transform the camera equirectangular frame into the lidar frame
 - Calibration file locations
     - `~/ros2_ws/output/calib.json`
@@ -148,7 +148,7 @@ python3 extract_calibration.py
 bash update_fusion_calibration.sh
 ```
 
-#### Testing and Capturing
+### Testing and Capturing
 ```
 # Setup camera permissions (sudo currently required)
 sudo ./setup_camera_permissions.sh
@@ -160,5 +160,5 @@ sudo ./setup_camera_permissions.sh
 python3 fusion_gui.py
 ```
 
-##### Sample Output
+#### Sample Output
 ![Point Cloud Result](assets/media/room-pointcloud.png "Result")
