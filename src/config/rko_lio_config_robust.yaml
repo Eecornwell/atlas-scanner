@@ -1,0 +1,34 @@
+# RKO-LIO Robust Configuration - Prevents intermittent dropouts
+imu_topic: /livox/imu
+lidar_topic: /livox/lidar
+base_frame: base_link
+imu_frame: "livox_frame"
+lidar_frame: "livox_frame"
+odom_frame: odom
+odom_topic: /rko_lio/odometry
+map_topic: /rko_lio/local_map
+
+# Reduced frequency to prevent overload
+publish_freq: 1.0
+publish_local_map: true
+publish_deskewed_scan: false
+invert_odom_tf: false
+
+# Forum settings + robustness tweaks
+deskew: false
+double_downsample: false
+initialization_phase: true
+extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+
+# Conservative processing parameters
+voxel_size: 1.0              # 1 Larger voxels = less processing
+max_points_per_voxel: 20     # 20 10 Fewer points = more stable
+max_range: 75.0              # 100 30 Shorter range = less data
+min_range: 1.0               # 1 2 Higher minimum
+max_correspondance_distance: 0.5 # 0.5 1.0
+convergence_criterion: 0.00001  # 0.00001 0.01 Less strict convergence
+max_num_threads: 1           # Single thread for stability
+max_expected_jerk: 5.0      # 3 20 Very tolerant
+min_beta: 200.0               # 200 50
+

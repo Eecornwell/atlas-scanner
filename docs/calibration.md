@@ -1,0 +1,323 @@
+# Calibration Procedure
+> *Note: Ensure the camera is turned on and the software installation procedure was successful before performing calibration*
+
+- Bring up the camera to calibrate
+    ```bash
+    sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh &&
+    cd ~/atlas_ws &&
+    source ~/atlas_ws/install/setup.bash &&
+    ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+    ```
+
+## Dual Fisheye to Equirectangular Calibration
+- This calibration will transform the dual fisheye lens into equirectangular frames
+- Equirectangular calibration file location
+    - `~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml`
+    - Use these as starting parameters
+        ```bash
+        ==================================================
+        CALIBRATION PARAMETERS (YAML FORMAT)
+        ==================================================
+        equirectangular_node:
+        ros__parameters:
+            cx_offset: 0.0
+            cy_offset: 0.0
+            crop_size: 960
+            translation: [-0.007, 0.007, -0.153]
+            rotation_deg: [0.7, -3.0, 1.5]
+            gpu: false
+            out_width: 1920
+            out_height: 960
+        ==================================================
+        ```
+
+- In a separate command window, with the camera running in another window, source the ROS2 workspace
+    ```bash
+    cd ~/atlas_ws &&
+    source install/setup.bash
+    ```
+
+- Start the equirectangular calibration, adjust the sliders slightly to align all of the views
+    ```bash
+    export QT_QPA_PLATFORM=xcb
+    ros2 run insta360_ros_driver equirectangular.py --calibrate --ros-args --params-file ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+    ```
+    > **Tips for calibration:**
+    > * Don't adjust `CX` or `CY` or `Crop Size` for best results.
+    > * First, adjust `TZ` until the middle of the equirectangular image is aligned.
+    > * Next, adjust `Pitch` so the cameras are centered from from left to right.
+    > * Adjust other translation and rotation values as needed to get a rough calibration.
+    > * Ensure atleast the center and right regions of the image are aligned. The left region of the image is not as important because that will primarily be hidden from the lidar.
+    > * Once a coarse calibration is complete, rotate the camera on the tripod with the calibration running to ensure the regions align in various configurations.
+
+![ERP Calibration Result](../assets/media/erp-calibration-result.png)
+
+- When satisfied with the calibration, press `s` to save the calibration to file
+
+> *Note: As a back-up, copy the `Translation` and `Rotation` parameters from the command line. Ensure the file at `~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml` does have these saved values before continuing.*
+
+![ERP Calibration Result](../assets/media/erp-calibration-result.gif)
+
+## Equirectangular to Lidar Calibration
+- This calibration will transform the camera equirectangular frame into the lidar frame
+- Calibration file locations
+    - `~/atlas_ws/output/calib.json`
+        - This intermediate file is used to pre-process the calibration since we are using bag files and a series of scans to perform the calibration
+    - `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`
+        - This will be where the final extrinsic calibration will be saved and used for the fusion capture
+
+- Procedure
+    1. Ensure both the Lidar and Camera are powered on. Capture new data of at least **1** scan. This will be used to create a mask for the equirectangular image.
+        ```bash
+        cd ~/atlas_ws/src/atlas-scanner/src
+        sudo ./setup_camera_permissions.sh
+        ./terrestrial_fusion_with_lio.sh
+        ```
+        > *Note: Take note of the session directory from the console output. It will be in the form: `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/`*
+
+    2. Create a mask image for your setup
+        * The mask defines which parts of the equirectangular image to use for coloring (white = use, black = ignore)
+        * This will help with calibration so the algorithm doesn't get false positive features to use
+        * You can use the image cloned from this repo at `~/atlas_ws/src/atlas-scanner/src/lidar_mask.png`, but the mask won't match your exact setup so quality might be affected. It is advised to use the manual method below
+            * Use existing ERP image took above, edit inside an image editor program. The path to the image will be similar to `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/fusion_scan_001/equirect_{TIMESTAMP}.jpg`
+            * Create a black/white PNG where white = use, black = ignore. We want to ignore the scanner and tripod in the spherical images. Also take note that the lidar only sees most of the top view camera and a small portion of the bottom view camera. This means that most of the bottom camera data will be discarded once the image to point cloud projection occurs
+            * Recommended size: 1920x960 (matching equirectangular output)
+            * Save new image mask to: ~/atlas_ws/src/atlas-scanner/src/lidar_mask.png
+
+        > *Note: You can use any image editor (GIMP, Photoshop, etc.) to create the mask. Paint white areas where you want to apply colors from the camera, and black areas to ignore (e.g., areas with the scanner itself visible).*
+
+    3. Capture new data of at least **10** scans from varying positions/rotations in same room. These scans will be used for the calibration procedure.
+        ```bash
+        cd ~/atlas_ws/src/atlas-scanner/src
+        sudo ./setup_camera_permissions.sh
+        ./terrestrial_fusion_with_lio.sh
+        ```
+        > *Note: Take note of the session directory from the console output. It will be in the form: `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/`*
+
+        > *Note: The script will pull in default extrinsic values during this capture, but we won't be using the colored point cloud during calibration so this behavior is ok. We process the image and point cloud seperately below and then populate the extrinsic calibration with the new values*
+
+    3. Combine all scans into a single calibration dataset. Replace {TIMESTAMP} with the scans from above.
+        ```bash
+        cd ~/atlas_ws/src/atlas-scanner/src/calibration
+        python3 combine_scans_for_calibration.py ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+        ```
+        > *Note: This will merge all scans into `~/atlas_ws/output` for calibration.*
+
+    4. Get initial guess
+        - Manual
+            - Recommended for commercial applications and is more reliable.
+            - Match atleast 5 image-to-pointcloud features in each bag file.
+            - After each pair, select `Add Picked Points`.
+            - When all points are marked for all bags, select `Estimate`.
+            - If the estimation was successful, select `Save` to save the calibration parameters to `~/atlas_ws/output/calib.json`
+            ```bash
+            cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
+            ./initial_guess_manual --data_path ~/atlas_ws/output
+            ```
+        - Auto
+            - Recommended for research projects, quick but can struggle in some configurations
+            ```bash
+            cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
+            python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
+            python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
+            source ~/atlas_ws/install/setup.bash
+            ros2 run direct_visual_lidar_calibration initial_guess_auto ~/atlas_ws/output
+            ```
+
+    5. Run calibration
+        ```bash
+        cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
+        ./calibrate --data_path ~/atlas_ws/output
+        ```
+        > *Note: Check that the calibration worked and that the point cloud corresponds to the ERP image. Use the `blend` slider to reveal both the point cloud and image.*
+
+        > *Note: If using the Auto method above and get a `[ros2run]: Segmentation fault`, the feature matcher failed. The recommended path is to use the manual method above.*
+
+    6. Extract and apply new calibration
+        ```bash
+        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_coordinate_transform.py \
+            ~/atlas_ws/src/atlas-scanner/src
+        ```
+        > *Note: This will properly invert the transformation from calib.json and save to: `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`*
+        
+        > *Important: Do NOT use extract_calibration.py - it doesn't invert the transformation correctly!*
+
+    7. Configuration notes for `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`
+        * The system uses exact projection matching the calibration tool
+        * All transformation values come directly from inverted calib.json
+        * No manual adjustments needed - alignment matches calibration tool exactly
+        * Baseline Settings
+
+            ```bash
+            roll_offset: 3.084333895782295
+            pitch_offset: 0.016921463456919694
+            yaw_offset: -1.6041524644977394
+            manual_roll_adjustment: 0.0
+            manual_pitch_adjustment: 0.0
+            manual_yaw_adjustment: 0.0
+            azimuth_offset: 0.0
+            elevation_offset: 0.0
+            x_offset: 0.03272758164346094
+            y_offset: 0.13525142783960337
+            z_offset: 0.1495769332683098
+            flip_x: false
+            flip_y: false
+            image_width: 1920
+            image_height: 960
+            use_fisheye: false
+            skip_rate: 5
+            ```
+
+    7. Now you are ready to capture! Go to [the Software Run doc](software-run.md) to start scanning!
+
+    >***Note: If the color on your point cloud seems to be misaligned, rerun the procedure above until results are satisfactory***
+
+roll_offset: -0.05725875780749812
+pitch_offset: 3.124671190132873 (0.01692) 3.158513
+yaw_offset: -3.1082365158869503 (0.0334) -3.175
+manual_roll_adjustment: 0.0
+manual_pitch_adjustment: 0.0
+manual_yaw_adjustment: 0.0
+azimuth_offset: 3.141592654
+elevation_offset: 0.0
+x_offset: 0.13877908670788272
+y_offset: 0.14862220610459517
+z_offset: 0.01972580147832913
+
+
+roll_offset: -0.05725875780749812
+pitch_offset: 3.124671190132873
+yaw_offset: -3.1082365158869503
+manual_roll_adjustment: 0.0
+manual_pitch_adjustment: 0.0
+manual_yaw_adjustment: 0.0
+azimuth_offset: 3.141592654
+elevation_offset: 0.0
+x_offset: 0.13877908670788272
+y_offset: 0.14862220610459517
+z_offset: 0.01972580147832913
+
+roll_offset: 3.084333895782295
+pitch_offset: 0.016921463456919694
+yaw_offset: -1.6041524644977394
+manual_roll_adjustment: 0.0
+manual_pitch_adjustment: 0.0
+manual_yaw_adjustment: 0.0
+azimuth_offset: -1.5707963267948966
+elevation_offset: 0.0
+x_offset: 0.03272758164346094
+y_offset: 0.13525142783960337
+z_offset: 0.1495769332683098
+flip_x: true
+flip_y: false
+image_width: 1920
+image_height: 960
+use_fisheye: false
+skip_rate: 5
+
+roll_offset: 3.084333895782295
+pitch_offset: 0.016921463456919694
+yaw_offset: -1.6041524644977394
+manual_roll_adjustment: 0.0
+manual_pitch_adjustment: 0.0
+manual_yaw_adjustment: 0.0
+azimuth_offset: -1.5707963267948966
+elevation_offset: 0.0
+x_offset: 0.03272758164346094
+y_offset: 0.13525142783960337
+z_offset: 0.1495769332683098
+flip_x: true
+flip_y: false
+image_width: 1920
+image_height: 960
+use_fisheye: false
+skip_rate: 5
+
+---
+
+## Troubleshooting: Color Misalignment
+
+If your colored point cloud has misaligned colors (colors don't match the geometry), follow these steps:
+
+### Quick Diagnosis
+
+Run the diagnostic script to identify the issue:
+```bash
+cd ~/atlas_ws
+python3 src/atlas-scanner/src/calibration/diagnose_transforms.py
+```
+
+This will tell you:
+- ✅ If your calibration is mathematically correct
+- ❌ If your calibration has transformation errors
+- What compensating adjustments are currently applied
+
+### Automated Fix
+
+Run the automated fix script:
+```bash
+cd ~/atlas_ws
+bash src/atlas-scanner/src/calibration/fix_misalignment.sh
+```
+
+This script will:
+1. Backup your current calibration
+2. Generate corrected calibration with proper matrix inversion
+3. Optionally restore your manual adjustments (azimuth_offset, flip_x)
+4. Provide testing instructions
+
+### Manual Fix
+
+If you prefer to fix manually:
+
+1. **Backup current config:**
+   ```bash
+   cp ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml \
+      ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml.backup
+   ```
+
+2. **Regenerate with correct inversion:**
+   ```bash
+   python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_coordinate_transform.py \
+       ~/atlas_ws/src/atlas-scanner/src
+   ```
+
+3. **Test with a new scan:**
+   ```bash
+   cd ~/atlas_ws/src/atlas-scanner/src
+   ./terrestrial_fusion_with_lio.sh
+   ```
+
+4. **Fine-tune if needed:**
+   Edit `fusion_calibration.yaml` and adjust:
+   - `azimuth_offset`: Rotates image horizontally (try ±0.01 to ±0.05 rad)
+   - `flip_x`: Mirrors image horizontally (true/false)
+   - `flip_y`: Mirrors image vertically (true/false)
+
+### Understanding the Issue
+
+The misalignment is typically caused by:
+
+1. **Wrong transformation direction**: The calibration tool outputs `T_lidar_camera` (camera → lidar), but projection needs `T_camera_lidar` (lidar → camera). These are matrix inverses of each other.
+
+2. **extract_calibration.py doesn't invert**: This script copies values directly without inversion, causing incorrect transformations.
+
+3. **Hardcoded transformations**: The `sensor_fusion.py` script has a hardcoded 90° roll rotation that may not match your hardware.
+
+4. **Compensating adjustments**: Large values for `azimuth_offset` (like 180°) or `flip_x: true` may be masking underlying transformation errors.
+
+### Documentation
+
+For detailed analysis, see:
+- `docs/transformation_pipeline_analysis.md` - Complete transformation flow
+- `docs/YOUR_CALIBRATION_DIAGNOSIS.md` - Your specific calibration analysis
+- `docs/QUICK_FIX_MISALIGNMENT.md` - Quick reference guide
+
+### Prevention
+
+To prevent this issue in future calibrations:
+
+1. **Don't use extract_calibration.py** - It doesn't perform the required matrix inversion
+2. **Use fix_coordinate_transform.py** - It correctly inverts the transformation
+3. **Set USE_EXISTING_CALIBRATION=false** in `terrestrial_fusion_with_lio.sh` - Forces regeneration with correct values
+4. **Use corrected_sensor_fusion.py** - Better transformation logic without hardcoded rotations

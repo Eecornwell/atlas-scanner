@@ -41,8 +41,10 @@
 
 #### TODO
 - [x] Release v1.0.0 hardware build
+- [x] Release software install guide
 - [x] Enable terrestrial mode
-- [ ] Release v1.0.0 code
+- [x] Release calibration procedure
+- [x] Release v1.0.0 code
 - [ ] Release sample dataset
 - [ ] Enable SLAM mode
 - [ ] Replace direct_visual_lidar_calibration feature matcher with [OpenCV 2D matcher](https://docs.opencv.org/4.x/db/dd9/group__xfeatures2d__match.html)
@@ -102,63 +104,14 @@ Please review [Software Installation documentation](docs/software-install.md)
 ### Hardware Build
 Please review [Hardware Build documentation](docs/atlas-hw-build-v1.pdf)
 
-### System
-#### Important Notes
-- The system bottleneck is currently in the image acquisition and so the video frame rate and resolution was adjusted to account for this. The system acquisition is triggered when an image is acquired and ready to use, then the lidar data is captured. The color projection onto the point cloud happens in post processing. Rosbags are recorded during acquisition as a redundency capture mechanism.
-
 ### Calibration
-#### Intrinsic
-- This calibration will transform the dual fisheye lens to equirectangular frames
-- Calibration file location
-    - `~/ros2_ws/src/insta360_ros_driver/config/equirectangular_calibration.yaml`
-```bash
-# Adjust the sliders slightly to align all of the views
-ros2 run insta360_ros_driver equirectangular.py --calibrate --ros-args --params-file ~/ros2_ws/src/insta360_ros_driver/config/equirectangular_calibration.yaml
-```
-
-#### Extrinsic
-- This calibration will transform the camera equirectangular frame into the lidar frame
-- Calibration file locations
-    - `~/ros2_ws/output/calib.json`
-    - `~/ros2_ws/fusion_calibration.yaml`
-
-- Procedure
-
-```bash
-# 1. Capture new data
-cd ~/ros2_ws
-./improved_auto_fusion_with_lio_clean.sh
-
-# 2. Preprocess the new bag
-cd ~/ros2_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-./preprocess --data_path /path/to/new/bag --dst_path ~/ros2_ws/output --camera_model equirectangular --camera_intrinsics 610,610,1920,960 --image_topic /equirectangular/image --points_topic /livox/lidar
-
-# 3. Generate feature matches
-python3 ./find_matches_superglue.py ~/ros2_ws/output
-
-# 4. Get initial guess (manual is more reliable)
-./initial_guess_manual --data_path ~/ros2_ws/output
-
-# 5. Run calibration
-./calibrate --data_path ~/ros2_ws/output
-
-# 6. Extract and apply new calibration
-cd ~/ros2_ws
-python3 extract_calibration.py
-bash update_fusion_calibration.sh
-```
+Please review [Calibration documentation](docs/calibration.md)
 
 ### Testing and Capturing
-```
-# Setup camera permissions (sudo currently required)
-sudo ./setup_camera_permissions.sh
-
-# Run headless
-./improved_auto_fusion_with_lio.sh
-
-# Run with gui
-python3 fusion_gui.py
-```
+Please review [Running the Software documentation](docs/software-run.md)
 
 #### Sample Output
 ![Point Cloud Result](assets/media/room-pointcloud.png "Result")
+
+#### Important Notes
+- The system bottleneck is currently in the image acquisition and so the video frame rate and resolution was adjusted to account for this. The system acquisition is triggered when an image is acquired and ready to use, then the lidar data is captured. The color projection onto the point cloud happens in post processing. Rosbags are recorded during acquisition as a redundency capture mechanism.

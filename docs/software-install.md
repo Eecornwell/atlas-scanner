@@ -4,8 +4,7 @@
 ```
 # Create ROS2 workspace
 mkdir -p ~/atlas_ws/src &&
-cd ~/atlas_ws/src &&
-source /opt/ros/humble/setup.bash
+cd ~/atlas_ws/src
 
 # Copy this repo files/folders into ~/atlas_ws/src
 cd ~/atlas_ws/src
@@ -13,7 +12,7 @@ git clone https://github.com/Eecornwell/atlas-scanner.git
 
 # Install dependencies
 sudo apt-get update &&
-sudo apt-get install -y libgoogle-glog-dev libgflags-dev libatlas-base-dev libeigen3-dev libsuitesparse-dev software-properties-common lsb-release python3-sensor-msgs python3-opencv ros-humble-rosbag2-transport ffmpeg ros-humble-robot-localization ros-humble-topic-tools ros-humble-cartographer ros-humble-cartographer-ros ros-humble-slam-toolbox ros-humble-pointcloud-to-laserscan ros-humble-cv-bridge ros-humble-vision-opencv libopencv-* libomp-dev libboost-all-dev libglm-dev libglfw3-dev libpng-dev libjpeg-dev ros-humble-ament-cmake-auto ros-humble-rosidl-default-generators ros-humble-pcl-conversions ros-humble-ament-lint-auto ros-humble-ament-lint-common ros-humble-rosbag2 ros-humble-camera-info-manager ros-humble-imu-tools ros-humble-launch ros-humble-launch-ros ros-humble-launch-xml ros-humble-launch-yaml ros-humble-ros2launch ros-humble-rviz2 ros-humble-ros2topic nlohmann-json3-dev
+sudo apt-get install -y libgoogle-glog-dev libgflags-dev libatlas-base-dev libeigen3-dev libsuitesparse-dev software-properties-common lsb-release python3-sensor-msgs python3-opencv ros-humble-rosbag2-transport ffmpeg ros-humble-robot-localization ros-humble-topic-tools ros-humble-cartographer ros-humble-cartographer-ros ros-humble-slam-toolbox ros-humble-pointcloud-to-laserscan ros-humble-cv-bridge ros-humble-vision-opencv libopencv-* libomp-dev libboost-all-dev libglm-dev libglfw3-dev libpng-dev libjpeg-dev ros-humble-ament-cmake-auto ros-humble-rosidl-default-generators ros-humble-pcl-conversions ros-humble-ament-lint-auto ros-humble-ament-lint-common ros-humble-rosbag2 ros-humble-camera-info-manager ros-humble-imu-tools ros-humble-launch ros-humble-launch-ros ros-humble-launch-xml ros-humble-launch-yaml ros-humble-ros2launch ros-humble-rviz2 ros-humble-ros2topic nlohmann-json3-dev humble-ros2run
 
 # Install cmake
 wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | sudo tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
@@ -26,15 +25,20 @@ sudo apt update &&
 sudo apt install -y cmake	
 
 # Prepare the Insta360 ROS Driver repo
-cd ~/atlas_ws/src
+cd ~/atlas_ws/src &&
 git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
+
 # To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the Insta360 website.
 # Unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip (latest version) and
 # find the libCameraSDK.so file and camera/ and stream/ folders
 # Then, the Insta360 libraries need to be installed as follows:
     # - chmod 777 camera/ stream/ libCameraSDK.so
     # - copy the camera and stream header files inside the include directory (~/atlas_ws/src/insta360_ros_driver/include)
-    # - copy the libCameraSDK.so library under the lib directory (~/atlas_ws/src/insta360_ros_driver/lib).
+    # - copy the libCameraSDK.so library under the lib directory (~/atlas_ws/src/insta360_ros_driver/lib)
+
+# Remove any old SDK versions and create symlink to ensure correct version is used
+rm -f ~/libCameraSDK.so ~/libCameraSDK.so.old &&
+ln -s ~/atlas_ws/src/insta360_ros_driver/lib/libCameraSDK.so ~/libCameraSDK.so
 
 # Prepare the Livox ROS Driver repo
 cd ~/atlas_ws/src &&
@@ -78,12 +82,17 @@ source /opt/ros/humble/setup.bash &&
 ln -s /home/orion/atlas_ws/src/livox_ros_driver2/package_ROS2.xml /home/orion/atlas_ws/src/livox_ros_driver2/package.xml
 
 # Apply fix to Livox Cmake
-python3 ~/atlas_ws/src/atlas-scanner/src/fix_livox_cmake.py
+python3 ~/atlas_ws/src/atlas-scanner/src/install/fix_livox_cmake.py
 
+# Install ROS dependencies
+cd ~/atlas_ws &&
+rosdep install --from-paths src --ignore-src -r -y
+
+# Build ROS2 packages with symlink-install
 export HUMBLE_ROS=humble &&
 cd ~/atlas_ws &&
 source /opt/ros/humble/setup.bash &&
-colcon build &&
+colcon build --symlink-install &&
 source install/setup.bash
 
 # Configure MID360_config.json
@@ -142,6 +151,8 @@ vi ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/MID360_co
 }
 
 # Check with Livox Viewer First to confirm can connect to lidar_configs
+cd ~/atlas_ws &&
+source ~/atlas_ws/install/setup.bash &&
 ros2 launch livox_ros_driver2 rviz_MID360_launch.py
 
 # Check Insta360 settings on device
@@ -158,6 +169,8 @@ bash ~/atlas_ws/src/insta360_ros_driver/setup.sh
 ls -l /dev/insta
 
 # Bring up camera to test driver
+cd ~/atlas_ws &&
+source ~/atlas_ws/install/setup.bash &&
 ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
 
 # While the above is running in terminal, open another terminal and run
@@ -189,22 +202,18 @@ make -j2
 sudo make install && sudo ldconfig
 
 # Install RKO LIO ROS package
-cd ~/atlas_ws/src
-git clone https://github.com/PRBonn/rko_lio.git &&
-cd ~/atlas_ws &&
-source ~/atlas_ws/install/setup.bash &&
-colcon build --packages-select rko_lio
+cd ~/atlas_ws/src &&
+git clone https://github.com/PRBonn/rko_lio.git
 
 # Install Direct Visual Lidar Calibration ROS package
 cd ~/atlas_ws/src &&
-git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive &&
-cd ~/atlas_ws &&
-source ~/atlas_ws/install/setup.bash &&
-colcon build --packages-select direct_visual_lidar_calibration
+git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive
 
-# Replace {/home/orion/} with your home path
+# Install SuperGlue (used for auto calibration which isn't currently used in the algorithm)
 cd ~/atlas_ws/ &&
 git clone https://github.com/magicleap/SuperGluePretrainedNetwork.git
+
+# Replace {/home/orion/} with your home path
 echo 'export PYTHONPATH=$PYTHONPATH:/home/orion/atlas_ws/SuperGluePretrainedNetwork' >> ~/.bashrc
 source ~/.bashrc
 
@@ -236,7 +245,7 @@ make -j2
 # Install Ceres (system-wide installation)
 sudo make install
 
-# Build Iridescence for visualization 
+# Build Iridescence for calibration visualization 
 cd ~/atlas_ws &&
 git clone https://github.com/koide3/iridescence --recursive &&
 mkdir iridescence/build && cd iridescence/build &&
@@ -246,13 +255,29 @@ make -j2
 # Install Iridescence (system-wide installation)
 sudo make install
 
+# Mark non-ROS packages to be ignored by colcon
+cd ~/atlas_ws &&
+touch ceres-solver/COLCON_IGNORE gtsam/COLCON_IGNORE iridescence/COLCON_IGNORE \
+      Livox-SDK2/COLCON_IGNORE Sophus/COLCON_IGNORE SuperGluePretrainedNetwork/COLCON_IGNORE
+
+# If you extracted the Insta360 SDK zip in the workspace root, also ignore it
+if [ -d "Linux_CameraSDK-2.1.1_MediaSDK-3.1.1" ]; then
+  touch Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/COLCON_IGNORE
+fi
+
+# Final build of all ROS packages
+cd ~/atlas_ws &&
+source /opt/ros/humble/setup.bash &&
+colcon build --symlink-install &&
+source install/setup.bash
+
+# Copy RViz config with odometry visualization to livox driver
+cp ~/atlas_ws/src/atlas-scanner/src/install/display_point_cloud_ROS2.rviz \
+   ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/display_point_cloud_ROS2.rviz
+
 # Replace {/home/orion/} with your home path
 export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibration/lib:/home/orion/atlas_ws/gtsam/build/lib:/home/orion/atlas_ws/ceres-solver/build/lib:/home/orion/atlas_ws/iridescence/build/lib:$LD_LIBRARY_PATH
-
-# Edit config/general_configuration.yaml if needed for base software
-#- lidar_topic: /livox/lidar
-#- frame_id: /base_link
-
-# Now your system should be setup to run this repo's software
-# Visit this repo's README.md for details on how to start running the software on your scanner
 ```
+
+* Now your system should be setup to run this repo's software
+* Next, calibrate your system setup using the [Calibration doc](calibration.md)
