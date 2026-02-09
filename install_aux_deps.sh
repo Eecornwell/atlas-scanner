@@ -20,10 +20,12 @@ fi
 
 # Build Sophus for calibration visualization
 cd ~/atlas_ws
-git clone https://github.com/strasdat/Sophus.git
+if [ ! -d "Sophus" ]; then
+  git clone https://github.com/strasdat/Sophus.git
+fi
 cd Sophus
 git reset --hard 'd0b7315a0d90fc6143defa54596a3a95d9fa10ec'
-mkdir build && cd build
+mkdir -p build && cd build
 cmake .. -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
 make -j2
 
@@ -33,13 +35,17 @@ sudo ldconfig
 
 # Clone RKO LIO ROS package
 cd ~/atlas_ws/src
-git clone https://github.com/PRBonn/rko_lio.git
+if [ ! -d "rko_lio" ]; then
+  git clone https://github.com/PRBonn/rko_lio.git
+fi
 cd ~/atlas_ws/src/rko_lio
 git reset --hard '2363d1f55d3a7db4ff1a1266e35ad84e81069728'
 
 # Clone Direct Visual Lidar Calibration ROS package
 cd ~/atlas_ws/src
-git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive
+if [ ! -d "direct_visual_lidar_calibration" ]; then
+  git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive
+fi
 cd ~/atlas_ws/src/direct_visual_lidar_calibration
 git reset --hard '02a0dc039f5509708f384be4ff3228e0ae09352d'
 
@@ -48,7 +54,9 @@ bash ~/atlas_ws/src/atlas-scanner/src/install/fix_dvl_calibration.sh
 
 # Clone (optional) SuperGlue (used for auto calibration which isn't currently recommended in the procedure)
 cd ~/atlas_ws/
-git clone https://github.com/magicleap/SuperGluePretrainedNetwork.git
+if [ ! -d "SuperGluePretrainedNetwork" ]; then
+  git clone https://github.com/magicleap/SuperGluePretrainedNetwork.git
+fi
 cd ~/atlas_ws/SuperGluePretrainedNetwork
 git reset --hard 'ddcf11f42e7e0732a0c4607648f9448ea8d73590'
 
@@ -58,9 +66,11 @@ source ~/.bashrc
 
 # Build GTSAM for calibration
 cd ~/atlas_ws
-git clone https://github.com/borglab/gtsam
+if [ ! -d "gtsam" ]; then
+  git clone https://github.com/borglab/gtsam
+fi
 cd gtsam && git checkout 4.2a9
-mkdir build && cd build
+mkdir -p build && cd build
 cmake .. -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF \
         -DGTSAM_BUILD_TESTS=OFF \
         -DGTSAM_WITH_TBB=OFF \
@@ -75,10 +85,12 @@ sudo ldconfig
 
 # Build Ceres for calibration
 cd ~/atlas_ws
-git clone --recurse-submodules https://github.com/ceres-solver/ceres-solver
+if [ ! -d "ceres-solver" ]; then
+  git clone --recurse-submodules https://github.com/ceres-solver/ceres-solver
+fi
 cd ceres-solver
 git checkout e47a42c2957951c9fafcca9995d9927e15557069
-mkdir build && cd build
+mkdir -p build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DUSE_CUDA=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j2
 
@@ -87,10 +99,12 @@ sudo make install
 
 # Build Iridescence for calibration visualization 
 cd ~/atlas_ws
-git clone https://github.com/koide3/iridescence --recursive
+if [ ! -d "iridescence" ]; then
+  git clone https://github.com/koide3/iridescence --recursive
+fi
 cd ~/atlas_ws/iridescence
 git reset --hard 'de083e26c7b27c14f4de37292decca9a18957fef'
-mkdir -p iridescence/build && cd iridescence/build
+mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j2
 

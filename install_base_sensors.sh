@@ -22,10 +22,6 @@ fi
 mkdir -p ~/atlas_ws/src
 cd ~/atlas_ws/src
 
-# Copy this repo files/folders into ~/atlas_ws/src
-cd ~/atlas_ws/src
-git clone https://github.com/Eecornwell/atlas-scanner.git
-
 # Install dependencies
 sudo apt-get update
 sudo apt-get install -y libgoogle-glog-dev libgflags-dev libatlas-base-dev libeigen3-dev libsuitesparse-dev software-properties-common lsb-release python3-sensor-msgs python3-opencv ros-humble-rosbag2-transport ffmpeg ros-humble-robot-localization ros-humble-topic-tools ros-humble-cartographer ros-humble-cartographer-ros ros-humble-slam-toolbox ros-humble-pointcloud-to-laserscan ros-humble-cv-bridge ros-humble-vision-opencv libopencv-* libomp-dev libboost-all-dev libglm-dev libglfw3-dev libpng-dev libjpeg-dev ros-humble-ament-cmake-auto ros-humble-rosidl-default-generators ros-humble-pcl-conversions ros-humble-ament-lint-auto ros-humble-ament-lint-common ros-humble-rosbag2 ros-humble-camera-info-manager ros-humble-imu-tools ros-humble-launch ros-humble-launch-ros ros-humble-launch-xml ros-humble-launch-yaml ros-humble-ros2launch ros-humble-rviz2 ros-humble-ros2topic nlohmann-json3-dev ros-humble-ros2run python3-rosdep ros-humble-rosbag2-cpp
@@ -41,7 +37,9 @@ sudo apt install -y cmake
 
 # Prepare the Insta360 ROS Driver repo
 cd ~/atlas_ws/src
-git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
+if [ ! -d "insta360_ros_driver" ]; then
+  git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
+fi
 cd insta360_ros_driver
 git reset --hard '9d2d3f51093d906903a6ea57bc5383c39a77ebfb'
 
@@ -63,18 +61,21 @@ ln -s ~/atlas_ws/src/insta360_ros_driver/lib/libCameraSDK.so ~/libCameraSDK.so
 
 # Prepare the Livox ROS Driver repo
 cd ~/atlas_ws/src
-git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+if [ ! -d "livox_ros_driver2" ]; then
+  git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+fi
 cd ~/atlas_ws/src/livox_ros_driver2
 git reset --hard '6b9356cadf77084619ba406e6a0eb41163b08039'
 
 # Build Livox-SDK2
 cd ~/atlas_ws
-git clone https://github.com/Livox-SDK/Livox-SDK2.git
+if [ ! -d "Livox-SDK2" ]; then
+  git clone https://github.com/Livox-SDK/Livox-SDK2.git
+fi
 cd ~/atlas_ws/Livox-SDK2
 git reset --hard '6a940156dd7151c3ab6a52442d86bc83613bd11b'
 find ~/atlas_ws/Livox-SDK2 -name "CMakeLists.txt" -exec sed -i 's/cmake_minimum_required(VERSION 3.0)/cmake_minimum_required(VERSION 3.10)/' {} +
-cd ./Livox-SDK2/
-mkdir build
+mkdir -p build
 cd build
 cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j2
@@ -98,11 +99,9 @@ wget --referer="https://www.livoxtech.com/" \
 
 echo ""
 echo "=== MANUAL STEP REQUIRED ==="
-echo "LivoxViewer2 will now launch. Please select the .bin file to update the firmware."
+echo "To update Mid360 firmware, run: ~/atlas_ws/src/LivoxViewer2\ for\ Ubuntu\ v2.3.0/LivoxViewer2.sh"
+echo "Then select the firmware file: LIVOX_MID360_FW_v13.18.0237.bin"
 echo ""
-./LivoxViewer2.sh
-
-rm -rf 'LIVOX_MID360_FW_v13.18.0237.bin'
 
 # Build ROS2 packages
 cd ~/atlas_ws
@@ -119,7 +118,7 @@ cd ~/atlas_ws
 rosdep install --from-paths src --ignore-src -r -y
 
 # Apply fix for insta360 library (remove unsupported SDK call)
-sed -i '/SyncLocalTimeToCamera/d; /offset_time/d; /utc_time/d' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i '/uint64_t utc_time/,/cam->SyncLocalTimeToCamera/d' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 
 # Build ROS2 packages with symlink-install
 export HUMBLE_ROS=humble
