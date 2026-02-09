@@ -1,6 +1,69 @@
 # Software Installation
 > *Note: Only Linux Ubuntu Jammy 22.04 is currently supported*
 
+## Automated Installation
+
+### Initial Setup
+First, create the ROS2 workspace and clone this repository:
+```bash
+mkdir -p ~/atlas_ws/src
+cd ~/atlas_ws/src
+git clone https://github.com/Eecornwell/atlas-scanner.git
+```
+
+### 1. Base Sensors Installation
+Installs camera and LiDAR drivers:
+```bash
+cd ~/atlas_ws/src/atlas-scanner
+./install_base_sensors.sh
+```
+
+**Manual steps required during script execution:**
+- Install Insta360 SDK files (camera/stream headers and libCameraSDK.so)
+- Update Mid360 firmware using LivoxViewer2
+- Configure network settings for LiDAR (Static IP 192.168.1.50)
+- Edit MID360_config.json to match your LiDAR IP address
+- Connect and configure Insta360 camera (dual camera mode, USB mode to Android)
+
+**After installation, validate sensors are working:**
+
+Test LiDAR:
+```bash
+cd ~/atlas_ws
+source ~/atlas_ws/install/setup.bash
+ros2 launch livox_ros_driver2 rviz_MID360_launch.py
+```
+
+Test Camera (in a new terminal):
+```bash
+cd ~/atlas_ws
+source ~/atlas_ws/install/setup.bash
+ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+```
+
+Verify topics (in another terminal):
+```bash
+cd ~/atlas_ws
+source ~/atlas_ws/install/setup.bash
+ros2 topic list
+# Should see: /dual_fisheye/image, /equirectangular/image, /imu/data, etc.
+```
+
+### 2. Auxiliary Dependencies Installation
+Installs calibration tools and additional packages:
+```bash
+cd ~/atlas_ws/src/atlas-scanner
+./install_aux_deps.sh
+```
+
+**Important:** Do NOT run these scripts with `sudo`. They will prompt for sudo when needed.
+
+---
+
+## Manual Installation
+
+If you prefer to run commands manually, follow the steps below:
+
 ```
 # Create ROS2 workspace
 mkdir -p ~/atlas_ws/src &&
