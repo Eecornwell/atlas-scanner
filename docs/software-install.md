@@ -26,7 +26,9 @@ sudo apt install -y cmake
 
 # Prepare the Insta360 ROS Driver repo
 cd ~/atlas_ws/src &&
-git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git
+git clone -b humble https://github.com/ai4ce/insta360_ros_driver.git &&
+cd insta360_ros_driver.git &&
+git reset --hard '9d2d3f51093d906903a6ea57bc5383c39a77ebfb'
 
 # To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the Insta360 website.
 # Unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip (latest version) and
@@ -43,10 +45,14 @@ ln -s ~/atlas_ws/src/insta360_ros_driver/lib/libCameraSDK.so ~/libCameraSDK.so
 # Prepare the Livox ROS Driver repo
 cd ~/atlas_ws/src &&
 git clone https://github.com/Livox-SDK/livox_ros_driver2.git
+cd ~/atlas_ws/src/livox_ros_driver2 &&
+git reset --hard '6b9356cadf77084619ba406e6a0eb41163b08039'
 
 # Build Livox-SDK2
 cd ~/atlas_ws &&
 git clone https://github.com/Livox-SDK/Livox-SDK2.git &&
+cd ~/atlas_ws/Livox-SDK2 &&
+git reset --hard '6a940156dd7151c3ab6a52442d86bc83613bd11b' &&
 find ~/atlas_ws/Livox-SDK2 -name "CMakeLists.txt" -exec sed -i 's/cmake_minimum_required(VERSION 3.0)/cmake_minimum_required(VERSION 3.10)/' {} + &&
 cd ./Livox-SDK2/ &&
 mkdir build &&
@@ -200,6 +206,7 @@ ros2 topic list
 # Build Sophus for calibration visualization
 cd ~/atlas_ws &&
 git clone https://github.com/strasdat/Sophus.git &&
+git reset --hard 'd0b7315a0d90fc6143defa54596a3a95d9fa10ec' &&
 cd Sophus &&
 mkdir build && cd build &&
 cmake .. -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF &&
@@ -210,30 +217,30 @@ sudo make install && sudo ldconfig
 
 # Clone RKO LIO ROS package
 cd ~/atlas_ws/src &&
-git clone https://github.com/PRBonn/rko_lio.git
+git clone https://github.com/PRBonn/rko_lio.git &&
+cd ~/atlas_ws/src/rko_lio &&
+git reset --hard '2363d1f55d3a7db4ff1a1266e35ad84e81069728'
 
 # Clone Direct Visual Lidar Calibration ROS package
 cd ~/atlas_ws/src &&
-git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive
+git clone https://github.com/koide3/direct_visual_lidar_calibration.git --recursive &&
+cd ~/atlas_ws/src/direct_visual_lidar_calibration &&
+git reset --hard '02a0dc039f5509708f384be4ff3228e0ae09352d'
 
 # Fix direct_visual_lidar_calibration for ROS2 Humble
-cd ~/atlas_ws/src/direct_visual_lidar_calibration &&
-sed -i '12,21d' CMakeLists.txt &&
-sed -i '11a# ROS2\nfind_package(ament_cmake_auto REQUIRED)\nfind_package(ament_cmake_python REQUIRED)\nfind_package(rosbag2_cpp REQUIRED)\nfind_package(rosbag2_storage REQUIRED)\nament_auto_find_build_dependencies()' CMakeLists.txt &&
-sed -i 's/set(OLD_DISTRO.*/# Force CV_BRIDGE_INCLUDE_H for ROS2 Humble\nadd_definitions(-DCV_BRIDGE_INCLUDE_H)/' CMakeLists.txt &&
-sed -i '/^if(\$ENV{ROS_VERSION} EQUAL 1)/,/^endif()/c\# ROS2\nament_auto_add_executable(preprocess\n  src/preprocess_ros2.cpp\n)\nament_target_dependencies(preprocess\n  rclcpp\n  rosbag2_cpp\n  rosbag2_storage\n  cv_bridge\n  sensor_msgs\n)\ntarget_link_libraries(preprocess\n  direct_visual_lidar_calibration\n)' CMakeLists.txt &&
-sed -i '/target_include_directories(preprocess_map/,+2d; /target_include_directories(initial_guess_manual/,+2d; /target_include_directories(initial_guess_auto/,+2d; /target_include_directories(calibrate/,+2d; /target_include_directories(viewer/,+2d' CMakeLists.txt &&
-sed -i '/^if(\$ENV{ROS_VERSION} EQUAL 1)/,/^endif()/c\# ROS2\nament_python_install_package(${PROJECT_NAME})\ninstall(PROGRAMS scripts/find_matches_superglue.py DESTINATION lib/${PROJECT_NAME})\nament_export_libraries(direct_visual_lidar_calibration)\nament_auto_package()' CMakeLists.txt
+bash ~/atlas_ws/src/atlas-scanner/src/install/fix_dvl_calibration.sh
 
-# Clone Optional SuperGlue (used for auto calibration which isn't currently used in the algorithm)
+# Clone (optional) SuperGlue (used for auto calibration which isn't currently recommended in the procedure)
 cd ~/atlas_ws/ &&
-git clone https://github.com/magicleap/SuperGluePretrainedNetwork.git
+git clone https://github.com/magicleap/SuperGluePretrainedNetwork.git &&
+cd cd ~/atlas_ws/SuperGluePretrainedNetwork &&
+git reset --hard 'ddcf11f42e7e0732a0c4607648f9448ea8d73590'
 
 # Replace {/home/orion/} with your home path
 echo 'export PYTHONPATH=$PYTHONPATH:/home/orion/atlas_ws/SuperGluePretrainedNetwork' >> ~/.bashrc
 source ~/.bashrc
 
-# Build GTSAM
+# Build GTSAM for calibration
 cd ~/atlas_ws &&
 git clone https://github.com/borglab/gtsam &&
 cd gtsam && git checkout 4.2a9 &&
@@ -249,7 +256,7 @@ make -j2
 # Install GTSAM (system-wide installation)
 sudo make install && sudo ldconfig
 
-# Build Ceres
+# Build Ceres for calibration
 cd ~/atlas_ws
 git clone --recurse-submodules https://github.com/ceres-solver/ceres-solver &&
 cd ceres-solver &&
@@ -264,6 +271,8 @@ sudo make install
 # Build Iridescence for calibration visualization 
 cd ~/atlas_ws &&
 git clone https://github.com/koide3/iridescence --recursive &&
+cd ~/atlas_ws/iridescence &&
+git reset --hard 'de083e26c7b27c14f4de37292decca9a18957fef' &&
 mkdir iridescence/build && cd iridescence/build &&
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 &&
 make -j2
