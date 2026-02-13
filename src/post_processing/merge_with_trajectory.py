@@ -35,6 +35,46 @@ def load_ply(ply_file):
     
     return np.array(points), np.array(colors)
 
+def merge_scans_simple(session_dir):
+    """Simple merge without trajectory - just concatenate all scans"""
+    session_path = Path(session_dir)
+    
+    scan_dirs = sorted([d for d in session_path.iterdir() 
+                       if d.is_dir() and d.name.startswith('fusion_scan_')])
+    
+    all_points = []
+    all_colors = []
+    
+    for scan_dir in scan_dirs:
+        colored_ply = scan_dir / "world_colored_exact.ply"
+        if not colored_ply.exists():
+            colored_ply = scan_dir / "sensor_colored_exact.ply"
+        
+        if not colored_ply.exists():
+            print(f"Warning: No colored point cloud for {scan_dir.name}, skipping")
+            continue
+        
+        points, colors = load_ply(colored_ply)
+        all_points.append(points)
+        all_colors.append(colors)
+        print(f"  {scan_dir.name}: {len(points)} points")
+    
+    if not all_points:
+        print("No points to merge")
+        return False
+    
+    merged_points = np.vstack(all_points)
+    merged_colors = np.vstack(all_colors)
+    
+    output_file = session_path / "merged_pointcloud.ply"
+    save_ply(output_file, merged_points, merged_colors)
+    
+    print(f"\n✓ Merged point cloud saved: {output_file}")
+    print(f"  Total points: {len(merged_points)}")
+    print("  Note: Merged without trajectory alignment (scans may not be aligned)")
+    
+    return True
+
 def save_ply(output_file, points, colors):
     """Save merged point cloud to PLY"""
     with open(output_file, 'w') as f:
@@ -82,8 +122,13 @@ def merge_scans_with_trajectory(session_dir):
     
     print(f"Merging {len(scan_dirs)} scans (transforming to first scan's frame)...")
     
-    # Get first scan's pose
+    # Check if first scan has trajectory
     traj_file = scan_dirs[0] / "trajectory.json"
+    if not traj_file.exists():
+        print("⚠ No trajectory data available, merging without transformation")
+        return merge_scans_simple(session_dir)
+    
+    # Get first scan's pose
     with open(traj_file) as f:
         ref_traj = json.load(f)
     T1 = np.array([float(x) for x in ref_traj['current_pose']['transformation_matrix_cloudcompare_absolute'].split()]).reshape(4,4)
@@ -109,30 +154,32 @@ def merge_scans_with_trajectory(session_dir):
         
         traj_file = scan_dir / "trajectory.json"
         if not traj_file.exists():
-            print(f"Warning: No trajectory for {scan_dir.name}, skipping")
-            continue
+            print(f"⚠ No trajectory for {scan_dir.name}, using identity transform")
+            # Use identity transform (no rotation)
+            points_aligned = points
         
-        with open(traj_file) as f:
-            traj = json.load(f)
-        
-        mat_str = traj['current_pose']['transformation_matrix_cloudcompare_absolute']
-        T = np.array([float(x) for x in mat_str.split()]).reshape(4, 4)
-        
-        # Points are in sensor frame. We want to align all to first scan's orientation.
-        # Relative transform from scan i to scan 1: T1.T @ T.T (inverse both, then compose)
-        # This undoes scan i's rotation and applies scan 1's inverse rotation
-        R = T[:3,:3]
-        R1 = T1[:3,:3]
-        R_rel = R1.T @ R.T
-        
-        # Apply relative rotation (no translation since robot rotates in place)
-        points_aligned = (R_rel @ points.T).T
-        
-        # Debug: show sample transformation
-        if len(points) > 0:
-            sample_before = points[0]
-            sample_after = points_aligned[0]
-            print(f"    Sample: {sample_before} -> {sample_after}")
+        else:
+            with open(traj_file) as f:
+                traj = json.load(f)
+            
+            mat_str = traj['current_pose']['transformation_matrix_cloudcompare_absolute']
+            T = np.array([float(x) for x in mat_str.split()]).reshape(4, 4)
+            
+            # Points are in sensor frame. We want to align all to first scan's orientation.
+            # Relative transform from scan i to scan 1: T1.T @ T.T (inverse both, then compose)
+            # This undoes scan i's rotation and applies scan 1's inverse rotation
+            R = T[:3,:3]
+            R1 = T1[:3,:3]
+            R_rel = R1.T @ R.T
+            
+            # Apply relative rotation (no translation since robot rotates in place)
+            points_aligned = (R_rel @ points.T).T
+            
+            # Debug: show sample transformation
+            if len(points) > 0:
+                sample_before = points[0]
+                sample_after = points_aligned[0]
+                print(f"    Sample: {sample_before} -> {sample_after}")
         
         all_points.append(points_aligned)
         all_colors.append(colors)
