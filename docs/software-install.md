@@ -1,5 +1,5 @@
 # Software Installation
-> *Note: Only Linux Ubuntu Jammy 22.04 is currently supported*
+> *Note: Only Linux Ubuntu Jammy 22.04, ROS2 Humble is currently supported*
 
 ## Automated Installation
 
