@@ -21,14 +21,24 @@ def combine_scans_for_calibration(base_dir, output_dir):
     total_count = 0
     
     for fusion_dir in fusion_dirs:
-        # Find masked equirectangular image first, fallback to regular
+        # Find masked equirectangular image - prefer blended version
         masked_files = list(fusion_dir.glob("equirect_*_masked.png"))
+        masked_raw_files = list(fusion_dir.glob("equirect_*_masked_raw.png"))
         equirect_files = list(fusion_dir.glob("equirect_*.jpg")) + list(fusion_dir.glob("equirect_*.png"))
         
-        # Prefer masked images for calibration (will fill with gray noise)
+        # Priority: blended masked > raw masked > regular
         if masked_files:
-            equirect_files = masked_files
-            print(f"  Using masked image from {fusion_dir.name}")
+            # Filter out raw versions to get blended
+            blended_masked = [f for f in masked_files if '_raw' not in f.name]
+            if blended_masked:
+                equirect_files = blended_masked
+                print(f"  Using blended masked image from {fusion_dir.name}")
+            elif masked_raw_files:
+                equirect_files = masked_raw_files
+                print(f"  Using raw masked image from {fusion_dir.name}")
+            else:
+                equirect_files = masked_files
+                print(f"  Using masked image from {fusion_dir.name}")
         else:
             equirect_files = [f for f in equirect_files if '_masked' not in f.name]
         

@@ -39,11 +39,15 @@ def exact_match_calibration_tool(scan_dir):
     sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir) 
                       if 'sensor_lidar' in f and f.endswith('.ply')), None)
     
-    # Find image
+    # Find image - prefer blended masked, then masked, then regular
     mask_file = None
     image_file = None
     
     for f in os.listdir(scan_dir):
+        # Skip raw backups
+        if '_raw' in f:
+            continue
+        # Prefer masked PNG (which should be blended if blend script ran)
         if f.endswith('_masked.png'):
             mask_file = os.path.join(scan_dir, f)
         elif ('equirect' in f or 'equirectangular' in f) and f.endswith('.jpg'):

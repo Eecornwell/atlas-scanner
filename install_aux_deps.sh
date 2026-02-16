@@ -128,6 +128,7 @@ cp ~/atlas_ws/src/atlas-scanner/src/install/display_point_cloud_ROS2.rviz \
 # Final build of all ROS packages
 cd ~/atlas_ws
 source /opt/ros/humble/setup.bash
+export ROS_VERSION=2
 colcon build --symlink-install
 source install/setup.bash
 

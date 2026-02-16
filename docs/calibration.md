@@ -129,11 +129,13 @@
         - Auto
             - Recommended for research projects, quick but can struggle in some configurations
             ```bash
-            cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
+            cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
-            source ~/atlas_ws/install/setup.bash
+            cd ~/atlas_ws
+            source install/setup.bash
             ros2 run direct_visual_lidar_calibration initial_guess_auto ~/atlas_ws/output
+            python3 -c "import json; f=open('~/atlas_ws/output/calib.json'.replace('~','$HOME'),'r+'); d=json.load(f); d['results']['init_T_lidar_camera']=d['results']['init_T_lidar_camera_auto']; f.seek(0); json.dump(d,f,indent=2); f.truncate()"
             ```
 
     5. Run calibration
@@ -142,8 +144,6 @@
         ./calibrate --data_path ~/atlas_ws/output
         ```
         > *Note: Check that the calibration worked and that the point cloud corresponds to the ERP image. Use the `blend` slider to reveal both the point cloud and image.*
-
-        > *Note: If using the Auto method above and get a `[ros2run]: Segmentation fault`, the feature matcher failed. The recommended path is to use the manual method above.*
 
     6. Extract and apply new calibration
         ```bash

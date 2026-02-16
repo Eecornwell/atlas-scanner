@@ -95,7 +95,7 @@ cleanup() {
         if [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
             if [ "$BLEND_ERP_SEAMS" = "true" ]; then
                 echo "Blending ERP image seams..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/blend_erp_seams.py" "$SCAN_DIR"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/blend_erp_seams_simple.py" "$SCAN_DIR"
             fi
             echo "Creating masked images from blended ERPs..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR"

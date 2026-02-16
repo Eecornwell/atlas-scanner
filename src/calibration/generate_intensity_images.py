@@ -5,8 +5,8 @@ import sys
 import os
 from pathlib import Path
 
-def generate_intensity_image(ply_file, output_image, width=1920, height=960):
-    """Generate intensity image from PLY point cloud for SuperGlue"""
+def generate_intensity_image(ply_file, output_image, point_indices_image, width=1920, height=960):
+    """Generate intensity image and point indices from PLY point cloud for SuperGlue"""
     
     # Read PLY file
     points = []
@@ -52,21 +52,35 @@ def generate_intensity_image(ply_file, output_image, width=1920, height=960):
     u = u[valid]
     v = v[valid]
     intensities = intensities[valid]
+    point_indices = np.where(valid)[0]
     
-    # Create intensity image
+    # Create intensity image and point indices image
     intensity_image = np.zeros((height, width), dtype=np.uint8)
+    indices_image = np.full((height, width), -1, dtype=np.int32)
     
     # Normalize intensities to 0-255
     if intensities.max() > 1.0:
         intensities = intensities / 255.0
     intensities = np.clip(intensities * 255, 0, 255).astype(np.uint8)
     
-    # Fill image
+    # Fill images
     intensity_image[v, u] = intensities
+    indices_image[v, u] = point_indices
     
-    # Save
+    # Save intensity image
     cv2.imwrite(output_image, intensity_image)
+    
+    # Save point indices as 8UC4 (RGBA) to store 32-bit int data
+    # The C++ code will reinterpret the 4 bytes as a single int32
+    indices_rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    indices_bytes = indices_image.astype(np.int32).tobytes()
+    indices_rgba_flat = np.frombuffer(indices_bytes, dtype=np.uint8)
+    indices_rgba = indices_rgba_flat.reshape((height, width, 4))
+    
+    cv2.imwrite(point_indices_image, indices_rgba)
+    
     print(f"✓ Generated {output_image}")
+    print(f"✓ Generated {point_indices_image}")
     return True
 
 if __name__ == "__main__":
@@ -88,7 +102,8 @@ if __name__ == "__main__":
     for ply_file in ply_files:
         base_name = ply_file.stem
         output_image = output_dir / f"{base_name}_lidar_intensities.png"
-        generate_intensity_image(str(ply_file), str(output_image))
+        point_indices_image = output_dir / f"{base_name}_lidar_indices.png"
+        generate_intensity_image(str(ply_file), str(output_image), str(point_indices_image))
     
     print(f"\n✓ Generated {len(ply_files)} intensity images")
     print("Now you can run SuperGlue:")
