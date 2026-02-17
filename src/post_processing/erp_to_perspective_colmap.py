@@ -103,8 +103,8 @@ def erp_to_perspective(erp_img, fov_deg, yaw, pitch, output_size=1024):
     erp_u = ((lon + np.pi) / (2 * np.pi) * w).astype(np.float32)
     erp_v = ((np.pi / 2 - lat) / np.pi * h).astype(np.float32)
     
-    # Remap
-    perspective = cv2.remap(erp_img, erp_u, erp_v, cv2.INTER_LINEAR)
+    # Remap with cubic interpolation and border replication to reduce seams
+    perspective = cv2.remap(erp_img, erp_u, erp_v, cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
     
     return perspective
 

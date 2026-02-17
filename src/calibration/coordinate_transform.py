@@ -26,20 +26,11 @@ def calibration_transform(root_path, use_existing=False):
             print("No existing calibration found, generating new one...")
             use_existing = False
     
-    # Load calib.json
-    calib_paths = [
-        os.path.join(root_path, 'output', 'calib.json'),
-        '/home/orion/atlas_ws/output/calib.json'
-    ]
+    # Load calib.json from workspace level
+    calib_path = '/home/orion/atlas_ws/output/calib.json'
     
-    calib_path = None
-    for path in calib_paths:
-        if os.path.exists(path):
-            calib_path = path
-            break
-    
-    if calib_path is None:
-        raise FileNotFoundError(f"calib.json not found in: {calib_paths}")
+    if not os.path.exists(calib_path):
+        raise FileNotFoundError(f"calib.json not found at: {calib_path}")
     
     with open(calib_path, 'r') as f:
         calib_data = json.load(f)

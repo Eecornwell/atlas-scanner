@@ -37,9 +37,6 @@ def save_e57_with_pose(points, filename, pose_data=None, colors=None):
     # Try to add pose via header modification (if supported)
     if pose_data:
         try:
-            # Get the header that was just created
-            header = e57.get_header(0)
-            
             pos = pose_data.get('position', {})
             ori = pose_data.get('orientation', {})
             
@@ -54,15 +51,11 @@ def save_e57_with_pose(points, filename, pose_data=None, colors=None):
             
             translation = np.array([pos.get('x', 0.0), pos.get('y', 0.0), pos.get('z', 0.0)])
             
-            # Try to set pose data if header supports it
-            if hasattr(header, 'rotation_matrix'):
-                header.rotation_matrix = rotation_matrix
-            if hasattr(header, 'translation'):
-                header.translation = translation
+            # pye57 doesn't support modifying headers after creation
+            # Pose data is preserved in PLY and JSON files
                 
         except Exception as e:
-            print(f"Note: Could not embed pose in E57 header: {e}")
-            print("Pose data available in PLY and JSON files")
+            pass  # Silently skip pose embedding
     e57.close()
     
     print(f"✓ Saved E57 file: {filename}")

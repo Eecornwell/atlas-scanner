@@ -125,19 +125,25 @@ def export_to_colmap(session_dir):
                 qw_c2w, qx_c2w, qy_c2w, qz_c2w = quat_w2c[3], quat_w2c[0], quat_w2c[1], quat_w2c[2]
                 t_c2w = T
         
-        # Find equirectangular image - prioritize masked blended version
+        # Find equirectangular image - prioritize blended masked version
         image_candidates = [
-            scan_dir / "equirect_*_masked.png",  # Highest priority: masked + blended
-            scan_dir / "equirect_*_raw_masked.png",  # Second: masked only
+            scan_dir / "equirect_blended_masked.png",  # Highest priority: blended + masked
+            scan_dir / "equirect_*_masked.png",  # Second: any masked version
+            scan_dir / "equirect_*_raw_masked.png",  # Third: raw masked
             scan_dir / "equirect_*.jpg"  # Fallback: original
         ]
         
         erp_image = None
         for pattern in image_candidates:
-            matches = list(scan_dir.glob(pattern.name))
-            if matches:
-                erp_image = matches[0]
-                break
+            if '*' in pattern.name:
+                matches = list(scan_dir.glob(pattern.name))
+                if matches:
+                    erp_image = matches[0]
+                    break
+            else:
+                if pattern.exists():
+                    erp_image = pattern
+                    break
         
         if not erp_image:
             print(f"Warning: No ERP image for {scan_dir.name}, skipping")

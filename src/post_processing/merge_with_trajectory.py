@@ -110,7 +110,7 @@ def transform_points(points, position, orientation):
     return points_world
 
 def merge_scans_with_trajectory(session_dir):
-    """Merge scans by transforming all to first scan's coordinate frame"""
+    """Merge scans by transforming all using trajectory poses"""
     session_path = Path(session_dir)
     
     scan_dirs = sorted([d for d in session_path.iterdir() 
@@ -120,23 +120,13 @@ def merge_scans_with_trajectory(session_dir):
         print("No scan directories found")
         return False
     
-    print(f"Merging {len(scan_dirs)} scans (transforming to first scan's frame)...")
+    print(f"Merging {len(scan_dirs)} scans using trajectory poses...")
     
     # Check if first scan has trajectory
     traj_file = scan_dirs[0] / "trajectory.json"
     if not traj_file.exists():
         print("⚠ No trajectory data available, merging without transformation")
         return merge_scans_simple(session_dir)
-    
-    # Get first scan's pose
-    with open(traj_file) as f:
-        ref_traj = json.load(f)
-    T1 = np.array([float(x) for x in ref_traj['current_pose']['transformation_matrix_cloudcompare_absolute'].split()]).reshape(4,4)
-    
-    # Compute inverse of first scan's pose
-    T1_inv = np.eye(4)
-    T1_inv[:3,:3] = T1[:3,:3].T
-    T1_inv[:3, 3] = -T1[:3,:3].T @ T1[:3, 3]
     
     all_points = []
     all_colors = []
@@ -155,33 +145,37 @@ def merge_scans_with_trajectory(session_dir):
         traj_file = scan_dir / "trajectory.json"
         if not traj_file.exists():
             print(f"⚠ No trajectory for {scan_dir.name}, using identity transform")
-            # Use identity transform (no rotation)
-            points_aligned = points
-        
+            points_transformed = points
         else:
             with open(traj_file) as f:
                 traj = json.load(f)
             
-            mat_str = traj['current_pose']['transformation_matrix_cloudcompare_absolute']
-            T = np.array([float(x) for x in mat_str.split()]).reshape(4, 4)
-            
-            # Points are in sensor frame. We want to align all to first scan's orientation.
-            # Relative transform from scan i to scan 1: T1.T @ T.T (inverse both, then compose)
-            # This undoes scan i's rotation and applies scan 1's inverse rotation
-            R = T[:3,:3]
-            R1 = T1[:3,:3]
-            R_rel = R1.T @ R.T
-            
-            # Apply relative rotation (no translation since robot rotates in place)
-            points_aligned = (R_rel @ points.T).T
-            
-            # Debug: show sample transformation
-            if len(points) > 0:
-                sample_before = points[0]
-                sample_after = points_aligned[0]
-                print(f"    Sample: {sample_before} -> {sample_after}")
+            # Get lidar pose (position and orientation)
+            if 'current_pose' in traj and 'lidar_pose' in traj['current_pose']:
+                lidar_pose = traj['current_pose']['lidar_pose']
+                position = lidar_pose['position']
+                orientation = lidar_pose['orientation']
+                
+                # Build transformation matrix
+                pos = np.array([position['x'], position['y'], position['z']])
+                quat = [orientation['x'], orientation['y'], orientation['z'], orientation['w']]
+                rot = R.from_quat(quat)
+                R_mat = rot.as_matrix()
+                
+                # Transform points: p_world = R * p_sensor + t
+                points_transformed = (R_mat @ points.T).T + pos
+                
+                # Debug: show sample transformation
+                if len(points) > 0:
+                    sample_before = points[0]
+                    sample_after = points_transformed[0]
+                    print(f"    Sample: {sample_before} -> {sample_after}")
+                    print(f"    Pose: t=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
+            else:
+                print(f"⚠ Invalid trajectory format for {scan_dir.name}, using identity")
+                points_transformed = points
         
-        all_points.append(points_aligned)
+        all_points.append(points_transformed)
         all_colors.append(colors)
         
         print(f"  {scan_dir.name}: {len(points)} points")

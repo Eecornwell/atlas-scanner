@@ -7,9 +7,9 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Configuration
 SAVE_E57=false                      # Set to true to enable E57 export
 USE_EXISTING_CALIBRATION=false      # Set to true to skip calibration update from calib.json
-ENABLE_ICP_ALIGNMENT=false          # Set to true to offer ICP alignment at end
+ENABLE_ICP_ALIGNMENT=true           # Set to true to offer ICP alignment at end
 BLEND_ERP_SEAMS=true                # Set to true to blend fisheye seams in ERP images before coloring
-EXPORT_COLMAP=false                 # Set to true to export session to COLMAP format
+EXPORT_COLMAP=true                  # Set to true to export session to COLMAP format (experimental)
 ENABLE_POST_PROCESSING_BAGS=false   # Set to true to offer post-processing option at end
 SKIP_LIVE_FUSION=true               # Set to true to skip fusion during scanning, only record bags
 AUTO_CREATE_COLORED=true            # Set to true to automatically create colored point clouds when SKIP_LIVE_FUSION=true
@@ -106,14 +106,19 @@ cleanup() {
         
         # Always merge scans using trajectory poses (if available)
         if [ "$SCAN_COUNT" -gt 1 ]; then
-            echo "Merging scans using trajectory poses..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/merge_with_trajectory.py" "$SCAN_DIR"
-            MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
-            
-            # Create E57 for merged file if enabled
-            if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
-                echo "Creating E57 for merged point cloud..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+            # If ICP alignment is enabled, skip trajectory merge and use ICP poses instead
+            if [ "$ENABLE_ICP_ALIGNMENT" = "true" ]; then
+                echo "Skipping trajectory-based merge (will use ICP alignment instead)..."
+            else
+                echo "Merging scans using trajectory poses..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/merge_with_trajectory.py" "$SCAN_DIR"
+                MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
+                
+                # Create E57 for merged file if enabled
+                if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
+                    echo "Creating E57 for merged point cloud..."
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+                fi
             fi
         elif [ "$SCAN_COUNT" -eq 1 ]; then
             # Single scan - just copy it as merged
@@ -132,15 +137,15 @@ cleanup() {
             fi
         fi
         
-        # ICP Alignment (optional refinement on top of pose-based merge)
+        # ICP Alignment
         if [ "$SCAN_COUNT" -gt 1 ] && [ "$ENABLE_ICP_ALIGNMENT" = "true" ]; then
-            echo "Applying ICP alignment for refinement..."
+            echo "Applying ICP alignment..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/align_scan_session.py" "$SCAN_DIR"
             if [ $? -eq 0 ]; then
                 echo "✓ ICP alignment complete"
-                # Use ICP-aligned merged file if it exists
-                if [ -f "$SCAN_DIR/merged_aligned_pointcloud.ply" ]; then
-                    MERGED_FILE="$SCAN_DIR/merged_aligned_pointcloud.ply"
+                # Use ICP-aligned merged file (colored version)
+                if [ -f "$SCAN_DIR/merged_aligned_colored.ply" ]; then
+                    MERGED_FILE="$SCAN_DIR/merged_aligned_colored.ply"
                     
                     # Create E57 for aligned merged file if enabled
                     if [ "$SAVE_E57" = "true" ]; then
@@ -149,7 +154,7 @@ cleanup() {
                     fi
                 fi
             else
-                echo "⚠ ICP alignment failed, using pose-based merge"
+                echo "⚠ ICP alignment failed"
             fi
         fi
         

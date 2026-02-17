@@ -1,12 +1,84 @@
 #!/usr/bin/env python3
 """
-BA-style registration with improved connectivity.
+Geometry-based point cloud alignment with RANSAC + Multi-scale ICP.
+
+Algorithm Overview:
+------------------
+1. RANSAC Initialization:
+   - Uses FPFH (Fast Point Feature Histograms) geometric features
+   - 200K iterations for robust initial alignment
+   - Purely geometry-based (no color influence)
+
+2. Multi-scale ICP Refinement:
+   - 4 scales: coarse to fine (voxel_size * 15 -> 1.0)
+   - Point-to-plane ICP with Tukey robust loss function
+   - Handles outliers and noise effectively
+
+3. Sequential Alignment Strategy:
+   - All scans aligned to first scan (reference)
+   - Avoids drift accumulation from sequential chaining
+   - More reliable than pose graph optimization for small scan sets
+
+4. Coordinate Frame Handling:
+   - world_lidar.ply: Already in world frame (poses baked in)
+   - world_colored_exact.ply: In sensor/camera frame (needs alignment)
+   - Algorithm aligns colored point clouds directly (sensor frame)
+   - Colors stripped during registration to focus on 3D geometry
+   - Refined transforms applied to colored point clouds for output
+
+5. Geometry-First Registration:
+   - Alignment computed using geometry only (colors removed)
+   - FPFH features based on surface normals and curvature
+   - Point-to-plane ICP uses geometric distances only
+   - Produces accurate alignment independent of color/texture
+
+Output:
+-------
+- Individual aligned colored point clouds: world_colored_exact_aligned.ply in each scan directory
+- Merged colored point cloud: merged_aligned_colored.ply in session directory
+
+Note: world_lidar.ply files are NOT aligned as they're already in world frame.
 """
 
 import sys
 from pathlib import Path
 import open3d as o3d
 import numpy as np
+import json
+
+def load_trajectory_pose(scan_dir):
+    """Load initial trajectory pose from trajectory.json or metadata.json."""
+    # Try trajectory.json first (newer format)
+    trajectory_file = scan_dir / "trajectory.json"
+    if trajectory_file.exists():
+        with open(trajectory_file, 'r') as f:
+            trajectory = json.load(f)
+            if 'current_pose' in trajectory and 'lidar_pose' in trajectory['current_pose']:
+                lidar_pose = trajectory['current_pose']['lidar_pose']
+                pose = np.eye(4)
+                # Extract position
+                pos = lidar_pose['position']
+                pose[:3, 3] = [pos['x'], pos['y'], pos['z']]
+                # Extract orientation (quaternion) and convert to rotation matrix
+                quat = lidar_pose['orientation']
+                from scipy.spatial.transform import Rotation as R
+                rot = R.from_quat([quat['x'], quat['y'], quat['z'], quat['w']])
+                pose[:3, :3] = rot.as_matrix()
+                return pose
+    
+    # Fallback to metadata.json (older format)
+    metadata_file = scan_dir / "metadata.json"
+    if metadata_file.exists():
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            if 'trajectory_pose' in metadata:
+                pose_data = metadata['trajectory_pose']
+                pose = np.eye(4)
+                pose[:3, :3] = np.array(pose_data['rotation']).reshape(3, 3)
+                pose[:3, 3] = np.array(pose_data['translation'])
+                return pose
+    
+    return np.eye(4)
 
 def get_point_cloud_center_ply(ply_path):
     """Get center of PLY point cloud."""
@@ -44,137 +116,217 @@ def get_sequential_and_knn_pairs(ply_files):
     
     return sequential_pairs, knn_pairs
 
-def pairwise_registration_ba_style(source, target, voxel_size=0.05):
-    """BA-style pairwise registration with Tukey loss."""
+def ransac_initial_alignment(source, target, voxel_size):
+    """RANSAC-based initial alignment using FPFH features."""
+    radius_feature = voxel_size * 5
+    source_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        source, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
+    target_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        target, o3d.geometry.KDTreeSearchParamHybrid(radius=radius_feature, max_nn=100))
     
-    sigmaf = 3.0
-    sigma = sigmaf * voxel_size
-    loss = o3d.pipelines.registration.TukeyLoss(k=sigma)
+    result_ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source, target, source_fpfh, target_fpfh, True,
+        max_correspondence_distance=voxel_size * 2.0,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=3,
+        checkers=[o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.8),
+                  o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel_size * 2.0)],
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(200000, 0.999))
     
-    max_correspondence_distance_coarse = voxel_size * 15
-    max_correspondence_distance_fine = voxel_size * 1.5
-    
-    # Coarse registration
-    icp_coarse = o3d.pipelines.registration.registration_icp(
-        source, target, max_correspondence_distance_coarse, np.identity(4),
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(loss))
-    
-    # Fine registration
-    icp_fine = o3d.pipelines.registration.registration_icp(
-        source, target, max_correspondence_distance_fine, icp_coarse.transformation,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(loss))
-    
-    transformation_icp = icp_fine.transformation
-    information_icp = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-        source, target, max_correspondence_distance_fine, icp_fine.transformation)
-    
-    return transformation_icp, information_icp, icp_fine.fitness
+    print(f"    RANSAC fitness: {result_ransac.fitness:.3f}, RMSE: {result_ransac.inlier_rmse:.4f}")
+    return result_ransac.transformation, result_ransac.fitness
 
-def register_final_ba(input_dir, output_dir):
-    """Final BA-style registration with guaranteed connectivity."""
+def pairwise_registration_ba_style(source, target, voxel_size=0.05):
+    """
+    RANSAC + Multi-scale ICP with Tukey loss.
     
-    input_path = Path(input_dir)
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    Steps:
+    1. RANSAC with FPFH features for initial alignment
+    2. Multi-scale ICP (4 scales) with point-to-plane + Tukey loss
+    3. Returns transformation, information matrix, and fitness score
+    """
     
-    # Find aligned PLY files
-    ply_files = sorted(input_path.glob("scan_*_aligned.ply"))
+    # RANSAC initialization
+    current_transform, ransac_fitness = ransac_initial_alignment(source, target, voxel_size)
     
-    print(f"Found {len(ply_files)} PLY files")
+    # Skip ICP if RANSAC failed badly
+    if ransac_fitness < 0.05:
+        print(f"    WARNING: RANSAC fitness too low ({ransac_fitness:.3f}), using identity")
+        current_transform = np.eye(4)
     
-    # Get pairs with guaranteed connectivity
-    sequential_pairs, knn_pairs = get_sequential_and_knn_pairs(ply_files)
-    print(f"Sequential pairs: {len(sequential_pairs)}, KNN pairs: {len(knn_pairs)}")
+    loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 2.0)
     
+    scales = [
+        (voxel_size * 15, 50),
+        (voxel_size * 5, 30),
+        (voxel_size * 2, 20),
+        (voxel_size * 1.0, 14)
+    ]
+    
+    for i, (max_dist, max_iter) in enumerate(scales):
+        result = o3d.pipelines.registration.registration_icp(
+            source, target, max_dist, current_transform,
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter))
+        current_transform = result.transformation
+        print(f"    ICP scale {i+1}: fitness={result.fitness:.3f}, RMSE={result.inlier_rmse:.4f}")
+    
+    information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        source, target, scales[-1][0], current_transform)
+    
+    return current_transform, information, result.fitness
+
+def register_final_ba(session_dir):
+    """
+    Sequential registration with RANSAC + multi-scale ICP.
+    
+    Process:
+    1. Load colored point clouds (sensor frame) for alignment
+    2. Strip colors and preprocess (outlier removal, downsampling, normals)
+    3. Align each scan to reference using RANSAC + ICP
+    4. Apply refined transforms to original colored point clouds
+    5. Save individual aligned colored clouds and merged result
+    
+    Note: world_lidar.ply files already have poses baked in (world frame),
+    while world_colored_exact.ply files are in sensor/camera frame and need alignment.
+    """
+    
+    session_path = Path(session_dir)
+    
+    # Find scan subdirectories
+    scan_dirs = sorted(session_path.glob("fusion_scan_*"))
+    
+    if len(scan_dirs) < 2:
+        print(f"Need at least 2 scans for alignment, found {len(scan_dirs)}")
+        return
+    
+    print(f"Found {len(scan_dirs)} scan directories")
+    
+    # Find point clouds - use colored for alignment since lidar is already in world frame
+    ply_files = []
+    for scan_dir in scan_dirs:
+        # Use colored point clouds (sensor frame) for alignment
+        ply = scan_dir / "world_colored_exact.ply"
+        if not ply.exists():
+            ply = scan_dir / "world_colored_pointcloud.ply"
+        if not ply.exists():
+            ply = scan_dir / "sensor_lidar.ply"  # Fallback to sensor frame lidar
+        if ply.exists():
+            ply_files.append(ply)
+            # Debug: check point cloud center
+            pcd_temp = o3d.io.read_point_cloud(str(ply))
+            center = np.mean(np.asarray(pcd_temp.points), axis=0)
+            print(f"  Using {scan_dir.name}/{ply.name}: center = [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]")
+    
+    if len(ply_files) < 2:
+        print(f"Need at least 2 point clouds, found {len(ply_files)}")
+        return
+    
+    print(f"Found {len(ply_files)} point clouds")
+    
+    # Load trajectory poses to unbake from colored point clouds
+    trajectory_poses = []
+    for scan_dir in scan_dirs:
+        pose = load_trajectory_pose(scan_dir)
+        trajectory_poses.append(pose)
+        # Debug: check if pose is identity
+        is_identity = np.allclose(pose, np.eye(4))
+        print(f"Loaded trajectory pose for {scan_dir.name}: {'Identity' if is_identity else 'Non-identity'}")
+        if not is_identity:
+            print(f"  Translation: {pose[:3, 3]}")
+    
+    # Remove debug output since we're now using colored directly
     # Load and preprocess clouds
     voxel_size = 0.05
     pcds = []
+    
     for f in ply_files:
         pcd = o3d.io.read_point_cloud(str(f))
+        # Remove colors to focus purely on geometry
+        pcd.colors = o3d.utility.Vector3dVector()
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         pcd = pcd.voxel_down_sample(voxel_size)
         pcd.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+        pcd.orient_normals_consistent_tangent_plane(30)
         pcds.append(pcd)
-        print(f"Preprocessed {f.name}: {len(pcd.points)} points")
+        print(f"Preprocessed {f.parent.name}/{f.name}: {len(pcd.points)} points")
     
-    # Create pose graph
-    pose_graph = o3d.pipelines.registration.PoseGraph()
+    # Sequential alignment to first scan (reference)
+    print("\nAligning scans sequentially to reference...")
+    reference_pcd = pcds[0]
+    transforms = [np.eye(4)]  # Reference has identity transform
     
-    # Add nodes
-    for i in range(len(pcds)):
-        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
-    
-    # Add sequential edges (certain)
-    print("Adding sequential edges...")
-    for p in sequential_pairs:
-        print(f"Sequential: {ply_files[p[0]].name} -> {ply_files[p[1]].name}")
+    for i in range(1, len(pcds)):
+        print(f"\nAligning scan {i+1} ({ply_files[i].parent.name}) to reference...")
         
         transformation, information, fitness = pairwise_registration_ba_style(
-            pcds[p[0]], pcds[p[1]], voxel_size)
+            pcds[i], reference_pcd, voxel_size)
         
-        print(f"  Fitness: {fitness:.3f}")
-        
-        pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
-            p[0], p[1], transformation, information, uncertain=False))
+        print(f"  Final fitness: {fitness:.3f}")
+        transforms.append(transformation)
     
-    # Add KNN edges (uncertain)
-    print("Adding KNN edges...")
-    for p in knn_pairs:
-        print(f"KNN: {ply_files[p[0]].name} -> {ply_files[p[1]].name}")
+    # Save results - colored point clouds with refined alignment
+    print("\nSaving aligned results...")
+    for i, scan_dir in enumerate(scan_dirs):
+        # Save aligned colored (this is what we aligned)
+        colored_file = scan_dir / "world_colored_exact.ply"
+        if not colored_file.exists():
+            colored_file = scan_dir / "world_colored_pointcloud.ply"
+        if colored_file.exists():
+            pcd_colored = o3d.io.read_point_cloud(str(colored_file))
+            pcd_colored.transform(transforms[i])
+            output_colored = scan_dir / f"{colored_file.stem}_aligned.ply"
+            o3d.io.write_point_cloud(str(output_colored), pcd_colored)
         
-        transformation, information, fitness = pairwise_registration_ba_style(
-            pcds[p[0]], pcds[p[1]], voxel_size)
+        # Extract rotation (as Euler angles) and translation
+        pose = transforms[i]
+        translation = pose[:3, 3]
+        rotation_matrix = pose[:3, :3]
         
-        print(f"  Fitness: {fitness:.3f}")
+        # Convert rotation matrix to Euler angles (ZYX convention)
+        sy = np.sqrt(rotation_matrix[0, 0]**2 + rotation_matrix[1, 0]**2)
+        singular = sy < 1e-6
+        if not singular:
+            x = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+            y = np.arctan2(-rotation_matrix[2, 0], sy)
+            z = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+        else:
+            x = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+            y = np.arctan2(-rotation_matrix[2, 0], sy)
+            z = 0
         
-        # Only add edge if fitness is reasonable
-        if fitness > 0.1:
-            pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
-                p[0], p[1], transformation, information, uncertain=True))
+        euler_deg = np.degrees([x, y, z])
+        print(f"{scan_dir.name}:")
+        print(f"  Position: [{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}]")
+        print(f"  Rotation: [{euler_deg[0]:.1f}°, {euler_deg[1]:.1f}°, {euler_deg[2]:.1f}°]")
     
-    # Global optimization
-    print("Running global optimization...")
-    option = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=voxel_size * 1.5,
-        edge_prune_threshold=0.25,
-        reference_node=0)
+    # Create merged colored point cloud
+    print("\nCreating merged colored point cloud...")
+    merged_colored = o3d.geometry.PointCloud()
     
-    o3d.pipelines.registration.global_optimization(
-        pose_graph,
-        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-        option)
+    for i, scan_dir in enumerate(scan_dirs):
+        colored_file = scan_dir / "world_colored_exact.ply"
+        if not colored_file.exists():
+            colored_file = scan_dir / "world_colored_pointcloud.ply"
+        if colored_file.exists():
+            pcd = o3d.io.read_point_cloud(str(colored_file))
+            pcd.transform(transforms[i])
+            merged_colored = merged_colored + pcd
     
-    # Save results
-    print("Saving results...")
-    for i, ply_file in enumerate(ply_files):
-        pcd = o3d.io.read_point_cloud(str(ply_file))
-        pcd.transform(pose_graph.nodes[i].pose)
-        
-        output_file = output_path / f"{ply_file.stem}_registered.ply"
-        o3d.io.write_point_cloud(str(output_file), pcd)
-        
-        translation = pose_graph.nodes[i].pose[:3, 3]
-        print(f"{ply_file.name}: [{translation[0]:.3f}, {translation[1]:.3f}, {translation[2]:.3f}]")
-    
-    # Merged result
-    merged = o3d.geometry.PointCloud()
-    for i, ply_file in enumerate(ply_files):
-        pcd = o3d.io.read_point_cloud(str(ply_file))
-        pcd.transform(pose_graph.nodes[i].pose)
-        merged = merged + pcd
-    
-    merged = merged.voxel_down_sample(0.005)
-    merged_file = output_path / "merged_result.ply"
-    o3d.io.write_point_cloud(str(merged_file), merged)
-    print(f"Merged: {merged_file} ({len(merged.points)} points)")
+    if len(merged_colored.points) > 0:
+        merged_colored = merged_colored.voxel_down_sample(0.005)
+        merged_colored_file = session_path / "merged_aligned_colored.ply"
+        o3d.io.write_point_cloud(str(merged_colored_file), merged_colored)
+        print(f"Merged colored: {merged_colored_file} ({len(merged_colored.points)} points)")
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python final_ba_registration.py <input_dir> <output_dir>")
+    if len(sys.argv) != 2:
+        print("Usage: python align_scan_session.py <session_dir>")
+        print("Example: python align_scan_session.py ~/atlas_ws/data/synchronized_scans/sync_fusion_20260216_203306")
         return
     
-    register_final_ba(sys.argv[1], sys.argv[2])
+    register_final_ba(sys.argv[1])
 
 if __name__ == "__main__":
     main()

@@ -69,8 +69,8 @@
 - Procedure
     1. Ensure both the Lidar and Camera are powered on. Capture new data of at least **1** scan. This will be used to create a mask for the equirectangular image.
         ```bash
-        mkdir -p ~/atlas_ws/src/atlas-scanner/src/output
-        cat > ~/atlas_ws/src/atlas-scanner/src/output/calib.json << 'EOF'
+        mkdir -p ~/atlas_ws/output
+        cat > ~/atlas_ws/output/calib.json << 'EOF'
         {
         "T_lidar_camera": [
             [1, 0, 0, 0],
@@ -147,7 +147,7 @@
 
     6. Extract and apply new calibration
         ```bash
-        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_coordinate_transform.py \
+        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
             ~/atlas_ws/src/atlas-scanner/src
         ```
         > *Note: This will properly invert the transformation from calib.json and save to: `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`*
