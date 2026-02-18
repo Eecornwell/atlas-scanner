@@ -5,7 +5,7 @@ import sys
 import os
 from pathlib import Path
 
-def generate_intensity_image(ply_file, output_image, point_indices_image, width=1920, height=960):
+def generate_intensity_image(ply_file, output_image, point_indices_image, width=3840, height=1920):
     """Generate intensity image and point indices from PLY point cloud for SuperGlue"""
     
     # Read PLY file

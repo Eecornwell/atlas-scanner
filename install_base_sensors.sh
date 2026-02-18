@@ -120,6 +120,26 @@ rosdep install --from-paths src --ignore-src -r -y
 # Apply fix for insta360 library (remove unsupported SDK call)
 sed -i '/uint64_t utc_time/,/cam->SyncLocalTimeToCamera/d' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 
+# Apply camera quality improvements
+echo "Applying camera quality improvements..."
+# 1. Update resolution to 3840x1920 (high quality)
+sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+# 2. Increase bitrate to 12 Mbps for better quality
+sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+# 3. Use high-quality Lanczos scaling instead of nearest neighbor
+sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
+# 4. Update equirectangular config for new resolution
+sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+sed -i 's/out_height: 960/out_height: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+# 5. Update atlas-scanner configs for new resolution
+sed -i 's/image_width: 1920/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
+sed -i 's/image_height: 960/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
+sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
+# 6. Update JPEG quality to 100 in capture scripts
+sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
+sed -i "s/cv2.imwrite(output_path, cv_image)/cv2.imwrite(output_path, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g" ~/atlas_ws/src/atlas-scanner/src/terrestrial_fusion_with_lio.sh
+
 # Build ROS2 packages with symlink-install
 export HUMBLE_ROS=humble
 cd ~/atlas_ws

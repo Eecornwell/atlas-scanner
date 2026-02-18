@@ -42,7 +42,7 @@ def combine_scans_for_calibration(base_dir, output_dir):
         else:
             equirect_files = [f for f in equirect_files if '_masked' not in f.name]
         
-        ply_files = list(fusion_dir.glob("sensor_lidar_*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
+        ply_files = list(fusion_dir.glob("sensor_lidar*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
         
         if equirect_files and ply_files:
             # Copy and convert image to PNG (handle alpha channel if present)
@@ -107,7 +107,7 @@ def combine_scans_for_calibration(base_dir, output_dir):
         "camera": {
             "camera_model": "equirectangular",
             "distortion_coeffs": [],
-            "intrinsics": [1920.0, 960.0]
+            "intrinsics": [3840.0, 1920.0]
         },
         "meta": {
             "bag_names": bag_names,
@@ -129,8 +129,8 @@ def combine_scans_for_calibration(base_dir, output_dir):
     # Create preprocessing metadata
     metadata = {
         "camera_model": "equirectangular",
-        "image_size": [1920, 960],
-        "camera_intrinsics": [610, 610, 1920, 960],
+        "image_size": [3840, 1920],
+        "camera_intrinsics": [1220, 1220, 3840, 1920],
         "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0],
         "image_topic": "/equirectangular/image",
         "points_topic": "/livox/lidar",

@@ -758,7 +758,7 @@ class FallbackImageCapture(Node):
                 cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 output_path = os.path.join('$SCAN_DIR', f'dual_fisheye_{timestamp}.jpg')
-                cv2.imwrite(output_path, cv_image)
+                cv2.imwrite(output_path, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])
                 print('✓ Fallback image saved')
                 self.captured = True
             except Exception as e:

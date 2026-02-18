@@ -95,7 +95,7 @@ class BufferedCameraCapture(Node):
             # Process and save image immediately
             cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
             img_file = os.path.join(self.output_dir, f'equirect_{timestamp}.jpg')
-            cv2.imwrite(img_file, cv_image)
+            cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])
             print(f"Debug: Saved image at start of LiDAR capture: {img_file}")
         except Exception as e:
             print(f"Error saving image: {e}")

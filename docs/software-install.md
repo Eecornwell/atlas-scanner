@@ -12,7 +12,12 @@ git clone https://github.com/Eecornwell/atlas-scanner.git
 ```
 
 ### 1. Base Sensors Installation
-Installs camera and LiDAR drivers:
+Installs camera and LiDAR drivers with optimized camera settings:
+- **Resolution**: 3840x1920 (high quality)
+- **Bitrate**: 12 Mbps (reduced compression artifacts)
+- **Scaling**: Lanczos interpolation (highest quality)
+- **JPEG Quality**: 100 (maximum)
+
 ```bash
 cd ~/atlas_ws/src/atlas-scanner
 ./install_base_sensors.sh
@@ -159,6 +164,18 @@ rosdep install --from-paths src --ignore-src -r -y
 
 # Apply fix for insta360 library (remove unsupported SDK call)
 sed -i '/SyncLocalTimeToCamera/d; /offset_time/d; /utc_time/d' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+
+# Apply camera quality improvements (automatically applied by install script)
+# - Resolution: 3840x1920 (high quality)
+# - Bitrate: 12 Mbps (reduced compression)
+# - Scaling: Lanczos interpolation (highest quality)
+# - JPEG Quality: 100 (maximum)
+sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
+sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+sed -i 's/out_height: 960/out_height: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 
 # Build ROS2 packages with symlink-install
 export HUMBLE_ROS=humble &&

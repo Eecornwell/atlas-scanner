@@ -40,10 +40,10 @@
 - Start the equirectangular calibration, adjust the sliders slightly to align all of the views
     ```bash
     export QT_QPA_PLATFORM=xcb
-    ros2 run insta360_ros_driver equirectangular.py --calibrate --ros-args --params-file ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
+    ros2 run insta360_ros_driver equirectangular.py --calibrate --auto-update --ros-args --params-file ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
     ```
     > **Tips for calibration:**
-    > * Don't adjust `CX` or `CY` or `Crop Size` for best results.
+    > * Try to adjust `CX`, `CY`, `Crop Size` as little as possible for best results.
     > * First, adjust `TZ` until the middle of the equirectangular image is aligned.
     > * Next, adjust `Pitch` so the cameras are centered from from left to right.
     > * Adjust other translation and rotation values as needed to get a rough calibration.
@@ -132,9 +132,7 @@
             python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
             cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
-            cd ~/atlas_ws
-            source install/setup.bash
-            ros2 run direct_visual_lidar_calibration initial_guess_auto ~/atlas_ws/output
+            ./initial_guess_auto ~/atlas_ws/output
             python3 -c "import json; f=open('~/atlas_ws/output/calib.json'.replace('~','$HOME'),'r+'); d=json.load(f); d['results']['init_T_lidar_camera']=d['results']['init_T_lidar_camera_auto']; f.seek(0); json.dump(d,f,indent=2); f.truncate()"
             ```
 
