@@ -122,8 +122,8 @@ sed -i '/uint64_t utc_time/,/cam->SyncLocalTimeToCamera/d' ~/atlas_ws/src/insta3
 
 # Apply camera quality improvements
 echo "Applying camera quality improvements..."
-# 1. Update resolution to 3840x1920 (high quality)
-sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+# 1. Update resolution to 2560x1280 (mid quality)
+sed -i 's/RES_1920_960P30/RES_2560_1280P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 # 2. Increase bitrate to 12 Mbps for better quality
 sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 # 3. Use high-quality Lanczos scaling instead of nearest neighbor

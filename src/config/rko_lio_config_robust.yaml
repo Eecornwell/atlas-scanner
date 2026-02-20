@@ -22,10 +22,10 @@ extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
 # Conservative processing parameters
-voxel_size: 1.0              # 1 Larger voxels = less processing
+voxel_size: 0.5              # 1 Larger voxels = less processing
 max_points_per_voxel: 20     # 20 10 Fewer points = more stable
-max_range: 75.0              # 100 30 Shorter range = less data
-min_range: 1.0               # 1 2 Higher minimum
+max_range: 20.0              # 100 30 Shorter range = less data
+min_range: 0.3               # 1 2 Higher minimum
 max_correspondance_distance: 0.5 # 0.5 1.0
 convergence_criterion: 0.00001  # 0.00001 0.01 Less strict convergence
 max_num_threads: 1           # Single thread for stability

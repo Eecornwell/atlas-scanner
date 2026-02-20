@@ -307,19 +307,17 @@ class FusionCaptureGUI:
                     self.fusion_process.stdin.write('q\n')
                     self.fusion_process.stdin.flush()
                 
-                # Wait for the script to complete post-processing (up to 60 seconds)
+                # Wait for the script to complete post-processing (up to 300 seconds)
                 self.log_message("Waiting for post-processing to complete...")
                 try:
-                    self.fusion_process.wait(timeout=60)
+                    self.fusion_process.wait(timeout=300)
+                    self.log_message("✓ Post-processing complete")
                 except subprocess.TimeoutExpired:
                     self.log_message("Post-processing timeout, force stopping...")
                     os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGKILL)
                         
             except Exception as e:
                 self.log_message(f"Error stopping process: {e}")
-        
-        # Additional cleanup of ROS processes
-        self._cleanup_ros_processes()
         
         self._system_stopped()
         

@@ -141,6 +141,14 @@ def main():
         try:
             with open(trajectory_json, 'r') as f:
                 trajectory_data = json.load(f)
+            # Support both the enhanced recorder format and a bare pose dict
+            if 'current_pose' in trajectory_data:
+                cp = trajectory_data['current_pose']
+                pose_data = cp.get('lidar_pose', cp)
+                # Ensure top-level position/orientation keys exist
+                if 'position' not in pose_data and 'position' in cp:
+                    pose_data = cp
+            else:
                 pose_data = trajectory_data.get('pose', trajectory_data)
         except Exception as e:
             print(f"Warning: Could not load trajectory data: {e}")

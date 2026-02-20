@@ -107,44 +107,39 @@ class BufferedCameraCapture(Node):
         # Save the LiDAR data with same timestamp
         self.save_lidar_data(points, timestamp, capture_time)
     def capture_dense_points(self):
-        """Capture points for the specified duration to increase density"""
+        """Collect already-buffered points without blocking the ROS executor."""
         scan_start = time.time()
         all_points = []
         processed_messages = set()
-        
+
         while time.time() - scan_start < self.scan_duration:
             with self.buffer_lock:
-                for timestamp, lidar_msg in list(self.lidar_buffer):
-                    msg_id = id(lidar_msg)  # Use object ID to avoid duplicates
-                    if msg_id not in processed_messages:
-                        processed_messages.add(msg_id)
-                        # Extract points with intensity from this message
-                        intensity_offset = None
-                        for field in lidar_msg.fields:
-                            if field.name == 'intensity':
-                                intensity_offset = field.offset
-                                break
-                        
-                        for i in range(0, len(lidar_msg.data), lidar_msg.point_step):
-                            if i + 12 <= len(lidar_msg.data):
-                                x = struct.unpack('<f', lidar_msg.data[i:i+4])[0]
-                                y = struct.unpack('<f', lidar_msg.data[i+4:i+8])[0]
-                                z = struct.unpack('<f', lidar_msg.data[i+8:i+12])[0]
-                                
-                                # Extract intensity if available
-                                intensity = 0.5  # Default intensity
-                                if intensity_offset is not None and i + intensity_offset + 4 <= len(lidar_msg.data):
-                                    try:
-                                        intensity = struct.unpack('<f', lidar_msg.data[i+intensity_offset:i+intensity_offset+4])[0]
-                                        intensity = max(0.0, min(1.0, intensity / 255.0))  # Normalize to 0-1
-                                    except:
-                                        intensity = 0.5
-                                
-                                if abs(x) < 20 and abs(y) < 20 and abs(z) < 10:
-                                    all_points.append([x, y, z, intensity])
-            
-            time.sleep(0.05)  # Small delay to allow buffer to fill
-        
+                current = list(self.lidar_buffer)
+            for timestamp, lidar_msg in current:
+                msg_id = id(lidar_msg)
+                if msg_id in processed_messages:
+                    continue
+                processed_messages.add(msg_id)
+                intensity_offset = next(
+                    (f.offset for f in lidar_msg.fields if f.name == 'intensity'), None)
+                for i in range(0, len(lidar_msg.data), lidar_msg.point_step):
+                    if i + 12 > len(lidar_msg.data):
+                        break
+                    x = struct.unpack('<f', lidar_msg.data[i:i+4])[0]
+                    y = struct.unpack('<f', lidar_msg.data[i+4:i+8])[0]
+                    z = struct.unpack('<f', lidar_msg.data[i+8:i+12])[0]
+                    if abs(x) < 20 and abs(y) < 20 and abs(z) < 10:
+                        intensity = 0.5
+                        if intensity_offset is not None and i + intensity_offset + 4 <= len(lidar_msg.data):
+                            try:
+                                raw = struct.unpack('<f', lidar_msg.data[i+intensity_offset:i+intensity_offset+4])[0]
+                                intensity = max(0.0, min(1.0, raw / 255.0))
+                            except Exception:
+                                pass
+                        all_points.append([x, y, z, intensity])
+            # Yield to ROS executor so LIO callbacks are not starved
+            rclpy.spin_once(self, timeout_sec=0.05)
+
         print(f"Debug: Captured {len(all_points)} points over {self.scan_duration}s")
         return all_points
     

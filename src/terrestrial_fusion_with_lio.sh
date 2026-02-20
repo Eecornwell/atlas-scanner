@@ -9,7 +9,7 @@ SAVE_E57=false                      # Set to true to enable E57 export
 USE_EXISTING_CALIBRATION=false      # Set to true to skip calibration update from calib.json
 ENABLE_ICP_ALIGNMENT=true           # Set to true to offer ICP alignment at end
 BLEND_ERP_SEAMS=true                # Set to true to blend fisheye seams in ERP images before coloring
-EXPORT_COLMAP=true                  # Set to true to export session to COLMAP format (experimental)
+EXPORT_COLMAP=false                 # Set to true to export session to COLMAP format (experimental)
 ENABLE_POST_PROCESSING_BAGS=false   # Set to true to offer post-processing option at end
 SKIP_LIVE_FUSION=true               # Set to true to skip fusion during scanning, only record bags
 AUTO_CREATE_COLORED=true            # Set to true to automatically create colored point clouds when SKIP_LIVE_FUSION=true
@@ -347,6 +347,8 @@ sleep 2
 ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true equirectangular_config:="$ROS_WS_DIR/src/insta360_ros_driver/config/equirectangular.yaml" &
 CAMERA_PID=$!
 PIDS+=($CAMERA_PID)
+# Lower camera node priority so LIO gets CPU when both are running
+sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null &
 
 echo "Waiting for camera to initialize (10 seconds)..."
 sleep 10
@@ -441,16 +443,18 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/rko_lio_config_robust.yaml" \
         double_downsample:=false rviz:=false > /tmp/rko_lio.log 2>&1 &
     LIO_PID=$!
+    # Elevate RKO-LIO priority so camera processing doesn't starve it
+    sleep 1 && renice -n -10 -p $LIO_PID 2>/dev/null &
     PIDS+=($LIO_PID)
     
     echo "Waiting for RKO-LIO to initialize (5 seconds)..."
     sleep 5
     
-    if wait_for_topic "/rko_lio/odometry" 10; then
+    if wait_for_topic "/rko_lio/odometry" 10 && wait_for_topic_data "/rko_lio/odometry" 10; then
         echo "✓ RKO-LIO odometry ready with $IMU_SOURCE IMU"
         LIO_ENABLED="true"
     else
-        echo "⚠ RKO-LIO failed to start"
+        echo "⚠ RKO-LIO failed to start or produce odometry"
         LIO_ENABLED="false"
     fi
 else
@@ -694,7 +698,7 @@ while true; do
     if [ "$CAMERA_AVAILABLE" = "true" ]; then
         echo "Using buffered synchronized LiDAR+camera capture..."
         # Try buffered camera-driven approach first with longer LiDAR capture
-        timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" "$INDIVIDUAL_SCAN_DIR" 15 5.0
+        timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" "$INDIVIDUAL_SCAN_DIR" 15 2.0
         CAPTURE_EXIT_CODE=$?
         
         # If that fails, try LiDAR-driven approach with image buffer
@@ -779,7 +783,8 @@ node.destroy_node()
     if [ "$LIO_ENABLED" = "true" ] && [ "$TRAJECTORY_RECORDING" = "true" ]; then
         # Create trigger file for trajectory recorder to save this scan's trajectory
         TRIGGER_FILE="$SCAN_DIR/.save_trajectory_${SCAN_NAME}"
-        echo "{\"scan_name\": \"$SCAN_NAME\", \"scan_dir\": \"$INDIVIDUAL_SCAN_DIR\"}" > "$TRIGGER_FILE"
+        CAPTURE_TIMESTAMP=$(python3 -c "import time; print(time.time())")
+        echo "{\"scan_name\": \"$SCAN_NAME\", \"scan_dir\": \"$INDIVIDUAL_SCAN_DIR\", \"capture_time\": $CAPTURE_TIMESTAMP}" > "$TRIGGER_FILE"
         #sleep 0.5  # Give trajectory recorder time to process
         echo "✓ Trajectory data saved to scan directory"
     fi

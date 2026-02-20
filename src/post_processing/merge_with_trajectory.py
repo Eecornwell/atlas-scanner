@@ -46,33 +46,36 @@ def merge_scans_simple(session_dir):
     all_colors = []
     
     for scan_dir in scan_dirs:
-        colored_ply = scan_dir / "world_colored_exact.ply"
-        if not colored_ply.exists():
-            colored_ply = scan_dir / "sensor_colored_exact.ply"
-        
-        if not colored_ply.exists():
+        candidates = [
+            "world_colored_exact.ply", "world_colored_pointcloud.ply",
+            "world_colored.ply", "sensor_colored_exact.ply",
+            "sensor_colored_pointcloud.ply", "sensor_colored.ply",
+        ]
+        colored_ply = next((scan_dir / n for n in candidates if (scan_dir / n).exists()), None)
+
+        if colored_ply is None:
             print(f"Warning: No colored point cloud for {scan_dir.name}, skipping")
             continue
-        
+
         points, colors = load_ply(colored_ply)
         all_points.append(points)
         all_colors.append(colors)
         print(f"  {scan_dir.name}: {len(points)} points")
-    
+
     if not all_points:
         print("No points to merge")
         return False
-    
+
     merged_points = np.vstack(all_points)
     merged_colors = np.vstack(all_colors)
-    
+
     output_file = session_path / "merged_pointcloud.ply"
     save_ply(output_file, merged_points, merged_colors)
-    
+
     print(f"\n✓ Merged point cloud saved: {output_file}")
     print(f"  Total points: {len(merged_points)}")
     print("  Note: Merged without trajectory alignment (scans may not be aligned)")
-    
+
     return True
 
 def save_ply(output_file, points, colors):
@@ -109,90 +112,113 @@ def transform_points(points, position, orientation):
     
     return points_world
 
+def pose_matrix_from_trajectory(traj):
+    """Return 4x4 pose matrix for this scan, using the full_trajectory entry
+    closest to scan_request_time."""
+    request_time = traj.get('scan_info', {}).get('scan_request_time')
+    full = traj.get('full_trajectory', [])
+    if request_time and full:
+        best = min(full, key=lambda p: abs(p['timestamp'] - request_time))
+    else:
+        cp = traj.get('current_pose', {})
+        best = cp.get('lidar_pose', cp)
+    pos = best.get('position', {})
+    ori = best.get('orientation', {})
+    T = np.eye(4)
+    T[:3, :3] = R.from_quat([ori.get('x', 0), ori.get('y', 0),
+                              ori.get('z', 0), ori.get('w', 1)]).as_matrix()
+    T[:3, 3] = [pos.get('x', 0), pos.get('y', 0), pos.get('z', 0)]
+    return T
+
+
 def merge_scans_with_trajectory(session_dir):
-    """Merge scans by transforming all using trajectory poses"""
+    """Merge scans into the reference frame of the first scan.
+
+    Each scan's sensor-frame points are transformed by T1_inv @ TN, where T1
+    is the first scan's absolute odom pose and TN is the current scan's pose.
+    This cancels the scanner's absolute orientation so all scans share the
+    first scan's coordinate frame.
+    """
     session_path = Path(session_dir)
-    
-    scan_dirs = sorted([d for d in session_path.iterdir() 
-                       if d.is_dir() and d.name.startswith('fusion_scan_')])
-    
+
+    scan_dirs = sorted([d for d in session_path.iterdir()
+                        if d.is_dir() and d.name.startswith('fusion_scan_')])
+
     if not scan_dirs:
         print("No scan directories found")
         return False
-    
+
     print(f"Merging {len(scan_dirs)} scans using trajectory poses...")
-    
-    # Check if first scan has trajectory
-    traj_file = scan_dirs[0] / "trajectory.json"
-    if not traj_file.exists():
-        print("⚠ No trajectory data available, merging without transformation")
-        return merge_scans_simple(session_dir)
-    
-    all_points = []
-    all_colors = []
-    
-    for i, scan_dir in enumerate(scan_dirs):
-        colored_ply = scan_dir / "world_colored_exact.ply"
-        if not colored_ply.exists():
-            colored_ply = scan_dir / "sensor_colored_exact.ply"
-        
-        if not colored_ply.exists():
-            print(f"Warning: No colored point cloud for {scan_dir.name}, skipping")
-            continue
-        
-        points, colors = load_ply(colored_ply)
-        
+
+    if not (scan_dirs[0] / "trajectory.json").exists():
+        print("✗ No trajectory data found - RKO-LIO was not running.")
+        print("  Cannot merge without poses. Re-run with a working LIO or enable ICP alignment.")
+        return False
+
+    # sensor_colored_exact.ply is always sensor-frame (world_colored_exact.ply is identical
+    # despite its name — exact_match_fusion saves sensor coords under both filenames).
+    SENSOR_CANDIDATES = [
+        "sensor_colored_exact.ply", "sensor_colored_pointcloud.ply", "sensor_colored.ply",
+        "world_colored_exact.ply", "world_colored_pointcloud.ply", "world_colored.ply",
+    ]
+
+    # Build pose matrices for every scan first so we can compute T1_inv once.
+    pose_matrices = {}
+    for scan_dir in scan_dirs:
         traj_file = scan_dir / "trajectory.json"
-        if not traj_file.exists():
-            print(f"⚠ No trajectory for {scan_dir.name}, using identity transform")
-            points_transformed = points
-        else:
+        if traj_file.exists():
             with open(traj_file) as f:
                 traj = json.load(f)
-            
-            # Get lidar pose (position and orientation)
-            if 'current_pose' in traj and 'lidar_pose' in traj['current_pose']:
-                lidar_pose = traj['current_pose']['lidar_pose']
-                position = lidar_pose['position']
-                orientation = lidar_pose['orientation']
-                
-                # Build transformation matrix
-                pos = np.array([position['x'], position['y'], position['z']])
-                quat = [orientation['x'], orientation['y'], orientation['z'], orientation['w']]
-                rot = R.from_quat(quat)
-                R_mat = rot.as_matrix()
-                
-                # Transform points: p_world = R * p_sensor + t
-                points_transformed = (R_mat @ points.T).T + pos
-                
-                # Debug: show sample transformation
-                if len(points) > 0:
-                    sample_before = points[0]
-                    sample_after = points_transformed[0]
-                    print(f"    Sample: {sample_before} -> {sample_after}")
-                    print(f"    Pose: t=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-            else:
-                print(f"⚠ Invalid trajectory format for {scan_dir.name}, using identity")
-                points_transformed = points
-        
+            pose_matrices[scan_dir.name] = pose_matrix_from_trajectory(traj)
+
+    if not pose_matrices:
+        print("✗ No trajectory data found in any scan - RKO-LIO was not running.")
+        print("  Cannot merge without poses. Re-run with a working LIO or enable ICP alignment.")
+        return False
+
+    # Reference frame = first scan's pose
+    first_name = scan_dirs[0].name
+    T_ref_inv = np.linalg.inv(pose_matrices[first_name])
+
+    all_points = []
+    all_colors = []
+
+    for scan_dir in scan_dirs:
+        colored_ply = next((scan_dir / n for n in SENSOR_CANDIDATES if (scan_dir / n).exists()), None)
+        if colored_ply is None:
+            print(f"Warning: No colored point cloud for {scan_dir.name}, skipping")
+            continue
+
+        points, colors = load_ply(colored_ply)
+
+        if scan_dir.name not in pose_matrices:
+            print(f"⚠ No trajectory for {scan_dir.name}, using identity")
+            points_transformed = points
+        else:
+            T = pose_matrices[scan_dir.name]
+            # Transform: sensor -> odom -> ref frame of scan_001
+            T_rel = T_ref_inv @ T
+            pts_h = np.hstack([points, np.ones((len(points), 1))])
+            points_transformed = (T_rel @ pts_h.T).T[:, :3]
+            t = T_rel[:3, 3]
+            print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]")
+
         all_points.append(points_transformed)
         all_colors.append(colors)
-        
-        print(f"  {scan_dir.name}: {len(points)} points")
-    
+
     if not all_points:
         print("No points to merge")
         return False
-    
+
     merged_points = np.vstack(all_points)
     merged_colors = np.vstack(all_colors)
-    
+
     output_file = session_path / "merged_pointcloud.ply"
     save_ply(output_file, merged_points, merged_colors)
-    
+
     print(f"\n✓ Merged point cloud saved: {output_file}")
     print(f"  Total points: {len(merged_points)}")
-    
+
     return True
 
 if __name__ == '__main__':

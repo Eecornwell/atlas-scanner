@@ -209,8 +209,8 @@ class EnhancedTrajectoryRecorder(Node):
                         scan_name = request_data['scan_name']
                         scan_dir = request_data['scan_dir']
                         
-                        # Capture current pose at the moment of scan request
-                        current_pose_snapshot = self.get_current_pose()
+                        capture_time = request_data.get('capture_time')
+                        current_pose_snapshot = self.get_pose_at_time(capture_time)
                         if current_pose_snapshot:
                             # Save trajectory for this scan with current pose
                             if self.save_scan_trajectory_to_dir(scan_name, scan_dir, current_pose_snapshot):
@@ -234,13 +234,17 @@ class EnhancedTrajectoryRecorder(Node):
         except Exception as e:
             pass  # Ignore other errors
     
-    def get_current_pose(self):
-        """Get the most recent pose from the live trajectory stream"""
+    def get_pose_at_time(self, capture_time=None):
+        """Get the pose closest to capture_time (wall clock). Falls back to latest."""
         if not self.trajectory:
+            self.get_logger().error(
+                'No odometry received - is /rko_lio/odometry publishing? '
+                'Check RKO-LIO logs at /tmp/rko_lio.log')
             return None
-        
-        # Return the actual latest pose from the trajectory
-        return self.trajectory[-1].copy()
+        if capture_time is None:
+            return self.trajectory[-1].copy()
+        best = min(self.trajectory, key=lambda p: abs(p['timestamp'] - capture_time))
+        return best.copy()
     
     def save_scan_trajectory_to_dir(self, scan_name, scan_dir, pose_snapshot):
         """Save trajectory data for a specific scan to its directory"""
