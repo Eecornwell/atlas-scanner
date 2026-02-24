@@ -137,10 +137,10 @@ cleanup() {
             fi
         fi
         
-        # ICP Alignment
+        # ICP Alignment with Pose Graph Optimization
         if [ "$SCAN_COUNT" -gt 1 ] && [ "$ENABLE_ICP_ALIGNMENT" = "true" ]; then
-            echo "Applying ICP alignment..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/align_scan_session.py" "$SCAN_DIR"
+            echo "Applying ICP alignment with pose graph optimization..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py" "$SCAN_DIR"
             if [ $? -eq 0 ]; then
                 echo "✓ ICP alignment complete"
                 # Use ICP-aligned merged file (colored version)

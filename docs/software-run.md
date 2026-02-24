@@ -53,7 +53,7 @@ EXPORT_COLMAP=false                 # Set to true to export session to COLMAP fo
 ### Perform ICP on Scans
 ```bash
 cd ~/atlas_ws && source install/setup.bash
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session.py ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
 
 ### View Point Cloud in HTML Web Viewer
