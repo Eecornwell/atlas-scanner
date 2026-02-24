@@ -176,9 +176,15 @@ def merge_scans_with_trajectory(session_dir):
         print("  Cannot merge without poses. Re-run with a working LIO or enable ICP alignment.")
         return False
 
-    # Reference frame = first scan's pose
+    # The LiDAR has a static mounting tilt so the odom Z-axis is not true vertical.
+    # Extract roll/pitch from the first scan's pose and build a gravity-alignment
+    # correction that levels the merged cloud (yaw left at 0 to keep X forward).
     first_name = scan_dirs[0].name
-    T_ref_inv = np.linalg.inv(pose_matrices[first_name])
+    T_first = pose_matrices[first_name]
+    euler_first = R.from_matrix(T_first[:3, :3]).as_euler('xyz', degrees=True)
+    print(f"  Odom tilt: roll={euler_first[0]:.2f} pitch={euler_first[1]:.2f} yaw={euler_first[2]:.2f} deg")
+    R_gravity = R.from_euler('xyz', [-euler_first[0], -euler_first[1], 0], degrees=True).as_matrix()
+    t_ref = T_first[:3, 3]
 
     all_points = []
     all_colors = []
@@ -196,12 +202,12 @@ def merge_scans_with_trajectory(session_dir):
             points_transformed = points
         else:
             T = pose_matrices[scan_dir.name]
-            # Transform: sensor -> odom -> ref frame of scan_001
-            T_rel = T_ref_inv @ T
+            # sensor -> odom world frame, translate to first-scan origin, then level
             pts_h = np.hstack([points, np.ones((len(points), 1))])
-            points_transformed = (T_rel @ pts_h.T).T[:, :3]
-            t = T_rel[:3, 3]
-            print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}]")
+            points_world = (T @ pts_h.T).T[:, :3]
+            points_transformed = (R_gravity @ (points_world - t_ref).T).T
+            t_rel = T[:3, 3] - t_ref
+            print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t_rel[0]:.3f},{t_rel[1]:.3f},{t_rel[2]:.3f}]")
 
         all_points.append(points_transformed)
         all_colors.append(colors)

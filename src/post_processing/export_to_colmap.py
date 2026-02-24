@@ -14,14 +14,62 @@ import cv2
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
-def quaternion_to_rotation_matrix(qw, qx, qy, qz):
-    """Convert quaternion to rotation matrix"""
-    return R.from_quat([qx, qy, qz, qw]).as_matrix()
+# ROS odom (X-forward, Y-left, Z-up) -> COLMAP world
+# ROS+X(fwd)->COLMAP+X, ROS+Z(up)->COLMAP-Y (up in GUI), ROS+Y(left)->COLMAP+Z
+R_ROS2COLMAP = np.array([
+    [ 1,  0,  0],   # ROS+X -> COLMAP+X
+    [ 0,  0, -1],   # ROS+Z -> COLMAP-Y (up in GUI, COLMAP+Y=down)
+    [ 0,  1,  0],   # ROS+Y -> COLMAP+Z
+], dtype=float)
 
-def rotation_matrix_to_quaternion(rot_mat):
-    """Convert rotation matrix to quaternion (w, x, y, z)"""
-    q = R.from_matrix(rot_mat).as_quat()  # Returns [x, y, z, w]
-    return [q[3], q[0], q[1], q[2]]  # Return [w, x, y, z]
+def _load_T_lidar_camera():
+    """Return T_lidar_camera (4x4): camera position/orientation in lidar frame."""
+    calib_path = Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml"
+    with open(calib_path) as f:
+        calib = yaml.safe_load(f)
+    # fusion_calibration.yaml stores T_camera_lidar (lidar->camera)
+    T_camera_lidar = np.eye(4)
+    T_camera_lidar[:3, :3] = R.from_euler('xyz', [
+        calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
+    ]).as_matrix()
+    T_camera_lidar[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    return np.linalg.inv(T_camera_lidar)  # invert once to get T_lidar_camera
+
+# Precompute the azimuth offset of cam_Z in the lidar frame (constant for a given calibration).
+# The Insta360 SDK gravity-stabilizes the ERP: image top = world up, lon=0 = the horizontal
+# azimuth direction the physical camera forward axis (cam_Z) points toward.
+# Since roll=~178 deg, cam_Z points nearly straight down, but its horizontal projection
+# defines the lon=0 direction of the panorama.
+def _cam_Z_azimuth_offset(T_lidar_camera):
+    cam_Z_lidar = T_lidar_camera[:3, 2]
+    return np.arctan2(cam_Z_lidar[1], cam_Z_lidar[0])
+
+
+def ros_pose_to_colmap_w2c(lidar_pos_xyz, lidar_quat_xyzw, T_lidar_camera, camera_quat_xyzw=None):
+    """Convert a ROS odom lidar pose to COLMAP w2c (qw,qx,qy,qz) + T.
+
+    The Insta360 SDK stitches the ERP in the camera's own frame (not gravity-stabilised).
+    We use the full camera c2w rotation from camera_pose.orientation directly.
+    ERP convention: +X=right, +Y=down, +Z=forward in camera frame.
+    """
+    R_lidar_w = R.from_quat(lidar_quat_xyzw).as_matrix()
+
+    if camera_quat_xyzw is not None:
+        # Full camera c2w rotation in ROS world — use directly, no yaw-only extraction
+        R_c2w = R_ROS2COLMAP @ R.from_quat(camera_quat_xyzw).as_matrix()
+    else:
+        # Fallback: derive camera orientation from lidar pose + calibration
+        R_cam_c2w = R_lidar_w @ T_lidar_camera[:3, :3]
+        R_c2w = R_ROS2COLMAP @ R_cam_c2w
+
+    R_w2c = R_c2w.T
+
+    C_ros = np.array(lidar_pos_xyz) + R_lidar_w @ T_lidar_camera[:3, 3]
+    C_colmap = R_ROS2COLMAP @ C_ros
+    T = -R_w2c @ C_colmap
+
+    q = R.from_matrix(R_w2c).as_quat()
+    return [q[3], q[0], q[1], q[2]], T.tolist()
 
 def export_to_colmap(session_dir):
     """Export scan session to COLMAP format"""
@@ -37,6 +85,9 @@ def export_to_colmap(session_dir):
     
     print(f"Exporting to COLMAP format: {colmap_dir}")
     
+    # Load camera-lidar calibration
+    T_lidar_camera = _load_T_lidar_camera()
+    
     # Find all scan directories
     scan_dirs = sorted([d for d in session_path.iterdir() 
                        if d.is_dir() and d.name.startswith('fusion_scan_')])
@@ -44,7 +95,7 @@ def export_to_colmap(session_dir):
     if not scan_dirs:
         print("No scan directories found")
         return False
-    
+
     # Load camera calibration
     calib_path = Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml"
     with open(calib_path, 'r') as f:
@@ -80,7 +131,6 @@ def export_to_colmap(session_dir):
         # Use identity pose if no trajectory
         if not traj_file.exists():
             print(f"No trajectory for {scan_dir.name}, using identity pose")
-            # Identity transformation
             qw_c2w, qx_c2w, qy_c2w, qz_c2w = 1.0, 0.0, 0.0, 0.0
             t_c2w = np.array([0.0, 0.0, 0.0])
             timestamp = 0.0
@@ -88,42 +138,46 @@ def export_to_colmap(session_dir):
             with open(traj_file, 'r') as f:
                 traj = json.load(f)
             
-            # Get current pose (use camera_pose if available, fallback to lidar_pose)
+            # Use lidar_pose orientation (gravity-aligned) with camera_pose position.
+            # The ERP image up-direction is defined by the lidar's gravity-aligned frame.
+            # Camera is physically inverted but ERP image is stitched right-side up.
             if 'current_pose' in traj:
                 pose_data = traj['current_pose']
-                if 'camera_pose' in pose_data:
-                    pose = pose_data['camera_pose']
-                elif 'lidar_pose' in pose_data:
-                    pose = pose_data['lidar_pose']
-                else:
-                    pose = {'position': pose_data['position'], 'orientation': pose_data['orientation']}
                 timestamp = pose_data.get('timestamp', 0.0)
+                cam_quat_xyzw = None
+
+                if 'camera_pose' in pose_data and 'lidar_pose' in pose_data:
+                    lid_pos = pose_data['lidar_pose']['position']
+                    lid_ori = pose_data['lidar_pose']['orientation']
+                    pos_xyz = [lid_pos['x'], lid_pos['y'], lid_pos['z']]
+                    quat_xyzw = [lid_ori['x'], lid_ori['y'], lid_ori['z'], lid_ori['w']]
+                    cam_ori = pose_data['camera_pose']['orientation']
+                    cam_quat_xyzw = [cam_ori['x'], cam_ori['y'], cam_ori['z'], cam_ori['w']]
+                elif 'camera_pose' in pose_data:
+                    cam = pose_data['camera_pose']
+                    pos_xyz = [cam['position']['x'], cam['position']['y'], cam['position']['z']]
+                    quat_xyzw = [cam['orientation']['x'], cam['orientation']['y'], cam['orientation']['z'], cam['orientation']['w']]
+                elif 'lidar_pose' in pose_data:
+                    p = pose_data['lidar_pose']
+                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
+                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
+                else:
+                    p = pose_data
+                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
+                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
             elif 'poses' in traj and traj['poses']:
-                pose = traj['poses'][-1]
-                timestamp = pose.get('timestamp', 0.0)
+                p = traj['poses'][-1]
+                timestamp = p.get('timestamp', 0.0)
+                pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
+                quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
             else:
                 print(f"Empty trajectory for {scan_dir.name}, using identity pose")
-                qw_c2w, qx_c2w, qy_c2w, qz_c2w = 1.0, 0.0, 0.0, 0.0
-                t_c2w = np.array([0.0, 0.0, 0.0])
+                pos_xyz = [0.0, 0.0, 0.0]
+                quat_xyzw = [0.0, 0.0, 0.0, 1.0]
                 timestamp = 0.0
-                pose = None
-            
-            if pose:
-                tx, ty, tz = pose['position']['x'], pose['position']['y'], pose['position']['z']
-                qx, qy, qz, qw = pose['orientation']['x'], pose['orientation']['y'], pose['orientation']['z'], pose['orientation']['w']
-                
-                # Trajectory: camera position (C) + c2w quaternion
-                # COLMAP: w2c quaternion (qw,qx,qy,qz) + T where C = -R_w2c^T * T
-                # So: T = -R_w2c * C
-                
-                R_c2w = R.from_quat([qx, qy, qz, qw]).as_matrix()
-                R_w2c = R_c2w.T
-                C = np.array([tx, ty, tz])
-                T = -R_w2c @ C
-                
-                quat_w2c = R.from_matrix(R_w2c).as_quat()
-                qw_c2w, qx_c2w, qy_c2w, qz_c2w = quat_w2c[3], quat_w2c[0], quat_w2c[1], quat_w2c[2]
-                t_c2w = T
+
+            (qw_c2w, qx_c2w, qy_c2w, qz_c2w), t_c2w_list = ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_lidar_camera, cam_quat_xyzw)
+            t_c2w = np.array(t_c2w_list)
         
         # Find equirectangular image - prioritize blended masked version
         image_candidates = [
@@ -177,15 +231,27 @@ def export_to_colmap(session_dir):
             'camera_id': 1,
             'name': image_name
         })
-        
-        # Load colored point cloud
-        colored_ply = scan_dir / "world_colored_exact.ply"
-        if not colored_ply.exists():
-            colored_ply = scan_dir / "world_colored.ply"
-        
-        if colored_ply.exists():
-            points = load_ply_points(colored_ply)
-            all_points.extend(points)
+    
+    # Use merged_pointcloud.ply as the authoritative lidar source if available,
+    # otherwise fall back to accumulating per-scan colored clouds.
+    merged_src = session_path / "merged_pointcloud.ply"
+    if merged_src.exists():
+        all_points = load_ply_points(merged_src)
+        for p in all_points:
+            xyz = R_ROS2COLMAP @ np.array(p[:3])
+            p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+        print(f"Using merged_pointcloud.ply ({len(all_points)} points)")
+    else:
+        for scan_dir in scan_dirs:
+            colored_ply = scan_dir / "world_colored_exact.ply"
+            if not colored_ply.exists():
+                colored_ply = scan_dir / "world_colored.ply"
+            if colored_ply.exists():
+                points = load_ply_points(colored_ply)
+                for p in points:
+                    xyz = R_ROS2COLMAP @ np.array(p[:3])
+                    p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+                all_points.extend(points)
     
     # Write images.txt
     with open(sparse_dir / "images.txt", 'w') as f:
@@ -197,10 +263,11 @@ def export_to_colmap(session_dir):
             f.write(f"{img['tx']} {img['ty']} {img['tz']} {img['camera_id']} {img['name']}\n")
             f.write("\n")  # Empty POINTS2D line
     
-    # Write points3D.txt (empty as requested)
+    # Write points3D.txt with lidar points for Gaussian splat initialization
     with open(sparse_dir / "points3D.txt", 'w') as f:
-        f.write("# 3D point list (empty - use sparse.ply instead)\n")
-        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
+        for i, p in enumerate(all_points, start=1):
+            f.write(f"{i} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(p[3])} {int(p[4])} {int(p[5])} 0\n")
     
     # Save merged colored point cloud as sparse.ply
     if all_points:
@@ -214,24 +281,12 @@ def export_to_colmap(session_dir):
     return True
 
 def load_ply_points(ply_file):
-    """Load points from PLY file"""
-    points = []
-    with open(ply_file, 'r') as f:
-        lines = f.readlines()
-    
-    header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
-    
-    for line in lines[header_end:]:
-        parts = line.strip().split()
-        if len(parts) >= 6:
-            try:
-                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                r, g, b = int(parts[3]), int(parts[4]), int(parts[5])
-                points.append([x, y, z, r, g, b])
-            except ValueError:
-                continue
-    
-    return points
+    """Load points from PLY file (ASCII or binary)."""
+    import open3d as o3d
+    pcd = o3d.io.read_point_cloud(str(ply_file))
+    pts = np.asarray(pcd.points)
+    cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() else np.zeros((len(pts), 3), int)
+    return [[*pts[i].tolist(), *cols[i].tolist()] for i in range(len(pts))]
 
 def save_ply(output_file, points):
     """Save points to PLY file"""

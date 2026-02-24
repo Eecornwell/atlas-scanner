@@ -35,10 +35,12 @@ def calibration_transform(root_path, use_existing=False):
     with open(calib_path, 'r') as f:
         calib_data = json.load(f)
     
-    # Extract T_lidar_camera
+    # direct_visual_lidar_calibration optimises T_camera_lidar (lidar->camera) but
+    # writes it under the misleading key "T_lidar_camera" in calib.json.
+    # Read it directly as T_camera_lidar — no inversion needed.
     if 'results' in calib_data:
-        T_lidar_camera = calib_data['results']['T_lidar_camera']
-        Tx, Ty, Tz, Qx, Qy, Qz, Qw = T_lidar_camera
+        vec = calib_data['results']['T_lidar_camera']  # actually T_camera_lidar
+        Tx, Ty, Tz, Qx, Qy, Qz, Qw = vec
     elif 'T_lidar_camera' in calib_data:
         T_matrix = np.array(calib_data['T_lidar_camera'])
         Tx, Ty, Tz = T_matrix[:3, 3]
@@ -47,25 +49,18 @@ def calibration_transform(root_path, use_existing=False):
     else:
         raise ValueError("Invalid calib.json format")
     
-    print("\n=== CALIBRATION TOOL OUTPUT (T_lidar_camera) ===")
+    print("\n=== CALIBRATION TOOL OUTPUT (T_camera_lidar, lidar->camera) ===")
     print(f"Translation: [{Tx:.4f}, {Ty:.4f}, {Tz:.4f}]")
     print(f"Quaternion: [{Qx:.4f}, {Qy:.4f}, {Qz:.4f}, {Qw:.4f}]")
     
-    # Build T_lidar_camera matrix
-    T_lidar_camera_mat = np.eye(4)
-    T_lidar_camera_mat[:3, :3] = R.from_quat([Qx, Qy, Qz, Qw]).as_matrix()
-    T_lidar_camera_mat[:3, 3] = [Tx, Ty, Tz]
+    # This IS T_camera_lidar — use directly, no inversion
+    T_camera_lidar_mat = np.eye(4)
+    T_camera_lidar_mat[:3, :3] = R.from_quat([Qx, Qy, Qz, Qw]).as_matrix()
+    T_camera_lidar_mat[:3, 3] = [Tx, Ty, Tz]
     
-    print("\nT_lidar_camera matrix:")
-    print(T_lidar_camera_mat)
-    
-    # CORRECT APPROACH: Invert to get T_camera_lidar
-    T_camera_lidar_mat = np.linalg.inv(T_lidar_camera_mat)
-    
-    print("\n=== INVERTED FOR PROJECTION (T_camera_lidar) ===")
+    print("\nT_camera_lidar matrix (lidar->camera):")
     print(T_camera_lidar_mat)
     
-    # Extract rotation and translation from T_camera_lidar
     R_camera_lidar = T_camera_lidar_mat[:3, :3]
     t_camera_lidar = T_camera_lidar_mat[:3, 3]
     

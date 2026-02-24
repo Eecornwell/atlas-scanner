@@ -170,7 +170,7 @@ sed -i '/SyncLocalTimeToCamera/d; /offset_time/d; /utc_time/d' ~/atlas_ws/src/in
 # - Bitrate: 12 Mbps (reduced compression)
 # - Scaling: Lanczos interpolation (highest quality)
 # - JPEG Quality: 100 (maximum)
-sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i 's/RES_1920_960P30/RES_2560_1280P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
 sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml

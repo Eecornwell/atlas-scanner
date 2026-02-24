@@ -4,9 +4,33 @@ import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 import json
+import yaml
 import numpy as np
 from datetime import datetime
 import os
+from pathlib import Path
+from scipy.spatial.transform import Rotation
+
+CALIB_PATH = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
+
+def _load_camera_lidar_transform():
+    """Load T_camera_lidar from fusion_calibration.yaml and return T_lidar_camera (4x4).
+    
+    fusion_calibration.yaml stores T_camera_lidar (lidar->camera) as euler XYZ + translation.
+    Invert once to get T_lidar_camera (camera->lidar frame, i.e. camera position in lidar frame).
+    """
+    with open(CALIB_PATH) as f:
+        calib = yaml.safe_load(f)
+    roll = calib['roll_offset']
+    pitch = calib['pitch_offset']
+    yaw = calib['yaw_offset']
+    tx = calib['x_offset']
+    ty = calib['y_offset']
+    tz = calib['z_offset']
+    T_camera_lidar = np.eye(4)
+    T_camera_lidar[:3, :3] = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+    T_camera_lidar[:3, 3] = [tx, ty, tz]
+    return np.linalg.inv(T_camera_lidar)  # T_lidar_camera: camera position in lidar frame
 
 class EnhancedTrajectoryRecorder(Node):
     def __init__(self, output_dir):
@@ -18,11 +42,19 @@ class EnhancedTrajectoryRecorder(Node):
         self.first_pose = None  # Store first pose as reference origin
         self.recording_started = True
         
-        # Camera-LiDAR calibration parameters (from your calibration)
-        self.camera_lidar_transform = {
-            'translation': {'x': -0.2, 'y': -0.05, 'z': -0.09},  # Camera relative to LiDAR
-            'rotation': {'roll': 178, 'pitch': -0.5, 'yaw': -3.0}  # degrees
-        }
+        # Load camera-lidar transform from calibration file
+        try:
+            self._T_lidar_camera = _load_camera_lidar_transform()
+            t = self._T_lidar_camera[:3, 3]
+            self.camera_lidar_transform = {
+                'translation': {'x': float(t[0]), 'y': float(t[1]), 'z': float(t[2])},
+                'source': str(CALIB_PATH)
+            }
+            self.get_logger().info(f'Loaded camera-lidar calibration from {CALIB_PATH}')
+        except Exception as e:
+            self.get_logger().warn(f'Failed to load calibration ({e}), using identity')
+            self._T_lidar_camera = np.eye(4)
+            self.camera_lidar_transform = {'translation': {'x': 0.0, 'y': 0.0, 'z': 0.0}}
         
         self.subscription = self.create_subscription(
             Odometry,
@@ -37,86 +69,28 @@ class EnhancedTrajectoryRecorder(Node):
         self.get_logger().info('Recording trajectory data immediately...')
     
     def calculate_camera_pose(self, lidar_pose):
-        """Calculate camera pose from LiDAR pose using calibration"""
-        # Extract LiDAR pose
+        """Calculate camera pose from LiDAR pose using calibrated T_lidar_camera."""
         pos = lidar_pose['position']
         ori = lidar_pose['orientation']
         
-        # Convert quaternion to rotation matrix
-        x, y, z, w = ori['x'], ori['y'], ori['z'], ori['w']
+        q = np.array([ori['x'], ori['y'], ori['z'], ori['w']])
+        q /= np.linalg.norm(q)
+        R_lidar = Rotation.from_quat(q).as_matrix()
         
-        # Normalize quaternion
-        norm = np.sqrt(x*x + y*y + z*z + w*w)
-        if norm > 0:
-            x, y, z, w = x/norm, y/norm, z/norm, w/norm
+        # T_world_camera = T_world_lidar @ T_lidar_camera
+        T_world_lidar = np.eye(4)
+        T_world_lidar[:3, :3] = R_lidar
+        T_world_lidar[:3, 3] = [pos['x'], pos['y'], pos['z']]
         
-        # LiDAR rotation matrix
-        R_lidar = np.array([
-            [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
-            [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
-            [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]
-        ])
+        T_world_camera = T_world_lidar @ self._T_lidar_camera
         
-        # Camera-LiDAR calibration transformation
-        cal = self.camera_lidar_transform
-        
-        # Convert calibration angles to radians
-        roll_rad = np.radians(cal['rotation']['roll'])
-        pitch_rad = np.radians(cal['rotation']['pitch'])
-        yaw_rad = np.radians(cal['rotation']['yaw'])
-        
-        # Create calibration rotation matrix (ZYX order)
-        cos_r, sin_r = np.cos(roll_rad), np.sin(roll_rad)
-        cos_p, sin_p = np.cos(pitch_rad), np.sin(pitch_rad)
-        cos_y, sin_y = np.cos(yaw_rad), np.sin(yaw_rad)
-        
-        R_cal = np.array([
-            [cos_y*cos_p, cos_y*sin_p*sin_r - sin_y*cos_r, cos_y*sin_p*cos_r + sin_y*sin_r],
-            [sin_y*cos_p, sin_y*sin_p*sin_r + cos_y*cos_r, sin_y*sin_p*cos_r - cos_y*sin_r],
-            [-sin_p, cos_p*sin_r, cos_p*cos_r]
-        ])
-        
-        # Translation offset
-        t_cal = np.array([cal['translation']['x'], cal['translation']['y'], cal['translation']['z']])
-        
-        # Calculate camera pose
-        # Camera position = LiDAR position + LiDAR rotation * calibration translation
-        camera_pos = np.array([pos['x'], pos['y'], pos['z']]) + R_lidar @ t_cal
-        
-        # Camera orientation = LiDAR rotation * calibration rotation
-        R_camera = R_lidar @ R_cal
-        
-        # Convert camera rotation matrix back to quaternion
-        trace = R_camera[0,0] + R_camera[1,1] + R_camera[2,2]
-        
-        if trace > 0:
-            s = np.sqrt(trace + 1.0) * 2  # s = 4 * qw
-            qw = 0.25 * s
-            qx = (R_camera[2,1] - R_camera[1,2]) / s
-            qy = (R_camera[0,2] - R_camera[2,0]) / s
-            qz = (R_camera[1,0] - R_camera[0,1]) / s
-        elif R_camera[0,0] > R_camera[1,1] and R_camera[0,0] > R_camera[2,2]:
-            s = np.sqrt(1.0 + R_camera[0,0] - R_camera[1,1] - R_camera[2,2]) * 2  # s = 4 * qx
-            qw = (R_camera[2,1] - R_camera[1,2]) / s
-            qx = 0.25 * s
-            qy = (R_camera[0,1] + R_camera[1,0]) / s
-            qz = (R_camera[0,2] + R_camera[2,0]) / s
-        elif R_camera[1,1] > R_camera[2,2]:
-            s = np.sqrt(1.0 + R_camera[1,1] - R_camera[0,0] - R_camera[2,2]) * 2  # s = 4 * qy
-            qw = (R_camera[0,2] - R_camera[2,0]) / s
-            qx = (R_camera[0,1] + R_camera[1,0]) / s
-            qy = 0.25 * s
-            qz = (R_camera[1,2] + R_camera[2,1]) / s
-        else:
-            s = np.sqrt(1.0 + R_camera[2,2] - R_camera[0,0] - R_camera[1,1]) * 2  # s = 4 * qz
-            qw = (R_camera[1,0] - R_camera[0,1]) / s
-            qx = (R_camera[0,2] + R_camera[2,0]) / s
-            qy = (R_camera[1,2] + R_camera[2,1]) / s
-            qz = 0.25 * s
+        cam_pos = T_world_camera[:3, 3]
+        cam_quat = Rotation.from_matrix(T_world_camera[:3, :3]).as_quat()  # [x,y,z,w]
         
         return {
-            'position': {'x': float(camera_pos[0]), 'y': float(camera_pos[1]), 'z': float(camera_pos[2])},
-            'orientation': {'x': float(qx), 'y': float(qy), 'z': float(qz), 'w': float(qw)}
+            'position': {'x': float(cam_pos[0]), 'y': float(cam_pos[1]), 'z': float(cam_pos[2])},
+            'orientation': {'x': float(cam_quat[0]), 'y': float(cam_quat[1]),
+                            'z': float(cam_quat[2]), 'w': float(cam_quat[3])}
         }
     
     def odometry_callback(self, msg):

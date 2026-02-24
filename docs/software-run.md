@@ -53,7 +53,7 @@ EXPORT_COLMAP=false                 # Set to true to export session to COLMAP fo
 ### Perform ICP on Scans
 ```bash
 cd ~/atlas_ws && source install/setup.bash
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session.py ~/atlas_ws/data/synchronized_scans/sync_fusion_[TIMESTAMP]
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session.py ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
 
 ### View Point Cloud in HTML Web Viewer
@@ -65,6 +65,7 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/web_3d_viewer.py <PLY_F
 
 ### Generate Colmap Reconstruction (experimental)
 ```bash
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/export_to_colmap.py ~/atlas_ws/data/synchronized_scans/sync_fusion_[TIMESTAMP]
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/erp_to_perspective_colmap.py ~/atlas_ws/data/synchronized_scans/sync_fusion_[TIMESTAMP]
+SESSION=~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+rm -rf $SESSION/colmap
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/erp_to_perspective_colmap.py $SESSION
 ```

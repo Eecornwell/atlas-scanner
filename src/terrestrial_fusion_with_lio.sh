@@ -7,9 +7,9 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Configuration
 SAVE_E57=false                      # Set to true to enable E57 export
 USE_EXISTING_CALIBRATION=false      # Set to true to skip calibration update from calib.json
-ENABLE_ICP_ALIGNMENT=true           # Set to true to offer ICP alignment at end
+ENABLE_ICP_ALIGNMENT=false           # Set to true to offer ICP alignment at end
 BLEND_ERP_SEAMS=true                # Set to true to blend fisheye seams in ERP images before coloring
-EXPORT_COLMAP=false                 # Set to true to export session to COLMAP format (experimental)
+EXPORT_COLMAP=false                  # Set to true to export session to COLMAP format (experimental)
 ENABLE_POST_PROCESSING_BAGS=false   # Set to true to offer post-processing option at end
 SKIP_LIVE_FUSION=true               # Set to true to skip fusion during scanning, only record bags
 AUTO_CREATE_COLORED=true            # Set to true to automatically create colored point clouds when SKIP_LIVE_FUSION=true
