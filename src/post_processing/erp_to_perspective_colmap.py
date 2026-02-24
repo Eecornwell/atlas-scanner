@@ -350,13 +350,26 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
         if ply_output.exists():
             print(f"✓ Exported to: {ply_output}")
 
+            # Use aligned point cloud if available
+            session_aligned = Path(session_dir) / "merged_aligned_colored.ply"
+            session_merged = Path(session_dir) / "merged_pointcloud.ply"
             lidar_ply = colmap_dir / "init_sparse" / "0" / "sparse.ply"
+            
+            # All source files are in ROS coordinates and need transformation
+            if session_aligned.exists():
+                base_ply = session_aligned
+            elif session_merged.exists():
+                base_ply = session_merged
+            elif lidar_ply.exists():
+                base_ply = lidar_ply
+            else:
+                base_ply = None
+            
             if lidar_ply.exists():
                 compare_point_clouds(lidar_ply, ply_output)
+            
             merged_ply = output_dir / "merged.ply"
-            session_merged = Path(session_dir) / "merged_pointcloud.ply"
-            base_ply = session_merged if session_merged.exists() else lidar_ply
-            if base_ply.exists():
+            if base_ply:
                 merged_pts = merge_point_clouds(base_ply, ply_output, merged_ply)
                 
                 # Write merged points back to points3D.bin
@@ -376,8 +389,9 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     return False
 
 def merge_point_clouds(lidar_ply, colmap_ply, output_ply):
-    """Merge lidar (ROS frame) and COLMAP (COLMAP world frame) point clouds.
-    COLMAP points are transformed back to ROS frame via R_ROS2COLMAP.T before merging.
+    """Merge lidar and COLMAP point clouds in COLMAP coordinate frame.
+    Lidar points (ROS frame) are transformed to COLMAP frame before merging.
+    COLMAP points are already in COLMAP frame.
     """
     import numpy as np
     import open3d as o3d
