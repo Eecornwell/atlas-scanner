@@ -77,8 +77,8 @@ def export_to_colmap(session_dir):
     
     # Create COLMAP directory structure
     colmap_dir = session_path / "colmap"
-    sparse_dir = colmap_dir / "sparse" / "0"
-    images_dir = colmap_dir / "images"
+    sparse_dir = colmap_dir / "init_sparse" / "0"
+    images_dir = colmap_dir / "pano_images"
     
     sparse_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)

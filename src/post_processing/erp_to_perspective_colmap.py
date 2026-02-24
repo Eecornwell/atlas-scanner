@@ -53,10 +53,10 @@ def convert_erp_to_perspectives(session_dir):
     """Convert all ERP images to perspective projections"""
     session_path = Path(session_dir).expanduser()
     colmap_dir = session_path / "colmap"
-    erp_dir = colmap_dir / "images"
-    persp_dir = colmap_dir / "perspective_images"
-    mask_dir = colmap_dir / "perspective_masks"
-    sparse_dir = colmap_dir / "sparse" / "0"
+    erp_dir = colmap_dir / "pano_images"
+    persp_dir = colmap_dir / "images"
+    mask_dir = colmap_dir / "masks"
+    sparse_dir = colmap_dir / "init_sparse" / "0"
     
     # Run export_to_colmap to ensure images/points are up to date
     import importlib.util, shutil
@@ -78,7 +78,7 @@ def convert_erp_to_perspectives(session_dir):
         shutil.rmtree(mask_dir)
     mask_dir.mkdir(exist_ok=True)
     
-    recon_dir = colmap_dir / "perspective_reconstruction"
+    recon_dir = colmap_dir / "sparse"
     if recon_dir.exists():
         shutil.rmtree(recon_dir)
     
@@ -208,8 +208,8 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     """Run COLMAP reconstruction on perspective images with known poses"""
     session_path = Path(session_dir).expanduser()
     colmap_dir = session_path / "colmap"
-    database = colmap_dir / "perspective_database.db"
-    output_dir = colmap_dir / "perspective_reconstruction"
+    database = colmap_dir / "database.db"
+    output_dir = colmap_dir / "sparse"
     output_dir.mkdir(exist_ok=True)
     
     print(f"\nRunning COLMAP on perspective images with known poses...")
@@ -232,7 +232,7 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
 
     # Feature extraction with per-image masks
     print("\n1. Extracting features...")
-    mask_dir = colmap_dir / "perspective_masks"
+    mask_dir = colmap_dir / "masks"
     mask_files = list(mask_dir.glob("*.png"))
     print(f"  Found {len(mask_files)} mask files")
 
@@ -350,14 +350,26 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
         if ply_output.exists():
             print(f"✓ Exported to: {ply_output}")
 
-            lidar_ply = colmap_dir / "sparse" / "0" / "sparse.ply"
+            lidar_ply = colmap_dir / "init_sparse" / "0" / "sparse.ply"
             if lidar_ply.exists():
                 compare_point_clouds(lidar_ply, ply_output)
             merged_ply = output_dir / "merged.ply"
             session_merged = Path(session_dir) / "merged_pointcloud.ply"
             base_ply = session_merged if session_merged.exists() else lidar_ply
             if base_ply.exists():
-                merge_point_clouds(base_ply, ply_output, merged_ply)
+                merged_pts = merge_point_clouds(base_ply, ply_output, merged_ply)
+                
+                # Write merged points back to points3D.bin
+                import struct
+                with open(model_dir / "points3D.bin", 'wb') as f:
+                    f.write(struct.pack('Q', len(merged_pts)))
+                    for i, p in enumerate(merged_pts, start=1):
+                        f.write(struct.pack('Q', i))
+                        f.write(struct.pack('ddd', p[0], p[1], p[2]))
+                        f.write(struct.pack('BBB', int(p[3]), int(p[4]), int(p[5])))
+                        f.write(struct.pack('d', 0.0))
+                        f.write(struct.pack('Q', 0))
+                print(f"✓ Wrote {len(merged_pts)} merged points to points3D.bin")
 
             return True
     
@@ -385,8 +397,6 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply):
         p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
 
     colmap_pts = read_ply(colmap_ply)
-    for p in colmap_pts:
-        p[3], p[4], p[5] = 255, 0, 0  # red markers
     all_pts = lidar_pts + colmap_pts
 
     with open(output_ply, 'w') as f:
@@ -398,6 +408,7 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply):
             f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(p[3])} {int(p[4])} {int(p[5])}\n')
 
     print(f'\u2713 Merged {len(lidar_pts)} lidar + {len(colmap_pts)} COLMAP points -> {output_ply}')
+    return all_pts
 
 
 def compare_point_clouds(original_path, reconstructed_path):
