@@ -7,9 +7,9 @@ Before running the software, you can configure various options by editing the se
 ```bash
 SAVE_E57=false                      # Set to true to enable E57 export
 USE_EXISTING_CALIBRATION=false      # Set to true to skip calibration update from calib.json
-ENABLE_ICP_ALIGNMENT=false          # Set to true to enable ICP alignment at end
+ENABLE_ICP_ALIGNMENT=false          # Set to true to enable ICP alignment at end (uses pose graph optimization)
 BLEND_ERP_SEAMS=true                # Set to true to blend fisheye seams in ERP images before coloring
-EXPORT_COLMAP=false                 # Set to true to export session to COLMAP format (experimental)
+EXPORT_COLMAP=false                 # Set to true to export session to COLMAP format (uses ICP-refined poses if available)
 ```
 
 ## Normal Operation

@@ -200,6 +200,33 @@ def register_pose_graph(session_dir):
     transforms = [node.pose for node in pose_graph.nodes]
     
     for i, scan_dir in enumerate(scan_dirs):
+        # Save refined trajectory
+        traj_file = scan_dir / "trajectory.json"
+        if traj_file.exists():
+            with open(traj_file, 'r') as f:
+                traj = json.load(f)
+            
+            # Update with refined pose
+            T_refined = transforms[i]
+            from scipy.spatial.transform import Rotation as R
+            
+            traj_refined = traj.copy()
+            traj_refined['current_pose'] = traj_refined.get('current_pose', {})
+            traj_refined['current_pose']['lidar_pose'] = {
+                'position': {
+                    'x': float(T_refined[0, 3]),
+                    'y': float(T_refined[1, 3]),
+                    'z': float(T_refined[2, 3])
+                },
+                'orientation': dict(zip(['x', 'y', 'z', 'w'], 
+                    R.from_matrix(T_refined[:3, :3]).as_quat().tolist()))
+            }
+            
+            # Save refined trajectory
+            with open(scan_dir / "trajectory_icp_refined.json", 'w') as f:
+                json.dump(traj_refined, f, indent=2)
+        
+        # Save aligned colored point cloud
         colored_file = scan_dir / "world_colored_exact.ply"
         if not colored_file.exists():
             colored_file = scan_dir / "world_colored_pointcloud.ply"
