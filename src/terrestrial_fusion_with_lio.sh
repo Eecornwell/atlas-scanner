@@ -7,9 +7,9 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # Configuration
 SAVE_E57=false                      # Set to true to enable E57 export
 USE_EXISTING_CALIBRATION=false      # Set to true to skip calibration update from calib.json
-ENABLE_ICP_ALIGNMENT=false           # Set to true to offer ICP alignment at end
+ENABLE_ICP_ALIGNMENT=true           # Set to true to offer ICP alignment at end
 BLEND_ERP_SEAMS=true                # Set to true to blend fisheye seams in ERP images before coloring
-EXPORT_COLMAP=false                  # Set to true to export session to COLMAP format (experimental)
+EXPORT_COLMAP=true                  # Set to true to export session to COLMAP format (experimental)
 ENABLE_POST_PROCESSING_BAGS=false   # Set to true to offer post-processing option at end
 SKIP_LIVE_FUSION=true               # Set to true to skip fusion during scanning, only record bags
 AUTO_CREATE_COLORED=true            # Set to true to automatically create colored point clouds when SKIP_LIVE_FUSION=true
@@ -350,14 +350,21 @@ PIDS+=($CAMERA_PID)
 # Lower camera node priority so LIO gets CPU when both are running
 sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null &
 
-echo "Waiting for camera to initialize (10 seconds)..."
-sleep 10
+echo "Waiting for camera to initialize and H.264 stream to stabilize..."
+sleep 3
 
-if wait_for_topic "/dual_fisheye/image/compressed" 10 && wait_for_topic_data "/dual_fisheye/image/compressed" 10; then
-    echo "✓ Camera driver ready"
-    CAMERA_STATUS="/dual_fisheye/image/compressed (~0.8 Hz)"
+if wait_for_topic "/dual_fisheye/image/compressed" 10; then
+    echo "Topic available, waiting for H.264 keyframe and valid decoded frames..."
+    sleep 2
+    if wait_for_topic_data "/dual_fisheye/image/compressed" 10; then
+        echo "✓ Camera driver ready"
+        CAMERA_STATUS="/dual_fisheye/image/compressed (~0.8 Hz)"
+    else
+        echo "✗ Camera failed to start - no valid frames"
+        exit 1
+    fi
 else
-    echo "✗ Camera failed to start"
+    echo "✗ Camera failed to start - topic not available"
     exit 1
 fi
 

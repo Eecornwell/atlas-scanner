@@ -105,20 +105,26 @@ def convert_erp_to_perspectives(session_dir):
             traj = json.load(f)
         pose_data = traj.get('current_pose', {})
         cam_quat_xyzw = None
-        if 'lidar_pose' in pose_data:
+        if 'camera_pose' in pose_data:
+            # Use camera pose directly
+            c = pose_data['camera_pose']
+            pos_xyz = [c['position']['x'], c['position']['y'], c['position']['z']]
+            q_xyzw = [c['orientation']['x'], c['orientation']['y'], c['orientation']['z'], c['orientation']['w']]
+            cam_quat_xyzw = q_xyzw
+        elif 'lidar_pose' in pose_data:
+            # Fallback to lidar pose
             p = pose_data['lidar_pose']
             pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
             q_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
-            if 'camera_pose' in pose_data:
-                c = pose_data['camera_pose']['orientation']
-                cam_quat_xyzw = [c['x'], c['y'], c['z'], c['w']]
         elif 'poses' in traj and traj['poses']:
             p = traj['poses'][-1]
             pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
             q_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
         else:
             continue
-        (qw, qx, qy, qz), T = _mod.ros_pose_to_colmap_w2c(pos_xyz, q_xyzw, T_lidar_camera, cam_quat_xyzw)
+        (qw, qx, qy, qz), T = _mod.ros_pose_to_colmap_w2c(
+            pos_xyz, q_xyzw, T_lidar_camera, cam_quat_xyzw
+        )
         image_name = f'scan_{idx:03d}.png'
         poses[image_name] = {'id': idx, 'quat': [qw, qx, qy, qz], 'trans': T, 'cam_quat_ros': cam_quat_xyzw}
     
@@ -289,11 +295,12 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     with open(persp_sparse_dir / "points3D.bin", 'wb') as f:
         f.write(struct.pack('Q', 0))
 
-    # Feature matching
+    # Feature matching - use sequential for better nearby matches
     print("\n2. Matching features...")
     subprocess.run([
-        "colmap", "exhaustive_matcher",
-        "--database_path", str(database)
+        "colmap", "sequential_matcher",
+        "--database_path", str(database),
+        "--SequentialMatching.overlap", "12"  # Match each image with 12 neighbors
     ])
     
     # Reconstruction: Import features into model with known poses
@@ -349,6 +356,15 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
         
         if ply_output.exists():
             print(f"✓ Exported to: {ply_output}")
+            
+            # Save camera-only points3D.bin before merging
+            camera_only_dir = output_dir / "camera_only"
+            camera_only_dir.mkdir(exist_ok=True)
+            import shutil
+            shutil.copy(model_dir / "points3D.bin", camera_only_dir / "points3D.bin")
+            shutil.copy(model_dir / "cameras.bin", camera_only_dir / "cameras.bin")
+            shutil.copy(model_dir / "images.bin", camera_only_dir / "images.bin")
+            print(f"✓ Saved camera-only reconstruction to: {camera_only_dir}")
 
             # Use aligned point cloud if available
             session_aligned = Path(session_dir) / "merged_aligned_colored.ply"

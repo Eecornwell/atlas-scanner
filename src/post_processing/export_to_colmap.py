@@ -45,26 +45,24 @@ def _cam_Z_azimuth_offset(T_lidar_camera):
     return np.arctan2(cam_Z_lidar[1], cam_Z_lidar[0])
 
 
-def ros_pose_to_colmap_w2c(lidar_pos_xyz, lidar_quat_xyzw, T_lidar_camera, camera_quat_xyzw=None):
-    """Convert a ROS odom lidar pose to COLMAP w2c (qw,qx,qy,qz) + T.
-
-    The Insta360 SDK stitches the ERP in the camera's own frame (not gravity-stabilised).
-    We use the full camera c2w rotation from camera_pose.orientation directly.
-    ERP convention: +X=right, +Y=down, +Z=forward in camera frame.
+def ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_lidar_camera, camera_quat_xyzw=None):
+    """Convert a ROS pose to COLMAP w2c (qw,qx,qy,qz) + T.
+    
+    If camera_quat_xyzw is provided, it's already the full camera orientation in ROS world.
+    Otherwise, derive it from the pose + calibration.
     """
-    R_lidar_w = R.from_quat(lidar_quat_xyzw).as_matrix()
-
     if camera_quat_xyzw is not None:
-        # Full camera c2w rotation in ROS world — use directly, no yaw-only extraction
+        # Camera pose already includes calibration - use directly
         R_c2w = R_ROS2COLMAP @ R.from_quat(camera_quat_xyzw).as_matrix()
+        C_ros = np.array(pos_xyz)
     else:
-        # Fallback: derive camera orientation from lidar pose + calibration
+        # Derive camera pose from lidar pose + calibration
+        R_lidar_w = R.from_quat(quat_xyzw).as_matrix()
         R_cam_c2w = R_lidar_w @ T_lidar_camera[:3, :3]
         R_c2w = R_ROS2COLMAP @ R_cam_c2w
+        C_ros = np.array(pos_xyz) + R_lidar_w @ T_lidar_camera[:3, 3]
 
     R_w2c = R_c2w.T
-
-    C_ros = np.array(lidar_pos_xyz) + R_lidar_w @ T_lidar_camera[:3, 3]
     C_colmap = R_ROS2COLMAP @ C_ros
     T = -R_w2c @ C_colmap
 
@@ -138,26 +136,34 @@ def export_to_colmap(session_dir):
             with open(traj_file, 'r') as f:
                 traj = json.load(f)
             
-            # Use lidar_pose orientation (gravity-aligned) with camera_pose position.
-            # The ERP image up-direction is defined by the lidar's gravity-aligned frame.
-            # Camera is physically inverted but ERP image is stitched right-side up.
+            # Use camera_pose when available for proper alignment with images
             if 'current_pose' in traj:
                 pose_data = traj['current_pose']
                 timestamp = pose_data.get('timestamp', 0.0)
                 cam_quat_xyzw = None
 
-                if 'camera_pose' in pose_data and 'lidar_pose' in pose_data:
-                    lid_pos = pose_data['lidar_pose']['position']
-                    lid_ori = pose_data['lidar_pose']['orientation']
-                    pos_xyz = [lid_pos['x'], lid_pos['y'], lid_pos['z']]
-                    quat_xyzw = [lid_ori['x'], lid_ori['y'], lid_ori['z'], lid_ori['w']]
-                    cam_ori = pose_data['camera_pose']['orientation']
-                    cam_quat_xyzw = [cam_ori['x'], cam_ori['y'], cam_ori['z'], cam_ori['w']]
-                elif 'camera_pose' in pose_data:
-                    cam = pose_data['camera_pose']
-                    pos_xyz = [cam['position']['x'], cam['position']['y'], cam['position']['z']]
-                    quat_xyzw = [cam['orientation']['x'], cam['orientation']['y'], cam['orientation']['z'], cam['orientation']['w']]
+                if 'camera_pose' in pose_data:
+                    # Recompute camera pose from lidar pose + calibration
+                    # The stored camera_pose uses inverted calibration, so recompute it
+                    p = pose_data['lidar_pose']
+                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
+                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
+                    
+                    # Compute camera pose correctly: T_world_camera = T_world_lidar @ T_lidar_camera
+                    R_lidar_w = R.from_quat(quat_xyzw).as_matrix()
+                    T_world_lidar = np.eye(4)
+                    T_world_lidar[:3, :3] = R_lidar_w
+                    T_world_lidar[:3, 3] = pos_xyz
+                    
+                    # T_lidar_camera is already inverted in _load_T_lidar_camera, so invert it back
+                    T_camera_lidar = np.linalg.inv(T_lidar_camera)
+                    T_world_camera = T_world_lidar @ T_camera_lidar
+                    
+                    cam_pos = T_world_camera[:3, 3]
+                    cam_quat = R.from_matrix(T_world_camera[:3, :3]).as_quat()
+                    cam_quat_xyzw = cam_quat.tolist()
                 elif 'lidar_pose' in pose_data:
+                    # Fallback to lidar pose if camera pose not available
                     p = pose_data['lidar_pose']
                     pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
                     quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
@@ -176,7 +182,9 @@ def export_to_colmap(session_dir):
                 quat_xyzw = [0.0, 0.0, 0.0, 1.0]
                 timestamp = 0.0
 
-            (qw_c2w, qx_c2w, qy_c2w, qz_c2w), t_c2w_list = ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_lidar_camera, cam_quat_xyzw)
+            (qw_c2w, qx_c2w, qy_c2w, qz_c2w), t_c2w_list = ros_pose_to_colmap_w2c(
+                pos_xyz, quat_xyzw, T_lidar_camera, cam_quat_xyzw
+            )
             t_c2w = np.array(t_c2w_list)
         
         # Find equirectangular image - prioritize blended masked version
