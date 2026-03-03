@@ -23,17 +23,16 @@ R_ROS2COLMAP = np.array([
 ], dtype=float)
 
 def _load_T_lidar_camera():
-    """Return T_lidar_camera (4x4): camera position/orientation in lidar frame."""
+    """Return T_camera_lidar (4x4): transforms points from lidar frame to camera frame."""
     calib_path = Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml"
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
-    # fusion_calibration.yaml stores T_camera_lidar (lidar->camera)
     T_camera_lidar = np.eye(4)
     T_camera_lidar[:3, :3] = R.from_euler('xyz', [
         calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
     ]).as_matrix()
     T_camera_lidar[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
-    return np.linalg.inv(T_camera_lidar)  # invert once to get T_lidar_camera
+    return T_camera_lidar  # T_camera_lidar: lidar->camera
 
 # Precompute the azimuth offset of cam_Z in the lidar frame (constant for a given calibration).
 # The Insta360 SDK gravity-stabilizes the ERP: image top = world up, lon=0 = the horizontal
@@ -45,28 +44,27 @@ def _cam_Z_azimuth_offset(T_lidar_camera):
     return np.arctan2(cam_Z_lidar[1], cam_Z_lidar[0])
 
 
-def ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_lidar_camera, camera_quat_xyzw=None):
-    """Convert a ROS pose to COLMAP w2c (qw,qx,qy,qz) + T.
-    
-    If camera_quat_xyzw is provided, it's already the full camera orientation in ROS world.
-    Otherwise, derive it from the pose + calibration.
+def ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_camera_lidar, camera_quat_xyzw=None):
+    """Convert a ROS lidar pose to COLMAP w2c quaternion + translation.
+    T_camera_lidar: 4x4 transform from lidar frame to camera frame.
+    camera_quat_xyzw: if provided, use as camera orientation directly (skips calibration).
     """
     if camera_quat_xyzw is not None:
-        # Camera pose already includes calibration - use directly
-        R_c2w = R_ROS2COLMAP @ R.from_quat(camera_quat_xyzw).as_matrix()
+        R_c2w_ros = R.from_quat(camera_quat_xyzw).as_matrix()
         C_ros = np.array(pos_xyz)
     else:
-        # Derive camera pose from lidar pose + calibration
+        # T_world_camera = T_world_lidar @ inv(T_camera_lidar)
+        # inv(T_camera_lidar) = T_lidar_camera
+        T_lidar_camera = np.linalg.inv(T_camera_lidar)
         R_lidar_w = R.from_quat(quat_xyzw).as_matrix()
-        R_cam_c2w = R_lidar_w @ T_lidar_camera[:3, :3]
-        R_c2w = R_ROS2COLMAP @ R_cam_c2w
+        R_c2w_ros = R_lidar_w @ T_lidar_camera[:3, :3]
         C_ros = np.array(pos_xyz) + R_lidar_w @ T_lidar_camera[:3, 3]
 
+    R_c2w = R_ROS2COLMAP @ R_c2w_ros
     R_w2c = R_c2w.T
     C_colmap = R_ROS2COLMAP @ C_ros
     T = -R_w2c @ C_colmap
-
-    q = R.from_matrix(R_w2c).as_quat()
+    q = R.from_matrix(R_w2c).as_quat()  # [x,y,z,w]
     return [q[3], q[0], q[1], q[2]], T.tolist()
 
 def export_to_colmap(session_dir):
@@ -141,27 +139,12 @@ def export_to_colmap(session_dir):
                 pose_data = traj['current_pose']
                 timestamp = pose_data.get('timestamp', 0.0)
                 cam_quat_xyzw = None
+                quat_xyzw = [0.0, 0.0, 0.0, 1.0]
 
                 if 'camera_pose' in pose_data:
-                    # Recompute camera pose from lidar pose + calibration
-                    # The stored camera_pose uses inverted calibration, so recompute it
-                    p = pose_data['lidar_pose']
+                    p = pose_data['camera_pose']
                     pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
-                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
-                    
-                    # Compute camera pose correctly: T_world_camera = T_world_lidar @ T_lidar_camera
-                    R_lidar_w = R.from_quat(quat_xyzw).as_matrix()
-                    T_world_lidar = np.eye(4)
-                    T_world_lidar[:3, :3] = R_lidar_w
-                    T_world_lidar[:3, 3] = pos_xyz
-                    
-                    # T_lidar_camera is already inverted in _load_T_lidar_camera, so invert it back
-                    T_camera_lidar = np.linalg.inv(T_lidar_camera)
-                    T_world_camera = T_world_lidar @ T_camera_lidar
-                    
-                    cam_pos = T_world_camera[:3, 3]
-                    cam_quat = R.from_matrix(T_world_camera[:3, :3]).as_quat()
-                    cam_quat_xyzw = cam_quat.tolist()
+                    cam_quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
                 elif 'lidar_pose' in pose_data:
                     # Fallback to lidar pose if camera pose not available
                     p = pose_data['lidar_pose']

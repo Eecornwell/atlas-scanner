@@ -183,11 +183,11 @@ class EnhancedTrajectoryRecorder(Node):
                         scan_name = request_data['scan_name']
                         scan_dir = request_data['scan_dir']
                         
-                        capture_time = request_data.get('capture_time')
+                        capture_time = request_data.get('capture_time') or request_data.get('scan_request_time')
                         current_pose_snapshot = self.get_pose_at_time(capture_time)
                         if current_pose_snapshot:
                             # Save trajectory for this scan with current pose
-                            if self.save_scan_trajectory_to_dir(scan_name, scan_dir, current_pose_snapshot):
+                            if self.save_scan_trajectory_to_dir(scan_name, scan_dir, current_pose_snapshot, capture_time):
                                 self.get_logger().info(f'Saved trajectory for {scan_name} to {scan_dir}')
                             else:
                                 self.get_logger().error(f'Failed to save trajectory for {scan_name}')
@@ -220,7 +220,7 @@ class EnhancedTrajectoryRecorder(Node):
         best = min(self.trajectory, key=lambda p: abs(p['timestamp'] - capture_time))
         return best.copy()
     
-    def save_scan_trajectory_to_dir(self, scan_name, scan_dir, pose_snapshot):
+    def save_scan_trajectory_to_dir(self, scan_name, scan_dir, pose_snapshot, capture_time=None):
         """Save trajectory data for a specific scan to its directory"""
         if not pose_snapshot:
             return False
@@ -233,6 +233,7 @@ class EnhancedTrajectoryRecorder(Node):
             'scan_info': {
                 'name': scan_name,
                 'timestamp': scan_timestamp,
+                'capture_time': capture_time,
                 'scan_request_time': scan_request_time,
                 'scan_pose_time': pose_snapshot['timestamp']
             },

@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""
+Reconstruct scan sessions from a rosbag using ROS header timestamps.
+
+Instead of interval-based live capture, this reads the bag after recording
+and groups LiDAR frames into scans, then finds the temporally closest
+fisheye image and odometry pose for each scan using header stamps.
+
+Usage:
+  python3 reconstruct_from_bag.py <session_dir> [--interval 3.0] [--lidar-window 2.0]
+"""
+
+import sys
+import os
+import json
+import struct
+import sqlite3
+import argparse
+import subprocess
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+from scipy.spatial.transform import Rotation
+
+import cv2
+
+try:
+    from rclpy.serialization import deserialize_message
+    from rosidl_runtime_py.utilities import get_message
+except ImportError:
+    print("✗ rclpy not available — source your ROS workspace first")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Bag reading helpers
+# ---------------------------------------------------------------------------
+
+def open_db3(bag_dir):
+    bag_path = Path(bag_dir)
+    db3_files = sorted(bag_path.glob("*.db3"))
+    if db3_files:
+        return sqlite3.connect(str(db3_files[0]))
+    zstd = sorted(bag_path.glob("*.db3.zstd"))
+    if not zstd:
+        raise FileNotFoundError(f"No .db3 file in {bag_dir}")
+    out = str(zstd[0]).replace(".zstd", "")
+    print(f"  Decompressing {zstd[0].name}...")
+    result = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"],
+                            capture_output=True)
+    if result.returncode != 0 or not Path(out).exists():
+        raise RuntimeError(
+            f"Bag is truncated/corrupt and cannot be recovered: {zstd[0].name}\n"
+            f"The recording was likely interrupted during compression.\n"
+            f"Future sessions use uncompressed recording to prevent this.")
+    return sqlite3.connect(out)
+
+
+def topic_map(con):
+    return {r[0]: (r[1], r[2]) for r in con.execute("SELECT id, name, type FROM topics")}
+
+
+def read_topic(con, topics, name_fragment):
+    """Return list of (ros_stamp_sec, data_bytes) sorted by stamp, matched by name fragment."""
+    tid = next((tid for tid, (n, _) in topics.items() if n == name_fragment), None)
+    if tid is None:
+        tid = next((tid for tid, (n, _) in topics.items() if name_fragment in n), None)
+    if tid is None:
+        return None, None
+    msg_type_str = topics[tid][1]
+    MsgType = get_message(msg_type_str)
+    rows = con.execute(
+        "SELECT data, timestamp FROM messages WHERE topic_id=? ORDER BY timestamp",
+        (tid,),
+    ).fetchall()
+    msgs = []
+    for data, bag_ts_ns in rows:
+        msg = deserialize_message(bytes(data), MsgType)
+        # Prefer header stamp when available
+        if hasattr(msg, "header"):
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        else:
+            stamp = bag_ts_ns / 1e9
+        msgs.append((stamp, msg))
+    msgs.sort(key=lambda x: x[0])
+    return msgs, MsgType
+
+
+# ---------------------------------------------------------------------------
+# Point cloud helpers
+# ---------------------------------------------------------------------------
+
+def unpack_lidar(msg):
+    points = []
+    intensity_offset = next((f.offset for f in msg.fields if f.name == "intensity"), None)
+    for i in range(0, len(msg.data), msg.point_step):
+        if i + 12 > len(msg.data):
+            break
+        x, y, z = (struct.unpack("<f", msg.data[i + o: i + o + 4])[0] for o in (0, 4, 8))
+        if not (abs(x) < 200 and abs(y) < 200 and abs(z) < 100):
+            continue
+        intensity = 0.5
+        if intensity_offset and i + intensity_offset + 4 <= len(msg.data):
+            try:
+                intensity = max(0.0, min(1.0,
+                    struct.unpack("<f", msg.data[i + intensity_offset: i + intensity_offset + 4])[0] / 255.0))
+            except Exception:
+                pass
+        points.append([x, y, z, intensity])
+    return points
+
+
+def save_ply(path, points, has_intensity=True):
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(points)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        if has_intensity:
+            f.write("property float intensity\n")
+        f.write("end_header\n")
+        for p in points:
+            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}")
+            if has_intensity:
+                f.write(f" {p[3]:.6f}")
+            f.write("\n")
+
+
+# ---------------------------------------------------------------------------
+# Closest-message lookup
+# ---------------------------------------------------------------------------
+
+def closest(msgs, target_stamp):
+    """Return the message whose stamp is closest to target_stamp."""
+    return min(msgs, key=lambda x: abs(x[0] - target_stamp))
+
+
+# ---------------------------------------------------------------------------
+# Pose helpers
+# ---------------------------------------------------------------------------
+
+def pose_to_matrix(odom_msg):
+    pos = odom_msg.pose.pose.position
+    ori = odom_msg.pose.pose.orientation
+    q = np.array([ori.x, ori.y, ori.z, ori.w])
+    q /= np.linalg.norm(q)
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_quat(q).as_matrix()
+    T[:3, 3] = [pos.x, pos.y, pos.z]
+    return T
+
+
+def write_trajectory_json(scan_dir, scan_name, capture_stamp, odom_msg, all_odom):
+    pos = odom_msg.pose.pose.position
+    ori = odom_msg.pose.pose.orientation
+    q = np.array([ori.x, ori.y, ori.z, ori.w])
+    q /= np.linalg.norm(q)
+
+    lidar_pose = {
+        "position": {"x": float(pos.x), "y": float(pos.y), "z": float(pos.z)},
+        "orientation": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2]), "w": float(q[3])},
+    }
+
+    start_ts = all_odom[0][0]
+    full_traj = []
+    for ts, om in all_odom:
+        op = om.pose.pose.position
+        oo = om.pose.pose.orientation
+        full_traj.append({
+            "timestamp": ts,
+            "relative_time": ts - start_ts,
+            "position": {"x": op.x, "y": op.y, "z": op.z},
+            "orientation": {"x": oo.x, "y": oo.y, "z": oo.z, "w": oo.w},
+            "lidar_pose": {
+                "position": {"x": op.x, "y": op.y, "z": op.z},
+                "orientation": {"x": oo.x, "y": oo.y, "z": oo.z, "w": oo.w},
+            },
+        })
+
+    data = {
+        "scan_info": {
+            "name": scan_name,
+            "timestamp": datetime.now().isoformat(),
+            "capture_time": capture_stamp,
+            "scan_request_time": capture_stamp,
+            "scan_pose_time": capture_stamp,
+        },
+        "current_pose": {
+            "timestamp": capture_stamp,
+            "relative_time": capture_stamp - start_ts,
+            "lidar_pose": lidar_pose,
+            "position": lidar_pose["position"],
+            "orientation": lidar_pose["orientation"],
+        },
+        "full_trajectory": full_traj,
+    }
+
+    with open(os.path.join(scan_dir, "trajectory.json"), "w") as f:
+        json.dump(data, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Fisheye decode — handles JPEG and H.264 CompressedImage
+# ---------------------------------------------------------------------------
+
+def _find_keyframes(image_msgs_raw):
+    """Return sorted list of message indices that contain an IDR (keyframe) NAL unit."""
+    keyframes = []
+    for i, (_, msg) in enumerate(image_msgs_raw):
+        raw = bytes(msg.data)
+        j = 0
+        while j < len(raw) - 4:
+            if raw[j:j+4] == b'\x00\x00\x00\x01':
+                if j + 4 < len(raw) and (raw[j+4] & 0x1f) == 5:  # IDR
+                    keyframes.append(i)
+                    break
+                j += 4
+            else:
+                j += 1
+    return keyframes
+
+
+def _h264_frame_size(image_msgs_raw):
+    """Decode a single frame to determine pixel dimensions."""
+    raw = b''.join(bytes(m.data) for _, m in image_msgs_raw[:30])
+    proc = subprocess.Popen(
+        ['ffmpeg', '-f', 'h264', '-i', 'pipe:0', '-frames:v', '1',
+         '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    out, err = proc.communicate(input=raw)
+    import re
+    m = re.search(rb'(\d{3,4})x(\d{3,4})', err)
+    if m:
+        return int(m.group(2)), int(m.group(1))  # h, w
+    return 1280, 2560
+
+
+def decode_h264_frame(image_msgs_raw, target_idx, h, w, keyframes):
+    """Decode a single H.264 frame by index, starting from the preceding keyframe."""
+    kf = max((k for k in keyframes if k <= target_idx), default=0)
+    raw = b''.join(bytes(m.data) for _, m in image_msgs_raw[kf: target_idx + 1])
+    skip = target_idx - kf
+    frame_bytes = h * w * 3
+    proc = subprocess.Popen(
+        ['ffmpeg', '-f', 'h264', '-i', 'pipe:0',
+         '-vf', f'select=gte(n\\,{skip})', '-frames:v', '1',
+         '-f', 'rawvideo', '-pix_fmt', 'bgr24', 'pipe:1'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    out, _ = proc.communicate(input=raw)
+    if len(out) < frame_bytes:
+        return None
+    return np.frombuffer(out[:frame_bytes], dtype=np.uint8).reshape(h, w, 3)
+
+
+def closest_image_index(image_msgs_raw, target_stamp):
+    """Return (index, stamp, msg) of the closest frame by stamp."""
+    idx = min(range(len(image_msgs_raw)), key=lambda i: abs(image_msgs_raw[i][0] - target_stamp))
+    return idx, image_msgs_raw[idx][0], image_msgs_raw[idx][1]
+
+
+def decode_jpeg_frame(msg):
+    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    return cv2.imdecode(buf, cv2.IMREAD_COLOR)
+
+
+def extract_back_fisheye(dual_img):
+    back = dual_img[:, : dual_img.shape[1] // 2]
+    return cv2.rotate(back, cv2.ROTATE_90_CLOCKWISE)
+
+
+# ---------------------------------------------------------------------------
+# Main reconstruction
+# ---------------------------------------------------------------------------
+
+def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
+    session_path = Path(session_dir)
+
+    bag_dirs = sorted(session_path.glob("rosbag_*"))
+    if not bag_dirs:
+        print("✗ No rosbag_* directory found in session")
+        sys.exit(1)
+
+    bag_dir = bag_dirs[0]
+    print(f"Reading bag: {bag_dir.name}")
+
+    con = open_db3(bag_dir)
+    topics = topic_map(con)
+
+    print("  Topics in bag:")
+    for tid, (name, typ) in topics.items():
+        count = con.execute("SELECT COUNT(*) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
+        print(f"    {name}  ({count} msgs)")
+
+    lidar_msgs, _ = read_topic(con, topics, "/livox/lidar")
+    image_msgs_raw, _ = read_topic(con, topics, "fisheye")
+    odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
+    con.close()
+
+    is_h264 = False
+    img_h, img_w = 1280, 2560
+    keyframes = []
+    if image_msgs_raw:
+        fmt = getattr(image_msgs_raw[0][1], 'format', 'unknown').lower()
+        is_h264 = 'h264' in fmt or 'h.264' in fmt
+        print(f"  Camera format: {fmt}  ({len(image_msgs_raw)} frames)")
+        if is_h264:
+            img_h, img_w = _h264_frame_size(image_msgs_raw)
+            keyframes = _find_keyframes(image_msgs_raw)
+            print(f"  Frame size: {img_w}x{img_h}, GOP size: ~{keyframes[1]-keyframes[0] if len(keyframes)>1 else 'N/A'}")
+
+    if not lidar_msgs:
+        print("✗ No LiDAR messages in bag")
+        sys.exit(1)
+
+    print(f"  LiDAR: {len(lidar_msgs)} frames  "
+          f"({lidar_msgs[-1][0] - lidar_msgs[0][0]:.1f}s)")
+    if image_msgs_raw:
+        print(f"  Camera: {len(image_msgs_raw)} frames  "
+              f"({image_msgs_raw[-1][0] - image_msgs_raw[0][0]:.1f}s)")
+    if odom_msgs:
+        print(f"  Odometry: {len(odom_msgs)} poses  "
+              f"({odom_msgs[-1][0] - odom_msgs[0][0]:.1f}s)")
+
+    # -----------------------------------------------------------------------
+    # Build scan centres from camera frame timestamps so each scan's image
+    # is the exact frame that drove the capture.  For H.264 we use keyframe
+    # indices directly; for JPEG every frame is a candidate.
+    # `interval` acts as a minimum gap between scans to avoid duplicates.
+    # LiDAR points are then collected within `lidar_window` of each centre.
+    # -----------------------------------------------------------------------
+    t_start = lidar_msgs[0][0]
+    t_end = lidar_msgs[-1][0]
+    duration = t_end - t_start
+
+    if image_msgs_raw:
+        # Use camera frame timestamps as scan centres, enforcing minimum gap.
+        if is_h264:
+            # Only keyframes are clean decode points — use those as candidates.
+            candidate_indices = keyframes if keyframes else list(range(len(image_msgs_raw)))
+        else:
+            candidate_indices = list(range(len(image_msgs_raw)))
+
+        centres = []          # (camera_stamp, image_index)
+        last_t = -float('inf')
+        for ci in candidate_indices:
+            t = image_msgs_raw[ci][0]
+            if t < t_start or t > t_end:
+                continue
+            if t - last_t >= interval:
+                centres.append((t, ci))
+                last_t = t
+
+        if not centres:
+            centres = [(image_msgs_raw[candidate_indices[0]][0], candidate_indices[0])]
+    else:
+        # No camera — fall back to LiDAR-derived centres.
+        centres = []
+        t = t_start + lidar_window / 2.0
+        while t < t_end - lidar_window / 2.0:
+            centres.append((t, None))
+            t += interval
+        if not centres:
+            centres = [((t_start + t_end) / 2.0, None)]
+
+    print(f"\n  Session duration: {duration:.1f}s  →  {len(centres)} scans "
+          f"(camera-driven, min_gap={interval}s, lidar_window={lidar_window}s)")
+
+    scan_count = 0
+    for idx, (centre, img_idx) in enumerate(centres):
+        scan_num = idx + 1
+        scan_name = f"fusion_scan_{scan_num:03d}"
+        scan_dir = session_path / scan_name
+        scan_dir.mkdir(exist_ok=True)
+
+        ts_str = datetime.fromtimestamp(centre).strftime("%Y%m%d_%H%M%S")
+
+        # --- LiDAR: collect all frames within the window around camera stamp ---
+        half = lidar_window / 2.0
+        window_frames = [msg for ts, msg in lidar_msgs if abs(ts - centre) <= half]
+        if not window_frames:
+            print(f"  ⚠ {scan_name}: no LiDAR frames in window, skipping")
+            continue
+
+        all_points = []
+        seen = set()
+        for msg in window_frames:
+            mid = id(msg)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            all_points.extend(unpack_lidar(msg))
+
+        if not all_points:
+            print(f"  ⚠ {scan_name}: zero valid points, skipping")
+            continue
+
+        ply_path = scan_dir / f"sensor_lidar_{ts_str}.ply"
+        save_ply(str(ply_path), all_points)
+
+        # --- Camera: decode the exact frame whose timestamp is the centre ---
+        fisheye_path = None
+        dt_img = 0.0
+        if image_msgs_raw and img_idx is not None:
+            img_out = scan_dir / f"fisheye_{ts_str}.jpg"
+            if is_h264:
+                bgr = decode_h264_frame(image_msgs_raw, img_idx, img_h, img_w, keyframes)
+            else:
+                bgr = decode_jpeg_frame(image_msgs_raw[img_idx][1])
+            if bgr is not None:
+                cv2.imwrite(str(img_out), extract_back_fisheye(bgr),
+                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                fisheye_path = str(img_out)
+        elif image_msgs_raw and img_idx is None:
+            # LiDAR-fallback path: find closest image
+            img_idx_fb, img_stamp_fb, img_msg_fb = closest_image_index(image_msgs_raw, centre)
+            dt_img = abs(img_stamp_fb - centre)
+            if dt_img < interval:
+                img_out = scan_dir / f"fisheye_{ts_str}.jpg"
+                bgr = decode_jpeg_frame(img_msg_fb)
+                if bgr is not None:
+                    cv2.imwrite(str(img_out), extract_back_fisheye(bgr),
+                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    fisheye_path = str(img_out)
+
+        # --- Odometry: closest pose to the camera frame stamp ---
+        dt_odom = float('inf')
+        if odom_msgs:
+            odom_stamp, odom_msg = closest(odom_msgs, centre)
+            dt_odom = abs(odom_stamp - centre)
+            if dt_odom < 5.0:
+                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msg, odom_msgs)
+
+                pos = odom_msg.pose.pose.position
+                ori = odom_msg.pose.pose.orientation
+                q = np.array([ori.x, ori.y, ori.z, ori.w])
+                q /= np.linalg.norm(q)
+                R_mat = Rotation.from_quat(q).as_matrix()
+                t_vec = np.array([pos.x, pos.y, pos.z])
+                world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
+                             for p in all_points]
+                save_ply(str(scan_dir / f"world_lidar_{ts_str}.ply"), world_pts)
+            else:
+                print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
+
+        scan_count += 1
+        print(f"  ✓ {scan_name}: {len(all_points)} pts  "
+              f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s")
+
+    print(f"\n✓ Reconstructed {scan_count} scans from bag")
+
+    # --- ERP conversion + colorization ---
+    pp = Path(__file__).resolve().parent
+
+    print("\nConverting fisheye → ERP and colorizing...")
+    for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+        if not scan_dir.is_dir():
+            continue
+        if not sorted(scan_dir.glob("fisheye_*.jpg")):
+            continue
+        print(f"  Coloring {scan_dir.name}...")
+        subprocess.run(
+            [sys.executable, str(pp / "color_with_fisheye.py"), str(scan_dir)],
+            check=False,
+        )
+
+    return scan_count
+
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("session_dir", help="Path to the session directory (contains rosbag_*)")
+    parser.add_argument("--interval", type=float, default=3.0,
+                        help="Seconds between scan centres (default: 3.0)")
+    parser.add_argument("--lidar-window", type=float, default=2.0,
+                        help="LiDAR accumulation window in seconds (default: 2.0)")
+    args = parser.parse_args()
+
+    reconstruct(args.session_dir, args.interval, args.lidar_window)

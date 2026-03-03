@@ -12,6 +12,23 @@ if ! grep -q "$RULE" /etc/udev/rules.d/99-insta.rules 2>/dev/null; then
     sleep 1
 fi
 
+# Reset USB device to clear any stale session state from previous runs
+BUS_DEV=$(lsusb | grep -i '2e1a' | grep -oP 'Bus \K[0-9]+ Device [0-9]+')
+if [ -n "$BUS_DEV" ]; then
+    BUS=$(echo "$BUS_DEV" | awk '{print $2}')
+    DEV=$(echo "$BUS_DEV" | awk '{print $4}')
+    USB_PATH="/dev/bus/usb/$(printf '%03d' $BUS)/$(printf '%03d' $DEV)"
+    if [ -e "$USB_PATH" ]; then
+        echo "Resetting USB device at $USB_PATH..."
+        sudo python3 -c "
+import fcntl
+with open('$USB_PATH', 'wb') as f:
+    fcntl.ioctl(f, 0x5514, 0)
+" 2>/dev/null && echo "USB reset done" || echo "USB reset skipped"
+        sleep 2
+    fi
+fi
+
 # Wait for device and set permissions
 echo "Waiting for camera device..."
 for i in {1..15}; do

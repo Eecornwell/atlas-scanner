@@ -35,6 +35,7 @@ class BufferedCameraCapture(Node):
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, 20)
         self.image_sub = self.create_subscription(Image, '/equirectangular/image', self.image_cb, 1)
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 10)
+        self.odom_buffered_sub = self.create_subscription(Odometry, '/rko_lio/odometry_buffered', self.odom_cb, 10)
         
         print(f"Debug: Buffered capture initialized with buffer size {buffer_size}")
         print(f"Debug: Will capture LiDAR data for {scan_duration} seconds for increased density")

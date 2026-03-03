@@ -177,7 +177,54 @@ sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/c
 sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 sed -i 's/out_height: 960/out_height: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 
-# Build ROS2 packages with symlink-install
+# Apply manual exposure control (MANUAL mode, 1/120s ISO 1600 for indoor use)
+# Note: SDK uses SetIso (not SetISO)
+python3 - <<'PYEOF'
+path = '/home/orion/atlas_ws/src/insta360_ros_driver/src/main.cpp'
+content = open(path).read()
+patch = '''
+        node_->declare_parameter("shutter_speed", 1.0 / 120.0);
+        node_->declare_parameter("iso", 1600);
+        double shutter = node_->get_parameter("shutter_speed").as_double();
+        int iso = node_->get_parameter("iso").as_int();
+        if (shutter > 0.0) {
+            auto exposure = std::make_shared<ins_camera::ExposureSettings>();
+            exposure->SetExposureMode(
+                ins_camera::PhotographyOptions_ExposureOptions_Program_MANUAL);
+            exposure->SetShutterSpeed(shutter);
+            exposure->SetIso(iso);
+            if (cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_LIVE_STREAM,
+                                         exposure)) {
+                RCLCPP_INFO(node_->get_logger(),
+                            "Manual exposure: 1/%.0fs ISO %d", 1.0 / shutter, iso);
+            } else {
+                RCLCPP_WARN(node_->get_logger(), "Failed to set exposure, using auto-exposure");
+            }
+        }'''
+marker = 'RCLCPP_INFO(node_->get_logger(), "Live streaming started.");'
+if marker in content and 'shutter_speed' not in content:
+    content = content.replace(marker, marker + patch)
+    open(path, 'w').write(content)
+    print('✓ Manual exposure patch applied')
+elif 'shutter_speed' in content:
+    print('✓ Manual exposure patch already present')
+else:
+    print('✗ Marker not found - check main.cpp manually')
+PYEOF
+
+# Add shutter_speed arg to bringup.launch.xml
+sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="1600"/>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+sed -i 's|exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>|exec="insta360_ros_driver" name="insta360_ros_driver" output="log">\n        <param name="shutter_speed" value="$(var shutter_speed)"/>\n        <param name="iso" value="$(var iso)"/>\n    </node>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+
+# Rebuild only the camera driver to verify patches compile cleanly
+cd ~/atlas_ws &&
+source /opt/ros/humble/setup.bash &&
+colcon build --packages-select insta360_ros_driver --cmake-args -DCMAKE_BUILD_TYPE=Release &&
+source install/setup.bash
+# Warnings about unused parameters are expected; the build must show no errors
+
 export HUMBLE_ROS=humble &&
 cd ~/atlas_ws &&
 source /opt/ros/humble/setup.bash &&
@@ -382,6 +429,19 @@ source install/setup.bash
 
 # Replace {/home/orion/} with your home path
 export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibration/lib:/home/orion/atlas_ws/gtsam/build/lib:/home/orion/atlas_ws/ceres-solver/build/lib:/home/orion/atlas_ws/iridescence/build/lib:$LD_LIBRARY_PATH
+```
+
+# Create desktop shortcut for ATLAS GUI
+cp ~/atlas_ws/src/atlas-scanner/assets/media/atlas_logo_app.png ~/.local/share/icons/atlas_logo_app.png
+cat > ~/Desktop/ATLAS.desktop << 'EOF'
+[Desktop Entry]
+Name=ATLAS
+Exec=bash -c '~/atlas_ws/src/atlas-scanner/src/run_gui.sh'
+Icon=atlas_logo_app
+Terminal=false
+Type=Application
+EOF
+chmod +x ~/Desktop/ATLAS.desktop
 ```
 
 * Now your system should be setup to run this repo's software

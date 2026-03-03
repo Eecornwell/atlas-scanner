@@ -9,6 +9,7 @@ import os
 import signal
 import time
 from datetime import datetime
+import sys
 import pathlib
 
 class FusionCaptureGUI:
@@ -16,12 +17,12 @@ class FusionCaptureGUI:
         self.root = root
         self.root.title("ATLAS - Automated Terrestrial LiDAR Acquisition System")
         w = 900 # width for the Tk root - increased for side-by-side layout
-        h = 550 # height for the Tk root - increased to prevent cropping
+        h = 555 # height for the Tk root - increased to prevent cropping
 
         # set the dimensions of the screen 
         # and where it is placed
         self.root.geometry('%dx%d+%d+%d' % (w, h, 100, 100))
-        self.root.minsize(800, 400)  # Set minimum window size
+        self.root.minsize(800, 420)  # Set minimum window size
         
         # Get script directory for relative paths
         self.script_dir = pathlib.Path(__file__).parent.resolve()
@@ -63,11 +64,6 @@ class FusionCaptureGUI:
         except Exception as e:
             pass  # Skip logo if not found
         
-        # Compact title
-        title_label = ttk.Label(left_panel, text="ATLAS Control", 
-                               font=('Arial', 14, 'bold'))
-        title_label.grid(row=1, column=0, pady=(0, 10))
-        
         # Status frame (compact)
         status_frame = ttk.LabelFrame(left_panel, text="Status", padding="5")
         status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
@@ -78,21 +74,39 @@ class FusionCaptureGUI:
         # Control buttons frame (vertical layout for compactness)
         control_frame = ttk.LabelFrame(left_panel, text="Controls", padding="5")
         control_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
-        
-        self.start_button = ttk.Button(control_frame, text="Start System", 
+
+        # Mode selectors
+        mode_frame = ttk.Frame(control_frame)
+        mode_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 4))
+        mode_frame.columnconfigure(1, weight=1)
+        ttk.Label(mode_frame, text="Camera:").grid(row=0, column=0, sticky=tk.W, padx=(0, 4))
+        self.camera_mode_var = tk.StringVar(value="dual_fisheye")
+        ttk.Combobox(mode_frame, textvariable=self.camera_mode_var,
+                     values=["dual_fisheye", "single_fisheye"],
+                     state="readonly", width=14).grid(row=0, column=1, sticky=(tk.W, tk.E))
+        ttk.Label(mode_frame, text="Capture:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        self.capture_mode_var = tk.StringVar(value="continuous")
+        ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
+                     values=["continuous", "stationary"],
+                     state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+        self.bag_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
+                        variable=self.bag_only_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+
+        self.start_button = ttk.Button(control_frame, text="Start System",
                                       command=self.start_fusion, style="Accent.TButton")
-        self.start_button.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 2))
+        self.start_button.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 2))
         
         # Larger capture button for easier pressing on small screens
         self.capture_button = ttk.Button(control_frame, text="CAPTURE SCAN", 
                                         command=self.capture_scan, state="disabled",
                                         style="Large.TButton")
-        self.capture_button.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 2), ipady=10)
+        self.capture_button.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 2), ipady=30)
         self.capture_button.configure(width=15)  # Make it wider
         
         self.stop_button = ttk.Button(control_frame, text="Stop System", 
                                      command=self.stop_fusion, state="disabled")
-        self.stop_button.grid(row=2, column=0, sticky=(tk.W, tk.E))
+        self.stop_button.grid(row=3, column=0, sticky=(tk.W, tk.E))
         
         # Scan info frame (compact)
         info_frame = ttk.LabelFrame(left_panel, text="Scan Info", padding="5")
@@ -201,8 +215,13 @@ class FusionCaptureGUI:
             self.log_message("Using existing camera permissions...")
             
             # Start the fusion script
+            cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
+                   '--camera', self.camera_mode_var.get(),
+                   '--capture', self.capture_mode_var.get()]
+            if self.bag_only_var.get():
+                cmd.append('--bag-only')
             self.fusion_process = subprocess.Popen(
-                ['./terrestrial_fusion_with_lio.sh'],
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -234,9 +253,22 @@ class FusionCaptureGUI:
                             self.root.after(0, self._scan_completed)
                         elif "Scan capture complete" in line:
                             self.root.after(0, self._scan_completed)
+                        elif any(err in line for err in (
+                            "✗ Camera failed", "✗ LiDAR", "Failed to start",
+                            "failed to start", "exit 1", "not found at /dev/insta"
+                        )):
+                            self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
                 except Exception as e:
                     self.root.after(0, lambda: self.log_message(f"Error reading output: {e}"))
                     break
+
+            # Process exited — surface any error and reset buttons
+            if self.is_running:
+                exit_code = self.fusion_process.poll() if self.fusion_process else -1
+                if exit_code not in (None, 0):
+                    self.root.after(0, lambda c=exit_code: self.update_status(
+                        f"Script exited with error (code {c}) — check log", "red"))
+                self.root.after(0, self._system_stopped)
                         
         except Exception as ex:
             error_msg = f"Error starting fusion: {ex}"
@@ -244,12 +276,21 @@ class FusionCaptureGUI:
             self.fusion_process = None
             self.root.after(0, self._system_stopped)
             
+    def _is_continuous_mode(self):
+        return self.capture_mode_var.get() == 'continuous'
+
     def _system_ready(self):
         """Called when system is ready"""
         self.update_status("System Ready - Ready to capture scans", "green")
-        self.capture_button.config(state="normal")
         self.log_message("✓ System is ready for scanning!")
-        
+
+        # Only enable capture button in stationary mode
+        if self._is_continuous_mode():
+            self.capture_button.config(state="disabled")
+            self.update_status("Continuous mode — press Stop when done", "green")
+        else:
+            self.capture_button.config(state="normal")
+
         # Extract output directory from logs
         log_content = self.log_text.get("1.0", tk.END)
         for line in log_content.split('\n'):
@@ -300,26 +341,27 @@ class FusionCaptureGUI:
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
         
-        # Send quit command and let the script handle post-processing
+        # Send SIGINT so the script's trap runs cleanup/post-processing,
+        # then wait in a background thread so the GUI stays responsive.
         if self.fusion_process:
             try:
-                if self.fusion_process.stdin:
-                    self.fusion_process.stdin.write('q\n')
-                    self.fusion_process.stdin.flush()
-                
-                # Wait for the script to complete post-processing (up to 300 seconds)
-                self.log_message("Waiting for post-processing to complete...")
-                try:
-                    self.fusion_process.wait(timeout=300)
-                    self.log_message("✓ Post-processing complete")
-                except subprocess.TimeoutExpired:
-                    self.log_message("Post-processing timeout, force stopping...")
-                    os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGKILL)
-                        
+                os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGINT)
             except Exception as e:
-                self.log_message(f"Error stopping process: {e}")
-        
-        self._system_stopped()
+                self.log_message(f"Error sending stop signal: {e}")
+
+        def _wait_for_finish():
+            try:
+                self.fusion_process.wait(timeout=300)
+                self.root.after(0, lambda: self.log_message("✓ Post-processing complete"))
+            except subprocess.TimeoutExpired:
+                self.root.after(0, lambda: self.log_message("Post-processing timeout, force stopping..."))
+                try:
+                    os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            self.root.after(0, self._system_stopped)
+
+        threading.Thread(target=_wait_for_finish, daemon=True).start()
         
     def _cleanup_ros_processes(self):
         """Clean up any remaining ROS processes"""
@@ -361,6 +403,27 @@ class FusionCaptureGUI:
             self.root.destroy()
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--camera', choices=['dual_fisheye', 'single_fisheye'])
+    parser.add_argument('--capture', choices=['continuous', 'stationary'])
+    args = parser.parse_args()
+
+    # Read defaults from atlas_fusion_capture.sh if no CLI args given
+    script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
+    default_camera, default_capture = 'dual_fisheye', 'continuous'
+    try:
+        for line in script.read_text().splitlines():
+            line = line.strip()
+            if line.startswith('CAMERA_MODE=') and '#' not in line.split('CAMERA_MODE=')[0]:
+                default_camera = line.split('=', 1)[1].split('#')[0].strip('"\' ')
+            elif line.startswith('CAPTURE_MODE=') and '#' not in line.split('CAPTURE_MODE=')[0]:
+                default_capture = line.split('=', 1)[1].split('#')[0].strip('"\' ')
+            if line.startswith('while'):
+                break  # stop before the CLI override block
+    except Exception:
+        pass
+
     root = tk.Tk()
     
     # Configure style for better appearance
@@ -371,6 +434,8 @@ def main():
     style.configure('Large.TButton', font=('Arial', 12, 'bold'))
     
     app = FusionCaptureGUI(root)
+    app.camera_mode_var.set(args.camera if args.camera else default_camera)
+    app.capture_mode_var.set(args.capture if args.capture else default_capture)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     try:

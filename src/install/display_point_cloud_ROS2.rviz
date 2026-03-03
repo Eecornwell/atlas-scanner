@@ -50,7 +50,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: Intensity
-      Decay Time: 0.20000000298023224
+      Decay Time: 0
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -59,9 +59,9 @@ Visualization Manager:
       Min Intensity: 0
       Name: PointCloud2
       Position Transformer: XYZ
-      Queue Size: 10
-      Selectable: true
-      Size (Pixels): 3
+      Queue Size: 5
+      Selectable: false
+      Size (Pixels): 2
       Size (m): 0.009999999776482582
       Style: Flat Squares
       Topic: /livox/lidar
@@ -79,15 +79,15 @@ Visualization Manager:
           Frame: Local
           Offset: 1
           Scale: 1
-          Value: true
+          Value: false
         Position:
           Alpha: 0.30000001192092896
           Color: 204; 51; 204
           Scale: 1
-          Value: true
-        Value: true
+          Value: false
+        Value: false
       Enabled: true
-      Keep: 100
+      Keep: 10
       Name: Odometry
       Position Tolerance: 0.10000000149011612
       Shape:
@@ -129,10 +129,10 @@ Visualization Manager:
       Name: LocalMap
       Position Transformer: XYZ
       Queue Size: 1
-      Selectable: true
+      Selectable: false
       Size (Pixels): 2
       Size (m): 0.05
-      Style: Spheres
+      Style: Flat Squares
       Topic: /rko_lio/local_map
       Unreliable: false
       Use Fixed Frame: true
@@ -142,7 +142,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Fixed Frame: odom
-    Frame Rate: 30
+    Frame Rate: 10
   Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera

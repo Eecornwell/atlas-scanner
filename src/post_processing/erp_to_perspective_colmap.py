@@ -67,7 +67,7 @@ def convert_erp_to_perspectives(session_dir):
     _mod = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_mod)
     _mod.export_to_colmap(session_dir)
-    T_lidar_camera = _mod._load_T_lidar_camera()
+    T_camera_lidar = _mod._load_T_lidar_camera()
 
     # Clean up previous perspective images and reconstruction
     if persp_dir.exists():
@@ -106,28 +106,40 @@ def convert_erp_to_perspectives(session_dir):
         pose_data = traj.get('current_pose', {})
         cam_quat_xyzw = None
         if 'camera_pose' in pose_data:
-            # Use camera pose directly
             c = pose_data['camera_pose']
             pos_xyz = [c['position']['x'], c['position']['y'], c['position']['z']]
-            q_xyzw = [c['orientation']['x'], c['orientation']['y'], c['orientation']['z'], c['orientation']['w']]
-            cam_quat_xyzw = q_xyzw
+            cam_quat_xyzw = [c['orientation']['x'], c['orientation']['y'], c['orientation']['z'], c['orientation']['w']]
         elif 'lidar_pose' in pose_data:
             # Fallback to lidar pose
             p = pose_data['lidar_pose']
             pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
             q_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
+            cam_quat_xyzw = None
         elif 'poses' in traj and traj['poses']:
             p = traj['poses'][-1]
             pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
             q_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
+            cam_quat_xyzw = None
         else:
             continue
+        q_xyzw_for_call = q_xyzw if cam_quat_xyzw is None else [0, 0, 0, 1]
         (qw, qx, qy, qz), T = _mod.ros_pose_to_colmap_w2c(
-            pos_xyz, q_xyzw, T_lidar_camera, cam_quat_xyzw
+            pos_xyz, q_xyzw_for_call, T_camera_lidar, cam_quat_xyzw
         )
+        # Compute camera orientation in ROS world for ERP ray casting
+        if cam_quat_xyzw is not None:
+            cam_quat_ros_stored = cam_quat_xyzw
+        else:
+            # Derive camera orientation from lidar pose + calibration
+            import numpy as _np
+            from scipy.spatial.transform import Rotation as _R
+            T_lidar_camera = _np.linalg.inv(T_camera_lidar)
+            R_lidar_w = _R.from_quat(q_xyzw).as_matrix()
+            R_c2w_ros = R_lidar_w @ T_lidar_camera[:3, :3]
+            cam_quat_ros_stored = _R.from_matrix(R_c2w_ros).as_quat().tolist()
         image_name = f'scan_{idx:03d}.png'
-        poses[image_name] = {'id': idx, 'quat': [qw, qx, qy, qz], 'trans': T, 'cam_quat_ros': cam_quat_xyzw}
-    
+        poses[image_name] = {'id': idx, 'quat': [qw, qx, qy, qz], 'trans': T, 'cam_quat_ros': cam_quat_ros_stored}
+
     perspective_images = []
 
     # Process images from colmap/images directory

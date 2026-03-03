@@ -136,23 +136,29 @@ def ransac_initial_alignment(source, target, voxel_size):
     print(f"    RANSAC fitness: {result_ransac.fitness:.3f}, RMSE: {result_ransac.inlier_rmse:.4f}")
     return result_ransac.transformation, result_ransac.fitness
 
-def pairwise_registration_ba_style(source, target, voxel_size=0.05):
+def pairwise_registration_ba_style(source, target, voxel_size=0.05, init_transform=None):
     """
     RANSAC + Multi-scale ICP with Tukey loss.
     
     Steps:
-    1. RANSAC with FPFH features for initial alignment
+    1. Use init_transform if provided, otherwise RANSAC with FPFH features
     2. Multi-scale ICP (4 scales) with point-to-plane + Tukey loss
     3. Returns transformation, information matrix, and fitness score
     """
     
-    # RANSAC initialization
-    current_transform, ransac_fitness = ransac_initial_alignment(source, target, voxel_size)
-    
-    # Skip ICP if RANSAC failed badly
-    if ransac_fitness < 0.05:
-        print(f"    WARNING: RANSAC fitness too low ({ransac_fitness:.3f}), using identity")
-        current_transform = np.eye(4)
+    # Use provided initialization or RANSAC
+    if init_transform is not None:
+        print(f"    Using trajectory pose initialization")
+        current_transform = init_transform
+        ransac_fitness = 1.0  # Skip RANSAC check
+    else:
+        # RANSAC initialization
+        current_transform, ransac_fitness = ransac_initial_alignment(source, target, voxel_size)
+        
+        # Skip ICP if RANSAC failed badly
+        if ransac_fitness < 0.05:
+            print(f"    WARNING: RANSAC fitness too low ({ransac_fitness:.3f}), using identity")
+            current_transform = np.eye(4)
     
     loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 2.0)
     
@@ -260,8 +266,12 @@ def register_final_ba(session_dir):
     for i in range(1, len(pcds)):
         print(f"\nAligning scan {i+1} ({ply_files[i].parent.name}) to reference...")
         
+        # Compute relative transform from trajectory poses
+        # T_i_to_ref = inv(T_ref) @ T_i
+        init_transform = np.linalg.inv(trajectory_poses[0]) @ trajectory_poses[i]
+        
         transformation, information, fitness = pairwise_registration_ba_style(
-            pcds[i], reference_pcd, voxel_size)
+            pcds[i], reference_pcd, voxel_size, init_transform=init_transform)
         
         print(f"  Final fitness: {fitness:.3f}")
         transforms.append(transformation)

@@ -18,12 +18,12 @@ import yaml
 from scipy.spatial.transform import Rotation as R
 
 def load_points(ply_file):
-    points = []
     with open(ply_file, 'r') as f:
-        lines = f.readlines()
-    
+        raw = f.read()
+    lines = raw.split(r'\n') if ('\n' not in raw and r'\n' in raw) else raw.splitlines()
+
     header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
-    
+    points = []
     for line in lines[header_end:]:
         parts = line.strip().split()
         if len(parts) >= 3:
@@ -31,7 +31,6 @@ def load_points(ply_file):
                 points.append([float(parts[0]), float(parts[1]), float(parts[2])])
             except ValueError:
                 continue
-    
     return np.array(points)
 
 def exact_match_calibration_tool(scan_dir):
@@ -192,9 +191,6 @@ def exact_match_calibration_tool(scan_dir):
             x, y, z = valid_points[i]
             r, g, b = colors[i]
             f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
-    
-    print(f"✓ Also saved as {output_file} (for backward compatibility)")
-    print("This uses EXACT projection from calibration tool (no azimuth_offset, no flip)")
     return True
 
 if __name__ == '__main__':

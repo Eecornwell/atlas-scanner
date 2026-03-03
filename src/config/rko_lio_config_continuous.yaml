@@ -1,0 +1,31 @@
+# RKO-LIO Continuous Mode Configuration - Minimal CPU/memory footprint
+imu_topic: /livox/imu
+lidar_topic: /livox/lidar
+base_frame: base_link
+imu_frame: "livox_frame"
+lidar_frame: "livox_frame"
+odom_frame: odom
+odom_topic: /rko_lio/odometry
+map_topic: /rko_lio/local_map
+
+# Lower publish rate — bag recorder only needs odometry, not every scan
+publish_freq: 5.0
+publish_local_map: false       # nobody reads this during continuous recording
+publish_deskewed_scan: false   # nobody reads this during continuous recording
+invert_odom_tf: false
+
+deskew: true
+double_downsample: true
+initialization_phase: false
+extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+
+voxel_size: 0.5
+max_points_per_voxel: 10
+max_range: 20.0
+min_range: 0.3
+max_correspondance_distance: 0.5
+convergence_criterion: 0.0001
+max_num_threads: 4             # 0 = use all available cores
+max_expected_jerk: 3.0
+min_beta: 200.0

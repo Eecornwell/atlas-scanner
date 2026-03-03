@@ -140,6 +140,48 @@ sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas
 sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
 sed -i "s/cv2.imwrite(output_path, cv_image)/cv2.imwrite(output_path, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g" ~/atlas_ws/src/atlas-scanner/src/terrestrial_fusion_with_lio.sh
 
+# Apply manual exposure control (1/120s ISO 1600 for indoor use)
+# ISO and shutter are ROS params — override at launch time without recompiling
+echo "Applying manual exposure patch..."
+python3 - <<'PYEOF'
+path = '/home/orion/atlas_ws/src/insta360_ros_driver/src/main.cpp'
+content = open(path).read()
+patch = '''
+        node_->declare_parameter("shutter_speed", 1.0 / 120.0);
+        node_->declare_parameter("iso", 1600);
+        double shutter = node_->get_parameter("shutter_speed").as_double();
+        int iso = node_->get_parameter("iso").as_int();
+        if (shutter > 0.0) {
+            auto exposure = std::make_shared<ins_camera::ExposureSettings>();
+            exposure->SetExposureMode(
+                ins_camera::PhotographyOptions_ExposureOptions_Program_MANUAL);
+            exposure->SetShutterSpeed(shutter);
+            exposure->SetIso(iso);
+            if (cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_LIVE_STREAM,
+                                         exposure)) {
+                RCLCPP_INFO(node_->get_logger(),
+                            "Manual exposure: 1/%.0fs ISO %d", 1.0 / shutter, iso);
+            } else {
+                RCLCPP_WARN(node_->get_logger(), "Failed to set exposure, using auto-exposure");
+            }
+        }'''
+marker = 'RCLCPP_INFO(node_->get_logger(), "Live streaming started.");'
+if marker in content and 'shutter_speed' not in content:
+    content = content.replace(marker, marker + patch)
+    open(path, 'w').write(content)
+    print('✓ Manual exposure patch applied')
+elif 'shutter_speed' in content:
+    print('✓ Manual exposure patch already present')
+else:
+    print('✗ Marker not found - check main.cpp manually')
+PYEOF
+
+# Add shutter_speed and iso args to bringup.launch.xml
+sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="1600"/>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+sed -i 's|exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>|exec="insta360_ros_driver" name="insta360_ros_driver" output="log">\n        <param name="shutter_speed" value="$(var shutter_speed)"/>\n        <param name="iso" value="$(var iso)"/>\n    </node>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+
 # Build ROS2 packages with symlink-install
 export HUMBLE_ROS=humble
 cd ~/atlas_ws

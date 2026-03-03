@@ -10,16 +10,17 @@ import sys
 import json
 import numpy as np
 from pathlib import Path
-from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Rotation as R, Slerp
 
 def load_ply(ply_file):
-    """Load points and colors from PLY file"""
+    """Load colored points from PLY, skipping uncolored (black) points"""
     points = []
     colors = []
-    
+
     with open(ply_file, 'r') as f:
-        lines = f.readlines()
-    
+        raw = f.read()
+    lines = raw.split(r'\n') if ('\n' not in raw and r'\n' in raw) else raw.splitlines()
+
     header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
     
     for line in lines[header_end:]:
@@ -28,6 +29,8 @@ def load_ply(ply_file):
             try:
                 x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
                 r, g, b = int(parts[3]), int(parts[4]), int(parts[5])
+                if r == 0 and g == 0 and b == 0:  # skip uncolored points
+                    continue
                 points.append([x, y, z])
                 colors.append([r, g, b])
             except ValueError:
@@ -113,17 +116,47 @@ def transform_points(points, position, orientation):
     return points_world
 
 def pose_matrix_from_trajectory(traj):
-    """Return 4x4 pose matrix for this scan, using the full_trajectory entry
-    closest to scan_request_time."""
-    request_time = traj.get('scan_info', {}).get('scan_request_time')
+    """Return 4x4 pose matrix interpolated to capture_time from full_trajectory."""
+    si = traj.get('scan_info', {})
+    target = si.get('capture_time') or si.get('scan_request_time')
     full = traj.get('full_trajectory', [])
-    if request_time and full:
-        best = min(full, key=lambda p: abs(p['timestamp'] - request_time))
+
+    if target and full:
+        times = np.array([p['timestamp'] for p in full])
+        idx = np.searchsorted(times, target)
+
+        if idx == 0:
+            entry = full[0]
+        elif idx >= len(full):
+            entry = full[-1]
+        else:
+            p0, p1 = full[idx - 1], full[idx]
+            t0, t1 = times[idx - 1], times[idx]
+            alpha = (target - t0) / (t1 - t0) if t1 != t0 else 0.0
+
+            pos0 = np.array([p0['position']['x'], p0['position']['y'], p0['position']['z']])
+            pos1 = np.array([p1['position']['x'], p1['position']['y'], p1['position']['z']])
+            t_interp = pos0 + alpha * (pos1 - pos0)
+
+            q0 = [p0['orientation']['x'], p0['orientation']['y'],
+                  p0['orientation']['z'], p0['orientation']['w']]
+            q1 = [p1['orientation']['x'], p1['orientation']['y'],
+                  p1['orientation']['z'], p1['orientation']['w']]
+            r_interp = Slerp([0.0, 1.0], R.from_quat([q0, q1]))(alpha)
+
+            T = np.eye(4)
+            T[:3, :3] = r_interp.as_matrix()
+            T[:3, 3] = t_interp
+            return T
+
+        pos = entry.get('position', {})
+        ori = entry.get('orientation', {})
     else:
         cp = traj.get('current_pose', {})
-        best = cp.get('lidar_pose', cp)
-    pos = best.get('position', {})
-    ori = best.get('orientation', {})
+        entry = cp.get('lidar_pose', cp)
+        pos = entry.get('position', {})
+        ori = entry.get('orientation', {})
+
     T = np.eye(4)
     T[:3, :3] = R.from_quat([ori.get('x', 0), ori.get('y', 0),
                               ori.get('z', 0), ori.get('w', 1)]).as_matrix()
@@ -183,7 +216,6 @@ def merge_scans_with_trajectory(session_dir):
     T_first = pose_matrices[first_name]
     euler_first = R.from_matrix(T_first[:3, :3]).as_euler('xyz', degrees=True)
     print(f"  Odom tilt: roll={euler_first[0]:.2f} pitch={euler_first[1]:.2f} yaw={euler_first[2]:.2f} deg")
-    R_gravity = R.from_euler('xyz', [-euler_first[0], -euler_first[1], 0], degrees=True).as_matrix()
     t_ref = T_first[:3, 3]
 
     all_points = []
@@ -202,10 +234,12 @@ def merge_scans_with_trajectory(session_dir):
             points_transformed = points
         else:
             T = pose_matrices[scan_dir.name]
-            # sensor -> odom world frame, translate to first-scan origin, then level
+            # Full relative transform: T1_inv @ TN rotates and translates sensor-frame
+            # points into the first scan's coordinate frame.
+            T_rel = np.linalg.inv(T_first) @ T
+            T_rel[2, 3] = 0.0  # zero Z: terrestrial scanner moves on flat ground
             pts_h = np.hstack([points, np.ones((len(points), 1))])
-            points_world = (T @ pts_h.T).T[:, :3]
-            points_transformed = (R_gravity @ (points_world - t_ref).T).T
+            points_transformed = (T_rel @ pts_h.T).T[:, :3]
             t_rel = T[:3, 3] - t_ref
             print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t_rel[0]:.3f},{t_rel[1]:.3f},{t_rel[2]:.3f}]")
 
