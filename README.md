@@ -45,9 +45,10 @@
 - [x] Enable terrestrial mode
 - [x] Release calibration procedure
 - [x] Implement scanning progress gui
+- [x] Enable SLAM (continuous) mode
 - [ ] Release v1.0.0 code
 - [ ] Release sample dataset
-- [ ] Enable SLAM mode
+
 - [ ] Replace direct_visual_lidar_calibration feature matcher with [OpenCV 2D matcher](https://docs.opencv.org/4.x/db/dd9/group__xfeatures2d__match.html)
 - [ ] Implement remote capture capability
 
@@ -112,11 +113,10 @@
 | Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                              |
 | Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                       |
 | Terrestrial mode (time-lapse scans) | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                  |
-| Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                             |
+| Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                 |
+| Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images     |
 | Sample gallery                      | Future    | Providing outputs to view various datasets taken with the scanner                                      |
-| Slam mode                           | Future    | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images     |
 | Remote capture capability           | Future    | Enable ability to remotely trigger a scan on the device                                                |
-
 
 ### Software Installation
 Please review [Software Installation documentation](docs/software-install.md)
