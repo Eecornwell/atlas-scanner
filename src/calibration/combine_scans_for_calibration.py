@@ -25,10 +25,9 @@ def combine_scans_for_calibration(base_dir, output_dir):
         masked_files = list(fusion_dir.glob("equirect_*_masked.png"))
         masked_raw_files = list(fusion_dir.glob("equirect_*_masked_raw.png"))
         equirect_files = list(fusion_dir.glob("equirect_*.jpg")) + list(fusion_dir.glob("equirect_*.png"))
-        
-        # Priority: blended masked > raw masked > regular
+
+        # Priority: blended masked > raw masked > regular > synthesise from single fisheye
         if masked_files:
-            # Filter out raw versions to get blended
             blended_masked = [f for f in masked_files if '_raw' not in f.name]
             if blended_masked:
                 equirect_files = blended_masked
@@ -41,6 +40,23 @@ def combine_scans_for_calibration(base_dir, output_dir):
                 print(f"  Using masked image from {fusion_dir.name}")
         else:
             equirect_files = [f for f in equirect_files if '_masked' not in f.name]
+
+        # Single-fisheye fallback: synthesise an ERP from the saved fisheye_*.jpg
+        if not equirect_files:
+            fisheye_files = list(fusion_dir.glob("fisheye_*.jpg"))
+            if fisheye_files:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent.parent / 'post_processing'))
+                from fisheye_to_erp import fisheye_jpg_to_erp
+                erp_cfg = os.path.expanduser(
+                    '~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
+                src = fisheye_files[0]
+                ts = src.stem.replace('fisheye_', '')
+                dst = fusion_dir / f'equirect_{ts}.jpg'
+                if not dst.exists():
+                    fisheye_jpg_to_erp(str(src), erp_cfg, str(dst))
+                equirect_files = [dst]
+                print(f"  Synthesised ERP from single fisheye for {fusion_dir.name}")
         
         ply_files = list(fusion_dir.glob("sensor_lidar*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
         

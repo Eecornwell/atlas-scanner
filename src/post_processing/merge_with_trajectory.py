@@ -229,6 +229,10 @@ def merge_scans_with_trajectory(session_dir):
 
         points, colors = load_ply(colored_ply)
 
+        if len(points) == 0:
+            print(f"⚠ No colored points in {scan_dir.name}, skipping")
+            continue
+
         if scan_dir.name not in pose_matrices:
             print(f"⚠ No trajectory for {scan_dir.name}, using identity")
             points_transformed = points

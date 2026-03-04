@@ -19,6 +19,7 @@ while [[ $# -gt 0 ]]; do
         --capture) CAPTURE_MODE="$2"; shift 2 ;;
         --interval) CONTINUOUS_INTERVAL="$2"; shift 2 ;;
         --bag-only) BAG_ONLY=true; shift ;;
+        --no-sync-benchmark) RUN_SYNC_BENCHMARK=false; shift ;;
         *) shift ;;
     esac
 done
@@ -26,12 +27,13 @@ done
 BAG_ONLY=${BAG_ONLY:-false}
 
 SAVE_E57=false
-USE_EXISTING_CALIBRATION=false
+USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
 ENABLE_ICP_ALIGNMENT=true
 EXPORT_COLMAP=false
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05        # voxel downsample in metres (0 = skip)
+RUN_SYNC_BENCHMARK=true
 
 ENABLE_POST_PROCESSING_BAGS=false
 SKIP_LIVE_FUSION=true
@@ -220,6 +222,12 @@ cleanup() {
         fi
 
         echo "Complete. Scans saved in: $SCAN_DIR"
+
+        if [ "$RUN_SYNC_BENCHMARK" = "true" ]; then
+            echo "Running sync benchmark..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/sync_benchmark.py" \
+                "$SCAN_DIR" --out "$SCAN_DIR/sync_benchmark.json"
+        fi
     else
         echo "Failed to initialize sensors or no scans captured. Check hardware connections."
     fi
@@ -315,8 +323,8 @@ else
     sleep 6
 fi
 
-if wait_for_topic "/dual_fisheye/image/compressed" 15; then
-    if wait_for_topic_data "/dual_fisheye/image/compressed" 20; then
+if wait_for_topic "/dual_fisheye/image/compressed" 20; then
+    if wait_for_topic_data "/dual_fisheye/image/compressed" 30; then
         echo "✓ Camera driver ready"
         CAMERA_STATUS="/dual_fisheye/image/compressed"
     else
@@ -393,6 +401,8 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
 
     if wait_for_topic "/rko_lio/odometry" 10 && wait_for_topic_data "/rko_lio/odometry" 10; then
         echo "✓ RKO-LIO ready with $IMU_SOURCE IMU"
+        echo "Waiting for IMU/LIO to stabilize..."
+        sleep 5
         LIO_ENABLED="true"
         rviz2 -d "$ROS_WS_DIR/install/livox_ros_driver2/share/livox_ros_driver2/config/display_point_cloud_ROS2.rviz" > /tmp/rviz.log 2>&1 &
         PIDS+=($!)
@@ -455,7 +465,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     PIDS+=($!)
     sleep 1
     # shellcheck disable=SC2086
-    nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 200000000 \
+    nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 50000000 \
         $CONTINUOUS_TOPICS &
     ROSBAG_PID=$!
     PIDS+=($ROSBAG_PID)

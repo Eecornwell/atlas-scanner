@@ -66,6 +66,8 @@ if [ ! -d "livox_ros_driver2" ]; then
 fi
 cd ~/atlas_ws/src/livox_ros_driver2
 git reset --hard '6b9356cadf77084619ba406e6a0eb41163b08039'
+# Set LiDAR point cloud publish frequency to 25 Hz
+sed -i 's/^publish_freq  = .*/publish_freq  = 25.0/' ~/atlas_ws/src/livox_ros_driver2/launch_ROS2/rviz_MID360_launch.py
 
 # Build Livox-SDK2
 cd ~/atlas_ws

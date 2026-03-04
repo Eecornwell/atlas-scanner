@@ -16,6 +16,7 @@ BLEND_ERP_SEAMS=true           # dual_fisheye only: blend fisheye seams before c
 EXPORT_COLMAP=true             # export session to COLMAP format
 CLEAN_POINTCLOUD=true          # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
+RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session (outputs to screen + sync_benchmark.json)
 ```
 
 | `CAMERA_MODE` | `CAPTURE_MODE` | Use case |
@@ -34,6 +35,7 @@ DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
     ros2 launch livox_ros_driver2 rviz_MID360_launch.py
     ```
     `Ctrl+C`
+    > *Note: In `RVIZ->Displays->Global Options`, change the `Fixed Frame` to `map`*
 
   - Verify camera
     ```bash
@@ -63,7 +65,8 @@ DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera dual_fisheye --capture continuous
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera single_fisheye --capture stationary
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --capture continuous --interval 5
-    ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --bag-only  # record bag, skip post-processing
+    ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --bag-only           # record bag, skip post-processing
+    ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --no-sync-benchmark  # skip sync benchmark
     ```
 
 - In **stationary** mode: press `ENTER` to capture each scan, `q` to finish

@@ -94,25 +94,31 @@ def load_trajectory_pose(scan_dir):
 
     return np.eye(4)
 
-def pairwise_icp(source, target, voxel_size, init_transform):
-    """Multi-scale ICP refinement."""
+def pairwise_icp(source, target, voxel_size, init_transform,
+                 source_colored=None, target_colored=None):
+    """Multi-scale geometry ICP, then colored ICP fine-tuning if colored clouds provided."""
     current_transform = init_transform
     loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 2.0)
-    
-    scales = [
+
+    for max_dist, max_iter in [
         (voxel_size * 15, 50),
-        (voxel_size * 5, 30),
-        (voxel_size * 2, 20),
-        (voxel_size * 1.0, 14)
-    ]
-    
-    for i, (max_dist, max_iter) in enumerate(scales):
+        (voxel_size * 5,  30),
+        (voxel_size * 2,  20),
+        (voxel_size * 1.0, 14),
+    ]:
         result = o3d.pipelines.registration.registration_icp(
             source, target, max_dist, current_transform,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter))
         current_transform = result.transformation
-    
+
+    if source_colored is not None and target_colored is not None:
+        result = o3d.pipelines.registration.registration_colored_icp(
+            source_colored, target_colored,
+            voxel_size * 1.0, current_transform,
+            o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+
     return result
 
 def register_pose_graph(session_dir):
@@ -159,19 +165,28 @@ def register_pose_graph(session_dir):
     for T in trajectory_poses:
         T[2, 3] = 0.0
 
-    # Preprocess clouds (geometry only — strip colors for ICP)
+    # Preprocess clouds — geometry-only for ICP coarse stages, colored for fine stage
     voxel_size = 0.05
     pcds = []
+    pcds_colored = []
     for f in ply_files:
         pcd = o3d.io.read_point_cloud(str(f))
-        pcd.colors = o3d.utility.Vector3dVector()
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         pcd = pcd.voxel_down_sample(voxel_size)
         pcd.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(30)
-        pcds.append(pcd)
-        print(f"Preprocessed {f.parent.name}: {len(pcd.points)} points")
+
+        # Colored copy retains RGB but needs normals for colored ICP
+        pcd_c = o3d.geometry.PointCloud(pcd)
+        pcd_c.colors = o3d.io.read_point_cloud(str(f)).voxel_down_sample(voxel_size).colors
+        has_color = pcd_c.has_colors()
+
+        pcd_geom = o3d.geometry.PointCloud(pcd)
+        pcd_geom.colors = o3d.utility.Vector3dVector()
+        pcds.append(pcd_geom)
+        pcds_colored.append(pcd_c if has_color else None)
+        print(f"Preprocessed {f.parent.name}: {len(pcd.points)} points  color={'yes' if has_color else 'no'}")
 
     # Build pose graph (nodes in relative frame)
     print("\nBuilding pose graph...")
@@ -186,9 +201,9 @@ def register_pose_graph(session_dir):
     # Sequential edges
     for i in range(n_scans - 1):
         print(f"\nRefining edge {i} -> {i+1} (sequential)")
-        # Relative transform: bring scan i into scan i+1's frame
         init_relative = np.linalg.inv(trajectory_poses[i+1]) @ trajectory_poses[i]
-        result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, init_relative)
+        result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, init_relative,
+                              pcds_colored[i], pcds_colored[i+1])
         print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
         information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
             pcds[i], pcds[i+1], voxel_size * 2, result.transformation)
@@ -215,7 +230,8 @@ def register_pose_graph(session_dir):
             src, tgt = pair
             print(f"\nRefining edge {src} -> {tgt} (KNN, dist={dist:.2f}m)")
             init_relative = np.linalg.inv(trajectory_poses[tgt]) @ trajectory_poses[src]
-            result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, init_relative)
+            result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, init_relative,
+                                  pcds_colored[src], pcds_colored[tgt])
             print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
             if result.fitness > 0.15:
                 information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(

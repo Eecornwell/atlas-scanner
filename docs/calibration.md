@@ -10,6 +10,7 @@
     ```
 
 ## Dual Fisheye to Equirectangular Calibration
+> *Note: If you plan to only use one fisheye camera, skip this step. Using dual cameras will increase coverage, but will also tax the system. Also calibrating the two fisheye cameras together can sometimes be tricky due to blind spots being introduced.*
 - This calibration will transform the dual fisheye lens into equirectangular frames
 - Equirectangular calibration file location
     - `~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml`
@@ -82,9 +83,10 @@
         EOF
 
         cd ~/atlas_ws/src/atlas-scanner/src
-        sudo ./setup_camera_permissions.sh
-        ./terrestrial_fusion_with_lio.sh
+        ./atlas_fusion_capture.sh --capture stationary --camera <dual_fisheye|single_fisheye>
         ```
+        > *Note: Choose `--camera dual_fisheye` for full 360° equirectangular coverage, or `--camera single_fisheye` for a lighter single-lens setup.*
+
         > *Note: Take note of the session directory from the console output. It will be in the form: `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/`*
 
     2. Create a mask image for your setup
@@ -98,12 +100,13 @@
 
         > *Note: You can use any image editor (GIMP, Photoshop, etc.) to create the mask. Paint white areas where you want to apply colors from the camera, and black areas to ignore (e.g., areas with the scanner itself visible).*
 
-    3. Capture new data of at least **10** scans from varying positions/rotations in same room. These scans will be used for the calibration procedure.
+    3. Capture new data of at least **5** scans from varying positions/rotations in same room. These scans will be used for the calibration procedure.
         ```bash
         cd ~/atlas_ws/src/atlas-scanner/src
-        sudo ./setup_camera_permissions.sh
-        ./terrestrial_fusion_with_lio.sh
+        ./atlas_fusion_capture.sh --capture stationary --camera <dual_fisheye|single_fisheye> 
         ```
+        > *Note: Use the same `--camera` mode as in step 1.*
+
         > *Note: Take note of the session directory from the console output. It will be in the form: `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/`*
 
         > *Note: The script will pull in default extrinsic values during this capture, but we won't be using the colored point cloud during calibration so this behavior is ok. We process the image and point cloud seperately below and then populate the extrinsic calibration with the new values*
@@ -129,6 +132,7 @@
         - Auto
             - Recommended for research projects, quick but can struggle in some configurations
             ```bash
+            for f in ~/atlas_ws/output/*.ply; do sed -i 's/\\n/\n/g' "$f"; done
             python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
             cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
@@ -149,8 +153,6 @@
             ~/atlas_ws/src/atlas-scanner/src
         ```
         > *Note: This will properly invert the transformation from calib.json and save to: `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`*
-        
-        > *Important: Do NOT use extract_calibration.py - it doesn't invert the transformation correctly!*
 
     7. Configuration notes for `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`
         * The system uses exact projection matching the calibration tool
@@ -159,21 +161,21 @@
         * Baseline Settings
 
             ```bash
-            roll_offset: 3.084333895782295
-            pitch_offset: 0.016921463456919694
-            yaw_offset: -1.6041524644977394
+            roll_offset: 3.1074520149288376
+            pitch_offset: 0.03025395699091904
+            yaw_offset: -1.6096116718826878
             manual_roll_adjustment: 0.0
             manual_pitch_adjustment: 0.0
             manual_yaw_adjustment: 0.0
             azimuth_offset: 0.0
             elevation_offset: 0.0
-            x_offset: 0.03272758164346094
-            y_offset: 0.13525142783960337
-            z_offset: 0.1495769332683098
+            x_offset: 0.15314562222691977
+            y_offset: 0.007200417361815034
+            z_offset: 0.07284122642016298
             flip_x: false
             flip_y: false
-            image_width: 1920
-            image_height: 960
+            image_width: 2560
+            image_height: 1280
             use_fisheye: false
             skip_rate: 5
             ```

@@ -20,7 +20,7 @@ import subprocess
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 import cv2
 
@@ -149,15 +149,37 @@ def pose_to_matrix(odom_msg):
     return T
 
 
-def write_trajectory_json(scan_dir, scan_name, capture_stamp, odom_msg, all_odom):
-    pos = odom_msg.pose.pose.position
-    ori = odom_msg.pose.pose.orientation
-    q = np.array([ori.x, ori.y, ori.z, ori.w])
-    q /= np.linalg.norm(q)
+def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
+    """Interpolate odometry at capture_stamp and write trajectory.json."""
+    times = np.array([ts for ts, _ in all_odom])
+    idx = np.searchsorted(times, capture_stamp)
+
+    if idx == 0 or idx >= len(all_odom):
+        _, odom_msg = all_odom[max(0, idx - 1)]
+        pos = odom_msg.pose.pose.position
+        ori = odom_msg.pose.pose.orientation
+        q = np.array([ori.x, ori.y, ori.z, ori.w])
+        q /= np.linalg.norm(q)
+        t_interp = np.array([pos.x, pos.y, pos.z])
+        q_interp = q
+    else:
+        ts0, om0 = all_odom[idx - 1]
+        ts1, om1 = all_odom[idx]
+        alpha = (capture_stamp - ts0) / (ts1 - ts0) if ts1 != ts0 else 0.0
+
+        p0, p1 = om0.pose.pose.position, om1.pose.pose.position
+        t_interp = np.array([p0.x, p0.y, p0.z]) + alpha * (
+            np.array([p1.x, p1.y, p1.z]) - np.array([p0.x, p0.y, p0.z]))
+
+        o0, o1 = om0.pose.pose.orientation, om1.pose.pose.orientation
+        q0 = np.array([o0.x, o0.y, o0.z, o0.w]); q0 /= np.linalg.norm(q0)
+        q1 = np.array([o1.x, o1.y, o1.z, o1.w]); q1 /= np.linalg.norm(q1)
+        q_interp = Slerp([0.0, 1.0], Rotation.from_quat([q0, q1]))(alpha).as_quat()
 
     lidar_pose = {
-        "position": {"x": float(pos.x), "y": float(pos.y), "z": float(pos.z)},
-        "orientation": {"x": float(q[0]), "y": float(q[1]), "z": float(q[2]), "w": float(q[3])},
+        "position": {"x": float(t_interp[0]), "y": float(t_interp[1]), "z": float(t_interp[2])},
+        "orientation": {"x": float(q_interp[0]), "y": float(q_interp[1]),
+                        "z": float(q_interp[2]), "w": float(q_interp[3])},
     }
 
     start_ts = all_odom[0][0]
@@ -423,20 +445,24 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
                                 [cv2.IMWRITE_JPEG_QUALITY, 95])
                     fisheye_path = str(img_out)
 
-        # --- Odometry: closest pose to the camera frame stamp ---
+        # --- Odometry: interpolate pose to the camera frame stamp ---
         dt_odom = float('inf')
         if odom_msgs:
             odom_stamp, odom_msg = closest(odom_msgs, centre)
             dt_odom = abs(odom_stamp - centre)
             if dt_odom < 5.0:
-                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msg, odom_msgs)
+                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
 
-                pos = odom_msg.pose.pose.position
-                ori = odom_msg.pose.pose.orientation
-                q = np.array([ori.x, ori.y, ori.z, ori.w])
+                # Use the interpolated pose stored in trajectory.json for world transform
+                import json as _json
+                with open(str(scan_dir / "trajectory.json")) as _f:
+                    _traj = _json.load(_f)
+                _cp = _traj["current_pose"]
+                _lp = _cp["lidar_pose"]
+                q = np.array([_lp["orientation"][k] for k in ("x", "y", "z", "w")])
                 q /= np.linalg.norm(q)
                 R_mat = Rotation.from_quat(q).as_matrix()
-                t_vec = np.array([pos.x, pos.y, pos.z])
+                t_vec = np.array([_lp["position"][k] for k in ("x", "y", "z")])
                 world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
                              for p in all_points]
                 save_ply(str(scan_dir / f"world_lidar_{ts_str}.ply"), world_pts)

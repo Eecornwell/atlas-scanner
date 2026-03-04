@@ -58,7 +58,8 @@ def main():
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"Odometry bridge error: {e}")
+        if str(e):
+            print(f"Odometry bridge error: {e}")
     finally:
         try:
             bridge.destroy_node()

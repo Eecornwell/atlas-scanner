@@ -86,7 +86,8 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path):
         raise FileNotFoundError(f"Cannot read: {fisheye_path}")
 
     h, w = img.shape[:2]
-    # Center-crop to configured crop_size
+    # Use the full image if smaller than configured crop_size
+    crop = min(crop, h, w)
     y0 = (h - crop) // 2
     x0 = (w - crop) // 2
     fisheye = img[y0:y0+crop, x0:x0+crop]

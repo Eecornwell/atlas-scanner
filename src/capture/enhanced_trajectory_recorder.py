@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime
 import os
 from pathlib import Path
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 CALIB_PATH = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
 
@@ -209,7 +209,7 @@ class EnhancedTrajectoryRecorder(Node):
             pass  # Ignore other errors
     
     def get_pose_at_time(self, capture_time=None):
-        """Get the pose closest to capture_time (wall clock). Falls back to latest."""
+        """Interpolate pose at capture_time using SLERP/lerp. Falls back to nearest."""
         if not self.trajectory:
             self.get_logger().error(
                 'No odometry received - is /rko_lio/odometry publishing? '
@@ -217,8 +217,46 @@ class EnhancedTrajectoryRecorder(Node):
             return None
         if capture_time is None:
             return self.trajectory[-1].copy()
-        best = min(self.trajectory, key=lambda p: abs(p['timestamp'] - capture_time))
-        return best.copy()
+
+        times = np.array([p['timestamp'] for p in self.trajectory])
+        idx = np.searchsorted(times, capture_time)
+
+        if idx == 0 or idx >= len(self.trajectory):
+            return self.trajectory[max(0, idx - 1)].copy()
+
+        p0, p1 = self.trajectory[idx - 1], self.trajectory[idx]
+        t0, t1 = times[idx - 1], times[idx]
+        dt = t1 - t0
+        if dt < 1e-9:
+            return p0.copy()
+        alpha = (capture_time - t0) / dt
+
+        pos0 = np.array([p0['position']['x'], p0['position']['y'], p0['position']['z']])
+        pos1 = np.array([p1['position']['x'], p1['position']['y'], p1['position']['z']])
+        t_interp = pos0 + alpha * (pos1 - pos0)
+
+        q0 = [p0['orientation']['x'], p0['orientation']['y'],
+              p0['orientation']['z'], p0['orientation']['w']]
+        q1 = [p1['orientation']['x'], p1['orientation']['y'],
+              p1['orientation']['z'], p1['orientation']['w']]
+        r_interp = Slerp([0.0, 1.0], Rotation.from_quat([q0, q1]))(alpha)
+        q_interp = r_interp.as_quat()  # [x,y,z,w]
+
+        interp_lidar_pose = {
+            'position': {'x': float(t_interp[0]), 'y': float(t_interp[1]), 'z': float(t_interp[2])},
+            'orientation': {'x': float(q_interp[0]), 'y': float(q_interp[1]),
+                            'z': float(q_interp[2]), 'w': float(q_interp[3])},
+        }
+
+        result = p0.copy()
+        result['timestamp'] = capture_time
+        result['relative_time'] = capture_time - (self.start_time or capture_time)
+        result['position'] = interp_lidar_pose['position']
+        result['orientation'] = interp_lidar_pose['orientation']
+        result['lidar_pose'] = interp_lidar_pose
+        result['camera_pose'] = self.calculate_camera_pose(interp_lidar_pose)
+        self.get_logger().info(f'Interpolated pose at t={capture_time:.3f} (alpha={alpha:.3f})')
+        return result
     
     def save_scan_trajectory_to_dir(self, scan_name, scan_dir, pose_snapshot, capture_time=None):
         """Save trajectory data for a specific scan to its directory"""
