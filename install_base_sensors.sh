@@ -138,7 +138,6 @@ sed -i 's/image_height: 960/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/s
 sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
 # 6. Update JPEG quality to 100 in capture scripts
 sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
-sed -i "s/cv2.imwrite(output_path, cv_image)/cv2.imwrite(output_path, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g" ~/atlas_ws/src/atlas-scanner/src/terrestrial_fusion_with_lio.sh
 
 # Apply manual exposure control (1/120s ISO 1600 for indoor use)
 # ISO and shutter are ROS params — override at launch time without recompiling
