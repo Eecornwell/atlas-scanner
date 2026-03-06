@@ -67,7 +67,8 @@ cd ~/atlas_ws/src/atlas-scanner
 
 ## Manual Installation
 
-If you prefer to run commands manually, follow the steps below:
+<details>
+<summary>Click to expand manual installation steps</summary>
 
 ```
 # Create ROS2 workspace
@@ -431,7 +432,15 @@ source install/setup.bash
 export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibration/lib:/home/orion/atlas_ws/gtsam/build/lib:/home/orion/atlas_ws/ceres-solver/build/lib:/home/orion/atlas_ws/iridescence/build/lib:$LD_LIBRARY_PATH
 ```
 
-# Create desktop shortcut for ATLAS GUI
+</details>
+
+---
+
+## Desktop Shortcuts
+
+### ATLAS GUI
+
+```bash
 cp ~/atlas_ws/src/atlas-scanner/assets/media/atlas_logo_app.png ~/.local/share/icons/atlas_logo_app.png
 cat > ~/Desktop/ATLAS.desktop << 'EOF'
 [Desktop Entry]
@@ -443,6 +452,27 @@ Type=Application
 EOF
 chmod +x ~/Desktop/ATLAS.desktop
 ```
+
+### Camera Permissions
+
+The camera requires USB permissions to be set each time it is reconnected. Create a desktop shortcut to run the permissions script without opening a terminal:
+
+```bash
+cp ~/atlas_ws/src/atlas-scanner/assets/media/atlas_logo_app.png ~/.local/share/icons/atlas_logo_app.png
+cat > ~/Desktop/ATLAS-Camera-Permissions.desktop << 'EOF'
+[Desktop Entry]
+Name=ATLAS Camera Permissions
+Exec=bash -c '~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh'
+Icon=atlas_logo_app
+Terminal=true
+Type=Application
+EOF
+chmod +x ~/Desktop/ATLAS-Camera-Permissions.desktop
+```
+
+> *Note: `Terminal=true` is set so you can see the output and confirm permissions were applied successfully.*
+
+---
 
 * Now your system should be setup to run this repo's software
 * Next, calibrate your system setup using the [Calibration doc](calibration.md)
