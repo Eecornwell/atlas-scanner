@@ -97,23 +97,23 @@
 
 #### Software Feature List
 ![Software Screenshot](assets/media/atlas-software-screenshot.png)
-| **Feature**                         | Supported | Notes                                                                                                  |
-| ------------------------------------| --------- | ------------------------------------------------------------------------------------------------------ |
-| Intrinsic calibration               | No        | Currently using spherical camera, so not needed                                                        |
-| Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                             |
-| Image acquisition                   | Yes       | Masked panos saved as 2.5K (2560 × 1280) - 4K on horizon                                               |
-| Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as ply                                                        |
-| Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                        |
-| Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                  |
-| Export Colmap model files           | Yes       | Retriangulate poses, merges color pointcloud with colmap reconstructed point cloud                     |
-| Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for 3 seconds per scan (mostly used for calibration) |
-| Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                              |
-| Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                       |
-| Terrestrial mode (time-lapse scans) | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                  |
-| Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                 |
-| Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images     |
-| Sample gallery                      | Future    | Providing outputs to view various datasets taken with the scanner                                      |
-| Remote capture capability           | Future    | Enable ability to remotely trigger a scan on the device                                                |
+| **Feature**                         | Supported | Notes                                                                                                            |
+| ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
+| Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
+| Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
+| Image acquisition                   | Yes       | Masked panos saved as 2.5K (2560 × 1280) - 4K on roadmap                                                         |
+| Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
+| Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
+| Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |
+| Export Colmap model files           | Yes       | Retriangulate poses, merges color pointcloud with colmap reconstructed point cloud                               |
+| Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for 3 seconds per scan (mostly used for calibration)           |
+| Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                                        |
+| Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                                 |
+| Terrestrial mode (time-lapse scans) | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
+| Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                           |
+| Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images               |
+| Sample gallery                      | Future    | Providing outputs to view various datasets taken with the scanner                                                |
+| Remote capture capability           | Future    | Enable ability to remotely trigger a scan on the device                                                          |
 
 ### Software Installation
 Please review [Software Installation documentation](docs/software-install.md)
