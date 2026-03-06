@@ -75,16 +75,12 @@
         - /livox/imu
             - ~200Hz
     - Camera
-        - /dual_fisheye/image
-            - ~0.2Hz
         - /dual_fisheye/image/compressed
-            - ~30Hz
-        - /equirectangular/image
-            - ~0.4Hz
-        - /imu/data
-            - ~60Hz (not used)
+            - ~30Hz (throttled to 15fps in continuous mode before recording)
+        - /dual_fisheye/image/compressed_15fps
+            - ~15Hz (continuous mode only — throttled topic used for bag recording)
         - /imu/data_raw
-            - ~60Hz (not used)
+            - ~60Hz (camera IMU fallback, used only if Livox IMU unavailable)
     - Mapping
         - /rko_lio/odometry
             - ~10Hz
@@ -95,11 +91,12 @@
 - Transforms
     - odom → base_link → livox_frame
     - camera_to_lidar
-        - Handled in image to lidar projection, uses extrinsic calibration obtained during calibration step
-    - dual_fisheye_to_equirectangular_projection
-        - Handled in camera driver, uses intrinsic calibration obtained during calibration step
+        - Handled in post-processing color projection, uses extrinsic calibration obtained during calibration step
+    - dual_fisheye_to_equirectangular
+        - Handled internally by the camera driver at launch, not a TF transform
 
-#### Feature List
+#### Software Feature List
+![Software Screenshot](assets/media/atlas-software-screenshot.png)
 | **Feature**                         | Supported | Notes                                                                                                  |
 | ------------------------------------| --------- | ------------------------------------------------------------------------------------------------------ |
 | Intrinsic calibration               | No        | Currently using spherical camera, so not needed                                                        |
@@ -134,4 +131,35 @@ Please review [Running the Software documentation](docs/software-run.md)
 ![Point Cloud Result](assets/media/room-pointcloud.png "Result")
 
 #### Important Notes
-- The system bottleneck is currently in the image acquisition and so the video frame rate and resolution was adjusted to account for this. The system acquisition is triggered when an image is acquired and ready to use, then the lidar data is captured. The color projection onto the point cloud happens in post processing. Rosbags are recorded during acquisition as a redundency capture mechanism.
+- Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
+
+- Acquisition is camera-triggered — the system waits for a valid camera frame before proceeding, making image availability the primary bottleneck
+
+- In single fisheye mode, the camera driver is reniced to priority 15 to reduce CPU competition; the LIO estimator is given priority -15 (highest) to keep odometry stable
+
+- In continuous mode, the camera is throttled from 30fps to 15fps before recording to reduce bag write load
+
+- A rosbag is recorded for every scan (stationary) or the entire session (continuous) as a redundancy capture mechanism — raw data can be replayed or reprocessed independently of the live pipeline
+
+- Color projection onto the point cloud is done entirely in post-processing, not during live capture
+
+- If the primary camera capture fails, the system automatically falls back to a buffered camera capture, then a LiDAR-driven capture as a last resort
+
+- RKO-LIO odometry requires an IMU — the system prefers the Livox Mid360's built-in IMU, falling back to the camera IMU if unavailable; if neither is found, odometry is disabled
+
+- Calibration is reloaded from calib.json at startup by default; set USE_EXISTING_CALIBRATION=true to skip this step
+
+- A sync benchmark report (sync_benchmark.json) is automatically generated at the end of each session to validate sensor timing alignment
+
+
+#### Process & Worker Management
+
+- Each sensor node (camera driver, LiDAR driver, RKO-LIO, rosbag recorder, trajectory recorder, etc.) runs as a dedicated OS process
+
+- CPU priority is managed via nice/renice — RKO-LIO gets highest priority (-15), rosbag recorder lowest (+10), camera drivers in between
+
+- All PIDs are tracked and bulk-terminated on exit via a trap cleanup handler bound to SIGINT, SIGTERM, and EXIT
+
+- The trajectory recorder is given a graceful shutdown window to flush any pending scan saves before being killed
+
+- There is no thread pool or worker queue — OS-level process isolation and nice values are the sole concurrency control mechanism

@@ -144,6 +144,8 @@
             ```bash
             eog ~/atlas_ws/output/000000_superglue.png
             ```
+            >*Note: The matches should look similar to below, where there are a lot of horizontal, parallel lines*
+            ![Superglue Example](../assets/media/superglue-example.png)
 
     5. Run calibration
         ```bash
