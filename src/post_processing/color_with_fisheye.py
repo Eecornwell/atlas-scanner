@@ -24,15 +24,15 @@ def color_scan_fisheye(scan_dir, config_path=None, mask_path=None):
     fisheye_img_path = fisheye_files[0]
     print(f"✓ Fisheye image: {os.path.basename(fisheye_img_path)}")
 
-    # Convert dual-fisheye to ERP using equirectangular calibration
+    # Convert single fisheye to ERP using single-lens config (zeroed alignment)
     erp_config = os.path.expanduser(
-        '~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
+        '~/atlas_ws/src/atlas-scanner/src/config/equirectangular_single.yaml')
     timestamp = os.path.basename(fisheye_img_path).replace('fisheye_', '').replace('.jpg', '')
     erp_path = os.path.join(scan_dir, f'equirect_{timestamp}.jpg')
 
     if not os.path.exists(erp_path):
         print("✓ Converting fisheye → ERP...")
-        fisheye_jpg_to_erp(fisheye_img_path, erp_config, erp_path)
+        fisheye_jpg_to_erp(fisheye_img_path, erp_config, erp_path, dual=False)
     else:
         print(f"✓ ERP already exists: {os.path.basename(erp_path)}")
 
@@ -60,7 +60,7 @@ def main():
     
     # Auto-detect mask if not provided
     if mask_path is None:
-        default_mask = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/lidar_mask.png')
+        default_mask = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/lidar_mask_single.png')
         if os.path.exists(default_mask):
             mask_path = default_mask
     

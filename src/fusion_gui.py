@@ -262,7 +262,19 @@ class FusionCaptureGUI:
                     self.root.after(0, lambda: self.log_message(f"Error reading output: {e}"))
                     break
 
-            # Process exited — surface any error and reset buttons
+            # Process exited — drain any remaining output before resetting
+            if self.fusion_process:
+                try:
+                    remaining = self.fusion_process.stdout.read()
+                    if remaining:
+                        for line in remaining.splitlines():
+                            line = line.strip()
+                            if line:
+                                self.root.after(0, lambda l=line: self.log_message(l))
+                except Exception:
+                    pass
+
+            # Surface any error and reset buttons
             if self.is_running:
                 exit_code = self.fusion_process.poll() if self.fusion_process else -1
                 if exit_code not in (None, 0):
@@ -341,22 +353,23 @@ class FusionCaptureGUI:
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
         
-        # Send SIGINT so the script's trap runs cleanup/post-processing,
-        # then wait in a background thread so the GUI stays responsive.
-        if self.fusion_process:
+        # Send SIGINT to the script process only (not the whole group) so the
+        # trap cleanup/post-processing runs to completion before children are killed.
+        proc = self.fusion_process
+        if proc:
             try:
-                os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGINT)
+                proc.send_signal(signal.SIGINT)
             except Exception as e:
                 self.log_message(f"Error sending stop signal: {e}")
 
         def _wait_for_finish():
             try:
-                self.fusion_process.wait(timeout=300)
+                proc.wait(timeout=300)
                 self.root.after(0, lambda: self.log_message("✓ Post-processing complete"))
             except subprocess.TimeoutExpired:
                 self.root.after(0, lambda: self.log_message("Post-processing timeout, force stopping..."))
                 try:
-                    os.killpg(os.getpgid(self.fusion_process.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     pass
             self.root.after(0, self._system_stopped)

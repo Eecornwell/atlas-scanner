@@ -295,7 +295,7 @@ def extract_back_fisheye(dual_img):
 # Main reconstruction
 # ---------------------------------------------------------------------------
 
-def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
+def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single_fisheye"):
     session_path = Path(session_dir)
 
     bag_dirs = sorted(session_path.glob("rosbag_*"))
@@ -417,7 +417,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
             print(f"  ⚠ {scan_name}: zero valid points, skipping")
             continue
 
-        ply_path = scan_dir / f"sensor_lidar_{ts_str}.ply"
+        ply_path = scan_dir / "sensor_lidar.ply"
         save_ply(str(ply_path), all_points)
 
         # --- Camera: decode the exact frame whose timestamp is the centre ---
@@ -430,8 +430,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
             else:
                 bgr = decode_jpeg_frame(image_msgs_raw[img_idx][1])
             if bgr is not None:
-                cv2.imwrite(str(img_out), extract_back_fisheye(bgr),
-                            [cv2.IMWRITE_JPEG_QUALITY, 95])
+                out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
+                cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                 fisheye_path = str(img_out)
         elif image_msgs_raw and img_idx is None:
             # LiDAR-fallback path: find closest image
@@ -441,8 +441,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
                 img_out = scan_dir / f"fisheye_{ts_str}.jpg"
                 bgr = decode_jpeg_frame(img_msg_fb)
                 if bgr is not None:
-                    cv2.imwrite(str(img_out), extract_back_fisheye(bgr),
-                                [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
+                    cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     fisheye_path = str(img_out)
 
         # --- Odometry: interpolate pose to the camera frame stamp ---
@@ -465,7 +465,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
                 t_vec = np.array([_lp["position"][k] for k in ("x", "y", "z")])
                 world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
                              for p in all_points]
-                save_ply(str(scan_dir / f"world_lidar_{ts_str}.ply"), world_pts)
+                save_ply(str(scan_dir / "world_lidar.ply"), world_pts)
             else:
                 print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
 
@@ -479,16 +479,30 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0):
     pp = Path(__file__).resolve().parent
 
     print("\nConverting fisheye → ERP and colorizing...")
-    for scan_dir in sorted(session_path.glob("fusion_scan_*")):
-        if not scan_dir.is_dir():
-            continue
-        if not sorted(scan_dir.glob("fisheye_*.jpg")):
-            continue
-        print(f"  Coloring {scan_dir.name}...")
+    if camera_mode == "dual_fisheye":
+        fisheye_to_erp = str(pp / "fisheye_to_erp.py")
+        for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+            if not scan_dir.is_dir():
+                continue
+            for fisheye_jpg in sorted(scan_dir.glob("fisheye_*.jpg")):
+                erp_path = scan_dir / "equirect_dual_fisheye.jpg"
+                subprocess.run(
+                    [sys.executable, fisheye_to_erp, str(fisheye_jpg), str(erp_path), "--dual"],
+                    check=False,
+                )
         subprocess.run(
-            [sys.executable, str(pp / "color_with_fisheye.py"), str(scan_dir)],
+            [sys.executable, str(pp / "post_process_coloring.py"), str(session_path), "--use-exact"],
             check=False,
         )
+    else:
+        for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+            if not scan_dir.is_dir() or not sorted(scan_dir.glob("fisheye_*.jpg")):
+                continue
+            print(f"  Coloring {scan_dir.name}...")
+            subprocess.run(
+                [sys.executable, str(pp / "color_with_fisheye.py"), str(scan_dir)],
+                check=False,
+            )
 
     return scan_count
 
@@ -502,6 +516,8 @@ if __name__ == "__main__":
                         help="Seconds between scan centres (default: 3.0)")
     parser.add_argument("--lidar-window", type=float, default=2.0,
                         help="LiDAR accumulation window in seconds (default: 2.0)")
+    parser.add_argument("--camera-mode", default="single_fisheye",
+                        choices=["dual_fisheye", "single_fisheye"])
     args = parser.parse_args()
 
-    reconstruct(args.session_dir, args.interval, args.lidar_window)
+    reconstruct(args.session_dir, args.interval, args.lidar_window, args.camera_mode)

@@ -50,7 +50,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: Intensity
-      Decay Time: 0
+      Decay Time: 0.5
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -59,11 +59,11 @@ Visualization Manager:
       Min Intensity: 0
       Name: PointCloud2
       Position Transformer: XYZ
-      Queue Size: 5
+      Queue Size: 2
       Selectable: false
-      Size (Pixels): 2
+      Size (Pixels): 1
       Size (m): 0.009999999776482582
-      Style: Flat Squares
+      Style: Points
       Topic: /livox/lidar
       Unreliable: false
       Use Fixed Frame: true
@@ -119,7 +119,7 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 0; 0; 255
       Color Transformer: FlatColor
-      Decay Time: 0
+      Decay Time: 2
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
@@ -130,11 +130,11 @@ Visualization Manager:
       Position Transformer: XYZ
       Queue Size: 1
       Selectable: false
-      Size (Pixels): 2
+      Size (Pixels): 1
       Size (m): 0.05
-      Style: Flat Squares
+      Style: Points
       Topic: /rko_lio/local_map
-      Unreliable: false
+      Unreliable: true
       Use Fixed Frame: true
       Use rainbow: false
       Value: true
@@ -142,7 +142,7 @@ Visualization Manager:
   Global Options:
     Background Color: 48; 48; 48
     Fixed Frame: odom
-    Frame Rate: 10
+    Frame Rate: 5
   Name: root
   Tools:
     - Class: rviz_default_plugins/MoveCamera

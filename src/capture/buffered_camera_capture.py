@@ -2,11 +2,12 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, Image
+from sensor_msgs.msg import PointCloud2, Image, CompressedImage
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 import struct
 import cv2
+import numpy as np
 import sys
 import time
 import os
@@ -33,7 +34,7 @@ class BufferedCameraCapture(Node):
         
         # Slower camera subscription rate to reduce timing pressure
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, 20)
-        self.image_sub = self.create_subscription(Image, '/equirectangular/image', self.image_cb, 1)
+        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, 1)
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 10)
         self.odom_buffered_sub = self.create_subscription(Odometry, '/rko_lio/odometry_buffered', self.odom_cb, 10)
         
@@ -93,11 +94,11 @@ class BufferedCameraCapture(Node):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         try:
-            # Process and save image immediately
-            cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            img_file = os.path.join(self.output_dir, f'equirect_{timestamp}.jpg')
-            cv2.imwrite(img_file, cv_image)
-            print(f"Debug: Saved image at start of LiDAR capture: {img_file}")
+            # Save raw compressed bytes — decoded from bag in post-processing
+            img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.h264')
+            with open(img_file, 'wb') as f:
+                f.write(bytes(msg.data))
+            print(f"Debug: Saved compressed fisheye frame: {img_file}")
         except Exception as e:
             print(f"Error saving image: {e}")
             return

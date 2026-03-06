@@ -4,6 +4,8 @@ import sys
 import os
 from pathlib import Path
 
+MASK_BASE = "/home/orion/atlas_ws/src/atlas-scanner/src"
+
 def apply_mask(image_path, mask_path, output_path):
     import cv2
     import numpy as np
@@ -27,17 +29,16 @@ def apply_mask(image_path, mask_path, output_path):
     return True
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2:
-        # Apply to all images in scan directory
-        scan_dir = Path(sys.argv[1])
-        mask_path = "/home/orion/atlas_ws/src/atlas-scanner/src/lidar_mask.png"
-        
-        for img_file in scan_dir.glob("equirect*.jpg"):
-            output = img_file.with_name(img_file.stem + "_masked.png")
-            apply_mask(str(img_file), mask_path, str(output))
-    elif len(sys.argv) == 4:
-        # Apply to single image
+    import argparse
+    if len(sys.argv) == 4:
         apply_mask(sys.argv[1], sys.argv[2], sys.argv[3])
     else:
-        print("Usage: python3 apply_lidar_mask.py <scan_dir>")
-        print("   or: python3 apply_lidar_mask.py <image> <mask> <output>")
+        parser = argparse.ArgumentParser()
+        parser.add_argument("scan_dir")
+        parser.add_argument("--camera-mode", default="dual_fisheye", choices=["dual_fisheye", "single_fisheye"])
+        args = parser.parse_args()
+        suffix = "dual" if args.camera_mode == "dual_fisheye" else "single"
+        mask_path = f"{MASK_BASE}/lidar_mask_{suffix}.png"
+        for img_file in Path(args.scan_dir).glob("equirect*.jpg"):
+            output = img_file.with_name(img_file.stem + "_masked.png")
+            apply_mask(str(img_file), mask_path, str(output))

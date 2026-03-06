@@ -4,6 +4,7 @@ Convert a saved dual-fisheye JPG to equirectangular (ERP) offline,
 using the same projection logic as equirectangular.py.
 """
 
+import argparse
 import cv2
 import numpy as np
 import math
@@ -49,11 +50,11 @@ def build_maps(cfg, crop):
         r = np.sqrt(Xf**2 + Yf**2).clip(1e-6)
         theta = np.arctan2(r, np.abs(Zf))
         r_img = 2 * theta / math.pi * (crop / 2)
-        u = cx + Xf / r * r_img
-        v = cy + Yf / r * r_img
-        return u.astype(np.float32), v.astype(np.float32)
+        u = (cx + Xf / r * r_img).astype(np.float32)
+        v = (cy + Yf / r * r_img).astype(np.float32)
+        return u, v
 
-    # The saved fisheye is the back lens - apply back-to-front rotation from equirectangular.yaml
+    # Back-to-front rotation from equirectangular.yaml
     tx, ty, tz = cfg['translation']
     roll, pitch, yaw = [math.radians(d) for d in cfg['rotation_deg']]
     Rx = np.array([[1,0,0],[0,math.cos(roll),-math.sin(roll)],[0,math.sin(roll),math.cos(roll)]])
@@ -62,54 +63,90 @@ def build_maps(cfg, crop):
     R = Rz @ Ry @ Rx
     t = np.array([tx, ty, tz])
 
-    # Map back hemisphere to the saved fisheye (same logic as equirectangular.py back hemisphere)
+    # Front hemisphere -> front lens (right half, rotated 90° CCW)
+    front_map_x = np.zeros((out_h, out_w), np.float32)
+    front_map_y = np.zeros((out_h, out_w), np.float32)
+    front_map_x[front_mask], front_map_y[front_mask] = fisheye_uv(
+        X[front_mask], Y[front_mask], Z[front_mask])
+
+    # Back hemisphere -> back lens (left half, rotated 90° CW), with back-to-front transform
     bp = np.stack([X[back_mask], Y[back_mask], Z[back_mask]], axis=1)
     tp = bp @ R.T + t
     Xb, Yb, Zb = -tp[:, 0], tp[:, 1], tp[:, 2]
-
     back_map_x = np.zeros((out_h, out_w), np.float32)
     back_map_y = np.zeros((out_h, out_w), np.float32)
     back_map_x[back_mask], back_map_y[back_mask] = fisheye_uv(Xb, Yb, Zb)
 
-    return back_map_x, back_map_y, back_mask
+    return front_map_x, front_map_y, front_mask, back_map_x, back_map_y, back_mask
 
 
-def fisheye_jpg_to_erp(fisheye_path, config_path, output_path):
+def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
     cfg = load_erp_config(config_path)
     crop = cfg['crop_size']
     out_w, out_h = cfg['out_width'], cfg['out_height']
 
-    # The saved fisheye is the back/LiDAR-facing lens: left half of dual image,
-    # already rotated 90° CW by the capture script. Use it as-is.
     img = cv2.imread(fisheye_path)
     if img is None:
-        raise FileNotFoundError(f"Cannot read: {fisheye_path}")
+        print(f"Warning: Cannot read: {fisheye_path}, skipping")
+        return None
 
-    h, w = img.shape[:2]
-    # Use the full image if smaller than configured crop_size
-    crop = min(crop, h, w)
-    y0 = (h - crop) // 2
-    x0 = (w - crop) // 2
-    fisheye = img[y0:y0+crop, x0:x0+crop]
+    if dual:
+        # Full side-by-side dual-fisheye: split, rotate, map both hemispheres
+        h, w = img.shape[:2]
+        mid = w // 2
+        front_raw = cv2.rotate(img[:, mid:], cv2.ROTATE_90_COUNTERCLOCKWISE)
+        back_raw  = cv2.rotate(img[:, :mid], cv2.ROTATE_90_CLOCKWISE)
 
-    fmx, fmy, back_mask = build_maps(cfg, crop)
+        def center_crop(im, size):
+            ih, iw = im.shape[:2]
+            y0 = (ih - size) // 2
+            x0 = (iw - size) // 2
+            return im[y0:y0+size, x0:x0+size]
 
-    remapped = cv2.remap(fisheye, fmx, fmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+        crop = min(crop, front_raw.shape[0], front_raw.shape[1])
+        front = center_crop(front_raw, crop)
+        back  = center_crop(back_raw,  crop)
 
-    # Back lens maps to left+right edges; front hemisphere (center) stays black
-    erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)
+        fmx, fmy, front_mask, bmx, bmy, back_mask = build_maps(cfg, crop)
+        front_remap = cv2.remap(front, fmx, fmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+        back_remap  = cv2.remap(back,  bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+        erp = np.where(front_mask[:, :, None], front_remap, back_remap).astype(np.uint8)
+    else:
+        # Single pre-extracted fisheye (already cropped/rotated by capture script)
+        h, w = img.shape[:2]
+        crop = min(crop, h, w)
+        y0 = (h - crop) // 2
+        x0 = (w - crop) // 2
+        fisheye = img[y0:y0+crop, x0:x0+crop]
+
+        # For single lens, only map the back hemisphere (the lens faces the LiDAR)
+        _, _, _, bmx, bmy, back_mask = build_maps(cfg, crop)
+        remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
+        erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)
 
     cv2.imwrite(output_path, erp)
-    print(f"✓ ERP saved: {output_path} ({out_w}x{out_h})")
+    print(f"\u2713 ERP saved: {output_path} ({out_w}x{out_h})")
     return output_path
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print("Usage: fisheye_to_erp.py <dual_fisheye.jpg> <output_erp.jpg> [equirectangular.yaml]")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input', help='Input fisheye JPG')
+    parser.add_argument('output', help='Output ERP JPG')
+    parser.add_argument('--config', help='Path to equirectangular yaml')
+    parser.add_argument('--dual', action='store_true',
+                        help='Use dual-fisheye calibration (translation/rotation from yaml). '
+                             'Omit for single-lens (zeroed alignment).')
+    args = parser.parse_args()
 
-    default_cfg = os.path.expanduser(
-        '~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
-    cfg_path = sys.argv[3] if len(sys.argv) > 3 else default_cfg
-    fisheye_jpg_to_erp(sys.argv[1], cfg_path, sys.argv[2])
+    cfg_dir = os.path.expanduser('~/atlas_ws/src/insta360_ros_driver/config')
+    atlas_cfg_dir = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/config')
+    if args.config:
+        cfg_path = args.config
+    elif args.dual:
+        cfg_path = os.path.join(cfg_dir, 'equirectangular.yaml')
+    else:
+        cfg_path = os.path.join(atlas_cfg_dir, 'equirectangular_single.yaml')
+
+    fisheye_jpg_to_erp(args.input, cfg_path, args.output, dual=args.dual)

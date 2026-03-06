@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
-CAMERA_MODE="single_fisheye"        # dual_fisheye | single_fisheye
+CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
@@ -29,7 +29,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
 ENABLE_ICP_ALIGNMENT=true
-EXPORT_COLMAP=false
+EXPORT_COLMAP=true
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05        # voxel downsample in metres (0 = skip)
@@ -49,6 +49,11 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/orion:/usr/local/lib
 mkdir -p data/synchronized_scans
 SCAN_DIR="data/synchronized_scans/sync_fusion_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$SCAN_DIR"
+
+# Tee all stdout+stderr to a session log
+LOG_FILE="$SCAN_DIR/session.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=== Session log started: $(date) ==="
 
 PIDS=()
 FUSION_READY="false"
@@ -115,15 +120,15 @@ cleanup() {
         if [ -n "$BAG_DIR" ]; then
             echo "Reconstructing scans from bag using header timestamps..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.5
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.5 --camera-mode "$CAMERA_MODE"
             echo "Generating masked images..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR"
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
         fi
     fi
 
     SCAN_COUNT=$(ls -d "$SCAN_DIR"/fusion_scan_* 2>/dev/null | wc -l)
 
-    if [ "$FUSION_READY" = "true" ] && [ "$SCAN_COUNT" -gt 0 ]; then
+    if [ "$SCAN_COUNT" -gt 0 ]; then
         echo ""
         echo "=========================================="
         echo "SCANNING SESSION COMPLETE"
@@ -135,12 +140,20 @@ cleanup() {
         # Coloring
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
             if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
+                echo "Converting fisheye images to ERP..."
+                for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
+                    [ -d "$scan_dir" ] || continue
+                    BAG_DIR=$(ls -d "$scan_dir"/rosbag_* 2>/dev/null | head -1)
+                    [ -z "$BAG_DIR" ] && continue
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
+                        "$BAG_DIR" "$scan_dir" --dual
+                done
                 if [ "$BLEND_ERP_SEAMS" = "true" ]; then
                     echo "Blending ERP image seams..."
                     python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/blend_erp_seams_simple.py" "$SCAN_DIR"
                 fi
                 echo "Creating masked images from blended ERPs..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             else
@@ -225,8 +238,14 @@ cleanup() {
 
         if [ "$RUN_SYNC_BENCHMARK" = "true" ]; then
             echo "Running sync benchmark..."
+            # In stationary mode bags live inside fusion_scan_*/rosbag_* — find the first one
+            BENCH_DIR="$SCAN_DIR"
+            if [ "$CAPTURE_MODE" = "stationary" ]; then
+                FIRST_BAG=$(ls -d "$SCAN_DIR"/fusion_scan_*/rosbag_* 2>/dev/null | head -1)
+                [ -n "$FIRST_BAG" ] && BENCH_DIR=$(dirname "$FIRST_BAG")
+            fi
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/sync_benchmark.py" \
-                "$SCAN_DIR" --out "$SCAN_DIR/sync_benchmark.json"
+                "$BENCH_DIR" --out "$SCAN_DIR/sync_benchmark.json"
         fi
     else
         echo "Failed to initialize sensors or no scans captured. Check hardware connections."
@@ -307,15 +326,16 @@ sleep 1
 
 if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
     ros2 launch insta360_ros_driver bringup.launch.xml \
-        equirectangular:=true \
-        equirectangular_config:="$ROS_WS_DIR/src/insta360_ros_driver/config/equirectangular.yaml" &
+        equirectangular:=false \
+        decode:=false \
+        imu_filter:=false &
     CAMERA_PID=$!
     PIDS+=($CAMERA_PID)
     sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null &
     sleep 3
 else
     ros2 launch insta360_ros_driver bringup.launch.xml \
-        equirectangular:=false shutter_speed:=0.00833 iso:=1600 \
+        equirectangular:=false imu_filter:=false \
         decode:=$([ "$CAPTURE_MODE" = "continuous" ] && echo false || echo true) &
     CAMERA_PID=$!
     PIDS+=($CAMERA_PID)
@@ -405,7 +425,10 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         sleep 5
         LIO_ENABLED="true"
         rviz2 -d "$ROS_WS_DIR/install/livox_ros_driver2/share/livox_ros_driver2/config/display_point_cloud_ROS2.rviz" > /tmp/rviz.log 2>&1 &
-        PIDS+=($!)
+        RVIZ_PID=$!
+        PIDS+=($RVIZ_PID)
+        # Give RViz higher priority than camera pipeline in dual_fisheye mode
+        [ "$CAMERA_MODE" = "dual_fisheye" ] && sleep 2 && renice -n 5 -p $RVIZ_PID 2>/dev/null &
     else
         echo "⚠ RKO-LIO failed to start"
         LIO_ENABLED="false"
@@ -497,7 +520,7 @@ else
         # Per-scan rosbag
         ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S_%N | cut -c1-18)
         ROSBAG_DIR="$INDIVIDUAL_SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
-        TOPICS_TO_RECORD="/livox/lidar /dual_fisheye/image/compressed"
+        TOPICS_TO_RECORD="/livox/lidar /dual_fisheye/image/compressed /livox/imu"
         if [ "$LIO_ENABLED" = "true" ]; then
             TOPICS_TO_RECORD="$TOPICS_TO_RECORD /rko_lio/odometry_buffered"
         fi

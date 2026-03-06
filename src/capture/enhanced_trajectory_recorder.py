@@ -347,8 +347,11 @@ if __name__ == '__main__':
     
     try:
         rclpy.spin(recorder)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         recorder.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass

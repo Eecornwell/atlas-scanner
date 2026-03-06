@@ -6,10 +6,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from apply_lidar_mask import apply_mask
 
-def regenerate_masked_images(session_dir):
+MASK_BASE = "/home/orion/atlas_ws/src/atlas-scanner/src"
+
+def regenerate_masked_images(session_dir, camera_mode="dual_fisheye"):
     """Regenerate masked images from blended ERP images"""
     session_path = Path(session_dir)
-    mask_file = "/home/orion/atlas_ws/src/atlas-scanner/src/lidar_mask.png"
+    suffix = "dual" if camera_mode == "dual_fisheye" else "single"
+    mask_file = f"{MASK_BASE}/lidar_mask_{suffix}.png"
     
     count = 0
     for scan_dir in sorted(session_path.glob("fusion_scan_*")):
@@ -24,8 +27,9 @@ def regenerate_masked_images(session_dir):
     print(f"✓ Regenerated {count} masked images from blended ERPs")
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python3 regenerate_masked_images.py <session_directory>")
-        sys.exit(1)
-    
-    regenerate_masked_images(sys.argv[1])
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("session_dir")
+    parser.add_argument("--camera-mode", default="dual_fisheye", choices=["dual_fisheye", "single_fisheye"])
+    args = parser.parse_args()
+    regenerate_masked_images(args.session_dir, args.camera_mode)
