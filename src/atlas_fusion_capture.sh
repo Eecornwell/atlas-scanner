@@ -9,7 +9,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="continuous"         # stationary | continuous
+CAPTURE_MODE="stationary"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -424,7 +424,8 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         echo "Waiting for IMU/LIO to stabilize..."
         sleep 5
         LIO_ENABLED="true"
-        rviz2 -d "$ROS_WS_DIR/install/livox_ros_driver2/share/livox_ros_driver2/config/display_point_cloud_ROS2.rviz" > /tmp/rviz.log 2>&1 &
+        QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
+            -stylesheet "$ROS_WS_DIR/src/atlas-scanner/src/config/rviz_kiosk.qss" > /tmp/rviz.log 2>&1 &
         RVIZ_PID=$!
         PIDS+=($RVIZ_PID)
         # Give RViz higher priority than camera pipeline in dual_fisheye mode

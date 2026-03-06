@@ -1,0 +1,1 @@
+QMenuBar { max-height: 0px; padding: 0px; border: none; } QToolBar { max-height: 0px; border: none; }
