@@ -115,7 +115,7 @@ cleanup() {
         if [ -n "$BAG_DIR" ]; then
             echo "Reconstructing scans from bag using header timestamps..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.5
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.5
             echo "Generating masked images..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR"
         fi
@@ -512,7 +512,7 @@ else
         echo "Capturing scan $SCAN_COUNT..."
         if [ "$CAMERA_MODE" = "single_fisheye" ]; then
             timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \
-                "$INDIVIDUAL_SCAN_DIR" 15 2.0
+                "$INDIVIDUAL_SCAN_DIR" 30 4.0
             CAPTURE_EXIT_CODE=$?
             if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
                 echo "  Primary capture failed, trying buffered camera capture..."

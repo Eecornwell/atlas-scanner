@@ -6,7 +6,7 @@ import json
 import numpy as np
 from pathlib import Path
 
-def combine_scans_for_calibration(base_dir, output_dir):
+def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     """Combine multiple scan sessions into one calibration dataset"""
     
     os.makedirs(f"{output_dir}/images", exist_ok=True)
@@ -26,20 +26,8 @@ def combine_scans_for_calibration(base_dir, output_dir):
         masked_raw_files = list(fusion_dir.glob("equirect_*_masked_raw.png"))
         equirect_files = list(fusion_dir.glob("equirect_*.jpg")) + list(fusion_dir.glob("equirect_*.png"))
 
-        # Priority: blended masked > raw masked > regular > synthesise from single fisheye
-        if masked_files:
-            blended_masked = [f for f in masked_files if '_raw' not in f.name]
-            if blended_masked:
-                equirect_files = blended_masked
-                print(f"  Using blended masked image from {fusion_dir.name}")
-            elif masked_raw_files:
-                equirect_files = masked_raw_files
-                print(f"  Using raw masked image from {fusion_dir.name}")
-            else:
-                equirect_files = masked_files
-                print(f"  Using masked image from {fusion_dir.name}")
-        else:
-            equirect_files = [f for f in equirect_files if '_masked' not in f.name]
+        # Always prefer raw equirect jpg — masking is handled by generate_intensity_images.py
+        equirect_files = [f for f in equirect_files if '_masked' not in f.name]
 
         # Single-fisheye fallback: synthesise an ERP from the saved fisheye_*.jpg
         if not equirect_files:
@@ -60,6 +48,9 @@ def combine_scans_for_calibration(base_dir, output_dir):
         
         ply_files = list(fusion_dir.glob("sensor_lidar*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
         
+        if total_count >= max_scans:
+            break
+
         if equirect_files and ply_files:
             # Copy and convert image to PNG (handle alpha channel if present)
             src_img = equirect_files[0]
@@ -70,22 +61,6 @@ def combine_scans_for_calibration(base_dir, output_dir):
             img = cv2.imread(str(src_img), cv2.IMREAD_UNCHANGED)
             if img is not None:
                 # If image has alpha channel (masked), fill transparent areas with gray noise instead of black
-                if img.shape[2] == 4:
-                    # Create gray noise background
-                    bgr = img[:, :, :3]
-                    alpha = img[:, :, 3] / 255.0
-                    # Generate gray noise (mean 128, std 20)
-                    noise = np.random.normal(128, 20, bgr.shape).astype('uint8')
-                    # Blend: use image where alpha=1, use noise where alpha=0
-                    img = (bgr * alpha[:,:,np.newaxis] + noise * (1 - alpha[:,:,np.newaxis])).astype('uint8')
-                    
-                    # Blur the transition areas to hide seams
-                    mask_edges = cv2.dilate((alpha < 0.99).astype('uint8'), np.ones((15,15), np.uint8))
-                    img = cv2.GaussianBlur(img, (15, 15), 0) * mask_edges[:,:,np.newaxis] + img * (1 - mask_edges[:,:,np.newaxis])
-                    img = img.astype('uint8')
-                    
-                    print(f"    Applied mask with gray noise fill and blurred edges")
-                
                 cv2.imwrite(dst_img, img)
                 
                 # Also copy to root directory for SuperGlue
@@ -123,7 +98,7 @@ def combine_scans_for_calibration(base_dir, output_dir):
         "camera": {
             "camera_model": "equirectangular",
             "distortion_coeffs": [],
-            "intrinsics": [3840.0, 1920.0]
+            "intrinsics": [960.0, 480.0]
         },
         "meta": {
             "bag_names": bag_names,
@@ -168,23 +143,22 @@ def combine_scans_for_calibration(base_dir, output_dir):
 if __name__ == '__main__':
     import sys
     
-    if len(sys.argv) != 2:
+    if len(sys.argv) < 2:
         print("Usage: python3 combine_scans_for_calibration.py <session_directory>")
         print("Example: python3 combine_scans_for_calibration.py /home/orion/atlas_ws/data/synchronized_scans/sync_fusion_20260121_170652")
         sys.exit(1)
-    
+
     base_dir = sys.argv[1]
     output_dir = "/home/orion/atlas_ws/output"
-    
+
     if not os.path.exists(base_dir):
         print(f"Error: Input directory {base_dir} does not exist")
         sys.exit(1)
-    
-    # Clean output directory
+
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
-    
-    count = combine_scans_for_calibration(base_dir, output_dir)
+
+    count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 4)
     
     if count > 1:
         print(f"\n✓ Ready for calibration with {count} images!")

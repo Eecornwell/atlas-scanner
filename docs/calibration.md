@@ -136,8 +136,13 @@
             python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
             cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
+            python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_matches.py ~/atlas_ws/output
             ./initial_guess_auto ~/atlas_ws/output
             python3 -c "import json; f=open('~/atlas_ws/output/calib.json'.replace('~','$HOME'),'r+'); d=json.load(f); d['results']['init_T_lidar_camera']=d['results']['init_T_lidar_camera_auto']; f.seek(0); json.dump(d,f,indent=2); f.truncate()"
+            ```
+            - You can view the matches visually
+            ```bash
+            eog ~/atlas_ws/output/000000_superglue.png
             ```
 
     5. Run calibration
@@ -155,23 +160,22 @@
         > *Note: This will properly invert the transformation from calib.json and save to: `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`*
 
     7. Configuration notes for `~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml`
-        * The system uses exact projection matching the calibration tool
+
         * All transformation values come directly from inverted calib.json
-        * No manual adjustments needed - alignment matches calibration tool exactly
         * Baseline Settings
 
             ```bash
-            roll_offset: 3.1074520149288376
-            pitch_offset: 0.03025395699091904
-            yaw_offset: -1.6096116718826878
+            roll_offset: 3.111823684392698
+            pitch_offset: -0.04820224102724069
+            yaw_offset: -1.6088051429066295
             manual_roll_adjustment: 0.0
             manual_pitch_adjustment: 0.0
             manual_yaw_adjustment: 0.0
             azimuth_offset: 0.0
             elevation_offset: 0.0
-            x_offset: 0.15314562222691977
-            y_offset: 0.007200417361815034
-            z_offset: 0.07284122642016298
+            x_offset: 0.14763194395461118
+            y_offset: 0.018967603469974777
+            z_offset: 0.08434658892015204
             flip_x: false
             flip_y: false
             image_width: 2560

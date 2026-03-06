@@ -22,7 +22,7 @@ extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
 # Conservative processing parameters
-voxel_size: 0.5              # coarser than 1.0 is too sparse; 0.5 balances speed vs accuracy
+voxel_size: 0.3              # coarser than 1.0 is too sparse; 0.3 balances speed vs accuracy
 max_points_per_voxel: 10
 max_range: 20.0
 min_range: 0.3
