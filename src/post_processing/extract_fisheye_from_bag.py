@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Extracts the best-quality dual-fisheye frame from a rosbag by decoding the H.264 stream with ffmpeg and converting the result to an equirectangular image.
 """
 Extract the best dual-fisheye frame from a rosbag and convert to ERP.
 Reads the full H.264 stream from /dual_fisheye/image/compressed,
@@ -30,7 +35,9 @@ def open_db3(bag_dir):
     if not zstd:
         raise FileNotFoundError(f"No .db3 file in {bag_dir}")
     out = str(zstd[0]).replace(".zstd", "")
-    subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"], check=True, capture_output=True)
+    result = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"], capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"zstd decompression failed for {zstd[0]}: {result.stderr.decode().strip() or result.stdout.decode().strip()}")
     return sqlite3.connect(out)
 
 
@@ -61,21 +68,20 @@ def extract_and_convert(bag_dir, scan_dir, dual=True):
             tmp.write(bytes(msg.data))
         tmp_path = tmp.name
 
-    # Decode middle frame (more likely to be a clean I-frame than the first)
-    mid = max(0, len(rows) // 2)
     fisheye_path = os.path.join(scan_dir, 'dual_fisheye.jpg')
-    result = subprocess.run([
-        'ffmpeg', '-y', '-i', tmp_path,
-        '-vf', f'select=eq(n\\,{mid})', '-frames:v', '1', '-q:v', '2', fisheye_path
-    ], capture_output=True)
-    os.unlink(tmp_path)
-
-    if result.returncode != 0 or not os.path.exists(fisheye_path):
-        # Fallback: grab first decodable frame
+    # Try middle frame first (more likely clean I-frame), then fall back to scanning all frames
+    for seek_frame in [max(0, len(rows) // 2), 0, max(0, len(rows) - 1)]:
         result = subprocess.run([
-            'ffmpeg', '-y', '-i', tmp_path if os.path.exists(tmp_path) else '/dev/null',
-            '-frames:v', '1', '-q:v', '2', fisheye_path
+            'ffmpeg', '-y', '-i', tmp_path,
+            '-vf', f'select=eq(n\\,{seek_frame})', '-frames:v', '1', '-q:v', '2', fisheye_path
         ], capture_output=True)
+        if result.returncode == 0 and os.path.exists(fisheye_path):
+            break
+    else:
+        # Last resort: grab first decodable frame without seeking
+        subprocess.run(['ffmpeg', '-y', '-i', tmp_path, '-frames:v', '1', '-q:v', '2', fisheye_path],
+                       capture_output=True)
+    os.unlink(tmp_path)
 
     if not os.path.exists(fisheye_path):
         print(f"✗ ffmpeg could not decode any frame from {bag_dir}")

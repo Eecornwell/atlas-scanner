@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Re-applies the LiDAR mask to all equirectangular images in a session directory. Useful after re-running seam blending or updating the mask file.
 import sys
 from pathlib import Path
 

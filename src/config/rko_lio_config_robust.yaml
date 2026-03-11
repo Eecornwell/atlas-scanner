@@ -16,8 +16,7 @@ invert_odom_tf: false
 
 # Forum settings + robustness tweaks
 deskew: true
-double_downsample: true
-initialization_phase: false
+initialization_phase: true
 extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 

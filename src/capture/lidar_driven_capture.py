@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: ROS2 node that triggers a synchronised LiDAR and camera capture on the first incoming LiDAR frame after buffers are ready. Used as a fallback capture path.
+
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, Image
+from sensor_msgs.msg import PointCloud2, Image, CompressedImage
 from nav_msgs.msg import Odometry
 from cv_bridge import CvBridge
 import struct
@@ -28,8 +33,10 @@ class LidarDrivenCapture(Node):
         self.buffer_lock = threading.Lock()
         
         # Subscriptions - LiDAR drives the timing
-        self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, 1)
-        self.image_sub = self.create_subscription(Image, '/equirectangular/image', self.image_cb, 5)
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+        lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
+        self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
+        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, 5)
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 1)
         
         # Wait for image buffer to fill
@@ -41,7 +48,11 @@ class LidarDrivenCapture(Node):
         """Store images in buffer with timestamps"""
         timestamp = time.time()
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            import numpy as _np
+            buf = _np.frombuffer(bytes(msg.data), dtype=_np.uint8)
+            cv_image = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            if cv_image is None:
+                return
             with self.buffer_lock:
                 self.image_buffer.append((timestamp, cv_image))
             
@@ -89,7 +100,7 @@ class LidarDrivenCapture(Node):
                 return
                 
             # Save image
-            img_file = os.path.join(self.output_dir, f'equirect_{timestamp}.jpg')
+            img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.jpg')
             cv2.imwrite(img_file, most_recent_image)
             
             # Process LiDAR data
@@ -169,31 +180,39 @@ def main():
     
     rclpy.init()
     node = LidarDrivenCapture(output_dir, buffer_size)
-    
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    time.sleep(2.0)  # allow DDS discovery with node already spinning
+
     try:
-        # Allow time to fill image buffer
         print("Debug: Filling image buffer for 5 seconds...")
-        start_time = time.time()
-        
-        while time.time() - start_time < 5:
-            rclpy.spin_once(node, timeout_sec=0.1)
-        
+        time.sleep(5.0)
+
         print(f"Debug: Image buffer filled with {len(node.image_buffer)} images")
-        
-        # Now wait for LiDAR to trigger capture
+
+        if len(node.image_buffer) == 0:
+            print("✗ No camera frames received - check /dual_fisheye/image/compressed is publishing")
+            return
+
         timeout = 30.0
         capture_start = time.time()
-        
-        while rclpy.ok() and not node.captured:
-            rclpy.spin_once(node, timeout_sec=0.1)
+        while not node.captured:
+            time.sleep(0.1)
             if time.time() - capture_start > timeout:
                 print("✗ Timeout waiting for LiDAR frame")
                 break
-                
+
     except KeyboardInterrupt:
         print("✗ Interrupted by user")
+    except rclpy.executors.ExternalShutdownException:
+        pass
     finally:
-        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     main()

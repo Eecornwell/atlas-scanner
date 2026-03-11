@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Reads the raw T_lidar_camera result from calib.json, inverts it to T_camera_lidar, and writes the final extrinsic parameters to fusion_calibration.yaml.
 """
 Calibration transformation that properly handles coordinate systems.
 

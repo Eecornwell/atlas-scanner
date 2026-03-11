@@ -13,7 +13,7 @@ SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
 ENABLE_ICP_ALIGNMENT=true      # ICP pose graph refinement on merged cloud
 BLEND_ERP_SEAMS=true           # dual_fisheye only: blend fisheye seams before coloring
-EXPORT_COLMAP=true             # export session to COLMAP format
+EXPORT_COLMAP=false            # export session to COLMAP format
 CLEAN_POINTCLOUD=true          # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
 RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session (outputs to screen + sync_benchmark.json)
@@ -93,7 +93,10 @@ sync_fusion_{TIMESTAMP}/
 cd ~/atlas_ws && source install/setup.bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    --camera-mode single_fisheye \
     --interval 3.0 --lidar-window 0.5
+
+# Use --camera-mode dual_fisheye if the session was captured with dual_fisheye mode
 ```
 
 ### Merge scans using trajectory poses

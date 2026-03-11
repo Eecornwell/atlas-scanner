@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Simplified single-pass seam blending for equirectangular images. Applies a linear gradient across a configurable pixel width at each seam.
 import cv2 as cv
 import numpy as np
 import sys

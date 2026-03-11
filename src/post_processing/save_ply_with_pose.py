@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Saves a point cloud as a PLY file with the capture pose and timestamp embedded as header comments, and optional per-point RGB color data.
+
 import numpy as np
 import json
 import sys

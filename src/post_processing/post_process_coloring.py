@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Applies ERP-based point cloud coloring to a single scan directory, selecting between world-frame and sensor-frame PLY inputs automatically.
 import os
 import sys
 from pathlib import Path

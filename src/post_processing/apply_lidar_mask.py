@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Applies a binary mask PNG to an equirectangular image, zeroing out regions (e.g. the scanner body and tripod) that should be excluded from point cloud coloring.
 import cv2
 import sys
 import os

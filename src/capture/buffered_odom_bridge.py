@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: ROS2 node that republishes the latest RKO-LIO odometry pose on /rko_lio/odometry_buffered at a fixed rate, ensuring downstream consumers always have a recent pose even during brief LIO gaps.
+
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
@@ -56,6 +61,8 @@ def main():
     try:
         rclpy.spin(bridge)
     except KeyboardInterrupt:
+        pass
+    except rclpy.executors.ExternalShutdownException:
         pass
     except Exception as e:
         if str(e):

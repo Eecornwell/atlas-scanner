@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Reads a session rosbag and reports cross-sensor timing statistics (LiDAR, camera, odometry, IMU) using message header timestamps to quantify synchronisation quality.
 """
 Synchronization benchmark for atlas-scanner sessions.
 
 Reads a rosbag and reports timing statistics between LiDAR, camera, and odometry.
-Produces a per-frame CSV and a summary with pass/fail grades against thresholds
-derived from sensor frame periods and walking-speed coloring error budget.
+Uses message header timestamps (not bag receive timestamps) for accurate sync measurement.
 
 Usage:
   python3 sync_benchmark.py <session_dir> [--walk-speed 0.5] [--out report.json]
@@ -38,30 +42,46 @@ OK_MS    = 100.0
 # Bag helpers (no ROS runtime needed — reads SQLite directly)
 # ---------------------------------------------------------------------------
 
-def open_db3(bag_dir: Path) -> sqlite3.Connection:
+def open_db3(bag_dir: Path) -> tuple[sqlite3.Connection, Path | None]:
+    """Returns (connection, temp_db3_path_or_None). Caller must close con then
+    delete temp_db3_path if not None."""
     db3 = sorted(bag_dir.glob("*.db3"))
     if db3:
-        return sqlite3.connect(str(db3[0]))
+        return sqlite3.connect(str(db3[0])), None
     zstd = sorted(bag_dir.glob("*.db3.zstd"))
     if not zstd:
         raise FileNotFoundError(f"No .db3 in {bag_dir}")
-    out = str(zstd[0]).replace(".zstd", "")
-    r = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"], capture_output=True)
+    out = Path(str(zstd[0]).replace(".zstd", ""))
+    r = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", str(out), "-f"], capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError(f"zstd decompress failed: {zstd[0]}")
-    return sqlite3.connect(out)
+        raise RuntimeError(f"zstd decompress failed (truncated bag?): {zstd[0]}")
+    return sqlite3.connect(str(out)), out
+
+
+def _header_stamp(data: bytes) -> float:
+    """Extract ROS2 CDR header stamp (sec+nanosec at bytes 4-12) as float seconds."""
+    import struct
+    sec  = struct.unpack_from('<i', data, 4)[0]
+    nsec = struct.unpack_from('<I', data, 8)[0]
+    return sec + nsec / 1e9
 
 
 def bag_stamps(con: sqlite3.Connection, fragment: str) -> np.ndarray:
-    """Return sorted array of bag-receive timestamps (ns→s) for a topic."""
+    """Return sorted array of message header timestamps (s) for a topic."""
     topics = {r[0]: r[1] for r in con.execute("SELECT id, name FROM topics")}
     tid = next((t for t, n in topics.items() if fragment in n), None)
     if tid is None:
         return np.array([])
     rows = con.execute(
-        "SELECT timestamp FROM messages WHERE topic_id=? ORDER BY timestamp", (tid,)
+        "SELECT data FROM messages WHERE topic_id=? ORDER BY timestamp", (tid,)
     ).fetchall()
-    return np.array([r[0] / 1e9 for r in rows])
+    stamps = []
+    for (data,) in rows:
+        try:
+            stamps.append(_header_stamp(bytes(data)))
+        except Exception:
+            pass
+    return np.sort(np.array(stamps))
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +89,12 @@ def bag_stamps(con: sqlite3.Connection, fragment: str) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def nearest_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """For each stamp in `a`, find the minimum absolute difference to any stamp in `b`."""
+    """For each stamp in `a` within b's time window, find the nearest stamp in `b`."""
     if len(b) == 0:
+        return np.array([])
+    # Restrict `a` to the window covered by `b` to avoid inflated gaps at boundaries
+    a = a[(a >= b[0]) & (a <= b[-1])]
+    if len(a) == 0:
         return np.array([])
     idx = np.searchsorted(b, a)
     idx = np.clip(idx, 1, len(b) - 1)
@@ -135,13 +159,24 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     if not bag_dirs:
         print("✗ No rosbag_* directory found"); sys.exit(1)
 
-    con = open_db3(bag_dirs[0])
+    con = None
+    tmp_db3 = None
+    for bag_dir in bag_dirs:
+        try:
+            con, tmp_db3 = open_db3(bag_dir)
+            break
+        except Exception as e:
+            print(f"  ⚠ Skipping {bag_dir.name}: {e}")
+    if con is None:
+        print("✗ No readable bag found"); sys.exit(1)
 
     lidar  = bag_stamps(con, "/livox/lidar")
     camera = bag_stamps(con, "fisheye")
     odom   = bag_stamps(con, "odometry")
     imu    = bag_stamps(con, "imu")
     con.close()
+    if tmp_db3 and tmp_db3.exists():
+        tmp_db3.unlink()
 
     print(f"\n=== Sync Benchmark: {session.name} ===")
     print(f"  LiDAR  : {len(lidar)}  frames  span={lidar[-1]-lidar[0]:.1f}s" if len(lidar) else "  LiDAR  : NOT FOUND")
@@ -160,10 +195,27 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
 
     for name, a, b in pairs:
         d = nearest_delta(a, b)
+        if len(d) == 0:
+            # Report the actual gap between the two windows
+            gap_s = max(b[0] - a[-1], a[0] - b[-1], 0.0)
+            print(f"  {name:25s}  [NO OVERLAP — windows separated by {gap_s*1000:.0f}ms]")
+            continue
         s = stats(d)
         s["grade"] = grade(s["mean_ms"])
         report["pairs"][name] = s
         print(" ", interpret(name, s, walk_speed))
+
+    # Odometry coverage: what fraction of the LiDAR/camera window has odometry?
+    if len(odom) and len(lidar):
+        lidar_window = lidar[-1] - lidar[0]
+        odom_overlap = min(odom[-1], lidar[-1]) - max(odom[0], lidar[0])
+        odom_coverage = max(0.0, odom_overlap) / lidar_window if lidar_window > 0 else 0.0
+        odom_start_delay = max(0.0, odom[0] - lidar[0])
+        report["odom_coverage"] = {"fraction": odom_coverage, "start_delay_s": odom_start_delay}
+        if odom_start_delay > 0.5:
+            print(f"\n  ⚠ Odometry starts {odom_start_delay:.2f}s after LiDAR — RKO-LIO init delay. "
+                  f"Coverage: {odom_coverage*100:.0f}% of scan window.")
+            print(f"    Fix: increase bag record duration or add pre-scan LIO warmup time.")
 
     print(f"\n--- Per-topic arrival jitter (scheduling noise) ---")
     for name, stamps in [("LiDAR", lidar), ("Camera", camera), ("Odom", odom), ("IMU", imu)]:

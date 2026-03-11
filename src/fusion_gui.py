@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Tkinter GUI front-end for the ATLAS system. Provides scan triggering, live system log, embedded RViz2 viewer, and session controls for stationary and continuous capture modes.
+
 import os
 import sys
 
 # X11 window embedding requires X11 — force XWayland if running under Wayland
-if os.environ.get('WAYLAND_DISPLAY'):
+_WAYLAND_DISPLAY = os.environ.get('WAYLAND_DISPLAY', '')
+if _WAYLAND_DISPLAY and not os.environ.get('_ATLAS_REEXEC'):
     os.environ['GDK_BACKEND'] = 'x11'
     os.environ['QT_QPA_PLATFORM'] = 'xcb'
+    os.environ['_ATLAS_REEXEC'] = '1'
+    os.environ['_ATLAS_WAYLAND_DISPLAY'] = _WAYLAND_DISPLAY
     os.environ.pop('WAYLAND_DISPLAY', None)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -17,6 +25,8 @@ import subprocess
 import threading
 import signal
 import time
+import logging
+import traceback
 from datetime import datetime
 import pathlib
 
@@ -34,8 +44,10 @@ class FusionCaptureGUI:
         self.fusion_process = None
         self.rviz_process = None
         self.rviz_win_id = None
+        self.web_viewer_process = None
         self.is_running = False
         self.scan_count = 0
+        self._pending_viewer_html = None
         
         # Setup GUI
         self.setup_gui()
@@ -129,8 +141,9 @@ class FusionCaptureGUI:
         notebook = ttk.Notebook(right_panel)
         notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        self.rviz_frame = tk.Frame(notebook, bg='black')
+        self.rviz_frame = tk.Frame(notebook, bg='black', width=800, height=600)
         self.rviz_frame.pack_propagate(False)
+        self.rviz_frame.grid_propagate(False)
         self.rviz_frame.update_idletasks()
         notebook.add(self.rviz_frame, text="Viewer")
 
@@ -167,7 +180,7 @@ class FusionCaptureGUI:
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.insert(tk.END, f"[{timestamp}] {message}\n")
         self.log_text.see(tk.END)
-        self.root.update_idletasks()
+        logging.info(message)
         # Badge the tab if it's not currently selected
         if self._notebook.index('current') != self._log_tab_index:
             self._notebook.tab(self._log_tab_index, text="System Log ●")
@@ -227,13 +240,56 @@ class FusionCaptureGUI:
     def _run_fusion_process(self):
         """Run the fusion process"""
         try:
-            # Prepare environment
+            # Prepare environment — ensure display vars are forwarded so
+            # web_3d_viewer.py can open a browser window from within the script
             env = os.environ.copy()
-            env['SKIP_SUDO_CHECK'] = '1'  # Skip sudo checks - permissions already set up
-            
-            # Skip sudo authentication - assume permissions are set up
-            self.log_message("Using existing camera permissions...")
-            
+            env['SKIP_SUDO_CHECK'] = '1'
+            env['ATLAS_GUI_MODE'] = '1'
+            env['DISPLAY'] = os.environ.get('DISPLAY', ':0')
+            env['XAUTHORITY'] = os.environ.get('XAUTHORITY', '')
+            env['DBUS_SESSION_BUS_ADDRESS'] = os.environ.get('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/run/user/1000/bus')
+            env['XDG_RUNTIME_DIR'] = os.environ.get('XDG_RUNTIME_DIR', '/run/user/1000')
+            wayland = os.environ.get('_ATLAS_WAYLAND_DISPLAY') or os.environ.get('WAYLAND_DISPLAY', '')
+            if wayland:
+                env['WAYLAND_DISPLAY'] = wayland
+
+            # Apply camera permissions — skip pkexec entirely if the udev rule is
+            # already installed and the device is accessible (the common case after
+            # first-time setup).  Only invoke pkexec when the rule file is missing,
+            # which means this is a fresh install and a one-time password prompt is
+            # acceptable.
+            perm_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'setup_camera_permissions.sh')
+            udev_rule = '/etc/udev/rules.d/99-insta.rules'
+            dev_accessible = os.access('/dev/insta', os.R_OK | os.W_OK) if os.path.exists('/dev/insta') else False
+            rule_installed = os.path.exists(udev_rule)
+
+            if dev_accessible:
+                self.root.after(0, lambda: self.log_message("✓ Camera permissions ready"))
+            else:
+                self.root.after(0, lambda: self.log_message("Setting up camera permissions..."))
+                perm_done = threading.Event()
+
+                def _run_perms():
+                    try:
+                        if rule_installed:
+                            # Rule exists but device not yet accessible — just trigger udev,
+                            # no password needed.
+                            result = subprocess.run(
+                                ['udevadm', 'trigger', '--subsystem-match=usb'],
+                                text=True, timeout=10)
+                            ok = result.returncode == 0
+                        else:
+                            # First-time setup: need pkexec to install the udev rule.
+                            result = subprocess.run(['pkexec', 'bash', perm_script], text=True, timeout=120)
+                            ok = result.returncode == 0
+                    except Exception:
+                        ok = False
+                    msg = "✓ Camera permissions set" if ok else "⚠ Camera permissions failed — check polkit/pkexec"
+                    self.root.after(0, lambda m=msg: self.log_message(m))
+                    perm_done.set()
+
+                threading.Thread(target=_run_perms, daemon=True).start()
+
             # Start the fusion script
             cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
                    '--camera', self.camera_mode_var.get(),
@@ -255,29 +311,45 @@ class FusionCaptureGUI:
             self.is_running = True
             
             # Read output in real-time
-            while self.fusion_process and self.fusion_process.poll() is None and self.is_running:
+            while self.fusion_process and self.is_running:
                 try:
                     line = self.fusion_process.stdout.readline()
-                    if line:
-                        line = line.strip()
-                        self.log_message(line)
-                        
-                        # Check for system ready status
-                        if "FUSION CAPTURE READY" in line:
-                            self.root.after(0, self._system_ready)
-                        elif "Press ENTER to capture" in line:
-                            self.root.after(0, self._system_ready)
-                        elif "Scan" in line and "completed" in line:
-                            self.root.after(0, self._scan_completed)
-                        elif "✓ Scan saved to:" in line:
-                            self.root.after(0, self._scan_completed)
-                        elif "Scan capture complete" in line:
-                            self.root.after(0, self._scan_completed)
-                        elif any(err in line for err in (
-                            "✗ Camera failed", "✗ LiDAR", "Failed to start",
-                            "failed to start", "exit 1", "not found at /dev/insta"
-                        )):
-                            self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
+                    if line == '':  # EOF
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    self.root.after(0, lambda l=line: self.log_message(l))
+                    if not getattr(self, '_session_log_attached', False):
+                        import re
+                        m = re.search(r'synchronized_scans/(sync_fusion_[\w]+)', line)
+                        if m:
+                            session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
+                            try:
+                                _add_session_log_handler(str(session_dir.resolve()))
+                                self._session_log_attached = True
+                            except Exception:
+                                pass
+                    if "FUSION CAPTURE READY" in line:
+                        self.root.after(0, self._system_ready)
+                    elif "Press ENTER to capture" in line:
+                        self.root.after(0, self._system_ready)
+                    elif "Scan" in line and "completed" in line:
+                        self.root.after(0, self._scan_completed)
+                    elif "✓ Scan saved to:" in line:
+                        self.root.after(0, self._scan_completed)
+                    elif "Scan capture complete" in line:
+                        self.root.after(0, self._scan_completed)
+                    elif "_viewer.html" in line or ("3D viewer" in line and ".html" in line):
+                        import re
+                        m = re.search(r'(/[^\s]+_viewer\.html)', line)
+                        if m:
+                            self._pending_viewer_html = m.group(1)
+                    elif any(err in line for err in (
+                        "✗ Camera failed", "✗ LiDAR", "Failed to start",
+                        "failed to start", "exit 1", "not found at /dev/insta"
+                    )):
+                        self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
                 except Exception as e:
                     self.root.after(0, lambda: self.log_message(f"Error reading output: {e}"))
                     break
@@ -289,18 +361,20 @@ class FusionCaptureGUI:
                     if remaining:
                         for line in remaining.splitlines():
                             line = line.strip()
-                            if line:
-                                self.root.after(0, lambda l=line: self.log_message(l))
+                            if not line:
+                                continue
+                            self.root.after(0, lambda l=line: self.log_message(l))
                 except Exception:
                     pass
 
-            # Surface any error and reset buttons
+            # Surface any error and reset buttons — only if stop_fusion hasn't
+            # already scheduled _system_stopped via its own _wait_for_finish thread.
             if self.is_running:
                 exit_code = self.fusion_process.poll() if self.fusion_process else -1
                 if exit_code not in (None, 0):
                     self.root.after(0, lambda c=exit_code: self.update_status(
                         f"Script exited with error (code {c}) — check log", "red"))
-                self.root.after(0, self._system_stopped)
+                self.root.after(500, self._system_stopped)
                         
         except Exception as ex:
             error_msg = f"Error starting fusion: {ex}"
@@ -308,66 +382,215 @@ class FusionCaptureGUI:
             self.fusion_process = None
             self.root.after(0, self._system_stopped)
             
+    def embed_web_viewer(self, html_path):
+        """Render the point cloud directly in the Viewer tab using Open3D offscreen renderer."""
+        if self.web_viewer_process:
+            self.web_viewer_process.set()  # stop previous viewer if any
+            self.web_viewer_process = None
+
+        ply_path = html_path.replace('_viewer.html', '.ply')
+        if not os.path.exists(ply_path):
+            self.log_message(f'⚠ PLY file not found: {ply_path}')
+            return
+
+        self._notebook.select(0)
+        self.root.update_idletasks()
+
+        # Clear the frame and embed the canvas viewer directly
+        for child in self.rviz_frame.winfo_children():
+            child.destroy()
+
+        try:
+            from post_processing.web_viewer_embed import embed_viewer
+        except ImportError:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                'web_viewer_embed',
+                str(self.script_dir / 'post_processing' / 'web_viewer_embed.py')
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            embed_viewer = mod.embed_viewer
+
+        self.web_viewer_process = embed_viewer(self.rviz_frame, ply_path)
+        self.log_message('✓ 3D viewer loaded in panel')
+        self.update_status('Session complete — 3D viewer ready', 'blue')
+
     def _is_continuous_mode(self):
         return self.capture_mode_var.get() == 'continuous'
 
     def embed_rviz(self):
         """Watch for the RViz2 window launched by the fusion script and embed it"""
-        self.rviz_process = True  # sentinel so _system_ready doesn't call us twice
-        threading.Thread(target=self._reparent_rviz, daemon=True).start()
+        self.rviz_process = True  # sentinel — set immediately to prevent double-call
+        self._rviz_search_start = time.monotonic()
+        self._notebook.select(0)
 
-    def _reparent_rviz(self):
-        """Poll for the RViz2 main window then reparent it into rviz_frame"""
-        frame_id = self.rviz_frame.winfo_id()
-        rviz_win_id = None
+        def _start_when_ready(attempts=0):
+            self.root.update_idletasks()
+            frame_id = self.rviz_frame.winfo_id()
+            if frame_id == 0 and attempts < 15:
+                self.root.after(100, lambda: _start_when_ready(attempts + 1))
+                return
+            threading.Thread(target=self._reparent_rviz, args=(frame_id,), daemon=True).start()
 
-        for _ in range(40):
-            time.sleep(0.5)
-            result = subprocess.run(['xdotool', 'search', '--name', 'RViz'],
+        _start_when_ready()
+
+    def _x11_embed(self, embed_wid_int, frame_id_int, w, h):
+        """Reparent embed_wid into frame_id using xdotool + Xlib."""
+        import tempfile, os as _os
+        # Unmap from WM first to avoid SIGSEGV on XReparentWindow
+        subprocess.run(['xdotool', 'windowunmap', '--sync', str(embed_wid_int)],
+                       capture_output=True, timeout=5)
+        code = f"""import ctypes, ctypes.util, sys
+lib = ctypes.CDLL(ctypes.util.find_library('X11'))
+vp = ctypes.c_void_p
+lib.XOpenDisplay.restype = vp; lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+lib.XCloseDisplay.argtypes = [vp]
+lib.XSync.argtypes = [vp, ctypes.c_int]
+lib.XReparentWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+lib.XResizeWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
+lib.XMapWindow.argtypes = [vp, ctypes.c_ulong]
+lib.XMoveWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+lib.XSetErrorHandler.restype = vp
+ok = [True]
+CB = ctypes.CFUNCTYPE(ctypes.c_int, vp, vp)
+cb = CB(lambda d, e: (ok.__setitem__(0, False), 0)[1])
+lib.XSetErrorHandler(cb)
+d = lib.XOpenDisplay(None)
+if not d: sys.exit(2)
+lib.XReparentWindow(d, {embed_wid_int}, {frame_id_int}, 0, 0)
+lib.XMoveWindow(d, {embed_wid_int}, 0, 0)
+lib.XResizeWindow(d, {embed_wid_int}, {w}, {h})
+lib.XMapWindow(d, {embed_wid_int})
+lib.XSync(d, False)
+lib.XCloseDisplay(d)
+print('ok' if ok[0] else 'x11err', flush=True)
+sys.exit(0 if ok[0] else 4)
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(code)
+            tmp = f.name
+        try:
+            env = _os.environ.copy()
+            env.setdefault('DISPLAY', ':0')
+            result = subprocess.run([sys.executable, tmp], env=env,
+                                    capture_output=True, timeout=10)
+            if result.returncode != 0:
+                self.root.after(0, lambda rc=result.returncode, out=result.stdout.strip():
+                    self.log_message(f"[embed] subprocess rc={rc} stdout={out}"))
+            return result.returncode == 0
+        finally:
+            _os.unlink(tmp)
+
+    def _x11_resize(self, wid_int, w, h):
+        script = (
+            "import ctypes, ctypes.util\n"
+            "lib=ctypes.CDLL(ctypes.util.find_library('X11'));vp=ctypes.c_void_p\n"
+            "lib.XOpenDisplay.restype=vp;lib.XOpenDisplay.argtypes=[ctypes.c_char_p]\n"
+            "lib.XCloseDisplay.argtypes=[vp];lib.XFlush.argtypes=[vp]\n"
+            "lib.XResizeWindow.argtypes=[vp,ctypes.c_ulong,ctypes.c_uint,ctypes.c_uint]\n"
+            f"d=lib.XOpenDisplay(None)\n"
+            "if not d: import sys;sys.exit(1)\n"
+            f"lib.XResizeWindow(d,{wid_int},{w},{h})\n"
+            "lib.XFlush(d);lib.XCloseDisplay(d)\n"
+        )
+        env = os.environ.copy()
+        env.setdefault('DISPLAY', ':0')
+        subprocess.Popen([sys.executable, '-c', script], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _reparent_rviz(self, frame_id):
+        """Poll for the RViz2 main window then reparent its Qt child into rviz_frame"""
+        import ctypes
+        outer_win_id = None
+
+        known_stale = getattr(self, '_stale_rviz_wids', set())
+        search_start_wall = time.time() - (time.monotonic() - self._rviz_search_start)
+
+        # Cache btime once — it never changes between polls
+        try:
+            btime = int(open('/proc/stat').read().split('btime')[1].split()[0])
+            clk_tck = ctypes.CDLL(None).sysconf(2)  # _SC_CLK_TCK = 2
+        except Exception:
+            btime, clk_tck = None, None
+
+        # Poll with a fast initial rate, backing off after the first 10 attempts
+        for attempt in range(120):
+            time.sleep(0.3 if attempt < 10 else 1.0)
+            result = subprocess.run(['xdotool', 'search', '--classname', 'rviz2'],
                                     capture_output=True, text=True)
+            candidates = []
             for wid in result.stdout.strip().split():
+                if wid in known_stale:
+                    continue
                 name = subprocess.run(['xdotool', 'getwindowname', wid],
                                       capture_output=True, text=True).stdout.strip()
-                if name.endswith('- RViz'):
-                    rviz_win_id = wid
-                    break
-            if rviz_win_id:
+                if not name.endswith('- RViz'):
+                    continue
+                # Only accept windows whose owning PID started after this session
+                pid_out = subprocess.run(['xdotool', 'getwindowpid', wid],
+                                         capture_output=True, text=True).stdout.strip()
+                if not pid_out.isdigit():
+                    continue
+                if btime is not None and clk_tck:
+                    try:
+                        with open(f'/proc/{pid_out}/stat') as f:
+                            fields = f.read().split(')')
+                            start_ticks = int(fields[-1].split()[19])
+                            pid_start_wall = btime + start_ticks / clk_tck
+                            if pid_start_wall < search_start_wall - 5:
+                                continue  # process predates this session
+                    except Exception:
+                        continue
+                candidates.append(wid)
+            if candidates:
+                outer_win_id = candidates[-1]
                 break
 
-        if not rviz_win_id:
+        if not outer_win_id:
             self.root.after(0, lambda: self.log_message("⚠ Could not find RViz2 window to embed"))
             return
 
-        w = str(self.rviz_frame.winfo_width())
-        h = str(self.rviz_frame.winfo_height())
+        # Brief settle time — reduced from 1.0s; RViz just needs to finish mapping
+        time.sleep(0.2)
 
-        # Unmap first so the WM doesn't fight us
-        subprocess.run(['xdotool', 'windowunmap', '--sync', rviz_win_id])
+        self.root.after(0, lambda: self.log_message(
+            f"[embed] outer={outer_win_id} frame_id={frame_id}"))
 
-        # Set override-redirect so the window manager stops managing this window
-        # entirely — this is what makes it move with the parent
-        subprocess.run(['xdotool', 'set_window', '--overrideredirect', '1', rviz_win_id])
+        self.rviz_win_id = outer_win_id
+        self.rviz_outer_win_id = outer_win_id
+        self._resize_after_id = None
+        self._rviz_last_size = (0, 0)
 
-        # Strip decorations
-        subprocess.run(['xprop', '-id', rviz_win_id, '-f', '_MOTIF_WM_HINTS', '32c',
-                        '-set', '_MOTIF_WM_HINTS', '2, 0, 0, 0, 0'], capture_output=True)
+        def _initial_size(attempt=0):
+            w = self.rviz_frame.winfo_width()
+            h = self.rviz_frame.winfo_height()
+            self._rviz_last_size = (w, h)
+            self.log_message(f"[embed] frame size={w}x{h}, calling _x11_embed (attempt {attempt})")
+            ok = self._x11_embed(int(self.rviz_win_id, 0), frame_id, w, h)
+            self.log_message(f"[embed] _x11_embed returned {ok}")
+            if not ok and attempt < 5:
+                self.root.after(1000, lambda: _initial_size(attempt + 1))
+                return
+            self.rviz_frame.bind('<Configure>', self._on_rviz_frame_resize)
+            if ok:
+                self.log_message("✓ RViz2 embedded")
+            else:
+                self.log_message("⚠ RViz2 embed failed after retries")
 
-        # Reparent into our frame, anchor to top-left, size to fill
-        subprocess.run(['xdotool', 'windowreparent', rviz_win_id, str(frame_id)])
-        subprocess.run(['xdotool', 'windowmove', '--sync', rviz_win_id, '0', '0'])
-        subprocess.run(['xdotool', 'windowsize', '--sync', rviz_win_id, w, h])
-        subprocess.run(['xdotool', 'windowmap', rviz_win_id])
-
-        # Lower the frame so RViz2 renders inside it, not behind Tkinter widgets
-        self.root.after(0, self.rviz_frame.lower)
-        self.rviz_frame.bind('<Configure>', self._on_rviz_frame_resize)
-        self.root.after(0, lambda: self.log_message("✓ RViz2 embedded"))
+        self.root.after(0, _initial_size)
 
     def _on_rviz_frame_resize(self, event):
-        if self.rviz_win_id:
-            subprocess.run(['xdotool', 'windowsize', self.rviz_win_id,
-                            str(event.width), str(event.height)], capture_output=True)
-
+        if not self.rviz_win_id or event.width < 10 or event.height < 10:
+            return
+        w, h = event.width, event.height
+        if (w, h) == self._rviz_last_size:
+            return
+        self._rviz_last_size = (w, h)
+        if self._resize_after_id:
+            self.root.after_cancel(self._resize_after_id)
+        wid_int = int(self.rviz_win_id, 0)
+        self._resize_after_id = self.root.after(150, lambda: self._x11_resize(wid_int, w, h))
     def _system_ready(self):
         """Called when system is ready"""
         self.update_status("System Ready - Ready to capture scans", "green")
@@ -388,8 +611,25 @@ class FusionCaptureGUI:
             if "Scans will be saved to:" in line:
                 output_dir = line.split("Scans will be saved to:")[-1].strip()
                 self.output_dir_label.config(text=output_dir, foreground="black")
+                try:
+                    _add_session_log_handler(output_dir)
+                except Exception:
+                    pass
                 break
                 
+    def _check_disk_space(self, warn_gb=5.0):
+        """Warn if free disk space on the data partition is below warn_gb."""
+        import shutil
+        try:
+            free_gb = shutil.disk_usage(str(self.script_dir)).free / 1e9
+            if free_gb < warn_gb:
+                self.log_message(f"⚠ Low disk space: {free_gb:.1f} GB free — consider freeing space before next scan")
+                self.update_status(f"⚠ Low disk space ({free_gb:.1f} GB free)", "orange")
+                return False
+        except Exception:
+            pass
+        return True
+
     def _scan_completed(self):
         """Called when a scan is completed"""
         self.scan_count += 1
@@ -398,7 +638,8 @@ class FusionCaptureGUI:
         
         # Re-enable capture button after scan completion
         self.capture_button.config(state="normal")
-        self.update_status("System Ready - Ready to capture scans", "green")
+        if self._check_disk_space():
+            self.update_status("System Ready - Ready to capture scans", "green")
         
     def capture_scan(self):
         """Trigger a scan capture"""
@@ -451,7 +692,7 @@ class FusionCaptureGUI:
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except Exception:
                     pass
-            self.root.after(0, self._system_stopped)
+            self.root.after(500, self._system_stopped)
 
         threading.Thread(target=_wait_for_finish, daemon=True).start()
         
@@ -474,12 +715,33 @@ class FusionCaptureGUI:
     
     def _system_stopped(self):
         """Called when system is stopped"""
+        if not self.is_running and self.fusion_process is None:
+            return  # already stopped, ignore duplicate call
         self.is_running = False
         self.fusion_process = None
 
         if self.rviz_process:
+            if self.rviz_win_id:
+                self.rviz_frame.unbind('<Configure>')
+                # Close the outer WM shell; rviz2 process will be killed by ROS shutdown
+                outer = getattr(self, 'rviz_outer_win_id', None)
+                if outer:
+                    subprocess.run(['xdotool', 'windowclose', outer], capture_output=True)
+                    if not hasattr(self, '_stale_rviz_wids'):
+                        self._stale_rviz_wids = set()
+                    self._stale_rviz_wids.add(outer)
             self.rviz_process = None
             self.rviz_win_id = None
+            self.rviz_outer_win_id = None
+
+        # Do NOT terminate web_viewer_process here — let it stay embedded
+        # so the user can inspect the point cloud after the session ends.
+        self._browser_win_id = None
+
+        if self._pending_viewer_html:
+            html_path = self._pending_viewer_html
+            self._pending_viewer_html = None
+            self.root.after(500, lambda p=html_path: self.embed_web_viewer(p))
 
         self.update_status("System stopped", "red")
         self.start_button.config(state="normal")
@@ -493,10 +755,31 @@ class FusionCaptureGUI:
         if self.is_running:
             if messagebox.askokcancel("Quit", "Fusion system is running. Stop and quit?"):
                 self.stop_fusion()
-                time.sleep(1)
-                self.root.destroy()
+                self.root.after(1000, self.root.destroy)
         else:
+            if self.web_viewer_process:
+                self.web_viewer_process.set()
             self.root.destroy()
+
+def _setup_logging():
+    log_path = pathlib.Path.home() / f"atlas_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+    logging.info(f"Log file: {log_path}")
+    return log_path
+
+def _add_session_log_handler(session_dir: str):
+    dest = pathlib.Path(session_dir) / 'gui.log'
+    handler = logging.FileHandler(dest)
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logging.getLogger().addHandler(handler)
+    logging.info(f"GUI log also writing to {dest}")
 
 def main():
     import argparse
@@ -520,8 +803,11 @@ def main():
     except Exception:
         pass
 
+    log_path = _setup_logging()
+    logging.info("fusion_gui starting")
+
     root = tk.Tk()
-    
+
     # Configure style for better appearance
     style = ttk.Style()
     style.theme_use('clam')
@@ -538,6 +824,9 @@ def main():
         root.mainloop()
     except KeyboardInterrupt:
         app.stop_fusion()
+    except Exception:
+        logging.critical("Unhandled exception in mainloop:\n" + traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     main()

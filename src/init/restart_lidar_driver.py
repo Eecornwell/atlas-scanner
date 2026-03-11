@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Utility script that kills any running livox_ros_driver2 process and relaunches it, polling until /livox/lidar and /livox/imu topics are available.
+
 import subprocess
 import time
 

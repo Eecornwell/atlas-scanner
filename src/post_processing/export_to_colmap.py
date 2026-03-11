@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Exports a full scan session to COLMAP sparse reconstruction format, writing cameras.txt, images.txt, and points3D.txt from trajectory poses and colored point clouds.
 """
 Export scan session to COLMAP format.
 Creates sparse reconstruction with camera poses and colored point cloud.

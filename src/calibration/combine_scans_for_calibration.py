@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Merges multiple scan session directories into a single calibration dataset under ~/atlas_ws/output. Copies equirectangular images and sensor-frame PLY files into the flat structure expected by direct_visual_lidar_calibration.
+
 import os
 import shutil
 import json
@@ -26,21 +31,30 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         masked_raw_files = list(fusion_dir.glob("equirect_*_masked_raw.png"))
         equirect_files = list(fusion_dir.glob("equirect_*.jpg")) + list(fusion_dir.glob("equirect_*.png"))
 
-        # Always prefer raw equirect jpg — masking is handled by generate_intensity_images.py
+        # Prefer raw dual-fisheye ERP; strip masked variants
         equirect_files = [f for f in equirect_files if '_masked' not in f.name]
+        dual_raw = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
+        if dual_raw.exists():
+            equirect_files = [dual_raw]
 
-        # Single-fisheye fallback: synthesise an ERP from the saved fisheye_*.jpg
+        # Dual-fisheye fallback: synthesise ERP from dual_fisheye.jpg
         if not equirect_files:
-            fisheye_files = list(fusion_dir.glob("fisheye_*.jpg"))
-            if fisheye_files:
-                import sys as _sys
-                _sys.path.insert(0, str(Path(__file__).parent.parent / 'post_processing'))
-                from fisheye_to_erp import fisheye_jpg_to_erp
-                erp_cfg = os.path.expanduser(
-                    '~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
-                src = fisheye_files[0]
-                ts = src.stem.replace('fisheye_', '')
-                dst = fusion_dir / f'equirect_{ts}.jpg'
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).parent.parent / 'post_processing'))
+            from fisheye_to_erp import fisheye_jpg_to_erp
+            dual_src = fusion_dir / 'dual_fisheye.jpg'
+            single_files = list(fusion_dir.glob('fisheye_*.jpg'))
+            if dual_src.exists():
+                erp_cfg = os.path.expanduser('~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
+                dst = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
+                if not dst.exists():
+                    fisheye_jpg_to_erp(str(dual_src), erp_cfg, str(dst), dual=True)
+                equirect_files = [dst]
+                print(f"  Synthesised ERP from dual fisheye for {fusion_dir.name}")
+            elif single_files:
+                erp_cfg = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/config/equirectangular_single.yaml')
+                src = single_files[0]
+                dst = fusion_dir / f'equirect_{src.stem}.jpg'
                 if not dst.exists():
                     fisheye_jpg_to_erp(str(src), erp_cfg, str(dst))
                 equirect_files = [dst]
@@ -91,14 +105,19 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         print("No valid scans found!")
         return 0
     
+    # Detect actual image dimensions from first copied image
+    import cv2 as _cv2
+    first_img = _cv2.imread(f"{output_dir}/images/000000.png")
+    img_h, img_w = first_img.shape[:2] if first_img is not None else (1280, 2560)
+
     # Create metadata files
     bag_names = [f"{i:06d}" for i in range(total_count)]
-    
+
     calib_data = {
         "camera": {
             "camera_model": "equirectangular",
             "distortion_coeffs": [],
-            "intrinsics": [960.0, 480.0]
+            "intrinsics": [img_w / 2.0, img_h / 2.0]
         },
         "meta": {
             "bag_names": bag_names,
@@ -120,8 +139,8 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     # Create preprocessing metadata
     metadata = {
         "camera_model": "equirectangular",
-        "image_size": [3840, 1920],
-        "camera_intrinsics": [1220, 1220, 3840, 1920],
+        "image_size": [img_w, img_h],
+        "camera_intrinsics": [img_w / 2.0, img_h / 2.0, img_w, img_h],
         "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0],
         "image_topic": "/equirectangular/image",
         "points_topic": "/livox/lidar",
@@ -158,7 +177,7 @@ if __name__ == '__main__':
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
 
-    count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 4)
+    count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 10)
     
     if count > 1:
         print(f"\n✓ Ready for calibration with {count} images!")

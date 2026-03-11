@@ -149,7 +149,7 @@ path = '/home/orion/atlas_ws/src/insta360_ros_driver/src/main.cpp'
 content = open(path).read()
 patch = '''
         node_->declare_parameter("shutter_speed", 1.0 / 120.0);
-        node_->declare_parameter("iso", 800);
+        node_->declare_parameter("iso", 400);
         double shutter = node_->get_parameter("shutter_speed").as_double();
         int iso = node_->get_parameter("iso").as_int();
         if (shutter > 0.0) {
@@ -178,7 +178,7 @@ else:
 PYEOF
 
 # Add shutter_speed and iso args to bringup.launch.xml
-sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="800"/>|' \
+sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="400"/>|' \
     ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
 sed -i 's|exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>|exec="insta360_ros_driver" name="insta360_ros_driver" output="log">\n        <param name="shutter_speed" value="$(var shutter_speed)"/>\n        <param name="iso" value="$(var iso)"/>\n    </node>|' \
     ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml

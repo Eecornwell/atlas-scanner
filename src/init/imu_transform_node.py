@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: ROS2 node that re-publishes IMU data with its frame_id remapped to the Livox frame. Used when an external IMU is substituted for the built-in Livox IMU.
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu

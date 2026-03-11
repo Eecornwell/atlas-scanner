@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Alternative coloring pipeline that applies T_camera_lidar directly as a rotation matrix rather than decomposing to Euler angles, avoiding gimbal-lock edge cases.
 """
 Corrected sensor fusion that properly applies T_camera_lidar transformation.
 
@@ -14,21 +19,28 @@ import yaml
 from scipy.spatial.transform import Rotation as R
 
 def load_points(ply_file):
-    points = []
-    with open(ply_file, 'r') as f:
-        lines = f.readlines()
-    
-    header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
-    
-    for line in lines[header_end:]:
-        parts = line.strip().split()
-        if len(parts) >= 3:
-            try:
-                points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-            except ValueError:
-                continue
-    
-    return np.array(points)
+    with open(ply_file, 'rb') as f:
+        header_lines = []
+        while True:
+            line = f.readline()
+            header_lines.append(line.decode('ascii'))
+            if line.strip() == b'end_header':
+                break
+        header = ''.join(header_lines)
+        binary = 'binary_little_endian' in header
+        n_verts = int(next(l.split()[-1] for l in header_lines if l.startswith('element vertex')))
+        fields = [l.split()[-1] for l in header_lines if l.startswith('property float')]
+        if binary:
+            data = np.frombuffer(f.read(n_verts * len(fields) * 4), dtype=np.float32).reshape(n_verts, len(fields))
+            return data[:, :3]
+        else:
+            pts = []
+            for line in f.read().decode('ascii').splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    try: pts.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                    except ValueError: continue
+            return np.array(pts)
 
 def corrected_fusion(scan_dir):
     # Find files

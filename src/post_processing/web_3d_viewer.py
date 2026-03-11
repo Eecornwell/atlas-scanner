@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Generates a self-contained HTML file with an embedded Three.js point cloud viewer for a given PLY file and optionally opens it in the system browser.
 import open3d as o3d
 import webbrowser
 import os
@@ -110,39 +115,38 @@ def create_web_viewer(ply_file):
         # Try multiple methods to open browser
         html_path = os.path.abspath(html_file)
         file_url = f'file://{html_path}'
-        
-        # Method 1: Use webbrowser module
-        try:
-            webbrowser.open(file_url)
-            print(f"✓ 3D viewer opened in browser with {len(pcd.points)} points")
+
+        # Propagate display/session env vars so snap-confined browsers can open windows
+        display_env = os.environ.copy()
+        display_env.setdefault('DISPLAY', ':0')
+        display_env.setdefault('XDG_RUNTIME_DIR', '/run/user/1000')
+        wayland = os.environ.get('_ATLAS_WAYLAND_DISPLAY') or os.environ.get('WAYLAND_DISPLAY', '')
+        if wayland:
+            display_env['WAYLAND_DISPLAY'] = wayland
+
+        # In GUI mode the panel embeds the viewer directly — skip opening a browser
+        if os.environ.get('ATLAS_GUI_MODE'):
+            print(f"✓ 3D viewer ready: {html_path}")
             return True
-        except:
-            pass
-        
-        # Method 2: Try xdg-open (Linux)
-        try:
-            subprocess.run(['xdg-open', html_path], check=True)
-            print(f"✓ 3D viewer opened in browser with {len(pcd.points)} points")
-            return True
-        except:
-            pass
-        
-        # Method 3: Try firefox directly
-        try:
-            subprocess.run(['firefox', html_path], check=True)
-            print(f"✓ 3D viewer opened in Firefox with {len(pcd.points)} points")
-            return True
-        except:
-            pass
-        
-        # Method 4: Try chromium
-        try:
-            subprocess.run(['chromium-browser', html_path], check=True)
-            print(f"✓ 3D viewer opened in Chromium with {len(pcd.points)} points")
-            return True
-        except:
-            pass
-        
+
+        for browser, args_fn in [
+            ('firefox',          lambda u: ['firefox', '--new-window', u]),
+            ('chromium-browser', lambda u: ['chromium-browser', '--new-window', u]),
+            ('chromium',         lambda u: ['chromium', '--new-window', u]),
+            ('google-chrome',    lambda u: ['google-chrome', '--new-window', u]),
+            ('xdg-open',         lambda u: ['xdg-open', u]),
+        ]:
+            try:
+                subprocess.Popen(args_fn(file_url),
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 env=display_env,
+                                 preexec_fn=os.setpgrp)
+                print(f"✓ 3D viewer opened in browser with {len(pcd.points)} points: {html_path}")
+                return True
+            except FileNotFoundError:
+                continue
+
         print(f"HTML viewer created at: {html_path}")
         print("Please open this file manually in your browser")
         return False

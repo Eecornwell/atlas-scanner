@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Converts a PLY point cloud to the E57 format using pye57 and Open3D. Preserves color data when present.
 import sys
 import numpy as np
 

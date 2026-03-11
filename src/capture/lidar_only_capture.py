@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Minimal ROS2 node that captures a single LiDAR frame and its closest odometry pose and saves them as a PLY file. Used when no camera is available.
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2

@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Patches the direct_visual_lidar_calibration CMakeLists.txt to fix build compatibility issues with ROS2 Humble.
 # Fix direct_visual_lidar_calibration CMakeLists.txt for ROS2 Humble
 
 cd ~/atlas_ws/src/direct_visual_lidar_calibration

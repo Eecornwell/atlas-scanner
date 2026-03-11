@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: One-shot script that prints the translation and rotation values from a completed calib.json result. Used for manual inspection of calibration output.
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation as R

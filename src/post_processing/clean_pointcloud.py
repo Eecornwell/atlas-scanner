@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Applies statistical outlier removal and voxel downsampling to a merged colored PLY to reduce noise and file size before export.
 """
 Clean a merged colored PLY point cloud.
 

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Projects LiDAR points into each scan's camera frame and renders per-pixel depth maps as 16-bit PNG files alongside the session images.
 """Export depth maps from lidar for each camera view"""
 import numpy as np
 import cv2

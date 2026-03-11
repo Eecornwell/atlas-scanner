@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Smooths the visible seam lines in a dual-fisheye equirectangular image by blending pixel columns on either side of each seam position.
 import cv2
 import numpy as np
 import sys

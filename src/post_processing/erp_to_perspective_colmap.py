@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Converts equirectangular session images to six perspective cubemap faces and exports them with COLMAP-compatible camera models and poses for use in photogrammetry pipelines.
 """
 Convert equirectangular images to perspective projections for COLMAP.
 Uses OpenCV and COLMAP CLI with camera mask support.

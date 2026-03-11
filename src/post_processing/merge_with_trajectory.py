@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Merges colored sensor-frame point clouds from all scans in a session into a single world-frame PLY by applying each scan's trajectory pose.
 """
 Merge colored point clouds using trajectory poses.
 
@@ -238,12 +243,17 @@ def merge_scans_with_trajectory(session_dir):
             points_transformed = points
         else:
             T = pose_matrices[scan_dir.name]
-            # Full relative transform: T1_inv @ TN rotates and translates sensor-frame
-            # points into the first scan's coordinate frame.
-            T_rel = np.linalg.inv(T_first) @ T
-            T_rel[2, 3] = 0.0  # zero Z: terrestrial scanner moves on flat ground
-            pts_h = np.hstack([points, np.ones((len(points), 1))])
-            points_transformed = (T_rel @ pts_h.T).T[:, :3]
+            # If world_lidar.ply exists the points are already motion-compensated in
+            # absolute world frame — just apply the relative translation to the first
+            # scan's origin so all scans share the same reference frame.
+            world_ply_exists = (scan_dir / "world_lidar.ply").exists() and colored_ply.name.startswith("world_")
+            if world_ply_exists:
+                t_rel = T[:3, 3] - t_ref
+                points_transformed = points + t_rel
+            else:
+                T_rel = np.linalg.inv(T_first) @ T
+                pts_h = np.hstack([points, np.ones((len(points), 1))])
+                points_transformed = (T_rel @ pts_h.T).T[:, :3]
             t_rel = T[:3, 3] - t_ref
             print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t_rel[0]:.3f},{t_rel[1]:.3f},{t_rel[2]:.3f}]")
 

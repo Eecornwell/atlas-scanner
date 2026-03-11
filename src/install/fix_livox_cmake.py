@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Patches livox_ros_driver2 CMakeLists.txt to conditionally exclude LIVOX_INTERFACES_INCLUDE_DIRECTORIES on ROS2 Humble where it causes build failures.
 """
 Fix livox_ros_driver2 CMakeLists.txt for ROS2 Humble compatibility.
 This script modifies the target_include_directories section to conditionally

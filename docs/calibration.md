@@ -9,9 +9,9 @@
     ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
     ```
 
-## Dual Fisheye to Equirectangular Calibration
-> *Note: If you plan to only use one fisheye camera, skip this step. Using dual cameras will increase coverage, but will also tax the system. Also calibrating the two fisheye cameras together can sometimes be tricky due to blind spots being introduced.*
-- This calibration will transform the dual fisheye lens into equirectangular frames
+## Fisheye to Equirectangular Calibration
+> *Note: This step is required for both `single_fisheye` and `dual_fisheye` modes. Both modes use the equirectangular pipeline for ERP projection and point cloud coloring. Using dual cameras will increase coverage, but will also tax the system. Calibrating the two fisheye cameras together can sometimes be tricky due to blind spots being introduced.*
+- This calibration will transform the fisheye lens(es) into equirectangular frames
 - Equirectangular calibration file location
     - `~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml`
     - Use these as starting parameters
@@ -23,12 +23,12 @@
         ros__parameters:
             cx_offset: 0.0
             cy_offset: 0.0
-            crop_size: 960
+            crop_size: 1280
             translation: [-0.007, 0.007, -0.153]
             rotation_deg: [0.7, -3.0, 1.5]
             gpu: false
-            out_width: 1920
-            out_height: 960
+            out_width: 2560
+            out_height: 1280
         ==================================================
         ```
 
@@ -92,7 +92,7 @@
     2. Create a mask image for your setup
         * The mask defines which parts of the equirectangular image to use for coloring (white = use, black = ignore)
         * This will help with calibration so the algorithm doesn't get false positive features to use
-        * You can use the image cloned from this repo at `~/atlas_ws/src/atlas-scanner/src/lidar_mask.png`, but the mask won't match your exact setup so quality might be affected. It is advised to use the manual method below
+        * You can use the image cloned from this repo at `~/atlas_ws/src/atlas-scanner/src/lidar_mask_{single/dual}.png`, but the mask won't match your exact setup so quality might be affected. It is advised to use the manual method below
             * Use existing ERP image took above, edit inside an image editor program. The path to the image will be similar to `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/fusion_scan_001/equirect_{TIMESTAMP}.jpg`
             * Create a black/white PNG where white = use, black = ignore. We want to ignore the scanner and tripod in the spherical images. Also take note that the lidar only sees most of the top view camera and a small portion of the bottom view camera. This means that most of the bottom camera data will be discarded once the image to point cloud projection occurs
             * Recommended size: 1920x960 (matching equirectangular output)
@@ -132,7 +132,6 @@
         - Auto
             - Recommended for research projects, quick but can struggle in some configurations
             ```bash
-            for f in ~/atlas_ws/output/*.ply; do sed -i 's/\\n/\n/g' "$f"; done
             python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py ~/atlas_ws/output
             cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
             python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor

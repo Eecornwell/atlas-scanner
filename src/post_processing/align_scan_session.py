@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Aligns all colored point clouds in a session using FPFH-initialised RANSAC followed by multi-scale point-to-plane ICP, producing a single merged world-frame PLY.
 """
 Geometry-based point cloud alignment with RANSAC + Multi-scale ICP.
 

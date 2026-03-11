@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Orchestrates per-scan point cloud coloring: converts the captured fisheye image to ERP and then calls exact_match_fusion to project and color the sensor-frame PLY.
 """
 Color point clouds using fisheye images.
 Converts dual-fisheye to ERP first, then uses the calibrated ERP coloring pipeline.

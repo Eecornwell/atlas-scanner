@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Deprecated post-processing entry point. Retained for reference only; post-processing is now handled directly by atlas_fusion_capture.sh.
 # DEPRECATED: This script is not currently used (ENABLE_POST_PROCESSING=false by default)
 # It has dependencies on external scripts that need to be migrated
 

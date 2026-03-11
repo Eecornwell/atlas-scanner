@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Post-processes SuperGlue keypoint match files by rescaling coordinates and filtering geometrically inconsistent matches with RANSAC on the fundamental matrix.
 """Scale kpts from half-res SuperGlue output back to full-res indices image coordinates,
 and filter geometrically inconsistent matches using RANSAC on the fundamental matrix."""
 import json

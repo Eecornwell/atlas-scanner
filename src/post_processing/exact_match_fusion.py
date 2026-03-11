@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Colors a sensor-frame PLY by projecting points into the equirectangular image using the exact same bearing-vector projection convention as direct_visual_lidar_calibration.
 """
 Sensor fusion that EXACTLY matches direct_visual_lidar_calibration projection.
 
@@ -18,20 +23,29 @@ import yaml
 from scipy.spatial.transform import Rotation as R
 
 def load_points(ply_file):
-    with open(ply_file, 'r') as f:
-        raw = f.read()
-    lines = raw.split(r'\n') if ('\n' not in raw and r'\n' in raw) else raw.splitlines()
-
-    header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
-    points = []
-    for line in lines[header_end:]:
-        parts = line.strip().split()
-        if len(parts) >= 3:
-            try:
-                points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-            except ValueError:
-                continue
-    return np.array(points)
+    with open(ply_file, 'rb') as f:
+        header_bytes = b''
+        while True:
+            line = f.readline()
+            header_bytes += line
+            if line.strip() == b'end_header':
+                break
+        header = header_bytes.decode('ascii')
+        binary = 'binary_little_endian' in header
+        n_verts = int(next(l.split()[-1] for l in header.splitlines() if l.startswith('element vertex')))
+        fields = [l.split()[-1] for l in header.splitlines() if l.startswith('property float')]
+        if binary:
+            data = np.frombuffer(f.read(n_verts * len(fields) * 4), dtype=np.float32).reshape(n_verts, len(fields))
+            return data[:, :3]
+        else:
+            lines = f.read().decode('ascii').splitlines()
+            pts = []
+            for line in lines:
+                parts = line.strip().split()
+                if len(parts) >= 3:
+                    try: pts.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                    except ValueError: continue
+            return np.array(pts)
 
 def exact_match_calibration_tool(scan_dir):
     # Find files
@@ -70,6 +84,9 @@ def exact_match_calibration_tool(scan_dir):
         return False
     
     points = load_points(sensor_ply)
+    if points.ndim < 2 or len(points) == 0:
+        print("Empty point cloud, skipping")
+        return False
     img_height, img_width = image.shape[:2]
     
     # Load calibration

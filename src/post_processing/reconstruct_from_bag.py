@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Reconstructs a full scan session from a recorded rosbag by grouping LiDAR frames into time-windowed scans and matching each to the closest camera frame and odometry pose.
 """
 Reconstruct scan sessions from a rosbag using ROS header timestamps.
 
@@ -149,10 +154,10 @@ def pose_to_matrix(odom_msg):
     return T
 
 
-def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
-    """Interpolate odometry at capture_stamp and write trajectory.json."""
+def interp_pose(all_odom, target_stamp):
+    """Return (t_interp, q_interp) interpolated at target_stamp."""
     times = np.array([ts for ts, _ in all_odom])
-    idx = np.searchsorted(times, capture_stamp)
+    idx = np.searchsorted(times, target_stamp)
 
     if idx == 0 or idx >= len(all_odom):
         _, odom_msg = all_odom[max(0, idx - 1)]
@@ -160,21 +165,26 @@ def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
         ori = odom_msg.pose.pose.orientation
         q = np.array([ori.x, ori.y, ori.z, ori.w])
         q /= np.linalg.norm(q)
-        t_interp = np.array([pos.x, pos.y, pos.z])
-        q_interp = q
-    else:
-        ts0, om0 = all_odom[idx - 1]
-        ts1, om1 = all_odom[idx]
-        alpha = (capture_stamp - ts0) / (ts1 - ts0) if ts1 != ts0 else 0.0
+        return np.array([pos.x, pos.y, pos.z]), q
 
-        p0, p1 = om0.pose.pose.position, om1.pose.pose.position
-        t_interp = np.array([p0.x, p0.y, p0.z]) + alpha * (
-            np.array([p1.x, p1.y, p1.z]) - np.array([p0.x, p0.y, p0.z]))
+    ts0, om0 = all_odom[idx - 1]
+    ts1, om1 = all_odom[idx]
+    alpha = (target_stamp - ts0) / (ts1 - ts0) if ts1 != ts0 else 0.0
 
-        o0, o1 = om0.pose.pose.orientation, om1.pose.pose.orientation
-        q0 = np.array([o0.x, o0.y, o0.z, o0.w]); q0 /= np.linalg.norm(q0)
-        q1 = np.array([o1.x, o1.y, o1.z, o1.w]); q1 /= np.linalg.norm(q1)
-        q_interp = Slerp([0.0, 1.0], Rotation.from_quat([q0, q1]))(alpha).as_quat()
+    p0, p1 = om0.pose.pose.position, om1.pose.pose.position
+    t_interp = np.array([p0.x, p0.y, p0.z]) + alpha * (
+        np.array([p1.x, p1.y, p1.z]) - np.array([p0.x, p0.y, p0.z]))
+
+    o0, o1 = om0.pose.pose.orientation, om1.pose.pose.orientation
+    q0 = np.array([o0.x, o0.y, o0.z, o0.w]); q0 /= np.linalg.norm(q0)
+    q1 = np.array([o1.x, o1.y, o1.z, o1.w]); q1 /= np.linalg.norm(q1)
+    q_interp = Slerp([0.0, 1.0], Rotation.from_quat([q0, q1]))(alpha).as_quat()
+    return t_interp, q_interp
+
+
+def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
+    """Interpolate odometry at capture_stamp and write trajectory.json."""
+    t_interp, q_interp = interp_pose(all_odom, capture_stamp)
 
     lidar_pose = {
         "position": {"x": float(t_interp[0]), "y": float(t_interp[1]), "z": float(t_interp[2])},
@@ -292,14 +302,150 @@ def extract_back_fisheye(dual_img):
 
 
 # ---------------------------------------------------------------------------
+# Stationary mode: one bag per scan already in fusion_scan_* dirs
+# ---------------------------------------------------------------------------
+
+def _reconstruct_stationary(session_path, per_scan_bags, camera_mode):
+    """Re-process per-scan bags that were recorded in stationary mode.
+    Each bag already corresponds to one scan; we just extract the image,
+    LiDAR, and odometry and run colorization."""
+    pp = Path(__file__).resolve().parent
+    scan_count = 0
+
+    for bag_dir in per_scan_bags:
+        scan_dir = bag_dir.parent
+        scan_name = scan_dir.name
+        print(f"\nProcessing {scan_name} from {bag_dir.name}...")
+
+        try:
+            con = open_db3(bag_dir)
+        except Exception as e:
+            print(f"  ✗ Could not open bag: {e}")
+            continue
+
+        topics = topic_map(con)
+        print("  Topics:", ", ".join(n for _, (n, _) in topics.items()))
+
+        lidar_msgs, _ = read_topic(con, topics, "/livox/lidar")
+        image_msgs_raw, _ = read_topic(con, topics, "fisheye")
+        odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
+        con.close()
+
+        if not lidar_msgs:
+            print(f"  ✗ No LiDAR messages, skipping")
+            continue
+
+        # --- LiDAR: accumulate all points from the bag ---
+        all_points = []
+        for _, msg in lidar_msgs:
+            all_points.extend(unpack_lidar(msg))
+
+        if not all_points:
+            print(f"  ✗ Zero valid points, skipping")
+            continue
+
+        # Only write PLY if not already present from live capture
+        sensor_ply = scan_dir / "sensor_lidar.ply"
+        if not sensor_ply.exists():
+            save_ply(str(sensor_ply), all_points)
+            print(f"  Saved sensor_lidar.ply ({len(all_points)} pts)")
+        else:
+            print(f"  sensor_lidar.ply already exists, skipping")
+
+        centre = lidar_msgs[len(lidar_msgs) // 2][0]  # mid-bag timestamp
+        ts_str = datetime.fromtimestamp(centre).strftime("%Y%m%d_%H%M%S")
+
+        # --- Camera: decode middle frame ---
+        if image_msgs_raw:
+            is_h264 = 'h264' in getattr(image_msgs_raw[0][1], 'format', '').lower()
+            img_out = scan_dir / f"fisheye_{ts_str}.jpg"
+            if not any(scan_dir.glob("fisheye_*.jpg")):
+                if is_h264:
+                    img_h, img_w = _h264_frame_size(image_msgs_raw)
+                    keyframes = _find_keyframes(image_msgs_raw)
+                    mid_idx = len(image_msgs_raw) // 2
+                    bgr = decode_h264_frame(image_msgs_raw, mid_idx, img_h, img_w, keyframes)
+                else:
+                    mid_idx = len(image_msgs_raw) // 2
+                    bgr = decode_jpeg_frame(image_msgs_raw[mid_idx][1])
+                if bgr is not None:
+                    out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
+                    cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    print(f"  Saved {img_out.name}")
+            else:
+                print(f"  fisheye image already exists, skipping")
+
+        # --- Odometry: write trajectory.json if not present ---
+        if odom_msgs and not (scan_dir / "trajectory.json").exists():
+            write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
+            print(f"  Saved trajectory.json")
+
+            import json as _json
+            with open(str(scan_dir / "trajectory.json")) as _f:
+                _traj = _json.load(_f)
+            _lp = _traj["current_pose"]["lidar_pose"]
+            q = np.array([_lp["orientation"][k] for k in ("x", "y", "z", "w")])
+            q /= np.linalg.norm(q)
+            R_mat = Rotation.from_quat(q).as_matrix()
+            t_vec = np.array([_lp["position"][k] for k in ("x", "y", "z")])
+            world_ply = scan_dir / "world_lidar.ply"
+            if not world_ply.exists():
+                world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
+                             for p in all_points]
+                save_ply(str(world_ply), world_pts)
+                print(f"  Saved world_lidar.ply")
+
+        scan_count += 1
+        print(f"  ✓ {scan_name} ready")
+
+    print(f"\n✓ Processed {scan_count} scans")
+
+    # --- Colorization ---
+    print("\nColorizing...")
+    if camera_mode == "dual_fisheye":
+        fisheye_to_erp = str(pp / "fisheye_to_erp.py")
+        for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+            if not scan_dir.is_dir():
+                continue
+            for fisheye_jpg in sorted(scan_dir.glob("fisheye_*.jpg")):
+                erp_path = scan_dir / "equirect_dual_fisheye.jpg"
+                if not erp_path.exists():
+                    subprocess.run(
+                        [sys.executable, fisheye_to_erp, str(fisheye_jpg), str(erp_path), "--dual"],
+                        check=False,
+                    )
+        subprocess.run(
+            [sys.executable, str(pp / "post_process_coloring.py"), str(session_path), "--use-exact"],
+            check=False,
+        )
+    else:
+        for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+            if not scan_dir.is_dir() or not list(scan_dir.glob("fisheye_*.jpg")):
+                continue
+            print(f"  Coloring {scan_dir.name}...")
+            subprocess.run(
+                [sys.executable, str(pp / "color_with_fisheye.py"), str(scan_dir)],
+                check=False,
+            )
+
+    return scan_count
+
+
+# ---------------------------------------------------------------------------
 # Main reconstruction
 # ---------------------------------------------------------------------------
 
 def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single_fisheye"):
     session_path = Path(session_dir)
 
+    # Continuous mode: single bag at session root
     bag_dirs = sorted(session_path.glob("rosbag_*"))
+
+    # Stationary mode: per-scan bags inside fusion_scan_*/rosbag_*
     if not bag_dirs:
+        per_scan_bags = sorted(session_path.glob("fusion_scan_*/rosbag_*"))
+        if per_scan_bags:
+            return _reconstruct_stationary(session_path, per_scan_bags, camera_mode)
         print("✗ No rosbag_* directory found in session")
         sys.exit(1)
 
@@ -397,21 +543,30 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
         ts_str = datetime.fromtimestamp(centre).strftime("%Y%m%d_%H%M%S")
 
-        # --- LiDAR: collect all frames within the window around camera stamp ---
+        # --- LiDAR: per-frame motion compensation within the window ---
+        # Each frame is transformed to world frame using its own interpolated pose,
+        # eliminating motion blur from accumulating frames with a single pose.
         half = lidar_window / 2.0
-        window_frames = [msg for ts, msg in lidar_msgs if abs(ts - centre) <= half]
-        if not window_frames:
+        window_lidar = [(ts, msg) for ts, msg in lidar_msgs if abs(ts - centre) <= half]
+        if not window_lidar:
             print(f"  ⚠ {scan_name}: no LiDAR frames in window, skipping")
             continue
 
-        all_points = []
+        all_points = []       # sensor-frame (for sensor_lidar.ply)
+        world_points = []     # motion-compensated world-frame (for world_lidar.ply)
         seen = set()
-        for msg in window_frames:
+        for frame_ts, msg in window_lidar:
             mid = id(msg)
             if mid in seen:
                 continue
             seen.add(mid)
-            all_points.extend(unpack_lidar(msg))
+            pts = unpack_lidar(msg)
+            all_points.extend(pts)
+            if odom_msgs:
+                t_f, q_f = interp_pose(odom_msgs, frame_ts)
+                R_f = Rotation.from_quat(q_f).as_matrix()
+                for p in pts:
+                    world_points.append((R_f @ np.array(p[:3]) + t_f).tolist() + [p[3]])
 
         if not all_points:
             print(f"  ⚠ {scan_name}: zero valid points, skipping")
@@ -445,27 +600,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     fisheye_path = str(img_out)
 
-        # --- Odometry: interpolate pose to the camera frame stamp ---
+        # --- Odometry: write trajectory.json at camera frame stamp; save motion-compensated world cloud ---
         dt_odom = float('inf')
         if odom_msgs:
             odom_stamp, odom_msg = closest(odom_msgs, centre)
             dt_odom = abs(odom_stamp - centre)
             if dt_odom < 5.0:
                 write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
-
-                # Use the interpolated pose stored in trajectory.json for world transform
-                import json as _json
-                with open(str(scan_dir / "trajectory.json")) as _f:
-                    _traj = _json.load(_f)
-                _cp = _traj["current_pose"]
-                _lp = _cp["lidar_pose"]
-                q = np.array([_lp["orientation"][k] for k in ("x", "y", "z", "w")])
-                q /= np.linalg.norm(q)
-                R_mat = Rotation.from_quat(q).as_matrix()
-                t_vec = np.array([_lp["position"][k] for k in ("x", "y", "z")])
-                world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
-                             for p in all_points]
-                save_ply(str(scan_dir / "world_lidar.ply"), world_pts)
+                if world_points:
+                    save_ply(str(scan_dir / "world_lidar.ply"), world_points)
             else:
                 print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
 

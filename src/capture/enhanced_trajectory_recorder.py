@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: ROS2 node that records odometry poses to a trajectory.json file throughout a scan session. Writes a trigger entry at each scan capture time for use in post-processing alignment.
+
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import Odometry

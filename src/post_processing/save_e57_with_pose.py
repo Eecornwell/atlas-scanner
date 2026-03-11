@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Saves a point cloud as an E57 file with embedded 6-DOF pose metadata and optional per-point color data using the pye57 library.
+
 import numpy as np
 import json
 import sys

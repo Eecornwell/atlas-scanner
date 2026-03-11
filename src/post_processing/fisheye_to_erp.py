@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Converts a saved dual-fisheye JPG to an equirectangular image offline, replicating the same projection and calibration parameters used by the live equirectangular ROS node.
 """
 Convert a saved dual-fisheye JPG to equirectangular (ERP) offline,
 using the same projection logic as equirectangular.py.
@@ -119,7 +124,7 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
         x0 = (w - crop) // 2
         fisheye = img[y0:y0+crop, x0:x0+crop]
 
-        # For single lens, only map the back hemisphere (the lens faces the LiDAR)
+        # Single fisheye is the back/LiDAR-facing lens (left half, rotated 90° CW by capture)
         _, _, _, bmx, bmy, back_mask = build_maps(cfg, crop)
         remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)

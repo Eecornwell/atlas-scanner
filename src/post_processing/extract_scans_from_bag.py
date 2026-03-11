@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Injects accurate trajectory poses from a session rosbag into existing fusion_scan_NNN directories by matching each scan's capture timestamp to the nearest odometry message.
 """
 Inject accurate trajectory poses from the session rosbag into existing
 fusion_scan_NNN/ directories created by continuous_fisheye_capture.py.
