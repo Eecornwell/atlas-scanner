@@ -121,47 +121,40 @@ def transform_points(points, position, orientation):
     return points_world
 
 def pose_matrix_from_trajectory(traj):
-    """Return 4x4 pose matrix interpolated to capture_time from full_trajectory."""
-    si = traj.get('scan_info', {})
-    target = si.get('capture_time') or si.get('scan_request_time')
-    full = traj.get('full_trajectory', [])
-
-    if target and full:
-        times = np.array([p['timestamp'] for p in full])
-        idx = np.searchsorted(times, target)
-
-        if idx == 0:
-            entry = full[0]
-        elif idx >= len(full):
-            entry = full[-1]
-        else:
-            p0, p1 = full[idx - 1], full[idx]
-            t0, t1 = times[idx - 1], times[idx]
-            alpha = (target - t0) / (t1 - t0) if t1 != t0 else 0.0
-
-            pos0 = np.array([p0['position']['x'], p0['position']['y'], p0['position']['z']])
-            pos1 = np.array([p1['position']['x'], p1['position']['y'], p1['position']['z']])
-            t_interp = pos0 + alpha * (pos1 - pos0)
-
-            q0 = [p0['orientation']['x'], p0['orientation']['y'],
-                  p0['orientation']['z'], p0['orientation']['w']]
-            q1 = [p1['orientation']['x'], p1['orientation']['y'],
-                  p1['orientation']['z'], p1['orientation']['w']]
-            r_interp = Slerp([0.0, 1.0], R.from_quat([q0, q1]))(alpha)
-
-            T = np.eye(4)
-            T[:3, :3] = r_interp.as_matrix()
-            T[:3, 3] = t_interp
-            return T
-
-        pos = entry.get('position', {})
-        ori = entry.get('orientation', {})
-    else:
-        cp = traj.get('current_pose', {})
-        entry = cp.get('lidar_pose', cp)
-        pos = entry.get('position', {})
-        ori = entry.get('orientation', {})
-
+    """Return 4x4 pose matrix from trajectory.json.
+    Prefers current_pose.lidar_pose (already interpolated at capture_time)
+    over re-interpolating full_trajectory, which avoids any timestamp mismatch."""
+    cp = traj.get('current_pose', {})
+    lp = cp.get('lidar_pose', cp)
+    pos = lp.get('position', {})
+    ori = lp.get('orientation', {})
+    if not pos or not ori or ori.get('w', 0) == 0:
+        # Fallback: interpolate from full_trajectory
+        si = traj.get('scan_info', {})
+        target = si.get('capture_time') or si.get('scan_request_time')
+        full = traj.get('full_trajectory', [])
+        if target and full:
+            times = np.array([p['timestamp'] for p in full])
+            idx = np.searchsorted(times, target)
+            if 0 < idx < len(full):
+                p0, p1 = full[idx - 1], full[idx]
+                t0, t1 = times[idx - 1], times[idx]
+                alpha = (target - t0) / (t1 - t0) if t1 != t0 else 0.0
+                pos0 = np.array([p0['position']['x'], p0['position']['y'], p0['position']['z']])
+                pos1 = np.array([p1['position']['x'], p1['position']['y'], p1['position']['z']])
+                t_interp = pos0 + alpha * (pos1 - pos0)
+                q0 = [p0['orientation']['x'], p0['orientation']['y'],
+                      p0['orientation']['z'], p0['orientation']['w']]
+                q1 = [p1['orientation']['x'], p1['orientation']['y'],
+                      p1['orientation']['z'], p1['orientation']['w']]
+                r_interp = Slerp([0.0, 1.0], R.from_quat([q0, q1]))(alpha)
+                T = np.eye(4)
+                T[:3, :3] = r_interp.as_matrix()
+                T[:3, 3] = t_interp
+                return T
+            entry = full[max(0, idx - 1)]
+            pos = entry.get('position', {})
+            ori = entry.get('orientation', {})
     T = np.eye(4)
     T[:3, :3] = R.from_quat([ori.get('x', 0), ori.get('y', 0),
                               ori.get('z', 0), ori.get('w', 1)]).as_matrix()
@@ -195,19 +188,30 @@ def merge_scans_with_trajectory(session_dir):
 
     # sensor_colored_exact.ply is always sensor-frame (world_colored_exact.ply is identical
     # despite its name — exact_match_fusion saves sensor coords under both filenames).
+    # All colored PLYs from exact_match_fusion are sensor-frame regardless of filename.
+    # Prefer sensor_colored_* names; fall back to world_colored_* (misnamed but sensor-frame).
     SENSOR_CANDIDATES = [
         "sensor_colored_exact.ply", "sensor_colored_pointcloud.ply", "sensor_colored.ply",
         "world_colored_exact.ply", "world_colored_pointcloud.ply", "world_colored.ply",
     ]
 
     # Build pose matrices for every scan first so we can compute T1_inv once.
+    # Prefer trajectory_icp_refined.json (written by align_scan_session_posegraph.py)
+    # which contains the ICP-corrected pose already in relative-to-first frame.
     pose_matrices = {}
+    icp_refined = {}
     for scan_dir in scan_dirs:
-        traj_file = scan_dir / "trajectory.json"
-        if traj_file.exists():
-            with open(traj_file) as f:
-                traj = json.load(f)
-            pose_matrices[scan_dir.name] = pose_matrix_from_trajectory(traj)
+        for fname in ("trajectory_icp_refined.json", "trajectory.json"):
+            traj_file = scan_dir / fname
+            if traj_file.exists():
+                with open(traj_file) as f:
+                    traj = json.load(f)
+                pose_matrices[scan_dir.name] = pose_matrix_from_trajectory(traj)
+                if fname == "trajectory_icp_refined.json":
+                    icp_refined[scan_dir.name] = True
+                break
+    if icp_refined:
+        print(f"  Using ICP-refined poses for {len(icp_refined)}/{len(scan_dirs)} scans")
 
     if not pose_matrices:
         print("✗ No trajectory data found in any scan - RKO-LIO was not running.")
@@ -219,6 +223,9 @@ def merge_scans_with_trajectory(session_dir):
     # correction that levels the merged cloud (yaw left at 0 to keep X forward).
     first_name = scan_dirs[0].name
     T_first = pose_matrices[first_name]
+    # ICP-refined poses are already in relative-to-first frame (T_first = identity).
+    # Raw trajectory poses are in absolute odom frame and need T_first_inv applied.
+    using_icp = bool(icp_refined)
     euler_first = R.from_matrix(T_first[:3, :3]).as_euler('xyz', degrees=True)
     print(f"  Odom tilt: roll={euler_first[0]:.2f} pitch={euler_first[1]:.2f} yaw={euler_first[2]:.2f} deg")
     t_ref = T_first[:3, 3]
@@ -243,17 +250,13 @@ def merge_scans_with_trajectory(session_dir):
             points_transformed = points
         else:
             T = pose_matrices[scan_dir.name]
-            # If world_lidar.ply exists the points are already motion-compensated in
-            # absolute world frame — just apply the relative translation to the first
-            # scan's origin so all scans share the same reference frame.
-            world_ply_exists = (scan_dir / "world_lidar.ply").exists() and colored_ply.name.startswith("world_")
-            if world_ply_exists:
-                t_rel = T[:3, 3] - t_ref
-                points_transformed = points + t_rel
+            # ICP-refined poses are already relative-to-first; raw odom poses need T_first_inv.
+            if using_icp:
+                T_rel = T
             else:
                 T_rel = np.linalg.inv(T_first) @ T
-                pts_h = np.hstack([points, np.ones((len(points), 1))])
-                points_transformed = (T_rel @ pts_h.T).T[:, :3]
+            pts_h = np.hstack([points, np.ones((len(points), 1))])
+            points_transformed = (T_rel @ pts_h.T).T[:, :3]
             t_rel = T[:3, 3] - t_ref
             print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t_rel[0]:.3f},{t_rel[1]:.3f},{t_rel[2]:.3f}]")
 

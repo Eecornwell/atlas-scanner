@@ -176,7 +176,7 @@ def register_pose_graph(session_dir):
     # Preprocess clouds — pre-transform into the reference frame using trajectory poses
     # so ICP sees overlapping geometry and only needs to find the small residual correction.
     # The pose graph edge transformation T_ij is then the small residual in reference frame.
-    voxel_size = 0.05
+    voxel_size = 0.05  # 50mm matches the good session that successfully corrected diverged poses
     pcds = []         # geometry-only, pre-transformed into reference frame
     pcds_colored = [] # colored, pre-transformed into reference frame
     for i, f in enumerate(ply_files):
@@ -288,12 +288,18 @@ def register_pose_graph(session_dir):
             with open(traj_file) as f:
                 traj = json.load(f)
             traj_refined = traj.copy()
-            traj_refined['current_pose'] = traj_refined.get('current_pose', {})
+            # Store the ICP-refined pose in current_pose.lidar_pose so
+            # pose_matrix_from_trajectory() and merge_with_trajectory.py read it correctly.
+            # T_rel is already in relative-to-first-scan frame.
+            q_refined = Rotation.from_matrix(T_rel[:3, :3]).as_quat()
+            traj_refined['current_pose'] = dict(traj_refined.get('current_pose', {}))
             traj_refined['current_pose']['lidar_pose'] = {
                 'position': {'x': float(T_rel[0, 3]), 'y': float(T_rel[1, 3]), 'z': float(T_rel[2, 3])},
-                'orientation': dict(zip(['x', 'y', 'z', 'w'],
-                    Rotation.from_matrix(T_rel[:3, :3]).as_quat().tolist()))
+                'orientation': {'x': float(q_refined[0]), 'y': float(q_refined[1]),
+                                'z': float(q_refined[2]), 'w': float(q_refined[3])}
             }
+            traj_refined['scan_info'] = dict(traj_refined.get('scan_info', {}))
+            traj_refined['scan_info']['icp_refined'] = True
             with open(scan_dir / "trajectory_icp_refined.json", 'w') as f:
                 json.dump(traj_refined, f, indent=2)
 

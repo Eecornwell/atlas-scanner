@@ -345,9 +345,12 @@ class FusionCaptureGUI:
                         m = re.search(r'(/[^\s]+_viewer\.html)', line)
                         if m:
                             self._pending_viewer_html = m.group(1)
+                    elif "Session ended with no scans captured" in line:
+                        self.root.after(0, lambda: self.update_status("No scans captured — stopped before triggering a scan", "orange"))
                     elif any(err in line for err in (
                         "✗ Camera failed", "✗ LiDAR", "Failed to start",
-                        "failed to start", "exit 1", "not found at /dev/insta"
+                        "failed to start", "exit 1", "not found at /dev/insta",
+                        "Failed to initialize sensors"
                     )):
                         self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
                 except Exception as e:

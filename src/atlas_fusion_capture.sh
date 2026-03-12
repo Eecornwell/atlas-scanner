@@ -15,7 +15,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="stationary"         # stationary | continuous
+CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -248,17 +248,15 @@ cleanup() {
 
         if [ "$RUN_SYNC_BENCHMARK" = "true" ]; then
             echo "Running sync benchmark..."
-            # In stationary mode bags live inside fusion_scan_*/rosbag_* — find the first one
-            BENCH_DIR="$SCAN_DIR"
-            if [ "$CAPTURE_MODE" = "stationary" ]; then
-                FIRST_BAG=$(ls -d "$SCAN_DIR"/fusion_scan_*/rosbag_* 2>/dev/null | head -1)
-                [ -n "$FIRST_BAG" ] && BENCH_DIR=$(dirname "$FIRST_BAG")
-            fi
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/sync_benchmark.py" \
-                "$BENCH_DIR" --out "$SCAN_DIR/sync_benchmark.json"
+                "$SCAN_DIR" --out "$SCAN_DIR/sync_benchmark.json"
         fi
     else
-        echo "Failed to initialize sensors or no scans captured. Check hardware connections."
+        if [ "$FUSION_READY" = "true" ]; then
+            echo "Session ended with no scans captured (stopped before any scan was triggered)."
+        else
+            echo "Failed to initialize sensors. Check hardware connections."
+        fi
     fi
     exit 0
 }

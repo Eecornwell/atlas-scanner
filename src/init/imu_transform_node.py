@@ -28,9 +28,10 @@ class IMUTransformNode(Node):
         self.output_frame = self.get_parameter('output_frame').value
         
         # Create subscriber and publisher
+        sensor_qos = rclpy.qos.QoSPresetProfiles.SENSOR_DATA.value
         self.imu_sub = self.create_subscription(
-            Imu, input_topic, self.imu_callback, 10)
-        self.imu_pub = self.create_publisher(Imu, output_topic, 10)
+            Imu, input_topic, self.imu_callback, sensor_qos)
+        self.imu_pub = self.create_publisher(Imu, output_topic, sensor_qos)
         
         # TF buffer and listener
         self.tf_buffer = tf2_ros.Buffer()

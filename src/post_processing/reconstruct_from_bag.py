@@ -531,6 +531,19 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         if not centres:
             centres = [((t_start + t_end) / 2.0, None)]
 
+    # Restrict centres to the odometry window so every scan gets a properly
+    # interpolated pose rather than a clamped boundary extrapolation.
+    # Frames before odom starts (RKO-LIO init delay) are silently dropped.
+    if odom_msgs:
+        odom_t0 = odom_msgs[0][0]
+        odom_t1 = odom_msgs[-1][0]
+        filtered = [(t, i) for t, i in centres if odom_t0 <= t <= odom_t1]
+        if len(filtered) < len(centres):
+            dropped = len(centres) - len(filtered)
+            print(f"  ⚠ Dropping {dropped} scan centre(s) outside odom window "
+                  f"(odom starts {odom_t0 - lidar_msgs[0][0]:.2f}s after LiDAR)")
+        centres = filtered if filtered else centres  # keep all if odom window is empty
+
     print(f"\n  Session duration: {duration:.1f}s  →  {len(centres)} scans "
           f"(camera-driven, min_gap={interval}s, lidar_window={lidar_window}s)")
 

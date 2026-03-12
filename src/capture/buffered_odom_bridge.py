@@ -30,13 +30,10 @@ class BufferedOdomBridge(Node):
         self.timer = self.create_timer(0.2, self.publish_buffered)  # 5 Hz
         
     def odom_callback(self, msg):
-        """Store latest pose and republish immediately"""
+        """Store latest pose and republish immediately, preserving original header stamp."""
         self.last_pose = copy.deepcopy(msg)
         self.last_update_time = time.time()
-        
-        # Republish immediately with current timestamp
-        msg.header.stamp = self.get_clock().now().to_msg()
-        self.odom_pub.publish(msg)
+        self.odom_pub.publish(msg)  # forward with original LIO header stamp intact
         
     def publish_buffered(self):
         """Publish last known pose if odometry has dropped out"""
