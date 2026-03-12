@@ -68,10 +68,11 @@ def exact_match_calibration_tool(scan_dir):
     
     if mask_file and os.path.exists(mask_file):
         image = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED)
-        if image.shape[2] == 4:
-            alpha_mask = image[:, :, 3] > 0
+        if image is not None and image.ndim == 3 and image.shape[2] == 4:
+            alpha_mask = image[:, :, 3] >= 128
             image = image[:, :, :3]
         else:
+            image = cv2.imread(mask_file)
             alpha_mask = None
     elif image_file and os.path.exists(image_file):
         image = cv2.imread(image_file)

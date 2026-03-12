@@ -151,6 +151,29 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - A sync benchmark report (sync_benchmark.json) is automatically generated at the end of each session to validate sensor timing alignment
 
+#### Sensor Timing & Synchronization
+
+- All timestamps are hardware-originated — the Livox driver stamps LiDAR and IMU messages from the sensor's own clock, and RKO-LIO preserves those stamps through to the odometry output. The buffered odometry bridge forwards live messages with their original LIO header timestamp intact; only stale fallback messages (published when odometry has dropped out) use wall clock time
+
+- Scan centers are defined by camera frame timestamps. During reconstruction (post processing), each camera stamp is used to interpolate a pose from the bracketing pair of odometry samples (SLERP for rotation, linear for translation). The interpolation bracket half-width — half the gap between the two surrounding odom samples — bounds the worst-case pose error at each scan centre. At ~10 Hz odometry this is typically ≤50 ms regardless of camera frame rate
+
+- Camera frames whose timestamps fall outside the odometry window (before the first or after the last odom sample) cannot be interpolated and are filtered out during reconstruction to avoid clamped extrapolation errors
+
+- Per-frame motion compensation is applied to each LiDAR scan: individual LiDAR returns within a scan are de-skewed using interpolated poses across the scan duration before the scan is projected into world frame
+
+- The Livox Mid360 IMU publishes at ~200 Hz using best-effort QoS (`SensorDataQoS`), matching RKO-LIO's subscriber. A QoS mismatch (reliable publisher vs best-effort subscriber) will cause IMU starvation and degrade odometry from ~10 Hz to ~6 Hz — the benchmark will report POOR in this case
+
+- The sync benchmark measures four quantities: raw inter-message gaps per topic, interpolation residual (odom bracket half-width at each scan centre), odom coverage fraction over the session window, and per-topic arrival jitter (std of inter-message gaps). Overall quality is rated GOOD / OK / POOR based on mean bracket half-width against a 33 ms threshold
+
+#### Post-Processing Pipeline
+
+- `reconstruct_from_bag.py` — replays the session bag, extracts camera frames as scan centres, filters centres outside the odometry window, applies per-frame motion compensation, and writes a sensor-frame `sensor_lidar.ply` and `trajectory.json` per scan
+
+- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded
+
+- `align_scan_session_posegraph.py` — pre-transforms each scan's colored cloud into world frame using its trajectory pose, then runs Open3D pose-graph ICP (50 mm voxels, 750 mm coarse search radius) to refine inter-scan alignment. Writes `trajectory_icp_refined.json` with corrected poses
+
+- `merge_with_trajectory.py` — applies the full rigid transform (T_first_inv × T) from `trajectory_icp_refined.json` (falling back to `trajectory.json`) to each sensor-frame colored PLY and concatenates them into a single world-frame merged cloud
 
 #### Process & Worker Management
 

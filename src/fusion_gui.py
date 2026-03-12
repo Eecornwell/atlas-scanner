@@ -151,6 +151,7 @@ class FusionCaptureGUI:
         self.log_text = scrolledtext.ScrolledText(log_tab, font=('Consolas', 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         notebook.add(log_tab, text="System Log")
+        notebook.select(1)
 
         # Switch to log tab on new message if viewer is active, badge the tab
         self._log_tab_index = 1
