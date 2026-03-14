@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
-CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="continuous"         # stationary | continuous
+CAMERA_MODE="dual_fisheye"      # dual_fisheye | single_fisheye
+CAPTURE_MODE="stationary"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -52,6 +52,8 @@ export PATH=/home/orion/cmake-3.25/bin:$PATH
 source install/setup.bash
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/orion:/usr/local/lib
 export FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_atlas.xml"
+# Prevent ros2 CLI tools from hanging when no display is available (headless / SSH)
+export QT_QPA_PLATFORM=offscreen
 
 mkdir -p data/synchronized_scans
 SCAN_DIR="data/synchronized_scans/sync_fusion_$(date +%Y%m%d_%H%M%S)"

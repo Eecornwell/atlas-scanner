@@ -68,6 +68,9 @@ cd ~/atlas_ws/src/livox_ros_driver2
 git reset --hard '6b9356cadf77084619ba406e6a0eb41163b08039'
 # Set LiDAR point cloud publish frequency to 25 Hz
 sed -i 's/^publish_freq  = .*/publish_freq  = 25.0/' ~/atlas_ws/src/livox_ros_driver2/launch_ROS2/rviz_MID360_launch.py
+# Set xfer_format=0 (PointCloud2) — upstream default is 1 (Livox custom format)
+# which RKO-LIO cannot deserialize, causing odometry to never publish
+sed -i 's/xfer_format   = 1/xfer_format   = 0/' ~/atlas_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py
 
 # Build Livox-SDK2
 cd ~/atlas_ws
@@ -141,7 +144,7 @@ sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas
 # 6. Update JPEG quality to 100 in capture scripts
 sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
 
-# Apply manual exposure control (1/120s ISO 1600 for indoor use)
+# Apply manual exposure control (1/120s ISO 400 for indoor use)
 # ISO and shutter are ROS params — override at launch time without recompiling
 echo "Applying manual exposure patch..."
 python3 - <<'PYEOF'

@@ -14,6 +14,8 @@ git clone https://github.com/Eecornwell/atlas-scanner.git
 ### 1. Base Sensors Installation
 Installs camera and LiDAR drivers with optimized camera settings:
 - **Resolution**: 3840x1920 (high quality)
+- **ISO**: 400 (increased light sensitivity)
+- **Exposure (shutter speed)**: 1/120 (faster shutter, motion compensation)
 - **Bitrate**: 12 Mbps (reduced compression artifacts)
 - **Scaling**: Lanczos interpolation (highest quality)
 - **JPEG Quality**: 100 (maximum)
@@ -116,6 +118,10 @@ cd ~/atlas_ws/src &&
 git clone https://github.com/Livox-SDK/livox_ros_driver2.git
 cd ~/atlas_ws/src/livox_ros_driver2 &&
 git reset --hard '6b9356cadf77084619ba406e6a0eb41163b08039'
+
+# Set xfer_format=0 (PointCloud2) — upstream default is 1 (Livox custom format)
+# which RKO-LIO cannot deserialize, causing odometry to never publish
+sed -i 's/xfer_format   = 1/xfer_format   = 0/' ~/atlas_ws/src/livox_ros_driver2/launch_ROS2/msg_MID360_launch.py
 
 # Build Livox-SDK2
 cd ~/atlas_ws &&

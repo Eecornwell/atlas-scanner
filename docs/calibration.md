@@ -23,12 +23,12 @@
         ros__parameters:
             cx_offset: 0.0
             cy_offset: 0.0
-            crop_size: 1280
+            crop_size: 1920
             translation: [-0.007, 0.007, -0.153]
             rotation_deg: [0.7, -3.0, 1.5]
             gpu: false
-            out_width: 2560
-            out_height: 1280
+            out_width: 3840
+            out_height: 1920
         ==================================================
         ```
 
