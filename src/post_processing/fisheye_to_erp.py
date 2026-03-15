@@ -124,7 +124,9 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
         x0 = (w - crop) // 2
         fisheye = img[y0:y0+crop, x0:x0+crop]
 
-        # Single fisheye is the back/LiDAR-facing lens (left half, rotated 90° CW by capture)
+        # The single fisheye is the back lens saved with the same 90° CW rotation as the
+        # dual path. Use the dual back maps directly with identity transform (zero rotation
+        # and translation from equirectangular_single.yaml).
         _, _, _, bmx, bmy, back_mask = build_maps(cfg, crop)
         remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)

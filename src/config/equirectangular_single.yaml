@@ -2,9 +2,9 @@ equirectangular_node:
   ros__parameters:
     cx_offset: 0.0
     cy_offset: 0.0
-    crop_size: 960
+    crop_size: 1920
     translation: [0.0, 0.0, 0.0]
     rotation_deg: [0.0, 0.0, 0.0]
     gpu: true
-    out_width: 1920
-    out_height: 960
+    out_width: 3840
+    out_height: 1920

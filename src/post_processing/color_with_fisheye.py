@@ -41,6 +41,14 @@ def color_scan_fisheye(scan_dir, config_path=None, mask_path=None):
     else:
         print(f"✓ ERP already exists: {os.path.basename(erp_path)}")
 
+    # Apply lidar mask to produce the masked PNG that exact_match_fusion prefers
+    masked_path = erp_path.replace('.jpg', '_masked.png')
+    if not os.path.exists(masked_path):
+        print("✓ Applying LiDAR mask...")
+        from apply_lidar_mask import apply_mask
+        mask_file = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/lidar_mask_single.png')
+        apply_mask(erp_path, mask_file, masked_path)
+
     # Use the calibrated ERP coloring pipeline
     print("✓ Coloring point cloud using ERP + calibrated extrinsics...")
     return exact_match_calibration_tool(scan_dir)
