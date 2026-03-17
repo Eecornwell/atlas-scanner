@@ -326,8 +326,9 @@ class FusionCaptureGUI:
                         m = re.search(r'synchronized_scans/(sync_fusion_[\w]+)', line)
                         if m:
                             session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
+                            self.scan_dir = str(session_dir.resolve())
                             try:
-                                _add_session_log_handler(str(session_dir.resolve()))
+                                _add_session_log_handler(self.scan_dir)
                                 self._session_log_attached = True
                             except Exception:
                                 pass
@@ -687,15 +688,37 @@ sys.exit(0 if ok[0] else 4)
                 self.log_message(f"Error sending stop signal: {e}")
 
         def _wait_for_finish():
-            try:
-                proc.wait(timeout=300)
-                self.root.after(0, lambda: self.log_message("✓ Post-processing complete"))
-            except subprocess.TimeoutExpired:
-                self.root.after(0, lambda: self.log_message("Post-processing timeout, force stopping..."))
+            # Poll until the process exits, using a silence-based watchdog rather
+            # than a fixed wall-clock timeout. As long as the script is writing
+            # output (coloring, ICP, benchmark, ...) the deadline keeps resetting.
+            # Only trigger if the process goes completely silent for SILENCE_LIMIT
+            # seconds, which catches genuine hangs without cutting off slow steps.
+            SILENCE_LIMIT = 120  # seconds of no output before force-kill
+            import time
+            last_output = time.monotonic()
+
+            while True:
+                if proc.poll() is not None:
+                    self.root.after(0, lambda: self.log_message("✓ Post-processing complete"))
+                    break
+                # Check whether the log file has grown since last poll as a proxy
+                # for output activity (stdout is already consumed by the reader thread).
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    if hasattr(self, 'scan_dir') and self.scan_dir:
+                        log_path = pathlib.Path(self.scan_dir) / 'session.log'
+                        if log_path.exists() and log_path.stat().st_mtime > last_output:
+                            last_output = log_path.stat().st_mtime
                 except Exception:
                     pass
+                if time.monotonic() - last_output > SILENCE_LIMIT:
+                    self.root.after(0, lambda: self.log_message(
+                        f"Post-processing timeout ({SILENCE_LIMIT}s silence), force stopping..."))
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+                    break
+                time.sleep(2)
             self.root.after(500, self._system_stopped)
 
         threading.Thread(target=_wait_for_finish, daemon=True).start()

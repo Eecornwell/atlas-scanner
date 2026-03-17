@@ -43,12 +43,20 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    from rclpy.serialization import deserialize_message
+    from rosidl_runtime_py.utilities import get_message
+    _RCLPY = True
+except ImportError:
+    _RCLPY = False
+
 
 # ---------------------------------------------------------------------------
-# Thresholds (mean of nearest-neighbour delta, ms)
+# Thresholds
 # ---------------------------------------------------------------------------
-GOOD_MS = 33.0   # sub-frame at 10 Hz LiDAR
-OK_MS   = 100.0  # one full LiDAR frame period
+GOOD_MS      = 33.0   # sub-frame at 10 Hz LiDAR
+OK_MS        = 100.0  # one full LiDAR frame period
+IMU_SYNC_TARGET_MS = 10.0  # advertised IMU soft-sync target
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +109,60 @@ def bag_stamps(con: sqlite3.Connection, fragment: str) -> np.ndarray:
 
 def topic_names(con: sqlite3.Connection) -> list:
     return [r[0] for r in con.execute("SELECT name FROM topics")]
+
+
+def bag_imu_gyro(con: sqlite3.Connection, fragment: str):
+    """Return (times_s, gyro_xyz) for the first IMU topic matching fragment.
+    Returns (None, None) if rclpy unavailable or topic not found."""
+    if not _RCLPY:
+        return None, None
+    topics = {r[0]: (r[1], r[2]) for r in con.execute("SELECT id, name, type FROM topics")}
+    tid = next((t for t, (n, _) in topics.items() if n == fragment), None)
+    if tid is None:
+        tid = next((t for t, (n, _) in topics.items() if fragment in n), None)
+    if tid is None:
+        return None, None
+    MsgType = get_message(topics[tid][1])
+    rows = con.execute(
+        "SELECT data FROM messages WHERE topic_id=? ORDER BY timestamp", (tid,)
+    ).fetchall()
+    times, gyros = [], []
+    for (data,) in rows:
+        try:
+            msg = deserialize_message(bytes(data), MsgType)
+            times.append(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
+            g = msg.angular_velocity
+            gyros.append([g.x, g.y, g.z])
+        except Exception:
+            pass
+    return (np.array(times), np.array(gyros)) if times else (None, None)
+
+
+# ---------------------------------------------------------------------------
+# IMU cross-correlation residual
+# ---------------------------------------------------------------------------
+
+def _xcorr_peak_lag(t_ref, sig_ref, t_query, sig_query,
+                    resample_hz=500.0, max_lag_s=0.5):
+    """Return the lag (s) at the cross-correlation peak.
+    sig_ref and sig_query must be 1-D arrays (single axis already selected)."""
+    t0 = max(t_ref[0], t_query[0])
+    t1 = min(t_ref[-1], t_query[-1])
+    if t1 - t0 < 1.0:
+        return None
+    t_grid = np.arange(t0, t1, 1.0 / resample_hz)
+    a = np.interp(t_grid, t_ref,   sig_ref)
+    b = np.interp(t_grid, t_query, sig_query)
+    a = (a - a.mean()) / (a.std() + 1e-12)
+    b = (b - b.mean()) / (b.std() + 1e-12)
+    max_lag = int(max_lag_s * resample_hz)
+    n = len(a) + len(b) - 1
+    fft_size = 1 << (n - 1).bit_length()
+    xcorr = np.fft.irfft(np.fft.rfft(a, n=fft_size) * np.conj(np.fft.rfft(b, n=fft_size)),
+                         n=fft_size)[:n]
+    xcorr = np.concatenate([xcorr[-max_lag:], xcorr[:max_lag + 1]])
+    lags   = np.arange(-max_lag, max_lag + 1) / resample_hz
+    return float(lags[np.argmax(np.abs(xcorr))])
 
 
 # ---------------------------------------------------------------------------
@@ -208,23 +270,41 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     lidar  = bag_stamps(con, "/livox/lidar")
     camera = bag_stamps(con, "fisheye")
     odom   = bag_stamps(con, odom_topic) if odom_topic else np.array([])
-    imu    = bag_stamps(con, "/livox/imu")
     con.close()
     if tmp_db3 and tmp_db3.exists():
         tmp_db3.unlink()
 
+    # IMU topics may be in a dedicated split bag (rosbag_*_imu)
+    imu_bag_dirs = sorted(session.glob("rosbag_*_imu"))
+    imu_con = imu_tmp = None
+    if imu_bag_dirs:
+        try:
+            imu_con, imu_tmp = open_db3(imu_bag_dirs[0])
+        except Exception:
+            pass
+    if imu_con is None:
+        imu_con, imu_tmp = open_db3(bag_dir)
+    imu_livox    = bag_stamps(imu_con, "/livox/imu")
+    imu_camera   = bag_stamps(imu_con, "/imu/data_raw")
+    imu_filtered = bag_stamps(imu_con, "/imu/data")
+    imu_con.close()
+    if imu_tmp and imu_tmp.exists():
+        imu_tmp.unlink()
+
     print(f"\n=== Sync Benchmark: {session.name} ===")
     def _span(arr, label):
         if len(arr):
-            print(f"  {label:8s}: {len(arr):4d} msgs  span={arr[-1]-arr[0]:.1f}s  "
+            print(f"  {label:12s}: {len(arr):4d} msgs  span={arr[-1]-arr[0]:.1f}s  "
                   f"rate={len(arr)/(arr[-1]-arr[0]):.1f}Hz" if arr[-1] > arr[0] else
-                  f"  {label:8s}: {len(arr):4d} msgs")
+                  f"  {label:12s}: {len(arr):4d} msgs")
         else:
-            print(f"  {label:8s}: NOT FOUND")
-    _span(lidar,  "LiDAR")
-    _span(camera, "Camera")
-    _span(odom,   f"Odom ({odom_topic.split('/')[-1] if odom_topic else '?'})")
-    _span(imu,    "IMU")
+            print(f"  {label:12s}: NOT FOUND")
+    _span(lidar,      "LiDAR")
+    _span(camera,     "Camera")
+    _span(odom,       f"Odom ({odom_topic.split('/')[-1] if odom_topic else '?'})")
+    _span(imu_livox,   "IMU (Livox)")
+    _span(imu_camera,  "IMU (Camera)")
+    _span(imu_filtered, "IMU (Filtered)")
 
     report = {
         "session": str(session),
@@ -240,7 +320,8 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     raw_pairs = []
     if len(lidar)  and len(camera): raw_pairs.append(("Camera↔LiDAR",  camera, lidar))
     if len(odom)   and len(camera): raw_pairs.append(("Camera↔Odom",   camera, odom))
-    if len(imu)    and len(camera): raw_pairs.append(("Camera↔IMU",    camera, imu))
+    if len(imu_livox)  and len(camera): raw_pairs.append(("Camera↔IMU(Livox)",  camera, imu_livox))
+    if len(imu_camera) and len(camera): raw_pairs.append(("Camera↔IMU(Camera)", camera, imu_camera))
     if len(lidar)  and len(odom):   raw_pairs.append(("LiDAR↔Odom",    lidar,  odom))
 
     for name, a, b in raw_pairs:
@@ -298,16 +379,85 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     # ── 4. Per-topic arrival jitter ───────────────────────────────────────
     print(f"\n--- Per-topic arrival jitter (scheduling noise) ---")
     for label, stamps in [("LiDAR", lidar), ("Camera", camera),
-                           ("Odom", odom), ("IMU", imu)]:
+                           ("Odom", odom), ("IMU(Livox)", imu_livox),
+                           ("IMU(Camera)", imu_camera), ("IMU(Filtered)", imu_filtered)]:
         if len(stamps) < 2:
             continue
         j = jitter(stamps)
         report["jitter"][label] = j
-        flag = "  ⚠ HIGH" if j["std_gap_ms"] > 20.0 else ""
+        # Suppress jitter warning for batch-delivered or derived topics:
+        # IMU(Camera) has SDK batch delivery so gap std is always high.
+        # IMU(Filtered) inherits the same burst pattern from its raw input.
+        suppress = label in ("IMU(Filtered)", "IMU(Camera)")
+        flag = "  ⚠ HIGH" if j["std_gap_ms"] > 20.0 and not suppress else ""
         print(f"  {label:8s}  mean_gap={j['mean_gap_ms']:.1f}ms  "
               f"std={j['std_gap_ms']:.1f}ms  max_gap={j['max_gap_ms']:.1f}ms{flag}")
 
-    # ── 5. Overall grade ──────────────────────────────────────────────────
+    # ── 5. IMU soft-sync quality (continuous mode only) ──────────────────
+    # Only meaningful when a session-level bag exists (continuous mode).
+    # Stationary mode has per-scan bags with no cross-IMU data.
+    is_continuous = bool(sorted(session.glob("rosbag_*")))
+    sync_file = bag_dir / "sync_offset.json" if bag_dir else None
+
+    if is_continuous:
+        print(f"\n--- IMU soft-sync (target ≤ {IMU_SYNC_TARGET_MS:.0f} ms) ---")
+        report["imu_sync"] = {}
+
+        if sync_file and sync_file.exists():
+            sync = json.loads(sync_file.read_text())
+            delta_ms   = sync.get("delta_t_s", 0.0) * 1000.0
+            confidence = sync.get("confidence", 0.0)
+            report["imu_sync"]["offset_ms"]   = round(delta_ms, 3)
+            report["imu_sync"]["confidence"]  = confidence
+
+            # Re-open IMU bag (dedicated split bag or main bag) to measure residual
+            _imu_bag = imu_bag_dirs[0] if imu_bag_dirs else bag_dir
+            con2, tmp2 = open_db3(_imu_bag)
+            t_livox, g_livox = bag_imu_gyro(con2, "/livox/imu")
+            t_cam,   g_cam   = bag_imu_gyro(con2, "/imu/data_raw")
+            if t_cam is None:
+                t_cam, g_cam = bag_imu_gyro(con2, "/imu/data")
+            con2.close()
+            if tmp2 and tmp2.exists():
+                tmp2.unlink()
+
+            if t_livox is not None and t_cam is not None:
+                # Use the same axis pair that imu_sync.py selected, recorded in
+                # sync_offset.json as "livox_axis" / "camera_axis" / "axis_sign".
+                # Fall back to z/z if the fields are absent (old format).
+                _ax = {'x': 0, 'y': 1, 'z': 2}
+                ref_ax   = _ax.get(sync.get("livox_axis",  sync.get("axis", "z")), 2)
+                query_ax = _ax.get(sync.get("camera_axis", sync.get("axis", "z")), 2)
+                axis_sign = float(sync.get("axis_sign", 1))
+                sig_livox = g_livox[:, ref_ax]
+                sig_cam   = g_cam[:,   query_ax] * axis_sign
+
+                # Residual: peak lag after applying the stored offset
+                t_cam_corrected = t_cam + sync.get("delta_t_s", 0.0)
+                residual_s = _xcorr_peak_lag(t_livox, sig_livox, t_cam_corrected, sig_cam)
+                if residual_s is not None:
+                    residual_ms = abs(residual_s) * 1000.0
+                    report["imu_sync"]["residual_ms"] = round(residual_ms, 3)
+                    passed = residual_ms <= IMU_SYNC_TARGET_MS
+                    flag   = "✓ PASS" if passed else "✗ FAIL"
+                    print(f"  Applied offset:  {delta_ms:+.2f} ms  (confidence={confidence:.3f})")
+                    print(f"  Residual after correction: {residual_ms:.2f} ms  "
+                          f"[{flag} — target ≤ {IMU_SYNC_TARGET_MS:.0f} ms]")
+                    if not passed:
+                        print(f"  ⚠ Residual exceeds target — re-run imu_sync.py, "
+                              f"ensure scanner was moving during capture")
+                else:
+                    print(f"  Applied offset:  {delta_ms:+.2f} ms  (confidence={confidence:.3f})")
+                    print(f"  Residual: insufficient IMU overlap to compute")
+            else:
+                print(f"  Applied offset:  {delta_ms:+.2f} ms  (confidence={confidence:.3f})")
+                print(f"  Residual: rclpy unavailable or IMU topics missing — "
+                      f"source your ROS workspace to enable")
+        else:
+            print(f"  No sync_offset.json found — run imu_sync.py first")
+            report["imu_sync"]["offset_ms"] = None
+
+    # ── 6. Overall grade ──────────────────────────────────────────────────
     grades = [v["grade"] for v in report["pairs"].values()]
     interp_grade = report["interpolation"].get("odom_half_bracket_ms", {}).get("grade", "")
     if interp_grade:

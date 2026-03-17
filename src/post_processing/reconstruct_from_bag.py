@@ -465,6 +465,31 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
     con.close()
 
+    # Load IMU-derived clock offset if available (produced by imu_sync.py).
+    # Only applied when confidence >= 0.7 — below that the cross-correlation
+    # peak is unreliable and applying a spurious offset makes alignment worse.
+    # Note: the camera driver stamps frames with rclpy.clock() (same ROS system
+    # clock as the Livox driver), so the true offset is typically <5ms and a
+    # low-confidence estimate should never override that.
+    _CONF_THRESHOLD = 0.7
+    _sync_path = bag_dir / "sync_offset.json"
+    _cam_dt = 0.0
+    if _sync_path.exists():
+        import json as _json
+        _sync = _json.loads(_sync_path.read_text())
+        _cam_dt = float(_sync.get("delta_t_s", 0.0))
+        _conf   = float(_sync.get("confidence", 0.0))
+        if _conf < _CONF_THRESHOLD:
+            print(f"  IMU sync offset: {_cam_dt * 1000:+.2f} ms  (confidence={_conf:.3f}) "
+                  f"— BELOW threshold ({_CONF_THRESHOLD}), not applied")
+            _cam_dt = 0.0
+        else:
+            print(f"  IMU sync offset: {_cam_dt * 1000:+.2f} ms  (confidence={_conf:.3f}) — applied")
+            if image_msgs_raw and _cam_dt != 0.0:
+                image_msgs_raw = [(_t + _cam_dt, _m) for _t, _m in image_msgs_raw]
+    else:
+        print("  No sync_offset.json found — run imu_sync.py for sub-10ms accuracy")
+
     is_h264 = False
     img_h, img_w = 1280, 2560
     keyframes = []

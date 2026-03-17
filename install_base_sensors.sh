@@ -127,8 +127,9 @@ sed -i '/uint64_t utc_time/,/cam->SyncLocalTimeToCamera/d' ~/atlas_ws/src/insta3
 
 # Apply camera quality improvements
 echo "Applying camera quality improvements..."
-# 1. Update resolution to 2560x1280 (mid quality)
-sed -i 's/RES_1920_960P30/RES_2560_1280P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+# 1. Update resolution to 3840x1920 (full native quality)
+sed -i 's/RES_2560_1280P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 # 2. Increase bitrate to 12 Mbps for better quality
 sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 # 3. Use high-quality Lanczos scaling instead of nearest neighbor
@@ -138,13 +139,16 @@ sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/c
 sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 sed -i 's/out_height: 960/out_height: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 # 5. Update atlas-scanner configs for new resolution
+sed -i 's/image_width: 2560/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
+sed -i 's/image_height: 1280/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
 sed -i 's/image_width: 1920/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
 sed -i 's/image_height: 960/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
 sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
+sed -i 's/width=2560, height=1280/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
 # 6. Update JPEG quality to 100 in capture scripts
 sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
 
-# Apply manual exposure control (1/120s ISO 400 for indoor use)
+# Apply manual exposure control (1/120s ISO 600 for indoor use)
 # ISO and shutter are ROS params — override at launch time without recompiling
 echo "Applying manual exposure patch..."
 python3 - <<'PYEOF'
@@ -152,7 +156,7 @@ path = '/home/orion/atlas_ws/src/insta360_ros_driver/src/main.cpp'
 content = open(path).read()
 patch = '''
         node_->declare_parameter("shutter_speed", 1.0 / 120.0);
-        node_->declare_parameter("iso", 400);
+        node_->declare_parameter("iso", 600);
         double shutter = node_->get_parameter("shutter_speed").as_double();
         int iso = node_->get_parameter("iso").as_int();
         if (shutter > 0.0) {
@@ -180,10 +184,18 @@ else:
     print('✗ Marker not found - check main.cpp manually')
 PYEOF
 
-# Add shutter_speed and iso args to bringup.launch.xml
-sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="400"/>|' \
+# Add shutter_speed and iso args to bringup.launch.xml (idempotent — updates if already present)
+sed -i 's|<arg name="shutter_speed" default="[^"]*"/>|<arg name="shutter_speed" default="0.00833"/>|' \
     ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
-sed -i 's|exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>|exec="insta360_ros_driver" name="insta360_ros_driver" output="log">\n        <param name="shutter_speed" value="$(var shutter_speed)"/>\n        <param name="iso" value="$(var iso)"/>\n    </node>|' \
+sed -i 's|<arg name="iso" default="[^"]*"/>|<arg name="iso" default="600"/>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+# Insert args if not yet present (fresh clone)
+grep -q 'shutter_speed' ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml || \
+    sed -i 's|<arg name="imu_filter" default="true"/>|<arg name="imu_filter" default="true"/>\n    <arg name="shutter_speed" default="0.00833"/>\n    <arg name="iso" default="600"/>|' \
+    ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
+# Wire params into node if not yet present (fresh clone)
+grep -q 'param name="shutter_speed"' ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml || \
+    sed -i 's|exec="insta360_ros_driver" name="insta360_ros_driver" output="log"/>|exec="insta360_ros_driver" name="insta360_ros_driver" output="log">\n        <param name="shutter_speed" value="$(var shutter_speed)"/>\n        <param name="iso" value="$(var iso)"/>\n    </node>|' \
     ~/atlas_ws/src/insta360_ros_driver/launch/bringup.launch.xml
 
 # Build ROS2 packages with symlink-install

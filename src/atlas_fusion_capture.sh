@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
-CAMERA_MODE="dual_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="stationary"         # stationary | continuous
+CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
+CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -35,7 +35,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
 ENABLE_ICP_ALIGNMENT=true
-EXPORT_COLMAP=false
+EXPORT_COLMAP=true
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # voxel downsample in metres (0 = skip)
@@ -129,6 +129,9 @@ cleanup() {
     if [ "$CAPTURE_MODE" = "continuous" ]; then
         BAG_DIR=$(ls -d "$SCAN_DIR"/rosbag_* 2>/dev/null | head -1)
         if [ -n "$BAG_DIR" ]; then
+            echo "Estimating IMU clock offset..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/imu_sync.py" \
+                "$SCAN_DIR" --window 20.0 || echo "  ⚠ IMU sync failed — continuing without offset"
             echo "Reconstructing scans from bag using header timestamps..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
                 "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.5 --camera-mode "$CAMERA_MODE"
@@ -346,18 +349,25 @@ sleep 1
 
 CAMERA_STARTED=false
 for _cam_attempt in 1 2 3; do
+    # Enable the Madgwick IMU filter in continuous mode only — it smooths /imu/data_raw
+    # into a regularly-timed /imu/data output needed for cross-correlation in imu_sync.py.
+    # Disabled in stationary mode to avoid unnecessary CPU load during capture.
+    _IMU_FILTER="false"
+    [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
+
     if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
         ros2 launch insta360_ros_driver bringup.launch.xml \
             equirectangular:=false \
             decode:=false \
-            imu_filter:=false &
+            imu_filter:=${_IMU_FILTER} &
         CAMERA_PID=$!
         PIDS+=($CAMERA_PID)
         { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null; } &
     else
         ros2 launch insta360_ros_driver bringup.launch.xml \
-            equirectangular:=false imu_filter:=false \
-            decode:=false &
+            equirectangular:=false \
+            decode:=false \
+            imu_filter:=${_IMU_FILTER} &
         CAMERA_PID=$!
         PIDS+=($CAMERA_PID)
         { sleep 2 && renice -n 15 -p $CAMERA_PID 2>/dev/null; } &
@@ -394,8 +404,11 @@ fi
 echo "✓ Camera data confirmed"
 
 echo "Starting LiDAR driver..."
-setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
+# Pin Livox driver to cores 0-1 so its UDP receive thread is isolated
+# from the bag recorders on cores 2-3, preventing IMU packet drops.
+taskset -c 0,1 setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
 LIDAR_PID=$!
+{ sleep 3 && renice -n -5 -p $LIDAR_PID 2>/dev/null; } &
 LIDAR_PGID=$(ps -o pgid= -p $LIDAR_PID 2>/dev/null | tr -d ' ')
 PIDS+=($LIDAR_PID)
 
@@ -534,18 +547,33 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
 
     ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     ROSBAG_DIR="$SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
-    CONTINUOUS_TOPICS="/livox/lidar /dual_fisheye/image/compressed_15fps /livox/imu"
+    CONTINUOUS_TOPICS="/livox/lidar /dual_fisheye/image/compressed_15fps"
     [ "$LIO_ENABLED" = "true" ] && CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
+    # IMU topics are recorded in a separate bag (${ROSBAG_DIR}_imu) to avoid
+    # write contention with the high-bandwidth LiDAR and image topics.
     # Throttle camera to 15fps before recording — driver publishes at 30fps but bag only needs 15fps
     ros2 run topic_tools throttle messages /dual_fisheye/image/compressed 15.0 \
         /dual_fisheye/image/compressed_15fps > /dev/null 2>&1 &
     PIDS+=($!)
     sleep 1
+    # Main bag: LiDAR + camera + odometry on cores 2-3
     # shellcheck disable=SC2086
-    nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 50000000 \
+    taskset -c 2,3 nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 100000000 \
         $CONTINUOUS_TOPICS &
     ROSBAG_PID=$!
     PIDS+=($ROSBAG_PID)
+
+    # IMU bag: separate high-priority recorder on core 3 so IMU topics
+    # are never starved by LiDAR/image write bursts in the main bag.
+    IMU_TOPICS="/livox/imu"
+    ros2 topic list 2>/dev/null | grep -q "/imu/data$"   && IMU_TOPICS="$IMU_TOPICS /imu/data"
+    ros2 topic list 2>/dev/null | grep -q "/imu/data_raw" && IMU_TOPICS="$IMU_TOPICS /imu/data_raw"
+    # shellcheck disable=SC2086
+    taskset -c 3 nice -n 5 ros2 bag record -o "${ROSBAG_DIR}_imu" --max-cache-size 20000000 \
+        $IMU_TOPICS &
+    IMU_BAG_PID=$!
+    PIDS+=($IMU_BAG_PID)
+    echo "✓ IMU bag recording started: ${ROSBAG_DIR}_imu"
     echo "✓ Rosbag recording started: $ROSBAG_DIR"
     echo "  Press Ctrl+C when scanning is complete."
 
