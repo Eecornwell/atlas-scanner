@@ -17,8 +17,10 @@ invert_odom_tf: false
 # Forum settings + robustness tweaks
 deskew: true
 initialization_phase: true
-extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+# Measured from IMU gravity vector at rest: roll=-7.17° pitch=21.93°
+# Computed via: R that maps g_sensor=[-0.374,-0.116,0.920] -> [0,0,1]
+extrinsic_imu2base_quat_xyzw_xyz: [-0.059087, 0.190578, 0.000000, 0.979892, 0.0, 0.0, 0.0]
+extrinsic_lidar2base_quat_xyzw_xyz: [-0.059087, 0.190578, 0.000000, 0.979892, 0.0, 0.0, 0.0]
 
 # Conservative processing parameters
 voxel_size: 0.2              # 0.2m: denser map than 0.3m, better ICP correspondences

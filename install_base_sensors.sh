@@ -216,6 +216,15 @@ sudo ufw allow from 192.168.1.186
 sudo apt install net-tools
 sudo ifconfig enp2s0 192.168.1.50
 
+# Persist UDP buffer tuning so Livox IMU stays at 200Hz under CPU load
+# (default rmem_max=212992 causes IMU to drop to 20-40Hz after ~15s)
+grep -q 'net.core.rmem_max' /etc/sysctl.conf || cat >> /etc/sysctl.conf << 'SYSCTL'
+net.core.rmem_max=26214400
+net.core.rmem_default=26214400
+net.core.netdev_max_backlog=5000
+SYSCTL
+sudo sysctl -p
+
 echo ""
 echo "=== MANUAL STEP REQUIRED ==="
 echo "If wired shows 'connecting', apply Network Settings to Wired:"
