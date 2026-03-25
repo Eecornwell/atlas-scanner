@@ -49,13 +49,8 @@ def load_points(ply_file):
 
 def exact_match_calibration_tool(scan_dir):
     # Find files
-    # Prefer world_lidar.ply (motion-compensated, scan-centre-relative) when it
-    # exists — this is produced in continuous mode and is the correct input for
-    # the ICP/merge pipeline.  Fall back to sensor_lidar.ply for stationary mode.
-    world_ply_path = os.path.join(scan_dir, 'world_lidar.ply')
-    sensor_ply = world_ply_path if os.path.exists(world_ply_path) else next(
-        (os.path.join(scan_dir, f) for f in os.listdir(scan_dir)
-         if 'sensor_lidar' in f and f.endswith('.ply')), None)
+    sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir) 
+                      if 'sensor_lidar' in f and f.endswith('.ply')), None)
     
     # Find image - prefer blended masked, then masked, then regular
     mask_file = None

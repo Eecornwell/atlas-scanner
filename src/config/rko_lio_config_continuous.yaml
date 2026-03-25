@@ -8,26 +8,23 @@ odom_frame: odom
 odom_topic: /rko_lio/odometry
 map_topic: /rko_lio/local_map
 
-# Note: rko_lio publishes odom once per LiDAR frame (~10Hz) — publish_freq is not a node parameter.
-# Pose accuracy between odom samples is handled by IMU dead-reckoning in reconstruct_from_bag.py.
+# Lower publish rate — bag recorder only needs odometry, not every scan
+publish_freq: 5.0
 publish_local_map: false       # nobody reads this during continuous recording
 publish_deskewed_scan: false   # nobody reads this during continuous recording
 invert_odom_tf: false
 
 deskew: true
-# initialization_phase=true: RKO-LIO uses the first two LiDAR frames at rest
-# to estimate IMU bias. The capture script waits for odom to stabilize before
-# signalling the operator to pick up the scanner, ensuring init completes first.
 initialization_phase: true
-extrinsic_imu2base_quat_xyzw_xyz: [-0.059087, 0.190578, 0.000000, 0.979892, 0.0, 0.0, 0.0]
-extrinsic_lidar2base_quat_xyzw_xyz: [-0.059087, 0.190578, 0.000000, 0.979892, 0.0, 0.0, 0.0]
+extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
-voxel_size: 0.2
+voxel_size: 0.5
 max_points_per_voxel: 10
 max_range: 20.0
 min_range: 0.3
-max_correspondance_distance: 0.8  # tightened for slow walking: 0.8m handles ~0.08m/frame at 10Hz without accepting spurious matches
-convergence_criterion: 0.00005   # tighter convergence for better pose accuracy
-max_num_threads: 0             # use all cores — LIO latency is the primary cause of pose lag during walking
-max_expected_jerk: 2.0         # slow walking; lower value gives IMU prediction more weight
-min_beta: 100.0                # stronger geometry weighting reduces drift on flat corridors
+max_correspondance_distance: 0.5
+convergence_criterion: 0.0001
+max_num_threads: 4             # 0 = use all available cores
+max_expected_jerk: 3.0
+min_beta: 200.0

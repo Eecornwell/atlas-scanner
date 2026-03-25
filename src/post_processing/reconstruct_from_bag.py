@@ -154,16 +154,8 @@ def pose_to_matrix(odom_msg):
     return T
 
 
-def interp_pose(all_odom, target_stamp, imu_msgs=None):
-    """Return (t_interp, q_interp) at target_stamp.
-
-    When imu_msgs is provided, integrates gyro from the preceding odom sample
-    for accurate orientation. Position is always linearly interpolated between
-    odom samples (max ~1.25cm error at 0.5m/s over 50ms — acceptable).
-    Accelerometer is intentionally not used: raw Livox IMU includes gravity
-    and RKO-LIO twist is body-frame, so accel integration diverges immediately.
-    Falls back to full slerp when no IMU samples are available.
-    """
+def interp_pose(all_odom, target_stamp):
+    """Return (t_interp, q_interp) interpolated at target_stamp."""
     times = np.array([ts for ts, _ in all_odom])
     idx = np.searchsorted(times, target_stamp)
 
@@ -177,43 +169,12 @@ def interp_pose(all_odom, target_stamp, imu_msgs=None):
 
     ts0, om0 = all_odom[idx - 1]
     ts1, om1 = all_odom[idx]
-
-    # --- IMU gyro integration for orientation only ---
-    # Accelerometer is NOT used: raw Livox IMU includes gravity (~9.8 m/s² on Z)
-    # and RKO-LIO twist is body-frame, so accel integration diverges immediately.
-    # Position is linearly interpolated between odom samples (max ~1.25cm at 0.5m/s
-    # over 50ms) — acceptable. Orientation benefits most from 200Hz gyro vs slerp.
-    if imu_msgs is not None and len(imu_msgs) > 0:
-        imu_window = [(t, m) for t, m in imu_msgs if ts0 < t <= target_stamp]
-        if imu_window:
-            ori0 = om0.pose.pose.orientation
-            q = np.array([ori0.x, ori0.y, ori0.z, ori0.w])
-            q /= np.linalg.norm(q)
-            t_prev = ts0
-            for t_imu, imu_msg in imu_window:
-                dt = t_imu - t_prev
-                if dt <= 0:
-                    continue
-                gyr = np.array([imu_msg.angular_velocity.x,
-                                imu_msg.angular_velocity.y,
-                                imu_msg.angular_velocity.z])
-                angle = np.linalg.norm(gyr) * dt
-                if angle > 1e-9:
-                    q = (Rotation.from_quat(q) * Rotation.from_rotvec(gyr * dt)).as_quat()
-                    q /= np.linalg.norm(q)
-                t_prev = t_imu
-            # Position: linear interpolation between odom samples
-            alpha = (target_stamp - ts0) / (ts1 - ts0) if ts1 != ts0 else 0.0
-            p0, p1 = om0.pose.pose.position, om1.pose.pose.position
-            t_pos = np.array([p0.x, p0.y, p0.z]) + alpha * (
-                np.array([p1.x, p1.y, p1.z]) - np.array([p0.x, p0.y, p0.z]))
-            return t_pos, q
-
-    # --- Fallback: slerp between odom samples ---
     alpha = (target_stamp - ts0) / (ts1 - ts0) if ts1 != ts0 else 0.0
+
     p0, p1 = om0.pose.pose.position, om1.pose.pose.position
     t_interp = np.array([p0.x, p0.y, p0.z]) + alpha * (
         np.array([p1.x, p1.y, p1.z]) - np.array([p0.x, p0.y, p0.z]))
+
     o0, o1 = om0.pose.pose.orientation, om1.pose.pose.orientation
     q0 = np.array([o0.x, o0.y, o0.z, o0.w]); q0 /= np.linalg.norm(q0)
     q1 = np.array([o1.x, o1.y, o1.z, o1.w]); q1 /= np.linalg.norm(q1)
@@ -221,9 +182,9 @@ def interp_pose(all_odom, target_stamp, imu_msgs=None):
     return t_interp, q_interp
 
 
-def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom, imu_msgs=None):
+def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
     """Interpolate odometry at capture_stamp and write trajectory.json."""
-    t_interp, q_interp = interp_pose(all_odom, capture_stamp, imu_msgs)
+    t_interp, q_interp = interp_pose(all_odom, capture_stamp)
 
     lidar_pose = {
         "position": {"x": float(t_interp[0]), "y": float(t_interp[1]), "z": float(t_interp[2])},
@@ -504,8 +465,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
     con.close()
 
-    # Load Livox IMU from the dedicated IMU bag (rosbag_*_imu) for dead-reckoning.
-    # The IMU bag is recorded separately at higher priority to avoid write contention.
+    # Load Livox IMU for gyro-based motion detection.
     imu_msgs = None
     imu_bag_dirs = sorted(session_path.glob("rosbag_*_imu"))
     _imu_bag_dir = imu_bag_dirs[0] if imu_bag_dirs else bag_dir
@@ -518,7 +478,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             print(f"  IMU: {len(imu_msgs)} samples from {_imu_bag_dir.name}  "
                   f"(~{len(imu_msgs)/(imu_msgs[-1][0]-imu_msgs[0][0]):.0f}Hz)")
     except Exception as e:
-        print(f"  ⚠ Could not load IMU data: {e} — falling back to slerp interpolation")
+        print(f"  ⚠ Could not load IMU data: {e} — gyro filter disabled")
 
     # Load IMU-derived clock offset if available (produced by imu_sync.py).
     # Only applied when confidence >= 0.7 — below that the cross-correlation
@@ -582,14 +542,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     duration = t_end - t_start
 
     if image_msgs_raw and odom_msgs:
-        # Select scan centres at low-motion moments using IMU gyroscope magnitude
-        # as the motion signal. The odom trajectory can drift (making odom-based
-        # motion detection unreliable), but the IMU directly measures angular
-        # velocity regardless of LIO tracking quality.
-        # Fall back to odom-based detection if IMU is unavailable.
+        # Select scan centres at low-motion moments using IMU gyroscope magnitude.
+        # Falls back to odom-based motion detection if IMU is unavailable.
 
         def gyro_magnitude_at(t, window=0.5):
-            """Return mean gyro magnitude (rad/s) over a window centred on t."""
             if imu_msgs is None or len(imu_msgs) == 0:
                 return None
             samples = [np.linalg.norm([m.angular_velocity.x,
@@ -602,10 +558,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         odom_times = np.array([ts for ts, _ in odom_msgs])
 
         def motion_score_at(t):
-            """Return motion score: lower = more stationary."""
             gyro = gyro_magnitude_at(t)
             if gyro is not None:
-                return gyro  # rad/s — directly measures rotation
+                return gyro
             # Fallback: odom-based
             w = 0.5
             idx0 = np.searchsorted(odom_times, t - w)
@@ -631,57 +586,33 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 continue
             if not (odom_times[0] <= t <= odom_times[-1]):
                 continue
-            score = motion_score_at(t)
-            scored.append((score, t, ci))
+            scored.append((motion_score_at(t), t, ci))
         scored.sort(key=lambda x: x[0])
 
         using_gyro = imu_msgs is not None and len(imu_msgs) > 0
         print(f"  Motion-gated scan selection using {'IMU gyro' if using_gyro else 'odom'}")
 
         centres = []
-        skipped = []
         for score, t, ci in scored:
             if using_gyro and score > max_gyro:
-                continue  # above threshold — never accept regardless of gap
+                continue
             if all(abs(t - tc) >= interval for tc, _ in centres):
                 centres.append((t, ci))
         centres.sort(key=lambda x: x[0])
 
-        # Report skipped time slots (windows where every candidate exceeded max_gyro)
-        if using_gyro and centres:
-            covered = set()
-            for tc, _ in centres:
-                slot = int((tc - t_start) / interval)
-                covered.add(slot)
-            n_slots = int((t_end - t_start) / interval)
-            for slot in range(n_slots):
-                if slot not in covered:
-                    t_slot = t_start + slot * interval + interval / 2
-                    # find best candidate in this slot
-                    slot_candidates = [(s, t2) for s, t2, _ in scored
-                                       if abs(t2 - t_slot) <= interval / 2]
-                    if slot_candidates:
-                        best = min(slot_candidates)[0]
-                        skipped.append((t_slot - t_start, best))
-
         if not centres:
-            # All candidates exceeded threshold — fall back to best available
             print(f"  ⚠ No frames below max_gyro={max_gyro:.2f} rad/s — using best available")
             for _, t, ci in scored:
                 if all(abs(t - tc) >= interval for tc, _ in centres):
                     centres.append((t, ci))
             centres.sort(key=lambda x: x[0])
 
-        # Report the motion score at each selected centre
         for tc, _ in centres:
             score = motion_score_at(tc)
             label = f'{score:.3f} rad/s' if using_gyro else f'score={score:.4f}'
             print(f"    t+{tc - t_start:.1f}s: {label}")
-        for t_rel, best_score in skipped:
-            print(f"    t+{t_rel:.1f}s: SKIPPED (best={best_score:.3f} rad/s > threshold={max_gyro:.2f})")
 
     elif image_msgs_raw:
-        # No odom available — fall back to time-based selection.
         if is_h264:
             candidate_indices = keyframes if keyframes else list(range(len(image_msgs_raw)))
         else:
@@ -741,31 +672,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # --- LiDAR: per-frame motion compensation within the window ---
         # Each frame is transformed to world frame using its own interpolated pose,
         # eliminating motion blur from accumulating frames with a single pose.
-        # Only include frames closer to this centre than to any other centre,
-        # preventing the same frame from contributing to two adjacent scans.
         half = lidar_window / 2.0
-        all_centres = [c for c, _ in centres]
-        window_lidar = [
-            (ts, msg) for ts, msg in lidar_msgs
-            if abs(ts - centre) <= half
-            and (len(all_centres) == 1 or min(abs(ts - c) for c in all_centres) == abs(ts - centre))
-        ]
+        window_lidar = [(ts, msg) for ts, msg in lidar_msgs if abs(ts - centre) <= half]
         if not window_lidar:
             print(f"  ⚠ {scan_name}: no LiDAR frames in window, skipping")
             continue
 
         all_points = []       # sensor-frame (for sensor_lidar.ply)
-        world_points = []     # motion-compensated, expressed relative to scan-centre pose
+        world_points = []     # motion-compensated world-frame (for world_lidar.ply)
         seen = set()
-        # Compute the reference pose at the median LiDAR timestamp — this is the
-        # same timestamp written to trajectory.json, so world_lidar.ply and the
-        # pose are consistent. (Computed after window_lidar is known.)
-        lidar_timestamps = [ts for ts, _ in window_lidar]
-        pose_stamp = float(np.median(lidar_timestamps))
-        t_ref, R_ref_inv = None, None
-        if odom_msgs:
-            t_ref, q_ref = interp_pose(odom_msgs, pose_stamp, imu_msgs)
-            R_ref_inv = Rotation.from_quat(q_ref).as_matrix().T
         for frame_ts, msg in window_lidar:
             mid = id(msg)
             if mid in seen:
@@ -773,15 +688,11 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             seen.add(mid)
             pts = unpack_lidar(msg)
             all_points.extend(pts)
-            if odom_msgs and t_ref is not None:
-                t_f, q_f = interp_pose(odom_msgs, frame_ts, imu_msgs)
+            if odom_msgs:
+                t_f, q_f = interp_pose(odom_msgs, frame_ts)
                 R_f = Rotation.from_quat(q_f).as_matrix()
                 for p in pts:
-                    # Transform to world frame then back to scan-centre sensor frame:
-                    # p_rel = R_ref^T @ (R_f @ p_sensor + t_f - t_ref)
-                    p_world = R_f @ np.array(p[:3]) + t_f
-                    p_rel = R_ref_inv @ (p_world - t_ref)
-                    world_points.append(p_rel.tolist() + [p[3]])
+                    world_points.append((R_f @ np.array(p[:3]) + t_f).tolist() + [p[3]])
 
         if not all_points:
             print(f"  ⚠ {scan_name}: zero valid points, skipping")
@@ -815,26 +726,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
                     fisheye_path = str(img_out)
 
-        # --- Odometry: write trajectory.json at the median LiDAR frame timestamp ---
-        # The camera timestamp (centre) selects the image; the pose must reflect
-        # where the scanner was during the actual LiDAR accumulation window.
-        # Using the median LiDAR timestamp eliminates the systematic offset that
-        # occurs when the lowest-motion camera frame is at the edge of the window.
+        # --- Odometry: write trajectory.json at camera frame stamp; save motion-compensated world cloud ---
         dt_odom = float('inf')
         if odom_msgs:
-            odom_stamp, odom_msg = closest(odom_msgs, pose_stamp)
-            dt_odom = abs(odom_stamp - pose_stamp)
+            odom_stamp, odom_msg = closest(odom_msgs, centre)
+            dt_odom = abs(odom_stamp - centre)
             if dt_odom < 5.0:
-                write_trajectory_json(str(scan_dir), scan_name, pose_stamp, odom_msgs, imu_msgs)
+                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
                 if world_points:
                     save_ply(str(scan_dir / "world_lidar.ply"), world_points)
             else:
                 print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
 
-        pose_dt = abs(pose_stamp - centre)
         scan_count += 1
         print(f"  ✓ {scan_name}: {len(all_points)} pts  "
-              f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s  pose_cam_dt={pose_dt:.3f}s")
+              f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s")
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 

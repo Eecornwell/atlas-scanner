@@ -15,8 +15,8 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="continuous"         # stationary | continuous
-CONTINUOUS_INTERVAL=2             # seconds between captures (continuous mode only)
+CAPTURE_MODE="stationary"         # stationary | continuous
+CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
@@ -183,11 +183,15 @@ cleanup() {
         MERGED_FILE=""
 
         if [ "$SCAN_COUNT" -gt 1 ]; then
-            echo "Merging scans using trajectory poses..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/merge_with_trajectory.py" "$SCAN_DIR"
-            MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
-            if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+            if [ "$ENABLE_ICP_ALIGNMENT" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
+                echo "Skipping trajectory-based merge (ICP alignment will merge instead)..."
+            else
+                echo "Merging scans using trajectory poses..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/merge_with_trajectory.py" "$SCAN_DIR"
+                MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
+                if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+                fi
             fi
         elif [ "$SCAN_COUNT" -eq 1 ]; then
             FIRST_SCAN=$(ls -d "$SCAN_DIR"/fusion_scan_* | head -1)
@@ -207,12 +211,9 @@ cleanup() {
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py" "$SCAN_DIR"
             if [ $? -eq 0 ] && [ -f "$SCAN_DIR/merged_aligned_colored.ply" ]; then
                 MERGED_FILE="$SCAN_DIR/merged_aligned_colored.ply"
-                echo "✓ ICP alignment improved the merge"
-            else
-                echo "  ICP skipped or failed — using trajectory merge"
-            fi
-            if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+                if [ "$SAVE_E57" = "true" ]; then
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
+                fi
             fi
         fi
 
@@ -292,17 +293,6 @@ echo "Scans will be saved to: $SCAN_DIR"
 
 if [ "$SKIP_SUDO_CHECK" != "1" ]; then
     sudo -v || { echo "Failed to obtain sudo access"; exit 1; }
-fi
-
-# Increase UDP receive buffer and packet backlog so Livox IMU packets (200Hz)
-# are not dropped by the kernel during CPU bursts from RKO-LIO processing.
-# Default rmem_max=212992 and netdev_max_backlog=1000 cause IMU to drop to
-# 20-40Hz after ~15s of operation when the packet queue fills.
-if [ "$SKIP_SUDO_CHECK" != "1" ]; then
-    sudo sysctl -w net.core.rmem_max=26214400       > /dev/null 2>&1
-    sudo sysctl -w net.core.rmem_default=26214400   > /dev/null 2>&1
-    sudo sysctl -w net.core.netdev_max_backlog=5000 > /dev/null 2>&1
-    echo "✓ UDP buffers tuned for 200Hz IMU (rmem=25MB, backlog=5000)"
 fi
 
 if [ "$USE_EXISTING_CALIBRATION" = "true" ]; then
@@ -414,10 +404,9 @@ fi
 echo "✓ Camera data confirmed"
 
 echo "Starting LiDAR driver..."
-# Pin Livox driver to core 0 so its UDP receive thread is isolated.
-# Core 1 is reserved for the IMU bag recorder (nice -5) to prevent
-# the 200Hz IMU stream from being starved by LiDAR/image write bursts.
-taskset -c 0 setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
+# Pin Livox driver to cores 0-1 so its UDP receive thread is isolated
+# from the bag recorders on cores 2-3, preventing IMU packet drops.
+taskset -c 0,1 setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
 LIDAR_PID=$!
 { sleep 3 && renice -n -5 -p $LIDAR_PID 2>/dev/null; } &
 LIDAR_PGID=$(ps -o pgid= -p $LIDAR_PID 2>/dev/null | tr -d ' ')
@@ -465,36 +454,6 @@ fi
 if [ "$IMU_AVAILABLE" = "true" ]; then
     echo "Starting RKO-LIO with $IMU_SOURCE IMU..."
 
-    # Verify IMU mounting hasn't changed since extrinsic calibration.
-    # Reads IMU at rest and checks gravity direction matches the
-    # calibrated value (roll=-7.17° pitch=21.93°). Warns if >5° off.
-    python3 - << 'IMUCHECK'
-import subprocess, sys, re
-import numpy as np
-result = subprocess.run(
-    ['ros2', 'topic', 'echo', '--once', '/livox/imu'],
-    capture_output=True, text=True, timeout=5)
-if result.returncode != 0:
-    sys.exit(0)
-# linear_acceleration block appears after the 'linear_acceleration:' line
-m = re.search(r'linear_acceleration:\s*\nx:\s*([\-\d\.eE+]+)\s*\ny:\s*([\-\d\.eE+]+)\s*\nz:\s*([\-\d\.eE+]+)', result.stdout)
-if not m:
-    sys.exit(0)
-g = np.array([float(m.group(1)), float(m.group(2)), float(m.group(3))])
-norm = np.linalg.norm(g)
-if norm < 0.1:
-    sys.exit(0)  # zero sample, skip
-g /= norm
-g_cal = np.array([-0.3735, -0.1158, 0.9204])
-angle_err = np.degrees(np.arccos(np.clip(np.dot(g, g_cal), -1, 1)))
-if angle_err > 5.0:
-    print(f'⚠ IMU gravity direction differs {angle_err:.1f}° from calibration — re-run extrinsic calibration')
-    print(f'  Current g={np.round(g,3)}  Calibrated g=[-0.374,-0.116,0.920]')
-else:
-    print(f'✓ IMU mounting verified ({angle_err:.1f}° from calibration)')
-IMUCHECK
-
-
     if [ "$IMU_SOURCE" = "camera" ]; then
         python3 "$ROS_WS_DIR/src/atlas-scanner/src/init/imu_transform_node.py" > /tmp/imu_transform.log 2>&1 &
         PIDS+=($!)
@@ -509,16 +468,11 @@ IMUCHECK
         sleep 2
     fi
 
-    _RKO_CONFIG="rko_lio_config_robust.yaml"
-    [ "$CAPTURE_MODE" = "continuous" ] && _RKO_CONFIG="rko_lio_config_continuous.yaml"
     ros2 launch rko_lio odometry.launch.py \
-        config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/$_RKO_CONFIG" \
+        config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/rko_lio_config_robust.yaml" \
         rviz:=false > /tmp/rko_lio.log 2>&1 &
     LIO_PID=$!
-    # Pin RKO-LIO to cores 2-3 (away from core 1 which is reserved for the IMU
-    # bag recorder). Without pinning, LIO's 4 threads compete with the IMU
-    # recorder and starve it, dropping 200Hz -> 77Hz.
-    { sleep 2 && taskset -cp 2,3 $LIO_PID 2>/dev/null && renice -n -15 -p $LIO_PID 2>/dev/null; } &
+    sleep 1 && renice -n -15 -p $LIO_PID 2>/dev/null &
     PIDS+=($LIO_PID)
     _rlio_count=0
     while [ $_rlio_count -lt 20 ]; do
@@ -529,48 +483,13 @@ IMUCHECK
 
     if grep -q "RKO LIO Node is up" /tmp/rko_lio.log 2>/dev/null; then
         echo "✓ RKO-LIO ready with $IMU_SOURCE IMU"
-        echo "Waiting for LIO to stabilize (keep scanner stationary)..."
-        # Poll for first odometry output
+        echo "Waiting for IMU/LIO to stabilize..."
+        # Poll for odometry output instead of a fixed 15s sleep
         _lio_stab=0
         while [ $_lio_stab -lt 20 ]; do
             timeout 3 ros2 topic echo /rko_lio/odometry --once > /dev/null 2>&1 && break
             _lio_stab=$((_lio_stab + 1))
         done
-        # Wait for odom Z to be stable over 2s — confirms initialization_phase
-        # has completed with a good bias estimate before operator picks up scanner.
-        echo "Verifying IMU bias initialization (keep scanner stationary)..."
-        python3 - << 'STABCHECK'
-import rclpy, sys, math, time
-from rclpy.node import Node
-from nav_msgs.msg import Odometry
-
-rclpy.init()
-node = Node('_stab_check')
-samples = []
-def cb(msg):
-    samples.append(msg.pose.pose.position.z)
-topic = '/rko_lio/odometry'
-sub = node.create_subscription(Odometry, topic, cb, 10)
-deadline = time.time() + 30.0
-while rclpy.ok() and time.time() < deadline:
-    rclpy.spin_once(node, timeout_sec=0.1)
-    if len(samples) >= 20:
-        z_std = (sum((z - sum(samples)/len(samples))**2 for z in samples) / len(samples)) ** 0.5
-        if z_std < 0.005:
-            print(f'STABLE z_std={z_std:.4f}m')
-            break
-        samples.pop(0)  # sliding window
-else:
-    print(f'TIMEOUT samples={len(samples)}')
-node.destroy_node()
-rclpy.shutdown()
-STABCHECK
-        _stab_result=$?
-        if [ $_stab_result -eq 0 ]; then
-            echo "✓ IMU bias initialized — you may now pick up the scanner and begin scanning"
-        else
-            echo "⚠ Stability check timed out — proceeding anyway"
-        fi
         LIO_ENABLED="true"
         QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
             -stylesheet "$ROS_WS_DIR/src/atlas-scanner/src/config/rviz_kiosk.qss" > /tmp/rviz.log 2>&1 &
@@ -644,16 +563,13 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     ROSBAG_PID=$!
     PIDS+=($ROSBAG_PID)
 
-    # IMU bag: dedicated core 1 (shared with Livox driver) at high priority.
-    # Core 3 was shared with the main bag's LiDAR/image write bursts, causing
-    # the recorder to stall and drop IMU packets (200Hz -> 20Hz observed).
-    # Core 1 is lightly loaded (Livox UDP receive only) and avoids that contention.
-    # Cache raised to 50MB so burst gaps don't overflow before the next flush.
+    # IMU bag: separate high-priority recorder on core 3 so IMU topics
+    # are never starved by LiDAR/image write bursts in the main bag.
     IMU_TOPICS="/livox/imu"
     ros2 topic list 2>/dev/null | grep -q "/imu/data$"   && IMU_TOPICS="$IMU_TOPICS /imu/data"
     ros2 topic list 2>/dev/null | grep -q "/imu/data_raw" && IMU_TOPICS="$IMU_TOPICS /imu/data_raw"
     # shellcheck disable=SC2086
-    taskset -c 1 nice -n -5 ros2 bag record -o "${ROSBAG_DIR}_imu" --max-cache-size 50000000 \
+    taskset -c 3 nice -n 5 ros2 bag record -o "${ROSBAG_DIR}_imu" --max-cache-size 20000000 \
         $IMU_TOPICS &
     IMU_BAG_PID=$!
     PIDS+=($IMU_BAG_PID)
