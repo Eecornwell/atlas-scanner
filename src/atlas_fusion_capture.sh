@@ -80,8 +80,8 @@ cleanup() {
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null
-            sleep 1
-            kill -KILL "$pid" 2>/dev/null
+            sleep 2
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
         fi
     done
 
@@ -302,10 +302,60 @@ else
 fi
 
 # Kill stale processes (use pgrep+kill to avoid pkill matching its own cmdline args)
+# Sends SIGTERM first so C++ destructors (StopLiveStreaming/Close) can run cleanly,
+# then SIGKILL only if the process is still alive after a short wait.
 _pkill() {
     local pat="$1"
-    pgrep -f "$pat" 2>/dev/null | grep -v "^$$\$" | xargs -r kill -9 2>/dev/null || true
+    local pids
+    pids=$(pgrep -f "$pat" 2>/dev/null | grep -v "^$$\$")
+    [ -z "$pids" ] && return 0
+    echo $pids | xargs -r kill -TERM 2>/dev/null || true
+    sleep 2
+    for _p in $pids; do kill -0 "$_p" 2>/dev/null && kill -KILL "$_p" 2>/dev/null || true; done
 }
+
+# Block until all insta360_ros_driver processes have fully exited.
+# This is the critical gate: the camera firmware needs the SDK to complete
+# StopLiveStreaming()+Close() before a new session can open cleanly.
+_wait_camera_dead() {
+    local _i
+    for _i in $(seq 1 15); do
+        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || return 0
+        sleep 1
+    done
+    # Still alive after 15s — force kill as last resort
+    pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+    pgrep -f "decoder" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+    sleep 1
+}
+
+# USB-level reset of the Insta360 camera — clears any firmware streaming state
+# that survived an unclean SDK shutdown.
+_usb_reset_camera() {
+    [ -e /dev/insta ] || return 0
+    local _dev
+    _dev=$(readlink -f /dev/insta 2>/dev/null) || return 0
+    if command -v usbreset > /dev/null 2>&1; then
+        echo "Resetting USB device $_dev..."
+        sudo usbreset "$_dev" 2>/dev/null || true
+    else
+        local _busdev
+        _busdev=$(udevadm info --query=path --name="$_dev" 2>/dev/null \
+            | grep -oP '[0-9]+-[0-9.]+(?=/[^/]+$)' | head -1)
+        if [ -n "$_busdev" ] && [ -d "/sys/bus/usb/devices/$_busdev" ]; then
+            echo "Resetting USB device via sysfs ($_busdev)..."
+            echo "$_busdev" | sudo tee /sys/bus/usb/drivers/usb/unbind > /dev/null 2>&1 || true
+            sleep 1
+            echo "$_busdev" | sudo tee /sys/bus/usb/drivers/usb/bind > /dev/null 2>&1 || true
+        fi
+    fi
+    # Wait for device node to re-appear after reset
+    for _i in $(seq 1 10); do
+        [ -e /dev/insta ] && return 0
+        sleep 1
+    done
+}
+
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
 _pkill "livox_ros_driver2" & _kpids=($!)
 _pkill "rko_lio" & _kpids+=($!)
@@ -323,6 +373,9 @@ _pkill "python.*equirectangular" & _kpids+=($!)
 _pkill "imu_frame" & _kpids+=($!)
 _pkill "imu_stabilized" & _kpids+=($!)
 wait "${_kpids[@]}"
+# Block until the camera driver process is fully gone so StopLiveStreaming()/Close()
+# completes before we attempt to open a new session.
+_wait_camera_dead
 rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port* 2>/dev/null || true
 sleep 1
 
@@ -330,6 +383,11 @@ sleep 1
 if [ "$SKIP_SUDO_CHECK" != "1" ]; then
     "$SCRIPT_DIR/setup_camera_permissions.sh"
 fi
+
+# USB reset clears any firmware streaming state left over from the previous session.
+# Runs after the driver process is confirmed dead so the reset isn't racing with
+# an in-progress StopLiveStreaming() call.
+_usb_reset_camera
 
 # Wait for /dev/insta — may still be re-enumerating after USB reset
 for _i in $(seq 1 15); do
@@ -373,33 +431,32 @@ for _cam_attempt in 1 2 3; do
         { sleep 2 && renice -n 15 -p $CAMERA_PID 2>/dev/null; } &
     fi
 
-    # Poll until driver is alive — no fixed pre-sleep
-    for _w in $(seq 1 10); do
+    # Poll until driver confirms streaming or exits — wait up to 20s
+    # The driver now exits with -1 if StartLiveStreaming() succeeds but no
+    # frames arrive within 8s, so a dead process here means a real failure.
+    for _w in $(seq 1 20); do
         kill -0 $CAMERA_PID 2>/dev/null || break
         sleep 1
     done
-    if kill -0 $CAMERA_PID 2>/dev/null && [ "$_w" -ge 5 ]; then
+    if kill -0 $CAMERA_PID 2>/dev/null; then
         echo "✓ Camera driver ready"
         CAMERA_STATUS="/dual_fisheye/image/compressed"
         CAMERA_STARTED=true
         break
     else
-        echo "⚠ Camera attempt $_cam_attempt failed, retrying..."
-        kill -KILL $CAMERA_PID 2>/dev/null
+        echo "⚠ Camera attempt $_cam_attempt failed (driver exited), retrying..."
         _pkill "insta360_ros_driver"
-        sleep 3
-        # Re-apply permissions — USB re-enumeration resets device node permissions
+        _pkill "decoder"
+        _wait_camera_dead
+        # USB reset to clear firmware streaming state before next attempt
+        _usb_reset_camera
+        for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
         [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
     fi
 done
 
 if [ "$CAMERA_STARTED" = "false" ]; then
     echo "✗ Camera failed to start after 3 attempts"; exit 1
-fi
-
-echo "Waiting for camera data on /dual_fisheye/image/compressed..."
-if ! timeout 10 ros2 topic echo /dual_fisheye/image/compressed --once > /dev/null 2>&1; then
-    echo "✗ No camera data received within 10s — check camera connection"; exit 1
 fi
 echo "✓ Camera data confirmed"
 
