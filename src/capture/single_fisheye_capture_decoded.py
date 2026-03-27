@@ -219,8 +219,8 @@ def main():
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     _t_start = time.time()
-    # Poll for DDS discovery (both LiDAR and camera) instead of fixed sleep
-    while time.time() - _t_start < 5.0:
+    # Wait for LiDAR first (fast), then keep waiting for camera up to 20s total
+    while time.time() - _t_start < 20.0:
         time.sleep(0.05)
         with node.buffer_lock:
             lidar_ok = len(node.lidar_buffer) > 0
@@ -237,13 +237,13 @@ def main():
         print(f"✓ Buffers ready - LiDAR: {lidar_count}, Odom: {odom_count}")
         if lidar_count == 0:
             print("✗ No LiDAR data received")
-            return
+            sys.exit(1)
 
         with node.image_lock:
             has_image = node.latest_image is not None
         if not has_image:
-            print("✗ No camera frame received during DDS discovery window")
-            return
+            print("✗ No camera frame received")
+            sys.exit(1)
 
 
         capture_time = time.time()
@@ -261,7 +261,7 @@ def main():
             front_fisheye = cv2.rotate(payload[:, :half], cv2.ROTATE_90_CLOCKWISE)
         if front_fisheye is None:
             print("✗ Failed to extract fisheye image")
-            return
+            sys.exit(1)
 
         img_file = os.path.join(output_dir, f'fisheye_{timestamp}.jpg')
         cv2.imwrite(img_file, front_fisheye, [cv2.IMWRITE_JPEG_QUALITY, 95])

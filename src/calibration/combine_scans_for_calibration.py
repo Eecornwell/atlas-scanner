@@ -52,7 +52,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
                 equirect_files = [dst]
                 print(f"  Synthesised ERP from dual fisheye for {fusion_dir.name}")
             elif single_files:
-                erp_cfg = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/config/equirectangular_single.yaml')
+                erp_cfg = os.path.expanduser('~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
                 src = single_files[0]
                 dst = fusion_dir / f'equirect_{src.stem}.jpg'
                 if not dst.exists():

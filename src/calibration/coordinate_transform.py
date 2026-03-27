@@ -85,6 +85,19 @@ def calibration_transform(root_path, use_existing=False):
         except:
             pass
     
+    # Load ERP output dimensions from equirectangular.yaml
+    erp_config_path = '/home/orion/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml'
+    erp_width, erp_height = 3840, 1920  # fallback defaults
+    if os.path.exists(erp_config_path):
+        try:
+            with open(erp_config_path, 'r') as f:
+                erp_cfg = yaml.safe_load(f)
+            p = erp_cfg.get('equirectangular_node', {}).get('ros__parameters', erp_cfg)
+            erp_width = p.get('out_width', erp_width)
+            erp_height = p.get('out_height', erp_height)
+        except:
+            pass
+
     # Create config with DIRECT values (no complex transformations)
     config = {
         'roll_offset': float(euler_xyz[0]),
@@ -100,8 +113,8 @@ def calibration_transform(root_path, use_existing=False):
         'z_offset': float(t_camera_lidar[2]),
         'flip_x': existing_config.get('flip_x', False),
         'flip_y': existing_config.get('flip_y', False),
-        'image_width': existing_config.get('image_width', 1920),
-        'image_height': existing_config.get('image_height', 960),
+        'image_width': erp_width,
+        'image_height': erp_height,
         'use_fisheye': existing_config.get('use_fisheye', False),
         'skip_rate': existing_config.get('skip_rate', 5)
     }

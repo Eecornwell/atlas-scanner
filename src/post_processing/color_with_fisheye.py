@@ -31,7 +31,7 @@ def color_scan_fisheye(scan_dir, config_path=None, mask_path=None):
 
     # Convert single fisheye to ERP using single-lens config (zeroed alignment)
     erp_config = os.path.expanduser(
-        '~/atlas_ws/src/atlas-scanner/src/config/equirectangular_single.yaml')
+        '~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
     timestamp = os.path.basename(fisheye_img_path).replace('fisheye_', '').replace('.jpg', '')
     erp_path = os.path.join(scan_dir, f'equirect_{timestamp}.jpg')
 

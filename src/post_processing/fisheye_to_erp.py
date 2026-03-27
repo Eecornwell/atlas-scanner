@@ -117,16 +117,23 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
         back_remap  = cv2.remap(back,  bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(front_mask[:, :, None], front_remap, back_remap).astype(np.uint8)
     else:
-        # Single pre-extracted fisheye (already cropped/rotated by capture script)
+        # Single fisheye: back lens only.
+        # If input is the raw side-by-side frame (width > height), extract the back
+        # lens (left half) and rotate 90° CW — same as the dual path does.
+        # If input is already a pre-extracted square fisheye, use it directly.
         h, w = img.shape[:2]
-        crop = min(crop, h, w)
-        y0 = (h - crop) // 2
-        x0 = (w - crop) // 2
-        fisheye = img[y0:y0+crop, x0:x0+crop]
+        if w > h:
+            back_raw = cv2.rotate(img[:, :w // 2], cv2.ROTATE_90_CLOCKWISE)
+        else:
+            back_raw = img
+        bh, bw = back_raw.shape[:2]
+        crop = min(crop, bh, bw)
+        y0 = (bh - crop) // 2
+        x0 = (bw - crop) // 2
+        fisheye = back_raw[y0:y0+crop, x0:x0+crop]
 
         # The single fisheye is the back lens saved with the same 90° CW rotation as the
-        # dual path. Use the dual back maps directly with identity transform (zero rotation
-        # and translation from equirectangular_single.yaml).
+        # dual path. Use the dual back maps with the same equirectangular.yaml calibration.
         _, _, _, bmx, bmy, back_mask = build_maps(cfg, crop)
         remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)
@@ -151,9 +158,7 @@ if __name__ == '__main__':
     atlas_cfg_dir = os.path.expanduser('~/atlas_ws/src/atlas-scanner/src/config')
     if args.config:
         cfg_path = args.config
-    elif args.dual:
-        cfg_path = os.path.join(cfg_dir, 'equirectangular.yaml')
     else:
-        cfg_path = os.path.join(atlas_cfg_dir, 'equirectangular_single.yaml')
+        cfg_path = os.path.join(cfg_dir, 'equirectangular.yaml')
 
     fisheye_jpg_to_erp(args.input, cfg_path, args.output, dual=args.dual)

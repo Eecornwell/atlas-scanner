@@ -103,6 +103,7 @@ cleanup() {
     _pkill "enhanced_trajectory_recorder"
     sleep 1
     _pkill "buffered_odom_bridge"
+    _pkill "rviz2"
     _pkill "insta360_ros_driver"
     _pkill "image_decoder"
     _pkill "decoder"
@@ -171,10 +172,18 @@ cleanup() {
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             else
-                echo "Creating colored point clouds using fisheye images..."
+                echo "Converting fisheye images to ERP (single fisheye)..."
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
-                    [ -d "$scan_dir" ] && python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/color_with_fisheye.py" "$scan_dir"
+                    [ -d "$scan_dir" ] || continue
+                    BAG_DIR=$(ls -d "$scan_dir"/rosbag_* 2>/dev/null | head -1)
+                    [ -z "$BAG_DIR" ] && continue
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
+                        "$BAG_DIR" "$scan_dir" || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
                 done
+                echo "Creating masked images..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
+                echo "Creating colored point clouds..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             fi
             echo "✓ Colored point clouds created"
         fi
@@ -696,27 +705,6 @@ else
             sleep 3
         fi
 
-        # Ensure camera topic is live — use a 3s timeout per attempt to allow
-        # DDS peer discovery to complete before declaring the topic dead
-        _cam_topic_wait=0
-        while [ $_cam_topic_wait -lt 10 ]; do
-            timeout 3 ros2 topic echo /dual_fisheye/image/compressed --once > /dev/null 2>&1 && break
-            _cam_topic_wait=$((_cam_topic_wait + 1))
-        done
-        if [ $_cam_topic_wait -ge 10 ]; then
-            echo "⚠ Camera topic not publishing, restarting driver..."
-            _pkill "insta360_ros_driver"
-            _pkill "decoder"
-            sleep 2
-            for _ci in $(seq 1 15); do [ -e /dev/insta ] && break; sleep 1; done
-            [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-            ros2 launch insta360_ros_driver bringup.launch.xml \
-                equirectangular:=false imu_filter:=false decode:=false &
-            CAMERA_PID=$!
-            PIDS+=($CAMERA_PID)
-            sleep 8
-        fi
-
         # Start per-scan rosbag immediately before capture so idle setup time
         # between scans is not recorded — keeps bag sizes proportional to the
         # ~4s capture window rather than the full inter-scan gap.
@@ -760,7 +748,7 @@ else
                 CAPTURE_EXIT_CODE=$?
             fi
         else
-            # dual_fisheye: use buffered camera capture (produces equirectangular via driver)
+            # dual_fisheye: image comes from bag in post-processing; only LiDAR capture needed here
             ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0

@@ -83,9 +83,9 @@
         EOF
 
         cd ~/atlas_ws/src/atlas-scanner/src
-        ./atlas_fusion_capture.sh --capture stationary --camera <dual_fisheye|single_fisheye>
+        ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye
         ```
-        > *Note: Choose `--camera dual_fisheye` for full 360° equirectangular coverage, or `--camera single_fisheye` for a lighter single-lens setup.*
+        > *Note: Choose `--camera dual_fisheye` for full 360° equirectangular coverage. The system will then adjust calibration to apply to `--camera single_fisheye` for a lighter single-lens setup to be used later.*
 
         > *Note: Take note of the session directory from the console output. It will be in the form: `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/`*
 
@@ -103,7 +103,7 @@
     3. Capture new data of at least **5** scans from varying positions/rotations in same room. These scans will be used for the calibration procedure.
         ```bash
         cd ~/atlas_ws/src/atlas-scanner/src
-        ./atlas_fusion_capture.sh --capture stationary --camera <dual_fisheye|single_fisheye> 
+        ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye
         ```
         > *Note: Use the same `--camera` mode as in step 1.*
 

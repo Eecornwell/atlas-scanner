@@ -14,7 +14,7 @@ git clone https://github.com/Eecornwell/atlas-scanner.git
 ### 1. Base Sensors Installation
 Installs camera and LiDAR drivers with optimized camera settings:
 - **Resolution**: 3840x1920 (high quality)
-- **ISO**: 400 (increased light sensitivity)
+- **ISO**: 600 (increased light sensitivity)
 - **Exposure (shutter speed)**: 1/120 (faster shutter, motion compensation)
 - **Bitrate**: 12 Mbps (reduced compression artifacts)
 - **Scaling**: Lanczos interpolation (highest quality)
