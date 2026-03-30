@@ -678,12 +678,13 @@ sys.exit(0 if ok[0] else 4)
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
         
-        # Send SIGINT to the script process only (not the whole group) so the
-        # trap cleanup/post-processing runs to completion before children are killed.
+        # Send 'q' to stdin to stop continuous mode (same as stationary mode exit).
+        # This lets the script's read loop exit cleanly and run post-processing.
         proc = self.fusion_process
         if proc:
             try:
-                proc.send_signal(signal.SIGINT)
+                proc.stdin.write('q\n')
+                proc.stdin.flush()
             except Exception as e:
                 self.log_message(f"Error sending stop signal: {e}")
 

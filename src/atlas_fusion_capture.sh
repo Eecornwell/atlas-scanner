@@ -75,12 +75,16 @@ SCAN_COUNT=0
 cleanup() {
     [ "$CLEANUP_DONE" = "true" ] && return
     CLEANUP_DONE=true
+    trap '' SIGINT SIGTERM
     echo "Shutting down..."
 
     for pid in "${PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null
-            sleep 2
+            for _w in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+            done
             kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
         fi
     done
@@ -101,7 +105,6 @@ cleanup() {
     fi
 
     _pkill "enhanced_trajectory_recorder"
-    sleep 1
     _pkill "buffered_odom_bridge"
     _pkill "rviz2"
     _pkill "insta360_ros_driver"
@@ -119,16 +122,18 @@ cleanup() {
     _pkill "ros2 launch.*insta360"
     _pkill "python.*equirectangular"
 
-    sleep 3
-
     if [ "$BAG_ONLY" = "true" ]; then
         echo "Bag-only mode: skipping post-processing. Bag saved in: $SCAN_DIR"
         exit 0
     fi
 
+    # Run all post-processing in a subshell with SIGINT ignored.
+    # Children (Python scripts) inherit SIG_IGN and cannot be killed by Ctrl+C.
+    (trap '' SIGINT SIGTERM
+
     # Continuous mode: reconstruct scans from the single session bag
     if [ "$CAPTURE_MODE" = "continuous" ]; then
-        BAG_DIR=$(ls -d "$SCAN_DIR"/rosbag_* 2>/dev/null | head -1)
+        BAG_DIR=$(ls -d "$SCAN_DIR"/rosbag_* 2>/dev/null | grep -v '_imu$' | head -1)
         if [ -n "$BAG_DIR" ]; then
             echo "Estimating IMU clock offset..."
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/imu_sync.py" \
@@ -272,7 +277,7 @@ cleanup() {
             echo "Failed to initialize sensors. Check hardware connections."
         fi
     fi
-    exit 0
+    ) # end post-processing subshell    exit 0
 }
 
 trap cleanup SIGINT SIGTERM EXIT
@@ -319,8 +324,13 @@ _pkill() {
     pids=$(pgrep -f "$pat" 2>/dev/null | grep -v "^$$\$")
     [ -z "$pids" ] && return 0
     echo $pids | xargs -r kill -TERM 2>/dev/null || true
-    sleep 2
-    for _p in $pids; do kill -0 "$_p" 2>/dev/null && kill -KILL "$_p" 2>/dev/null || true; done
+    for _p in $pids; do
+        for _w in $(seq 1 20); do
+            kill -0 "$_p" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -0 "$_p" 2>/dev/null && kill -KILL "$_p" 2>/dev/null || true
+    done
 }
 
 # Block until all insta360_ros_driver processes have fully exited.
@@ -608,7 +618,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     echo ""
     echo "=========================================="
     echo "CONTINUOUS MODE: recording session bag"
-    echo "Press Ctrl+C to stop"
+    echo "Press 'q' + ENTER to stop"
     echo "=========================================="
 
     ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -641,10 +651,37 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     PIDS+=($IMU_BAG_PID)
     echo "✓ IMU bag recording started: ${ROSBAG_DIR}_imu"
     echo "✓ Rosbag recording started: $ROSBAG_DIR"
-    echo "  Press Ctrl+C when scanning is complete."
+    echo "  Press 'q' + ENTER when scanning is complete."
 
-    wait $ROSBAG_PID 2>/dev/null || true
-    SCAN_COUNT=0
+    # Camera watchdog: restart driver if it dies mid-session
+    (
+        while true; do
+            sleep 2
+            [ -f "$SCAN_DIR/.session_done" ] && exit 0
+            if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+                echo "⚠ Camera driver died, restarting..."
+                _pkill "insta360_ros_driver"
+                _pkill "decoder"
+                _wait_camera_dead
+                _usb_reset_camera
+                for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
+                [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
+                ros2 launch insta360_ros_driver bringup.launch.xml \
+                    equirectangular:=false decode:=false imu_filter:=true &
+                CAMERA_PID=$!
+                echo "✓ Camera driver restarted (pid $CAMERA_PID)"
+                sleep 10  # give driver time to stabilise before next check
+            fi
+        done
+    ) &
+    WATCHDOG_PID=$!
+    PIDS+=("$WATCHDOG_PID")
+
+    while true; do
+        read -r _input
+        [ "$_input" = "q" ] || [ "$_input" = "quit" ] && break
+    done
+    touch "$SCAN_DIR/.session_done"  # signal watchdog to exit
 
 else
     # ── Stationary mode ──────────────────────────────────────────────────────
@@ -737,12 +774,14 @@ else
         echo "Capturing scan $SCAN_COUNT..."
         if [ "$CAMERA_MODE" = "single_fisheye" ]; then
             ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
             timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \
                 "$INDIVIDUAL_SCAN_DIR" 30 4.0
             CAPTURE_EXIT_CODE=$?
             if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
                 echo "  Primary capture failed, trying buffered camera capture..."
                 ROS_DISABLE_LOANED_MESSAGES=1 \
+                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
                 timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                     "$INDIVIDUAL_SCAN_DIR" 15 2.0
                 CAPTURE_EXIT_CODE=$?
@@ -750,6 +789,7 @@ else
         else
             # dual_fisheye: image comes from bag in post-processing; only LiDAR capture needed here
             ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0
             CAPTURE_EXIT_CODE=$?
@@ -759,6 +799,7 @@ else
         if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
             echo "  Trying LiDAR-driven capture..."
             ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
             timeout 15 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/lidar_driven_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 8
             CAPTURE_EXIT_CODE=$?

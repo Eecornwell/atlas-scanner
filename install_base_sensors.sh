@@ -229,6 +229,22 @@ echo "Change the lidar IP address to fit your model (default: 192.168.1.186)"
 echo ""
 read -p "Press Enter once you have completed the network configuration..."
 
+# Configure FastDDS profiles
+# The main profile (fastdds_atlas.xml) restricts DDS traffic to the LiDAR wired
+# interface (192.168.1.50) and SHM, preventing discovery noise from WiFi/Docker.
+# The capture profile (fastdds_capture.xml) uses UDP-only on the same interface
+# so short-lived capture processes avoid SHM segment conflicts with long-running drivers.
+HOST_IP=$(ip -4 addr show | grep 'inet 192\.168\.1\.' | awk '{print $2}' | cut -d/ -f1 | head -1)
+if [ -z "$HOST_IP" ]; then
+    echo "⚠ Could not detect a 192.168.1.x address — defaulting to 192.168.1.50"
+    HOST_IP="192.168.1.50"
+fi
+echo "Configuring FastDDS profiles for host IP: $HOST_IP"
+sed -i "s|<address>192\.168\.1\.[0-9]*</address>|<address>$HOST_IP</address>|g" \
+    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_atlas.xml \
+    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_capture.xml
+echo "✓ FastDDS profiles updated"
+
 echo ""
 echo "=== Testing Livox Viewer ==="
 echo "Check with Livox Viewer First to confirm can connect to lidar"

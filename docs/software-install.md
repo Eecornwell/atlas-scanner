@@ -255,47 +255,18 @@ sudo ifconfig enp2s0 192.168.1.50
 
 # For SDK, change settings here, change the lidar IP address to fit your model:
 vi ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/MID360_config.json
-{
-"lidar_summary_info" : {
-    "lidar_type": 8
-},
-"MID360": {
-    "lidar_net_info" : {
-    "cmd_data_port": 56100,
-    "push_msg_port": 56200,
-    "point_data_port": 56300,
-    "imu_data_port": 56400,
-    "log_data_port": 56500
-    },
-    "host_net_info" : {
-    "cmd_data_ip" : "192.168.1.50",
-    "cmd_data_port": 56101,
-    "push_msg_ip": "192.168.1.50",
-    "push_msg_port": 56201,
-    "point_data_ip": "192.168.1.50",
-    "point_data_port": 56301,
-    "imu_data_ip" : "192.168.1.50",
-    "imu_data_port": 56401,
-    "log_data_ip" : "",
-    "log_data_port": 56501
-    }
-},
-"lidar_configs" : [
-    {
-    "ip" : "192.168.1.186",
-    "pcl_data_type" : 1,
-    "pattern_mode" : 0,
-    "extrinsic_parameter" : {
-        "roll": 0.0,
-        "pitch": 0.0,
-        "yaw": 0.0,
-        "x": 0,
-        "y": 0,
-        "z": 0
-    }
-    }
-]
-}
+
+# Configure FastDDS profiles
+# Replace the IP below if your wired interface uses a different 192.168.1.x address.
+# fastdds_atlas.xml  — used by long-running driver processes (LiDAR, RKO-LIO, camera).
+#   Restricts DDS discovery to SHM + the wired LiDAR interface only, preventing
+#   WiFi/Docker interfaces from being used for sensor traffic.
+# fastdds_capture.xml — used by short-lived capture processes.
+#   UDP-only on the same interface; avoids SHM segment conflicts with the drivers.
+HOST_IP="192.168.1.50"   # change if your wired IP differs
+sed -i "s|<address>192\.168\.1\.[0-9]*</address>|<address>$HOST_IP</address>|g" \
+    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_atlas.xml \
+    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_capture.xml
 
 # Check with Livox Viewer First to confirm can connect to lidar_configs
 cd ~/atlas_ws &&

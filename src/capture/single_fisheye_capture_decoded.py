@@ -229,7 +229,6 @@ def main():
         if lidar_ok and cam_ok:
             break
 
-
     try:
         with node.buffer_lock:
             lidar_count = len(node.lidar_buffer)
