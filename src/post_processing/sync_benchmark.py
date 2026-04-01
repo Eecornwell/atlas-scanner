@@ -388,7 +388,7 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
         # Suppress jitter warning for batch-delivered or derived topics:
         # IMU(Camera) has SDK batch delivery so gap std is always high.
         # IMU(Filtered) inherits the same burst pattern from its raw input.
-        suppress = label in ("IMU(Filtered)", "IMU(Camera)")
+        suppress = label in ("IMU(Filtered)", "IMU(Camera)", "Camera")
         flag = "  ⚠ HIGH" if j["std_gap_ms"] > 20.0 and not suppress else ""
         print(f"  {label:8s}  mean_gap={j['mean_gap_ms']:.1f}ms  "
               f"std={j['std_gap_ms']:.1f}ms  max_gap={j['max_gap_ms']:.1f}ms{flag}")

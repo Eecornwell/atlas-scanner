@@ -258,11 +258,10 @@ vi ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/MID360_co
 
 # Configure FastDDS profiles
 # Replace the IP below if your wired interface uses a different 192.168.1.x address.
+# Both profiles use SHM + UDP restricted to the wired LiDAR interface, preventing
+# WiFi/Docker interfaces from being used for sensor traffic.
 # fastdds_atlas.xml  — used by long-running driver processes (LiDAR, RKO-LIO, camera).
-#   Restricts DDS discovery to SHM + the wired LiDAR interface only, preventing
-#   WiFi/Docker interfaces from being used for sensor traffic.
-# fastdds_capture.xml — used by short-lived capture processes.
-#   UDP-only on the same interface; avoids SHM segment conflicts with the drivers.
+# fastdds_capture.xml — used by short-lived capture processes (identical transport config).
 HOST_IP="192.168.1.50"   # change if your wired IP differs
 sed -i "s|<address>192\.168\.1\.[0-9]*</address>|<address>$HOST_IP</address>|g" \
     ~/atlas_ws/src/atlas-scanner/src/config/fastdds_atlas.xml \

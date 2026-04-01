@@ -20,8 +20,8 @@ from collections import deque
 import threading
 
 class LidarDrivenCapture(Node):
-    def __init__(self, output_dir=".", image_buffer_size=5):
-        super().__init__('lidar_driven_capture')
+    def __init__(self, output_dir=".", image_buffer_size=5, context=None):
+        super().__init__('lidar_driven_capture', context=context)
         self.bridge = CvBridge()
         self.captured = False
         self.output_dir = output_dir
@@ -35,17 +35,21 @@ class LidarDrivenCapture(Node):
         # Subscriptions - LiDAR drives the timing
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
+        image_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
-        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, 5)
+        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, image_qos)
+        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, image_qos)
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 1)
         
         # Wait for image buffer to fill
         self.min_images_before_capture = 2
         
-        print(f"Debug: LiDAR-driven capture initialized with image buffer size {image_buffer_size}")
 
     def image_cb(self, msg):
-        """Store images in buffer with timestamps"""
+        """Store compressed images in buffer — skip H.264 streams (decoded via image_raw_cb)."""
+        fmt = getattr(msg, 'format', '').lower()
+        if 'h264' in fmt or 'h.264' in fmt:
+            return
         timestamp = time.time()
         try:
             import numpy as _np
@@ -55,15 +59,19 @@ class LidarDrivenCapture(Node):
                 return
             with self.buffer_lock:
                 self.image_buffer.append((timestamp, cv_image))
-            
-            if not hasattr(self, '_image_count'):
-                self._image_count = 0
-            self._image_count += 1
-            if self._image_count % 5 == 0:
-                print(f"Debug: Image buffer size: {len(self.image_buffer)}")
         except Exception as e:
-            print(f"Debug: Failed to process image: {e}")
-        
+            print(f"Failed to process image: {e}")
+
+    def image_raw_cb(self, msg):
+        """Store software-decoded frames (from the H.264 decoder node)."""
+        timestamp = time.time()
+        try:
+            import numpy as _np
+            cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            with self.buffer_lock:
+                self.image_buffer.append((timestamp, cv_image))
+        except Exception as e:
+            print(f"Failed to process decoded image: {e}")
     def odom_cb(self, msg):
         """Store latest odometry"""
         self.latest_odom = msg
@@ -82,7 +90,6 @@ class LidarDrivenCapture(Node):
         capture_time = time.time()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        print(f"Debug: LiDAR frame triggered capture, using most recent image from buffer...")
         
         try:
             # Get most recent image from buffer
@@ -93,10 +100,8 @@ class LidarDrivenCapture(Node):
                 if self.image_buffer:
                     img_timestamp, most_recent_image = self.image_buffer[-1]  # Most recent
                     image_age = capture_time - img_timestamp
-                    print(f"Debug: Using image from buffer (age: {image_age:.3f}s)")
             
             if most_recent_image is None:
-                print("Debug: No images available in buffer")
                 return
                 
             # Save image
@@ -105,7 +110,6 @@ class LidarDrivenCapture(Node):
             
             # Process LiDAR data
             points = []
-            print(f"Debug: LiDAR data size: {len(msg.data)} bytes, point_step: {msg.point_step}")
             
             raw_points = 0
             filtered_points = 0
@@ -118,7 +122,6 @@ class LidarDrivenCapture(Node):
                     if abs(x) < 20 and abs(y) < 20 and abs(z) < 10:
                         points.append([x, y, z])
                         filtered_points += 1
-            print(f"Debug: Raw points: {raw_points}, Filtered points: {filtered_points}")
             
             # Transform to world coordinates if odometry available
             if self.latest_odom and points:
@@ -167,33 +170,26 @@ class LidarDrivenCapture(Node):
             traceback.print_exc()
 
 def main():
-    if len(sys.argv) > 1:
-        output_dir = sys.argv[1]
-    else:
-        output_dir = "."
-    
-    # Image buffer size can be passed as second argument
+    output_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     buffer_size = 5 if len(sys.argv) <= 2 else int(sys.argv[2])
-    
-    # Ensure output directory exists
+
     os.makedirs(output_dir, exist_ok=True)
-    
-    rclpy.init()
-    node = LidarDrivenCapture(output_dir, buffer_size)
-    executor = rclpy.executors.SingleThreadedExecutor()
+
+    ctx = rclpy.Context()
+    rclpy.init(context=ctx)
+    node = LidarDrivenCapture(output_dir, buffer_size, context=ctx)
+    executor = rclpy.executors.SingleThreadedExecutor(context=ctx)
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     time.sleep(2.0)  # allow DDS discovery with node already spinning
 
     try:
-        print("Debug: Filling image buffer for 5 seconds...")
-        time.sleep(5.0)
+        time.sleep(8.0)
 
-        print(f"Debug: Image buffer filled with {len(node.image_buffer)} images")
 
         if len(node.image_buffer) == 0:
-            print("✗ No camera frames received - check /dual_fisheye/image/compressed is publishing")
+            print("✗ No camera frames received - check /dual_fisheye/image/compressed or /dual_fisheye/image is publishing")
             return
 
         timeout = 30.0
@@ -210,7 +206,7 @@ def main():
         pass
     finally:
         try:
-            rclpy.shutdown()
+            rclpy.shutdown(context=ctx)
         except Exception:
             pass
 

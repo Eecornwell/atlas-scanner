@@ -41,8 +41,8 @@ def _write_ply_binary(path, pts):
 
 
 class SingleFisheyeCaptureDecoded(Node):
-    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0):
-        super().__init__('single_fisheye_capture_decoded')
+    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0, context=None):
+        super().__init__('single_fisheye_capture_decoded', context=context)
         self.captured = False
         self.output_dir = output_dir
         self.buffer_size = buffer_size
@@ -60,13 +60,14 @@ class SingleFisheyeCaptureDecoded(Node):
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
-        image_qos_reliable = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=1)
-        image_qos_be = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=1)
+        image_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        odom_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         from sensor_msgs.msg import CompressedImage
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
-        self.image_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_cb, image_qos_reliable)
-        self.compressed_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.compressed_cb, image_qos_be)
-        self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 10)
+        self.image_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_cb, image_qos)
+        self.compressed_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.compressed_cb, image_qos)
+        self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, odom_qos)
+        self.odom_buffered_sub = self.create_subscription(Odometry, '/rko_lio/odometry_buffered', self.odom_cb, 10)
 
         print(f"✓ Single fisheye capture initialized")
         print(f"  - Using /dual_fisheye/image/compressed (direct decode)")
@@ -212,16 +213,17 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
 
-    rclpy.init()
-    node = SingleFisheyeCaptureDecoded(output_dir, buffer_size, scan_duration)
-    executor = rclpy.executors.SingleThreadedExecutor()
+    ctx = rclpy.Context()
+    rclpy.init(context=ctx)
+    node = SingleFisheyeCaptureDecoded(output_dir, buffer_size, scan_duration, context=ctx)
+    executor = rclpy.executors.SingleThreadedExecutor(context=ctx)
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
+    time.sleep(2.0)  # allow DDS participant discovery to complete before checking buffers
     _t_start = time.time()
-    # Wait for LiDAR first (fast), then keep waiting for camera up to 20s total
-    while time.time() - _t_start < 20.0:
-        time.sleep(0.05)
+    while time.time() - _t_start < 10.0:
+        time.sleep(0.1)
         with node.buffer_lock:
             lidar_ok = len(node.lidar_buffer) > 0
         with node.image_lock:
@@ -279,7 +281,10 @@ def main():
         executor.shutdown(timeout_sec=0.5)
         spin_thread.join(timeout=1.0)
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown(context=ctx)
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

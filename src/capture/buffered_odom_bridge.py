@@ -27,7 +27,6 @@ class BufferedOdomBridge(Node):
         
     def odom_callback(self, msg):
         self.last_pose = copy.deepcopy(msg)
-        self.odom_pub.publish(msg)  # forward with original LIO header stamp intact
         
     def publish_buffered(self):
         """Always republish last known pose at timer rate to fill LIO gaps."""

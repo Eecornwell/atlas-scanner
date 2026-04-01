@@ -395,7 +395,7 @@ wait "${_kpids[@]}"
 # Block until the camera driver process is fully gone so StopLiveStreaming()/Close()
 # completes before we attempt to open a new session.
 _wait_camera_dead
-rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port* 2>/dev/null || true
+rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port* /dev/shm/fastrtps_[0-9a-f]* 2>/dev/null || true
 sleep 1
 
 # Camera permissions
@@ -404,9 +404,10 @@ if [ "$SKIP_SUDO_CHECK" != "1" ]; then
 fi
 
 # USB reset clears any firmware streaming state left over from the previous session.
-# Runs after the driver process is confirmed dead so the reset isn't racing with
-# an in-progress StopLiveStreaming() call.
-_usb_reset_camera
+# Only needed if a previous driver was running — skip on a clean start.
+if pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+    _usb_reset_camera
+fi
 
 # Wait for /dev/insta — may still be re-enumerating after USB reset
 for _i in $(seq 1 15); do
@@ -418,66 +419,6 @@ if [ ! -e /dev/insta ]; then
     echo "✗ Camera device not found at /dev/insta"
     exit 1
 fi
-
-# ─── Camera driver ────────────────────────────────────────────────────────────
-echo "Starting camera driver (mode: $CAMERA_MODE)..."
-_pkill "insta360_ros_driver"
-sleep 1
-
-CAMERA_STARTED=false
-for _cam_attempt in 1 2 3; do
-    # Enable the Madgwick IMU filter in continuous mode only — it smooths /imu/data_raw
-    # into a regularly-timed /imu/data output needed for cross-correlation in imu_sync.py.
-    # Disabled in stationary mode to avoid unnecessary CPU load during capture.
-    _IMU_FILTER="false"
-    [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
-
-    if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-        ros2 launch insta360_ros_driver bringup.launch.xml \
-            equirectangular:=false \
-            decode:=false \
-            imu_filter:=${_IMU_FILTER} &
-        CAMERA_PID=$!
-        PIDS+=($CAMERA_PID)
-        { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null; } &
-    else
-        ros2 launch insta360_ros_driver bringup.launch.xml \
-            equirectangular:=false \
-            decode:=false \
-            imu_filter:=${_IMU_FILTER} &
-        CAMERA_PID=$!
-        PIDS+=($CAMERA_PID)
-        { sleep 2 && renice -n 15 -p $CAMERA_PID 2>/dev/null; } &
-    fi
-
-    # Poll until driver confirms streaming or exits — wait up to 20s
-    # The driver now exits with -1 if StartLiveStreaming() succeeds but no
-    # frames arrive within 8s, so a dead process here means a real failure.
-    for _w in $(seq 1 20); do
-        kill -0 $CAMERA_PID 2>/dev/null || break
-        sleep 1
-    done
-    if kill -0 $CAMERA_PID 2>/dev/null; then
-        echo "✓ Camera driver ready"
-        CAMERA_STATUS="/dual_fisheye/image/compressed"
-        CAMERA_STARTED=true
-        break
-    else
-        echo "⚠ Camera attempt $_cam_attempt failed (driver exited), retrying..."
-        _pkill "insta360_ros_driver"
-        _pkill "decoder"
-        _wait_camera_dead
-        # USB reset to clear firmware streaming state before next attempt
-        _usb_reset_camera
-        for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
-        [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-    fi
-done
-
-if [ "$CAMERA_STARTED" = "false" ]; then
-    echo "✗ Camera failed to start after 3 attempts"; exit 1
-fi
-echo "✓ Camera data confirmed"
 
 echo "Starting LiDAR driver..."
 # Pin Livox driver to cores 0-1 so its UDP receive thread is isolated
@@ -501,7 +442,7 @@ done
 # Poll for first LiDAR data instead of a fixed warmup sleep
 echo "Waiting for first LiDAR data..."
 _lidar_data_wait=0
-while [ $_lidar_data_wait -lt 15 ]; do
+while [ $_lidar_data_wait -lt 3 ]; do
     timeout 3 ros2 topic echo /livox/lidar --once > /dev/null 2>&1 && break
     _lidar_data_wait=$((_lidar_data_wait + 1))
 done
@@ -559,20 +500,17 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
 
     if grep -q "RKO LIO Node is up" /tmp/rko_lio.log 2>/dev/null; then
         echo "✓ RKO-LIO ready with $IMU_SOURCE IMU"
-        echo "Waiting for IMU/LIO to stabilize..."
-        # Poll for odometry output instead of a fixed 15s sleep
-        _lio_stab=0
-        while [ $_lio_stab -lt 20 ]; do
-            timeout 3 ros2 topic echo /rko_lio/odometry --once > /dev/null 2>&1 && break
-            _lio_stab=$((_lio_stab + 1))
-        done
         LIO_ENABLED="true"
-        QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
-            -stylesheet "$ROS_WS_DIR/src/atlas-scanner/src/config/rviz_kiosk.qss" > /tmp/rviz.log 2>&1 &
-        RVIZ_PID=$!
-        # Not added to PIDS — RViz crash should not terminate the session
-        # Give RViz higher priority than camera pipeline in dual_fisheye mode
-        [ "$CAMERA_MODE" = "dual_fisheye" ] && sleep 2 && renice -n 5 -p $RVIZ_PID 2>/dev/null &
+        if [ -n "${DISPLAY:-}" ]; then
+            QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
+                -stylesheet "$ROS_WS_DIR/src/atlas-scanner/src/config/rviz_kiosk.qss" > /tmp/rviz.log 2>&1 &
+            RVIZ_PID=$!
+            # Not added to PIDS — RViz crash should not terminate the session
+            # Give RViz higher priority than camera pipeline in dual_fisheye mode
+            [ "$CAMERA_MODE" = "dual_fisheye" ] && sleep 2 && renice -n 5 -p $RVIZ_PID 2>/dev/null &
+        else
+            echo "⚠ No display available — skipping RViz"
+        fi
     else
         echo "⚠ RKO-LIO failed to start"
         LIO_ENABLED="false"
@@ -581,6 +519,82 @@ else
     echo "⚠ No IMU available - RKO-LIO disabled"
     LIO_ENABLED="false"
 fi
+
+# ─── Trajectory recorder (start before camera so no delay after camera is live) ────
+if [ "$LIO_ENABLED" = "true" ]; then
+    TRAJ_PID_FILE="$SCAN_DIR/.trajectory_recorder.pid"
+    _pkill "enhanced_trajectory_recorder"
+    _pkill "buffered_odom_bridge"
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/enhanced_trajectory_recorder.py" \
+        "$SCAN_DIR" > "$SCAN_DIR/trajectory_recorder.log" 2>&1 &
+    TRAJECTORY_PID=$!
+    echo "$TRAJECTORY_PID" > "$TRAJ_PID_FILE"
+    PIDS+=($TRAJECTORY_PID)
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_odom_bridge.py" \
+        > "$SCAN_DIR/odom_buffer.log" 2>&1 &
+    PIDS+=($!)
+    TRAJECTORY_RECORDING=true
+fi
+
+# ─── Camera driver ────────────────────────────────────────────────────────────
+# Started last so the Insta360 SDK streaming timeout doesn't expire during
+# the LiDAR + RKO-LIO startup sequence (~50s).
+echo "Starting camera driver (mode: $CAMERA_MODE)..."
+_pkill "insta360_ros_driver"
+sleep 1
+
+CAMERA_STARTED=false
+for _cam_attempt in 1 2 3; do
+    _IMU_FILTER="false"
+    [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
+
+    if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
+        env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+            equirectangular:=false \
+            decode:=false \
+            imu_filter:=${_IMU_FILTER} &
+        CAMERA_PID=$!
+        PIDS+=($CAMERA_PID)
+        { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null; } &
+    else
+        env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+            equirectangular:=false \
+            decode:=false \
+            imu_filter:=${_IMU_FILTER} &
+        CAMERA_PID=$!
+        PIDS+=($CAMERA_PID)
+        { sleep 2 && renice -n 15 -p $CAMERA_PID 2>/dev/null; } &
+    fi
+
+    for _w in $(seq 1 20); do
+        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+        echo "✓ Camera driver ready"
+        CAMERA_STATUS="/dual_fisheye/image/compressed"
+        # For single_fisheye, wait until the decoder has produced at least one
+        # decoded frame on /dual_fisheye/image (I-frame sync can take several seconds).
+        if [ "$CAMERA_MODE" = "single_fisheye" ]; then
+            sleep 5  # wait for H.264 decoder to sync to first I-frame
+        fi
+        CAMERA_STARTED=true
+        break
+    else
+        echo "⚠ Camera attempt $_cam_attempt failed (driver exited), retrying..."
+        _pkill "insta360_ros_driver"
+        _pkill "decoder"
+        _wait_camera_dead
+        _usb_reset_camera
+        for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
+        [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
+    fi
+done
+
+if [ "$CAMERA_STARTED" = "false" ]; then
+    echo "✗ Camera failed to start after 3 attempts"; exit 1
+fi
+echo "✓ Camera data confirmed"
 
 FUSION_READY="true"
 
@@ -594,25 +608,6 @@ echo "  Camera      : $CAMERA_STATUS"
 [ "$LIO_ENABLED" = "true" ] && echo "  Odometry    : RKO-LIO ($IMU_SOURCE IMU)"
 echo "=========================================="
 
-# ─── Trajectory recorder (start once, used by both modes) ─────────────────────
-if [ "$LIO_ENABLED" = "true" ]; then
-    echo "Starting trajectory recording..."
-    TRAJ_PID_FILE="$SCAN_DIR/.trajectory_recorder.pid"
-    _pkill "enhanced_trajectory_recorder"
-    _pkill "buffered_odom_bridge"
-    sleep 2
-    python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/enhanced_trajectory_recorder.py" \
-        "$SCAN_DIR" > "$SCAN_DIR/trajectory_recorder.log" 2>&1 &
-    TRAJECTORY_PID=$!
-    echo "$TRAJECTORY_PID" > "$TRAJ_PID_FILE"
-    PIDS+=($TRAJECTORY_PID)
-    python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_odom_bridge.py" \
-        > "$SCAN_DIR/odom_buffer.log" 2>&1 &
-    PIDS+=($!)
-    TRAJECTORY_RECORDING=true
-    echo "✓ Trajectory recording started"
-fi
-
 # ─── Capture loop ─────────────────────────────────────────────────────────────
 if [ "$CAPTURE_MODE" = "continuous" ]; then
     echo ""
@@ -623,15 +618,8 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
 
     ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     ROSBAG_DIR="$SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
-    CONTINUOUS_TOPICS="/livox/lidar /dual_fisheye/image/compressed_15fps"
+    CONTINUOUS_TOPICS="/livox/lidar /dual_fisheye/image/compressed"
     [ "$LIO_ENABLED" = "true" ] && CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
-    # IMU topics are recorded in a separate bag (${ROSBAG_DIR}_imu) to avoid
-    # write contention with the high-bandwidth LiDAR and image topics.
-    # Throttle camera to 15fps before recording — driver publishes at 30fps but bag only needs 15fps
-    ros2 run topic_tools throttle messages /dual_fisheye/image/compressed 15.0 \
-        /dual_fisheye/image/compressed_15fps > /dev/null 2>&1 &
-    PIDS+=($!)
-    sleep 1
     # Main bag: LiDAR + camera + odometry on cores 2-3
     # shellcheck disable=SC2086
     taskset -c 2,3 nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 100000000 \
@@ -666,7 +654,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
                 _usb_reset_camera
                 for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
                 [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-                ros2 launch insta360_ros_driver bringup.launch.xml \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
                     equirectangular:=false decode:=false imu_filter:=true &
                 CAMERA_PID=$!
                 echo "✓ Camera driver restarted (pid $CAMERA_PID)"
@@ -697,24 +685,28 @@ else
         mkdir -p "$INDIVIDUAL_SCAN_DIR"
 
         # Verify camera is alive, restart if needed
-        if ! kill -0 $CAMERA_PID 2>/dev/null || ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+        if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
             echo "⚠ Camera driver died, restarting..."
             _pkill "insta360_ros_driver"
             _pkill "decoder"
-            sleep 2
-            for _ci in $(seq 1 15); do [ -e /dev/insta ] && break; sleep 1; done
+            _wait_camera_dead
+            _usb_reset_camera
+            for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
             [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
             if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                ros2 launch insta360_ros_driver bringup.launch.xml \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
                     equirectangular:=false decode:=false imu_filter:=false &
             else
-                ros2 launch insta360_ros_driver bringup.launch.xml \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
                     equirectangular:=false imu_filter:=false decode:=false &
             fi
             CAMERA_PID=$!
             PIDS+=($CAMERA_PID)
-            sleep 10
-            if ! kill -0 $CAMERA_PID 2>/dev/null; then
+            for _cw in $(seq 1 20); do
+                pgrep -f "insta360_ros_driver" > /dev/null 2>&1 && break
+                sleep 1
+            done
+            if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
                 echo "✗ Camera driver failed to restart, skipping scan"
                 SCAN_COUNT=$((SCAN_COUNT - 1)); continue
             fi
@@ -749,47 +741,36 @@ else
         ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S_%N | cut -c1-18)
         ROSBAG_DIR="$INDIVIDUAL_SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
         TOPICS_TO_RECORD="/livox/lidar /dual_fisheye/image/compressed /livox/imu"
-        [ "$LIO_ENABLED" = "true" ] && TOPICS_TO_RECORD="$TOPICS_TO_RECORD /rko_lio/odometry_buffered"
+        [ "$LIO_ENABLED" = "true" ] && TOPICS_TO_RECORD="$TOPICS_TO_RECORD /rko_lio/odometry"
         setsid ros2 bag record -o "$ROSBAG_DIR" \
             --compression-mode file --compression-format zstd \
             --max-cache-size 100000000 $TOPICS_TO_RECORD > "$ROSBAG_DIR.log" 2>&1 &
         ROSBAG_PID=$!
         ROSBAG_PGID=$(ps -o pgid= -p $ROSBAG_PID 2>/dev/null | tr -d ' ')
-        # Wait for bag recorder to subscribe to all topics (max 30s)
+        # Wait for bag recorder to subscribe to all topics (max 5s)
         _bag_wait=0
-        while [ $_bag_wait -lt 60 ]; do
+        while [ $_bag_wait -lt 10 ]; do
             grep -q "All requested topics are subscribed" "$ROSBAG_DIR.log" 2>/dev/null && break
             sleep 0.5; _bag_wait=$((_bag_wait + 1))
         done
-        # Wait for RKO-LIO odometry to be live rather than a fixed 2s sleep
-        if [ "$LIO_ENABLED" = "true" ]; then
-            _odom_wait=0
-            while [ $_odom_wait -lt 10 ]; do
-                timeout 3 ros2 topic echo /rko_lio/odometry_buffered --once > /dev/null 2>&1 && break
-                _odom_wait=$((_odom_wait + 1))
-            done
-        fi
 
-        # Capture
+        # Capture — unset the atlas FastDDS profile so capture nodes use default
+        # multicast discovery, which reliably finds all publishers on the same machine.
         echo "Capturing scan $SCAN_COUNT..."
         if [ "$CAMERA_MODE" = "single_fisheye" ]; then
-            ROS_DISABLE_LOANED_MESSAGES=1 \
-            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \
                 "$INDIVIDUAL_SCAN_DIR" 30 4.0
             CAPTURE_EXIT_CODE=$?
             if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
                 echo "  Primary capture failed, trying buffered camera capture..."
-                ROS_DISABLE_LOANED_MESSAGES=1 \
-                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
                 timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                     "$INDIVIDUAL_SCAN_DIR" 15 2.0
                 CAPTURE_EXIT_CODE=$?
             fi
         else
-            # dual_fisheye: image comes from bag in post-processing; only LiDAR capture needed here
-            ROS_DISABLE_LOANED_MESSAGES=1 \
-            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0
             CAPTURE_EXIT_CODE=$?
@@ -798,8 +779,7 @@ else
         # Fallback: LiDAR-driven capture
         if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
             echo "  Trying LiDAR-driven capture..."
-            ROS_DISABLE_LOANED_MESSAGES=1 \
-            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 15 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/lidar_driven_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 8
             CAPTURE_EXIT_CODE=$?
@@ -821,22 +801,23 @@ else
             fi
             wait $ROSBAG_PID 2>/dev/null || true
         fi
-        # Remove uncompressed .db3 files once the zstd file is stable (non-growing)
-        # instead of a fixed sleep — avoids waiting longer than necessary.
+        # Wait for zstd compressor to finish flushing after the bag recorder exits.
+        # The compressor is a child process that may outlive the recorder by several seconds
+        # for large bags. Poll until the file stops growing, up to 30s.
         for _db3 in "$ROSBAG_DIR"/*.db3; do
             [ -f "$_db3" ] || continue
             _zstd="${_db3}.zstd"
             [ -f "$_zstd" ] || continue
             _prev=0; _stable=0
-            for _si in $(seq 1 10); do
+            for _si in $(seq 1 60); do
                 _cur=$(stat -c%s "$_zstd" 2>/dev/null || echo 0)
                 if [ "$_cur" = "$_prev" ] && [ "$_cur" -gt 0 ]; then
                     _stable=$((_stable + 1))
-                    [ "$_stable" -ge 2 ] && break
+                    [ "$_stable" -ge 3 ] && break
                 else
                     _stable=0
                 fi
-                _prev=$_cur; sleep 0.3
+                _prev=$_cur; sleep 0.5
             done
             [ -s "$_zstd" ] && rm -f "$_db3"
         done

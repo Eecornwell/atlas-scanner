@@ -37,8 +37,8 @@ def _write_ply_binary(path, pts):
 
 
 class BufferedCameraCapture(Node):
-    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0):
-        super().__init__('buffered_camera_capture')
+    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0, context=None):
+        super().__init__('buffered_camera_capture', context=context)
         self.bridge = CvBridge()
         self.captured = False
         self.output_dir = output_dir
@@ -54,25 +54,19 @@ class BufferedCameraCapture(Node):
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
+        image_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        odom_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
-        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, 1)
-        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, 1)
-        self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, 10)
-        self.odom_buffered_sub = self.create_subscription(Odometry, '/rko_lio/odometry_buffered', self.odom_cb, 10)
+        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, image_qos)
+        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, image_qos)
+        self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, odom_qos)
 
-        print(f"Debug: Buffered capture initialized with buffer size {buffer_size}")
-        print(f"Debug: Will capture LiDAR data for {scan_duration} seconds for increased density")
+        print(f"✓ Buffered capture initialized")
 
     def lidar_cb(self, msg):
         timestamp = time.time()
         with self.buffer_lock:
             self.lidar_buffer.append((timestamp, msg))
-
-        if not hasattr(self, '_lidar_count'):
-            self._lidar_count = 0
-        self._lidar_count += 1
-        if self._lidar_count % 50 == 0:
-            print(f"Debug: LiDAR buffer size: {len(self.lidar_buffer)}")
 
     def odom_cb(self, msg):
         timestamp = time.time()
@@ -81,9 +75,6 @@ class BufferedCameraCapture(Node):
             self.last_odom = msg
             self.odom_received_count += 1
 
-        if self.odom_received_count % 10 == 1:
-            pos = msg.pose.pose.position
-            print(f"Debug: Received odometry #{self.odom_received_count}: ({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})")
 
     def find_closest_message(self, buffer, target_time, max_age=0.5):
         if not buffer:
@@ -99,6 +90,12 @@ class BufferedCameraCapture(Node):
 
     def image_cb(self, msg):
         if self.captured or not self.buffers_ready:
+            return
+        # Only attempt imdecode for JPEG/PNG compressed images.
+        # H.264 streams (format='h264') cannot be decoded by cv2.imdecode;
+        # those frames arrive decoded via image_raw_cb instead.
+        fmt = getattr(msg, 'format', '').lower()
+        if 'h264' in fmt or 'h.264' in fmt:
             return
         arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -122,7 +119,6 @@ class BufferedCameraCapture(Node):
         threading.Thread(target=self._do_capture, args=(frame,), daemon=True).start()
 
     def _do_capture(self, frame):
-        print(f"Debug: Starting {self.scan_duration}s LiDAR capture for increased density...")
         capture_time = time.time()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -133,7 +129,7 @@ class BufferedCameraCapture(Node):
                 return
             img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.jpg')
             cv2.imwrite(img_file, frame)
-            print(f"Debug: Saved fisheye frame: {img_file} {frame.shape}")
+            print(f"✓ Saved fisheye frame: {img_file}")
         except Exception as e:
             print(f"Error saving image: {e}")
             self.save_complete = True
@@ -183,11 +179,9 @@ class BufferedCameraCapture(Node):
             time.sleep(0.05)
 
         result = np.vstack(chunks) if chunks else np.empty((0, 4), dtype=np.float32)
-        print(f"Debug: Captured {len(result)} points over {self.scan_duration}s")
         return result
 
     def save_lidar_data(self, points, timestamp, capture_time):
-        print(f"Debug: Saving LiDAR data - {len(points)} points")
         try:
             with self.buffer_lock:
                 closest_odom = self.find_closest_message(self.odom_buffer, capture_time, max_age=5.0)
@@ -199,12 +193,10 @@ class BufferedCameraCapture(Node):
             pts = np.asarray(points, dtype=np.float32)
             sensor_ply_file = os.path.join(self.output_dir, f'sensor_lidar_{timestamp}.ply')
             _write_ply_binary(sensor_ply_file, pts)
-            print(f"Debug: Saved sensor coordinates to {sensor_ply_file}")
 
             if closest_odom:
                 pos = closest_odom.pose.pose.position
                 ori = closest_odom.pose.pose.orientation
-                print(f"Debug: Also transforming {len(pts)} points to world coordinates")
                 x, y, z, w = ori.x, ori.y, ori.z, ori.w
                 norm = np.sqrt(x*x + y*y + z*z + w*w)
                 if norm > 0:
@@ -218,13 +210,10 @@ class BufferedCameraCapture(Node):
                     world_pts = np.hstack([world_xyz, pts[:, 3:4]]).astype(np.float32)
                     world_ply_file = os.path.join(self.output_dir, f'world_lidar_{timestamp}.ply')
                     _write_ply_binary(world_ply_file, world_pts)
-                    print(f"Debug: Saved world coordinates to {world_ply_file}")
                     ply_file = world_ply_file
                 else:
-                    print(f"Debug: Invalid quaternion, only sensor coordinates saved")
                     ply_file = sensor_ply_file
             else:
-                print(f"Debug: No odometry, only sensor coordinates saved")
                 ply_file = sensor_ply_file
 
             print(f'✓ Dense {self.scan_duration}s capture: {len(pts)} points')
@@ -260,9 +249,13 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
 
-    rclpy.init()
-    node = BufferedCameraCapture(output_dir, buffer_size, scan_duration)
-    executor = rclpy.executors.SingleThreadedExecutor()
+    # Use a fresh context so any prior rclpy.shutdown() in the same process
+    # group (e.g. from ros2 topic echo calls in the shell script) cannot
+    # poison this node's DDS context and cause ExternalShutdownException.
+    ctx = rclpy.Context()
+    rclpy.init(context=ctx)
+    node = BufferedCameraCapture(output_dir, buffer_size, scan_duration, context=ctx)
+    executor = rclpy.executors.SingleThreadedExecutor(context=ctx)
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -271,7 +264,6 @@ def main():
 
 
     try:
-        print("Debug: Waiting for LiDAR buffer to fill...")
         fill_start = time.time()
         while time.time() - fill_start < 15.0:
             with node.buffer_lock:
@@ -281,28 +273,24 @@ def main():
 
 
         with node.buffer_lock:
-            print(f"Debug: Initial buffer status - LiDAR: {len(node.lidar_buffer)}, Odom: {len(node.odom_buffer)}")
             if len(node.odom_buffer) == 0 and node.last_odom is None:
                 print("Warning: No odometry data received - check if /rko_lio/odometry is publishing")
-            print(f"Debug: Total odometry messages received: {node.odom_received_count}")
             node.save_complete = True
             node.buffers_ready = True
-            print("Debug: Buffers ready, enabling camera capture")
 
-        cam_wait_start = time.time()
+        # Give DDS a moment to (re-)discover the decoder publisher now that
+        # buffers_ready is True and the image callbacks are unblocked.
+        time.sleep(1.0)
+
         start_time = time.time()
-        timeout = 20.0
+        timeout = 30.0
 
         while not node.captured:
             time.sleep(0.1)
             elapsed = time.time() - start_time
             if elapsed > timeout:
-                print("\u2717 Timeout waiting for camera frame")
-                print(f"Debug: Final buffer status - LiDAR: {len(node.lidar_buffer)}, Odom: {len(node.odom_buffer)}")
+                print("✗ Timeout waiting for camera frame")
                 break
-            if elapsed > 5.0 and int(elapsed * 10) % 10 == 0:
-                with node.buffer_lock:
-                    print(f"Debug: Waiting for camera frame - LiDAR: {len(node.lidar_buffer)}, Odom: {len(node.odom_buffer)} (elapsed: {elapsed:.1f}s)")
 
 
         save_wait = time.time()
@@ -322,7 +310,7 @@ def main():
         spin_thread.join(timeout=1.0)
         node.destroy_node()
         try:
-            rclpy.shutdown()
+            rclpy.shutdown(context=ctx)
         except Exception:
             pass
 

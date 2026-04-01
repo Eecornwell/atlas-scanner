@@ -230,10 +230,10 @@ echo ""
 read -p "Press Enter once you have completed the network configuration..."
 
 # Configure FastDDS profiles
-# The main profile (fastdds_atlas.xml) restricts DDS traffic to the LiDAR wired
-# interface (192.168.1.50) and SHM, preventing discovery noise from WiFi/Docker.
-# The capture profile (fastdds_capture.xml) uses UDP-only on the same interface
-# so short-lived capture processes avoid SHM segment conflicts with long-running drivers.
+# Both profiles use SHM + UDP restricted to the wired LiDAR interface (192.168.1.50),
+# preventing WiFi/Docker interfaces from being used for sensor traffic.
+# fastdds_atlas.xml  — long-running driver processes (LiDAR, RKO-LIO, camera).
+# fastdds_capture.xml — short-lived capture processes (identical transport config).
 HOST_IP=$(ip -4 addr show | grep 'inet 192\.168\.1\.' | awk '{print $2}' | cut -d/ -f1 | head -1)
 if [ -z "$HOST_IP" ]; then
     echo "⚠ Could not detect a 192.168.1.x address — defaulting to 192.168.1.50"

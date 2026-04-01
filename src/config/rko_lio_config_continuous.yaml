@@ -8,8 +8,8 @@ odom_frame: odom
 odom_topic: /rko_lio/odometry
 map_topic: /rko_lio/local_map
 
-# Lower publish rate — bag recorder only needs odometry, not every scan
-publish_freq: 5.0
+# Publish at LiDAR rate for good pose interpolation at camera frame rate
+publish_freq: 10.0
 publish_local_map: false       # nobody reads this during continuous recording
 publish_deskewed_scan: false   # nobody reads this during continuous recording
 invert_odom_tf: false

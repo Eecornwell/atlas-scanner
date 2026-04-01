@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8" ?>
 <!-- FastDDS profile for short-lived capture processes.
-     Uses UDP only (no SHM) to avoid stale SHM segment conflicts with
-     long-running driver processes, while still discovering them via the
-     same 192.168.1.50 interface used by fastdds_atlas.xml. -->
+     Uses SHM + UDP so large image payloads from the camera driver are
+     reachable via shared memory, same as the long-running driver processes.
+     SHM segment conflicts between scans are avoided by the script clearing
+     stale /dev/shm/fastrtps_* files before each capture invocation. -->
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <transport_descriptors>
         <transport_descriptor>
@@ -13,13 +14,27 @@
                 <address>192.168.1.50</address>
             </interfaceWhiteList>
         </transport_descriptor>
+        <transport_descriptor>
+            <transport_id>shm_transport</transport_id>
+            <type>SHM</type>
+        </transport_descriptor>
     </transport_descriptors>
     <participant profile_name="atlas_participant" is_default_profile="true">
         <rtps>
             <userTransports>
+                <transport_id>shm_transport</transport_id>
                 <transport_id>udp_wired_only</transport_id>
             </userTransports>
             <useBuiltinTransports>false</useBuiltinTransports>
+            <builtin>
+                <initialPeersList>
+                    <locator>
+                        <udpv4>
+                            <address>127.0.0.1</address>
+                        </udpv4>
+                    </locator>
+                </initialPeersList>
+            </builtin>
         </rtps>
     </participant>
 </profiles>
