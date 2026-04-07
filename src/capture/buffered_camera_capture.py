@@ -271,6 +271,13 @@ def main():
                     break
             time.sleep(0.1)
 
+        # Wait up to 5s for first odometry message (DDS discovery can lag behind LiDAR)
+        odom_wait_start = time.time()
+        while time.time() - odom_wait_start < 5.0:
+            with node.buffer_lock:
+                if node.last_odom is not None:
+                    break
+            time.sleep(0.1)
 
         with node.buffer_lock:
             if len(node.odom_buffer) == 0 and node.last_odom is None:
@@ -313,6 +320,7 @@ def main():
             rclpy.shutdown(context=ctx)
         except Exception:
             pass
+        time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
 
     sys.exit(0 if node.captured else 1)
 

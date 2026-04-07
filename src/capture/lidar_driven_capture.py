@@ -187,28 +187,30 @@ def main():
     try:
         time.sleep(8.0)
 
-
         if len(node.image_buffer) == 0:
             print("✗ No camera frames received - check /dual_fisheye/image/compressed or /dual_fisheye/image is publishing")
-            return
-
-        timeout = 30.0
-        capture_start = time.time()
-        while not node.captured:
-            time.sleep(0.1)
-            if time.time() - capture_start > timeout:
-                print("✗ Timeout waiting for LiDAR frame")
-                break
+        else:
+            timeout = 30.0
+            capture_start = time.time()
+            while not node.captured:
+                time.sleep(0.1)
+                if time.time() - capture_start > timeout:
+                    print("✗ Timeout waiting for LiDAR frame")
+                    break
 
     except KeyboardInterrupt:
         print("✗ Interrupted by user")
     except rclpy.executors.ExternalShutdownException:
         pass
     finally:
+        executor.shutdown(timeout_sec=0.5)
+        spin_thread.join(timeout=1.0)
+        node.destroy_node()
         try:
             rclpy.shutdown(context=ctx)
         except Exception:
             pass
+        time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
 
 if __name__ == '__main__':
     main()

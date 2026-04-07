@@ -52,6 +52,7 @@ export PATH=/home/orion/cmake-3.25/bin:$PATH
 source install/setup.bash
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/orion:/usr/local/lib
 export FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_atlas.xml"
+export ROS_DISABLE_DAEMON=1
 # Prevent ros2 CLI tools from hanging when no display is available (headless / SSH)
 export QT_QPA_PLATFORM=offscreen
 
@@ -78,7 +79,24 @@ cleanup() {
     trap '' SIGINT SIGTERM
     echo "Shutting down..."
 
+    # Shut down camera driver first with a long graceful wait so the SDK can
+    # call StopLiveStreaming()+Close() cleanly. SIGKILL before this completes
+    # leaves the firmware in streaming state for the next session.
+    # Send SIGINT (not SIGTERM) to the ros2 launch process — ros2 launch handles
+    # SIGINT gracefully by forwarding it to children, whereas SIGTERM causes it
+    # to SIGKILL children immediately without giving the SDK time to shut down.
+    for _cam_pid in $(pgrep -f "insta360_ros_driver" 2>/dev/null); do
+        kill -INT "$_cam_pid" 2>/dev/null
+    done
+    for _w in $(seq 1 150); do
+        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+
+    # Kill all other tracked processes (excluding camera driver already handled above)
     for pid in "${PIDS[@]}"; do
+        pgrep -f "insta360_ros_driver" 2>/dev/null | grep -qw "$pid" && continue
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null
             for _w in $(seq 1 20); do
@@ -108,8 +126,8 @@ cleanup() {
     _pkill "buffered_odom_bridge"
     _pkill "rviz2"
     _pkill "insta360_ros_driver"
+    _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
     _pkill "image_decoder"
-    _pkill "decoder"
     _pkill "equirectangular"
     _pkill "dual_fisheye"
     _pkill "bringup.launch"
@@ -323,9 +341,12 @@ _pkill() {
     local pids
     pids=$(pgrep -f "$pat" 2>/dev/null | grep -v "^$$\$")
     [ -z "$pids" ] && return 0
-    echo $pids | xargs -r kill -TERM 2>/dev/null || true
+    echo $pids | xargs -r kill -INT 2>/dev/null || true
+    # For the camera driver, allow up to 15s for StopLiveStreaming()+Close() to complete
+    local _max=20
+    echo "$pat" | grep -q "insta360" && _max=150
     for _p in $pids; do
-        for _w in $(seq 1 20); do
+        for _w in $(seq 1 $_max); do
             kill -0 "$_p" 2>/dev/null || break
             sleep 0.1
         done
@@ -338,49 +359,86 @@ _pkill() {
 # StopLiveStreaming()+Close() before a new session can open cleanly.
 _wait_camera_dead() {
     local _i
-    for _i in $(seq 1 15); do
-        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || return 0
+    for _i in $(seq 1 20); do
+        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
         sleep 1
     done
-    # Still alive after 15s — force kill as last resort
     pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
-    pgrep -f "decoder" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
-    sleep 1
+    for _i in $(seq 1 5); do
+        pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" > /dev/null 2>&1 || break
+        sleep 1
+    done
+    pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+    pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+    rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true
+    sleep 3
+}
+
+# After killing the driver, the Insta360 firmware may still be in streaming
+# mode for up to ~30s. Poll a fresh driver instance to detect when the firmware
+# has reset (sync succeeds) before handing control back to the caller.
+_wait_firmware_ready() {
+    # Clear sentinel if it predates the current boot
+    if [ -f /tmp/.insta360_session_ran ]; then
+        _boot_time=$(date -d "$(uptime -s)" +%s 2>/dev/null || echo 0)
+        _sentinel_time=$(stat -c %Y /tmp/.insta360_session_ran 2>/dev/null || echo 0)
+        [ "$_sentinel_time" -lt "$_boot_time" ] && rm -f /tmp/.insta360_session_ran
+    fi
+    [ ! -f /tmp/.insta360_session_ran ] && return 0
+    echo "Waiting for camera firmware to reset..."
+    sleep 3
+    echo "✓ Camera firmware ready"
 }
 
 # USB-level reset of the Insta360 camera — clears any firmware streaming state
 # that survived an unclean SDK shutdown.
+# NOTE: The Insta360 ONE firmware shuts down (rather than re-enumerates) in
+# response to USBDEVFS_RESET, requiring a physical button press to recover.
+# Only reset if the device is already in a bad state (bConfigurationValue=0/empty).
 _usb_reset_camera() {
     [ -e /dev/insta ] || return 0
-    local _dev
+    local _dev _busdev _cfg
     _dev=$(readlink -f /dev/insta 2>/dev/null) || return 0
-    if command -v usbreset > /dev/null 2>&1; then
-        echo "Resetting USB device $_dev..."
-        sudo usbreset "$_dev" 2>/dev/null || true
-    else
-        local _busdev
-        _busdev=$(udevadm info --query=path --name="$_dev" 2>/dev/null \
-            | grep -oP '[0-9]+-[0-9.]+(?=/[^/]+$)' | head -1)
-        if [ -n "$_busdev" ] && [ -d "/sys/bus/usb/devices/$_busdev" ]; then
-            echo "Resetting USB device via sysfs ($_busdev)..."
-            echo "$_busdev" | sudo tee /sys/bus/usb/drivers/usb/unbind > /dev/null 2>&1 || true
-            sleep 1
-            echo "$_busdev" | sudo tee /sys/bus/usb/drivers/usb/bind > /dev/null 2>&1 || true
-        fi
+    _busdev=$(udevadm info --query=path --name="$_dev" 2>/dev/null \
+        | grep -oP '[0-9]+-[0-9.]+$')
+    # Check if device is already configured — if so, skip the reset entirely.
+    _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$_cfg" ] && [ "$_cfg" != "0" ]; then
+        echo "✓ Camera USB device already configured (bConfigurationValue=$_cfg), skipping reset"
+        return 0
     fi
-    # Wait for device node to re-appear after reset
-    for _i in $(seq 1 10); do
-        [ -e /dev/insta ] && return 0
+    echo "Resetting USB device ($_busdev)..."
+    sudo python3 -c "
+import fcntl, struct, sys
+USBDEVFS_RESET = 0x5514
+try:
+    with open('$_dev', 'wb') as f:
+        fcntl.ioctl(f, USBDEVFS_RESET, 0)
+except Exception as e:
+    sys.exit(1)
+" 2>/dev/null || true
+    # Wait for device node to re-appear and bConfigurationValue to be set
+    for _i in $(seq 1 15); do
+        [ -e /dev/insta ] || { sleep 1; continue; }
+        [ -d "/sys/bus/usb/devices/$_busdev" ] || { sleep 1; continue; }
+        _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
+        [ -n "$_cfg" ] && [ "$_cfg" != "0" ] && break
         sleep 1
     done
+    _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$_cfg" ] && [ "$_cfg" != "0" ]; then
+        sleep 2  # allow firmware to settle
+        return 0
+    fi
+    echo "  ⚠ USB reset could not enumerate device (bConfigurationValue='$_cfg') — driver may fail to connect"
 }
 
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
 _pkill "livox_ros_driver2" & _kpids=($!)
 _pkill "rko_lio" & _kpids+=($!)
 _pkill "insta360_ros_driver" & _kpids+=($!)
+_pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder" & _kpids+=($!)
 _pkill "image_decoder" & _kpids+=($!)
-_pkill "decoder" & _kpids+=($!)
 _pkill "equirectangular" & _kpids+=($!)
 _pkill "dual_fisheye" & _kpids+=($!)
 _pkill "bringup.launch" & _kpids+=($!)
@@ -395,19 +453,21 @@ wait "${_kpids[@]}"
 # Block until the camera driver process is fully gone so StopLiveStreaming()/Close()
 # completes before we attempt to open a new session.
 _wait_camera_dead
-rm -f /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port* /dev/shm/fastrtps_[0-9a-f]* 2>/dev/null || true
-sleep 1
+_wait_firmware_ready
+rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null || true
+# Kill the ros2 CLI daemon — it holds SHM ports open between sessions
+ros2 daemon stop 2>/dev/null || true
+pkill -f "ros2-daemon" 2>/dev/null || true
 
 # Camera permissions
 if [ "$SKIP_SUDO_CHECK" != "1" ]; then
     "$SCRIPT_DIR/setup_camera_permissions.sh"
 fi
 
-# USB reset clears any firmware streaming state left over from the previous session.
-# Only needed if a previous driver was running — skip on a clean start.
-if pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
-    _usb_reset_camera
-fi
+# Always reset the USB device at startup — clears firmware streaming state from
+# a previous unclean session and ensures bConfigurationValue is set before the
+# driver attempts to claim the interface.
+_usb_reset_camera
 
 # Wait for /dev/insta — may still be re-enumerating after USB reset
 for _i in $(seq 1 15); do
@@ -420,12 +480,34 @@ if [ ! -e /dev/insta ]; then
     exit 1
 fi
 
+# Verify camera is in Android USB mode by checking for a network interface
+# or RNDIS-class USB interface. If absent, the SDK cannot connect.
+_cam_sysfs=$(find /sys/bus/usb/devices/ -name "idVendor" 2>/dev/null | \
+    xargs grep -l "2e1a" 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+if [ -n "$_cam_sysfs" ]; then
+    _cam_class=$(cat "$_cam_sysfs/bDeviceClass" 2>/dev/null | tr -d '[:space:]')
+    _has_rndis=false
+    for _iface in "$_cam_sysfs"/*:*; do
+        [ -d "$_iface" ] || continue
+        _ic=$(cat "$_iface/bInterfaceClass" 2>/dev/null | tr -d '[:space:]')
+        if [ "$_ic" = "02" ] || [ "$_ic" = "e0" ] || [ "$_ic" = "0a" ]; then
+            _has_rndis=true
+            break
+        fi
+    done
+    if [ "$_has_rndis" = "false" ]; then
+        echo "⚠ Camera USB mode may not be set to Android (no RNDIS/CDC interface found)."
+        echo "  If streaming fails: on the camera go to Settings → General → USB Mode → Android"
+        echo "  then reconnect the USB cable."
+    fi
+fi
+
 echo "Starting LiDAR driver..."
 # Pin Livox driver to cores 0-1 so its UDP receive thread is isolated
 # from the bag recorders on cores 2-3, preventing IMU packet drops.
 taskset -c 0,1 setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
 LIDAR_PID=$!
-{ sleep 3 && renice -n -5 -p $LIDAR_PID 2>/dev/null; } &
+{ sleep 3 && renice -n -5 -p $LIDAR_PID 2>/dev/null 1>/dev/null; } &
 LIDAR_PGID=$(ps -o pgid= -p $LIDAR_PID 2>/dev/null | tr -d ' ')
 PIDS+=($LIDAR_PID)
 
@@ -489,7 +571,7 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/rko_lio_config_robust.yaml" \
         rviz:=false > /tmp/rko_lio.log 2>&1 &
     LIO_PID=$!
-    sleep 1 && renice -n -15 -p $LIO_PID 2>/dev/null &
+    sleep 1 && renice -n -15 -p $LIO_PID 2>/dev/null 1>/dev/null &
     PIDS+=($LIO_PID)
     _rlio_count=0
     while [ $_rlio_count -lt 20 ]; do
@@ -502,12 +584,12 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         echo "✓ RKO-LIO ready with $IMU_SOURCE IMU"
         LIO_ENABLED="true"
         if [ -n "${DISPLAY:-}" ]; then
-            QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
+            env -u QT_QPA_PLATFORM QT_QPA_PLATFORM=xcb rviz2 -d "$ROS_WS_DIR/src/atlas-scanner/src/config/atlas_display.rviz" \
                 -stylesheet "$ROS_WS_DIR/src/atlas-scanner/src/config/rviz_kiosk.qss" > /tmp/rviz.log 2>&1 &
             RVIZ_PID=$!
             # Not added to PIDS — RViz crash should not terminate the session
             # Give RViz higher priority than camera pipeline in dual_fisheye mode
-            [ "$CAMERA_MODE" = "dual_fisheye" ] && sleep 2 && renice -n 5 -p $RVIZ_PID 2>/dev/null &
+            [ "$CAMERA_MODE" = "dual_fisheye" ] && sleep 2 && renice -n 5 -p $RVIZ_PID 2>/dev/null 1>/dev/null &
         else
             echo "⚠ No display available — skipping RViz"
         fi
@@ -547,30 +629,27 @@ CAMERA_STARTED=false
 for _cam_attempt in 1 2 3; do
     _IMU_FILTER="false"
     [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
+    > /tmp/camera.log  # clear log for this attempt
+    env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+        equirectangular:=false \
+        imu_filter:=${_IMU_FILTER} > /tmp/camera.log 2>&1 &
+    CAMERA_PID=$!
+    PIDS+=($CAMERA_PID)
+    { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null 1>/dev/null; } &
 
-    if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-        env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
-            equirectangular:=false \
-            decode:=false \
-            imu_filter:=${_IMU_FILTER} &
-        CAMERA_PID=$!
-        PIDS+=($CAMERA_PID)
-        { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null; } &
-    else
-        env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
-            equirectangular:=false \
-            decode:=false \
-            imu_filter:=${_IMU_FILTER} &
-        CAMERA_PID=$!
-        PIDS+=($CAMERA_PID)
-        { sleep 2 && renice -n 15 -p $CAMERA_PID 2>/dev/null; } &
-    fi
-
-    for _w in $(seq 1 20); do
-        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
+    # Wait up to 70s for "Live streaming started" in /tmp/camera.log.
+    _stream_ready=false
+    for _sw in $(seq 1 70); do
+        if grep -q "Live streaming started" /tmp/camera.log 2>/dev/null; then
+            _stream_ready=true
+            break
+        fi
+        if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+            break
+        fi
         sleep 1
     done
-    if pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+    if [ "$_stream_ready" = "true" ]; then
         echo "✓ Camera driver ready"
         CAMERA_STATUS="/dual_fisheye/image/compressed"
         # For single_fisheye, wait until the decoder has produced at least one
@@ -583,8 +662,9 @@ for _cam_attempt in 1 2 3; do
     else
         echo "⚠ Camera attempt $_cam_attempt failed (driver exited), retrying..."
         _pkill "insta360_ros_driver"
-        _pkill "decoder"
+        _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
         _wait_camera_dead
+        _wait_firmware_ready
         _usb_reset_camera
         for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
         [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
@@ -595,6 +675,7 @@ if [ "$CAMERA_STARTED" = "false" ]; then
     echo "✗ Camera failed to start after 3 attempts"; exit 1
 fi
 echo "✓ Camera data confirmed"
+touch /tmp/.insta360_session_ran  # sentinel: firmware needs settle time before next session
 
 FUSION_READY="true"
 
@@ -623,7 +704,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     # Main bag: LiDAR + camera + odometry on cores 2-3
     # shellcheck disable=SC2086
     taskset -c 2,3 nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 100000000 \
-        $CONTINUOUS_TOPICS &
+        $CONTINUOUS_TOPICS > "$SCAN_DIR/rosbag_main.log" 2>&1 &
     ROSBAG_PID=$!
     PIDS+=($ROSBAG_PID)
 
@@ -634,7 +715,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     ros2 topic list 2>/dev/null | grep -q "/imu/data_raw" && IMU_TOPICS="$IMU_TOPICS /imu/data_raw"
     # shellcheck disable=SC2086
     taskset -c 3 nice -n 5 ros2 bag record -o "${ROSBAG_DIR}_imu" --max-cache-size 20000000 \
-        $IMU_TOPICS &
+        $IMU_TOPICS > "$SCAN_DIR/rosbag_imu.log" 2>&1 &
     IMU_BAG_PID=$!
     PIDS+=($IMU_BAG_PID)
     echo "✓ IMU bag recording started: ${ROSBAG_DIR}_imu"
@@ -649,13 +730,13 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
             if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
                 echo "⚠ Camera driver died, restarting..."
                 _pkill "insta360_ros_driver"
-                _pkill "decoder"
+                _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
                 _wait_camera_dead
                 _usb_reset_camera
                 for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
                 [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
                 env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
-                    equirectangular:=false decode:=false imu_filter:=true &
+                    equirectangular:=false imu_filter:=true > /tmp/camera.log 2>&1 &
                 CAMERA_PID=$!
                 echo "✓ Camera driver restarted (pid $CAMERA_PID)"
                 sleep 10  # give driver time to stabilise before next check
@@ -666,18 +747,57 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     PIDS+=("$WATCHDOG_PID")
 
     while true; do
-        read -r _input
-        [ "$_input" = "q" ] || [ "$_input" = "quit" ] && break
+        if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
+            # GUI mode: poll for quit trigger file
+            [ -f "$SCAN_DIR/.quit_trigger" ] && rm -f "$SCAN_DIR/.quit_trigger" && break
+            sleep 0.2
+        else
+            read -r _input < /dev/tty 2>/dev/null
+            [ "$_input" = "q" ] || [ "$_input" = "quit" ] && break
+        fi
     done
     touch "$SCAN_DIR/.session_done"  # signal watchdog to exit
 
 else
     # ── Stationary mode ──────────────────────────────────────────────────────
-    echo "Press ENTER to capture a scan, 'q' to exit."
+    # Keep the camera stream alive between scans - the Insta360 SDK closes the
+    # connection if no subscriber consumes frames for ~40s.
+    env -u FASTRTPS_DEFAULT_PROFILES_FILE python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/camera_keepalive.py" "$CAMERA_MODE" &
+    KEEPALIVE_PID=$!
+    PIDS+=($KEEPALIVE_PID)
+
+    # Use /dev/tty if available (interactive terminal), otherwise use GUI trigger file mode
+    _GUI_MODE=false
+    if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
+        _GUI_MODE=true
+        _TTY=/dev/null
+        echo "GUI mode: waiting for trigger files in $SCAN_DIR"
+    else
+        _TTY=/dev/tty
+    fi
+
+    # Flush any buffered newlines left in stdin
+    [ "$_GUI_MODE" = "false" ] && while read -r -t 0.1 _flush < "$_TTY"; do :; done 2>/dev/null
 
     while true; do
-        read -p "Scan $((SCAN_COUNT + 1)) - Press ENTER to capture (or 'q' to exit): " input
-        [ "$input" = "quit" ] || [ "$input" = "q" ] && break
+        if [ "$_GUI_MODE" = "true" ]; then
+            # Wait for GUI to write a trigger file: .capture_trigger (scan) or .quit_trigger (stop)
+            while true; do
+                if [ -f "$SCAN_DIR/.quit_trigger" ]; then
+                    rm -f "$SCAN_DIR/.quit_trigger"
+                    break 2
+                fi
+                if [ -f "$SCAN_DIR/.capture_trigger" ]; then
+                    rm -f "$SCAN_DIR/.capture_trigger"
+                    input=""
+                    break
+                fi
+                sleep 0.2
+            done
+        else
+            read -p "Scan $((SCAN_COUNT + 1)) - Press ENTER to capture (or 'q' to exit): " input < "$_TTY" 2>/dev/null
+            [ "$input" = "quit" ] || [ "$input" = "q" ] && break
+        fi
 
         SCAN_COUNT=$((SCAN_COUNT + 1))
         SCAN_NAME="fusion_scan_$(printf "%03d" $SCAN_COUNT)"
@@ -688,18 +808,13 @@ else
         if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
             echo "⚠ Camera driver died, restarting..."
             _pkill "insta360_ros_driver"
-            _pkill "decoder"
+            _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
             _wait_camera_dead
             _usb_reset_camera
             for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
             [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-            if [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
-                    equirectangular:=false decode:=false imu_filter:=false &
-            else
-                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
-                    equirectangular:=false imu_filter:=false decode:=false &
-            fi
+            env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+                equirectangular:=false imu_filter:=false > /tmp/camera.log 2>&1 &
             CAMERA_PID=$!
             PIDS+=($CAMERA_PID)
             for _cw in $(seq 1 20); do
@@ -711,6 +826,7 @@ else
                 SCAN_COUNT=$((SCAN_COUNT - 1)); continue
             fi
             echo "✓ Camera driver restarted"
+            printf '\nScan %d - Press ENTER to capture (or q to exit): ' "$((SCAN_COUNT + 1))" > "$_TTY" 2>/dev/null
         fi
 
         # Verify LiDAR is alive, restart if needed
@@ -757,20 +873,25 @@ else
         # Capture — unset the atlas FastDDS profile so capture nodes use default
         # multicast discovery, which reliably finds all publishers on the same machine.
         echo "Capturing scan $SCAN_COUNT..."
+        # Remove only stale SHM port files (no live holder) before launching the capture node
+        for _shm in /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*; do
+            [ -e "$_shm" ] || continue
+            fuser "$_shm" > /dev/null 2>&1 || rm -f "$_shm"
+        done
         if [ "$CAMERA_MODE" = "single_fisheye" ]; then
-            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \
                 "$INDIVIDUAL_SCAN_DIR" 30 4.0
             CAPTURE_EXIT_CODE=$?
             if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
                 echo "  Primary capture failed, trying buffered camera capture..."
-                env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
+                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
                 timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                     "$INDIVIDUAL_SCAN_DIR" 15 2.0
                 CAPTURE_EXIT_CODE=$?
             fi
         else
-            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0
             CAPTURE_EXIT_CODE=$?
@@ -779,7 +900,7 @@ else
         # Fallback: LiDAR-driven capture
         if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
             echo "  Trying LiDAR-driven capture..."
-            env -u FASTRTPS_DEFAULT_PROFILES_FILE ROS_DISABLE_LOANED_MESSAGES=1 \
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 15 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/lidar_driven_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 8
             CAPTURE_EXIT_CODE=$?
@@ -802,14 +923,12 @@ else
             wait $ROSBAG_PID 2>/dev/null || true
         fi
         # Wait for zstd compressor to finish flushing after the bag recorder exits.
-        # The compressor is a child process that may outlive the recorder by several seconds
-        # for large bags. Poll until the file stops growing, up to 30s.
-        for _db3 in "$ROSBAG_DIR"/*.db3; do
-            [ -f "$_db3" ] || continue
-            _zstd="${_db3}.zstd"
+        # With --compression-mode file, files are named *.db3.zstd (no plain .db3).
+        # Poll all .zstd files until they stop growing.
+        for _zstd in "$ROSBAG_DIR"/*.zstd; do
             [ -f "$_zstd" ] || continue
             _prev=0; _stable=0
-            for _si in $(seq 1 60); do
+            for _si in $(seq 1 120); do
                 _cur=$(stat -c%s "$_zstd" 2>/dev/null || echo 0)
                 if [ "$_cur" = "$_prev" ] && [ "$_cur" -gt 0 ]; then
                     _stable=$((_stable + 1))
@@ -819,6 +938,11 @@ else
                 fi
                 _prev=$_cur; sleep 0.5
             done
+        done
+        # Also remove any leftover uncompressed .db3 files
+        for _db3 in "$ROSBAG_DIR"/*.db3; do
+            [ -f "$_db3" ] || continue
+            _zstd="${_db3}.zstd"
             [ -s "$_zstd" ] && rm -f "$_db3"
         done
 
@@ -850,7 +974,7 @@ else
 fi
 
 if [ "$ENABLE_POST_PROCESSING_BAGS" = "true" ]; then
-    read -p "Run post-processing on all bag files? (y/n): " post_process
+    read -p "Run post-processing on all bag files? (y/n): " post_process < "$_TTY" 2>/dev/null
     if [ "$post_process" = "y" ] || [ "$post_process" = "Y" ]; then
         python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_bags.py" "$SCAN_DIR"
     fi

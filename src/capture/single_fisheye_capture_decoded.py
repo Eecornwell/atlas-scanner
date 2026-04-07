@@ -231,6 +231,7 @@ def main():
         if lidar_ok and cam_ok:
             break
 
+    _failed = False
     try:
         with node.buffer_lock:
             lidar_count = len(node.lidar_buffer)
@@ -238,13 +239,13 @@ def main():
         print(f"✓ Buffers ready - LiDAR: {lidar_count}, Odom: {odom_count}")
         if lidar_count == 0:
             print("✗ No LiDAR data received")
-            sys.exit(1)
+            raise RuntimeError("no_lidar")
 
         with node.image_lock:
             has_image = node.latest_image is not None
         if not has_image:
             print("✗ No camera frame received")
-            sys.exit(1)
+            raise RuntimeError("no_camera")
 
 
         capture_time = time.time()
@@ -262,7 +263,7 @@ def main():
             front_fisheye = cv2.rotate(payload[:, :half], cv2.ROTATE_90_CLOCKWISE)
         if front_fisheye is None:
             print("✗ Failed to extract fisheye image")
-            sys.exit(1)
+            raise RuntimeError("no_fisheye")
 
         img_file = os.path.join(output_dir, f'fisheye_{timestamp}.jpg')
         cv2.imwrite(img_file, front_fisheye, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -275,6 +276,8 @@ def main():
 
     except KeyboardInterrupt:
         print("✗ Interrupted")
+    except RuntimeError:
+        _failed = True
     except rclpy.executors.ExternalShutdownException:
         pass
     finally:
@@ -285,6 +288,10 @@ def main():
             rclpy.shutdown(context=ctx)
         except Exception:
             pass
+        time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
+
+    if _failed:
+        sys.exit(1)
 
 
 if __name__ == '__main__':

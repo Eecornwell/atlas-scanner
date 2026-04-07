@@ -103,7 +103,7 @@
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
 | Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
-| Image acquisition                   | Yes       | Masked panos saved as 2.5K (2560 × 1280) - 4K on roadmap                                                         |
+| Image acquisition                   | Yes       | Masked panos saved as 4K (3840_1920)                                                        |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
 | Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
 | Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |

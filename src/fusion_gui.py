@@ -224,9 +224,16 @@ class FusionCaptureGUI:
         # Skip sudo check - assume permissions are already set up
         self.sudo_password = None
             
-        # Reset scan count for new session
+        # Reset scan count and session state for new session
         self.scan_count = 0
         self.scan_count_label.config(text="0")
+        self._session_log_attached = False
+        self.scan_dir = None
+        self._stale_rviz_wids = set()  # clear stale window IDs so new RViz can be found
+        self.rviz_process = None
+        self.rviz_win_id = None
+        self.rviz_outer_win_id = None
+        self._rviz_search_start = time.monotonic()  # reset so PID filter uses new session time
         
         self.log_message("Starting Automated Terrestrial LiDAR Acquisition System (ATLAS)...")
         self.update_status("Starting system...", "orange")
@@ -530,7 +537,7 @@ sys.exit(0 if ok[0] else 4)
                     continue
                 name = subprocess.run(['xdotool', 'getwindowname', wid],
                                       capture_output=True, text=True).stdout.strip()
-                if not name.endswith('- RViz'):
+                if not name.endswith('- RViz2') and not name.endswith('- RViz'):
                     continue
                 # Only accept windows whose owning PID started after this session
                 pid_out = subprocess.run(['xdotool', 'getwindowpid', wid],
@@ -543,8 +550,8 @@ sys.exit(0 if ok[0] else 4)
                             fields = f.read().split(')')
                             start_ticks = int(fields[-1].split()[19])
                             pid_start_wall = btime + start_ticks / clk_tck
-                            if pid_start_wall < search_start_wall - 5:
-                                continue  # process predates this session
+                            if pid_start_wall < search_start_wall - 30:
+                                continue  # process predates this session by more than 30s
                     except Exception:
                         continue
                 candidates.append(wid)
@@ -651,23 +658,23 @@ sys.exit(0 if ok[0] else 4)
         if not self.is_running or not self.fusion_process:
             self.log_message("Cannot capture scan: system not ready")
             return
-            
+
         self.log_message(f"Triggering scan {self.scan_count + 1}...")
         self.update_status(f"Capturing scan {self.scan_count + 1}...", "orange")
-        
+
         # Disable capture button during scan
         self.capture_button.config(state="disabled")
-        
-        # Send enter key to fusion process
+
+        # Write trigger file for GUI mode; also write to stdin as fallback for terminal mode
         try:
+            if hasattr(self, 'scan_dir') and self.scan_dir:
+                trigger = pathlib.Path(self.scan_dir) / '.capture_trigger'
+                trigger.touch()
             if self.fusion_process and self.fusion_process.stdin:
                 self.fusion_process.stdin.write('\n')
                 self.fusion_process.stdin.flush()
-            else:
-                raise Exception("Fusion process not available")
         except Exception as e:
             self.log_message(f"Error triggering scan: {e}")
-            # Re-enable button if error occurs
             self.capture_button.config(state="normal")
 
     def stop_fusion(self):
@@ -678,11 +685,12 @@ sys.exit(0 if ok[0] else 4)
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
         
-        # Send 'q' to stdin to stop continuous mode (same as stationary mode exit).
-        # This lets the script's read loop exit cleanly and run post-processing.
+        # Write quit trigger file for GUI mode; also write to stdin as fallback
         proc = self.fusion_process
         if proc:
             try:
+                if hasattr(self, 'scan_dir') and self.scan_dir:
+                    pathlib.Path(self.scan_dir, '.quit_trigger').touch()
                 proc.stdin.write('q\n')
                 proc.stdin.flush()
             except Exception as e:
