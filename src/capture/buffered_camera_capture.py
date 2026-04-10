@@ -51,6 +51,8 @@ class BufferedCameraCapture(Node):
         self.last_odom = None
         self.odom_received_count = 0
         self.buffers_ready = False
+        self.latest_frame = None
+        self.frame_lock = threading.Lock()
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
@@ -89,11 +91,9 @@ class BufferedCameraCapture(Node):
         return best_msg
 
     def image_cb(self, msg):
-        if self.captured or not self.buffers_ready:
-            return
-        # Only attempt imdecode for JPEG/PNG compressed images.
-        # H.264 streams (format='h264') cannot be decoded by cv2.imdecode;
-        # those frames arrive decoded via image_raw_cb instead.
+        # Always buffer the latest decodable frame regardless of buffers_ready.
+        # Dropping frames here causes misses when buffers_ready flips after
+        # RELIABLE delivery has already occurred and won't be resent.
         fmt = getattr(msg, 'format', '').lower()
         if 'h264' in fmt or 'h.264' in fmt:
             return
@@ -101,17 +101,21 @@ class BufferedCameraCapture(Node):
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
             return
-        self._trigger_capture(frame)
+        with self.frame_lock:
+            self.latest_frame = frame
+        if not self.captured and self.buffers_ready:
+            self._trigger_capture(frame)
 
     def image_raw_cb(self, msg):
-        if self.captured or not self.buffers_ready:
-            return
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             print(f"Error converting raw image: {e}")
             return
-        self._trigger_capture(frame)
+        with self.frame_lock:
+            self.latest_frame = frame
+        if not self.captured and self.buffers_ready:
+            self._trigger_capture(frame)
 
     def _trigger_capture(self, frame):
         self.captured = True
@@ -285,9 +289,12 @@ def main():
             node.save_complete = True
             node.buffers_ready = True
 
-        # Give DDS a moment to (re-)discover the decoder publisher now that
-        # buffers_ready is True and the image callbacks are unblocked.
-        time.sleep(1.0)
+        # If a frame already arrived during the discovery/buffer-fill window,
+        # use it immediately rather than waiting for the next one.
+        with node.frame_lock:
+            buffered = node.latest_frame
+        if buffered is not None and not node.captured:
+            node._trigger_capture(buffered)
 
         start_time = time.time()
         timeout = 30.0
@@ -320,7 +327,7 @@ def main():
             rclpy.shutdown(context=ctx)
         except Exception:
             pass
-        time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
+        time.sleep(2.0)  # allow FastDDS to release SHM port locks before process exits
 
     sys.exit(0 if node.captured else 1)
 

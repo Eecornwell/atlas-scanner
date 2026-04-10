@@ -3,7 +3,6 @@
     <participant profile_name="capture_participant" is_default_profile="true">
         <rtps>
             <useBuiltinTransports>true</useBuiltinTransports>
-            <participantID>50</participantID>
         </rtps>
     </participant>
 </profiles>

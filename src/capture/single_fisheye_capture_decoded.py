@@ -113,13 +113,16 @@ class SingleFisheyeCaptureDecoded(Node):
             self.latest_image = ('decoded', msg)
 
     def compressed_cb(self, msg):
-        """Fallback: decode compressed frame inline if decoded topic not yet received."""
-        with self.image_lock:
-            if self.latest_image is not None and self.latest_image[0] == 'decoded':
-                return  # decoded topic already has data, prefer it
-            arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is not None:
+        """Use compressed frames for dual_fisheye (no decoder node).
+        For single_fisheye the stream is H.264 and cannot be decoded by cv2.imdecode;
+        those frames arrive decoded on /dual_fisheye/image via image_cb instead."""
+        fmt = getattr(msg, 'format', '').lower()
+        if 'h264' in fmt or 'h.264' in fmt:
+            return
+        arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            with self.image_lock:
                 self.latest_image = ('compressed', frame)
 
     def capture_dense_points(self):
@@ -288,7 +291,7 @@ def main():
             rclpy.shutdown(context=ctx)
         except Exception:
             pass
-        time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
+        time.sleep(2.0)  # allow FastDDS to release SHM port locks before process exits
 
     if _failed:
         sys.exit(1)
