@@ -57,6 +57,10 @@ export ROS_DISABLE_DAEMON=1
 export QT_QPA_PLATFORM=offscreen
 
 mkdir -p data/synchronized_scans
+# Increase UDP receive buffer to prevent Livox MID360 packet drops under load.
+# Default 208KB is insufficient for ~2-4MB/s point cloud UDP stream; 32MB gives
+# enough headroom during rosbag compression bursts between scans.
+sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=33554432 > /dev/null 2>&1 || true
 SCAN_DIR="data/synchronized_scans/sync_fusion_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$SCAN_DIR"
 
@@ -181,7 +185,7 @@ cleanup() {
                 echo "Converting fisheye images to ERP..."
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
                     [ -d "$scan_dir" ] || continue
-                    BAG_DIR=$(ls -d "$scan_dir"/rosbag_* 2>/dev/null | head -1)
+                    BAG_DIR=$(find "$scan_dir" -maxdepth 1 -name "rosbag_*" -type d 2>/dev/null | grep -v '_imu$' | head -1)
                     [ -z "$BAG_DIR" ] && continue
                     python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
                         "$BAG_DIR" "$scan_dir" --dual || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
@@ -198,7 +202,7 @@ cleanup() {
                 echo "Converting fisheye images to ERP (single fisheye)..."
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
                     [ -d "$scan_dir" ] || continue
-                    BAG_DIR=$(ls -d "$scan_dir"/rosbag_* 2>/dev/null | head -1)
+                    BAG_DIR=$(find "$scan_dir" -maxdepth 1 -name "rosbag_*" -type d 2>/dev/null | grep -v '_imu$' | head -1)
                     [ -z "$BAG_DIR" ] && continue
                     python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
                         "$BAG_DIR" "$scan_dir" || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
@@ -526,9 +530,9 @@ done
 # Poll for first LiDAR data instead of a fixed warmup sleep
 echo "Waiting for first LiDAR data..."
 _lidar_data_wait=0
-while [ $_lidar_data_wait -lt 3 ]; do
-    timeout 3 ros2 topic echo /livox/lidar --once > /dev/null 2>&1 && break
-    _lidar_data_wait=$((_lidar_data_wait + 1))
+while [ $_lidar_data_wait -lt 10 ]; do
+    grep -q "livox/lidar publish" /tmp/lidar.log 2>/dev/null && break
+    sleep 1; _lidar_data_wait=$((_lidar_data_wait + 1))
 done
 
 ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link livox_frame > /tmp/tf.log 2>&1 &
@@ -855,10 +859,10 @@ else
         INDIVIDUAL_SCAN_DIR="$SCAN_DIR/$SCAN_NAME"
         mkdir -p "$INDIVIDUAL_SCAN_DIR"
 
-        # Verify LiDAR is alive and actively publishing, restart if needed.
-        # Check both process liveness and publisher count — faster than ros2 topic echo
-        # which requires full DDS discovery. Fall back to a live echo only if the
-        # publisher count check passes but we suspect a silent driver (no process crash).
+        # Verify LiDAR is alive and actively publishing.
+        # Use publisher count only — ros2 topic echo spawns a new DDS participant
+        # whose discovery multicast floods the MID360's UDP receive path and can
+        # cause it to drop its own heartbeat, killing the driver.
         _lidar_ok=false
         if kill -0 $LIDAR_PID 2>/dev/null; then
             _pub_count=$(ros2 topic info /livox/lidar 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
@@ -881,6 +885,31 @@ else
                 SCAN_COUNT=$((SCAN_COUNT - 1)); continue
             fi
             echo "✓ LiDAR driver restarted"
+            # RKO-LIO loses its input when the LiDAR driver dies — restart it too.
+            if [ "$LIO_ENABLED" = "true" ]; then
+                echo "Restarting RKO-LIO after LiDAR restart..."
+                _pkill "rko_lio"
+                sleep 1
+                > /tmp/rko_lio.log
+                ros2 launch rko_lio odometry.launch.py \
+                    config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/rko_lio_config_robust.yaml" \
+                    rviz:=false > /tmp/rko_lio.log 2>&1 &
+                LIO_PID=$!
+                sleep 1 && renice -n -15 -p $LIO_PID 2>/dev/null 1>/dev/null &
+                PIDS+=($LIO_PID)
+                _rlio_w=0
+                while [ $_rlio_w -lt 20 ]; do
+                    grep -q "RKO LIO Node is up" /tmp/rko_lio.log 2>/dev/null && break
+                    kill -0 $LIO_PID 2>/dev/null || break
+                    sleep 1; _rlio_w=$((_rlio_w + 1))
+                done
+                if grep -q "RKO LIO Node is up" /tmp/rko_lio.log 2>/dev/null; then
+                    echo "✓ RKO-LIO restarted"
+                else
+                    echo "⚠ RKO-LIO failed to restart — odometry unavailable for this scan"
+                    LIO_ENABLED="false"
+                fi
+            fi
             sleep 3
         fi
 
@@ -892,7 +921,8 @@ else
         ROSBAG_DIR="$INDIVIDUAL_SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
         TOPICS_TO_RECORD="/livox/lidar /dual_fisheye/image/compressed /livox/imu"
         [ "$LIO_ENABLED" = "true" ] && TOPICS_TO_RECORD="$TOPICS_TO_RECORD /rko_lio/odometry"
-        setsid ros2 bag record -o "$ROSBAG_DIR" \
+        setsid env FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_rosbag.xml" \
+            ros2 bag record -o "$ROSBAG_DIR" \
             --compression-mode file --compression-format zstd \
             --max-cache-size 100000000 $TOPICS_TO_RECORD > "$ROSBAG_DIR.log" 2>&1 &
         ROSBAG_PID=$!

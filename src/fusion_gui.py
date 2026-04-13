@@ -234,6 +234,12 @@ class FusionCaptureGUI:
         self.rviz_win_id = None
         self.rviz_outer_win_id = None
         self._rviz_search_start = time.monotonic()  # reset so PID filter uses new session time
+        # Clear any web viewer or previous RViz content from the viewer frame
+        if self.web_viewer_process:
+            self.web_viewer_process.set()
+            self.web_viewer_process = None
+        for child in self.rviz_frame.winfo_children():
+            child.destroy()
         
         self.log_message("Starting Automated Terrestrial LiDAR Acquisition System (ATLAS)...")
         self.update_status("Starting system...", "orange")

@@ -95,13 +95,24 @@
         * You can use the image cloned from this repo at `~/atlas_ws/src/atlas-scanner/src/lidar_mask_{single/dual}.png`, but the mask won't match your exact setup so quality might be affected. It is advised to use the manual method below
             * Use existing ERP image took above, edit inside an image editor program. The path to the image will be similar to `~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/fusion_scan_001/equirect_{TIMESTAMP}.jpg`
             * Create a black/white PNG where white = use, black = ignore. We want to ignore the scanner and tripod in the spherical images. Also take note that the lidar only sees most of the top view camera and a small portion of the bottom view camera. This means that most of the bottom camera data will be discarded once the image to point cloud projection occurs
-            * Recommended size: 1920x960 (matching equirectangular output)
+            * Recommended size: 3840x1920 (matching equirectangular output)
             * Save new image mask to: ~/atlas_ws/src/atlas-scanner/src/lidar_mask.png
 
         > *Note: You can use any image editor (GIMP, Photoshop, etc.) to create the mask. Paint white areas where you want to apply colors from the camera, and black areas to ignore (e.g., areas with the scanner itself visible).*
 
     3. Capture new data of at least **5** scans from varying positions/rotations in same room. These scans will be used for the calibration procedure.
         ```bash
+        mkdir -p ~/atlas_ws/output
+        cat > ~/atlas_ws/output/calib.json << 'EOF'
+        {
+        "T_lidar_camera": [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ]
+        }
+        EOF
         cd ~/atlas_ws/src/atlas-scanner/src
         ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye
         ```
