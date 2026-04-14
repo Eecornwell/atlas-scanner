@@ -708,7 +708,7 @@ sys.exit(0 if ok[0] else 4)
             # output (coloring, ICP, benchmark, ...) the deadline keeps resetting.
             # Only trigger if the process goes completely silent for SILENCE_LIMIT
             # seconds, which catches genuine hangs without cutting off slow steps.
-            SILENCE_LIMIT = 120  # seconds of no output before force-kill
+            SILENCE_LIMIT = 600  # seconds of no output before force-kill
             import time
             last_output = time.monotonic()
 
