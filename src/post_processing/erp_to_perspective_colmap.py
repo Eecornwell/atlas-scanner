@@ -188,13 +188,20 @@ def convert_erp_to_perspectives(session_dir):
             R_face_w2c = R_face_in_cam @ R_cam_w2c_col
             persp_img = erp_to_perspective(erp_img, fov_deg=90, R_face_w2c=R_face_w2c, R_cam_w2c_ros=R_cam_c2w_ros)
             out_name = f"{base_name}_view{i:02d}.png"
-            cv2.imwrite(str(persp_dir / out_name), persp_img)
-            print(f"  Saved: {out_name}")
 
+            persp_mask = None
             if erp_mask is not None:
                 persp_mask = erp_to_perspective(erp_mask, fov_deg=90, R_face_w2c=R_face_w2c, R_cam_w2c_ros=R_cam_c2w_ros)
                 _, persp_mask = cv2.threshold(persp_mask, 127, 255, cv2.THRESH_BINARY)
+                valid_ratio = np.count_nonzero(persp_mask) / persp_mask.size
+                if valid_ratio < 0.05:
+                    print(f"  Skipped (blank): {out_name} ({valid_ratio*100:.1f}% valid)")
+                    continue
+
+            cv2.imwrite(str(persp_dir / out_name), persp_img)
+            if persp_mask is not None:
                 cv2.imwrite(str(mask_dir / f"{out_name}.png"), persp_mask)
+            print(f"  Saved: {out_name}")
 
             if camera_center is not None:
                 T_face = -R_face_w2c @ camera_center
@@ -259,13 +266,21 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     mask_files = list(mask_dir.glob("*.png"))
     print(f"  Found {len(mask_files)} mask files")
 
+    # Camera intrinsics are analytically exact: f = output_size / (2*tan(fov/2))
+    # Keep these in sync with erp_to_perspective(output_size, fov_deg) above.
+    _output_size = 1024
+    _fov_deg = 90
+    _f = _output_size / (2 * np.tan(np.radians(_fov_deg) / 2))
+    _c = _output_size / 2.0
+    _camera_params = f"{_f},{_f},{_c},{_c}"
+
     cmd = [
         "colmap", "feature_extractor",
         "--database_path", str(database),
         "--image_path", str(persp_dir),
         "--ImageReader.camera_model", "PINHOLE",
         "--ImageReader.single_camera_per_image", "1",
-        "--ImageReader.camera_params", "512,512,512,512",
+        "--ImageReader.camera_params", _camera_params,
     ]
     if mask_files:
         cmd.extend(["--ImageReader.mask_path", str(mask_dir)])
@@ -312,12 +327,12 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     with open(persp_sparse_dir / "points3D.bin", 'wb') as f:
         f.write(struct.pack('Q', 0))
 
-    # Feature matching - use sequential for better nearby matches
+    # Feature matching - exhaustive matcher handles spatially scattered stationary
+    # poses correctly; sequential matcher assumes temporal ordering which doesn't apply here.
     print("\n2. Matching features...")
     subprocess.run([
-        "colmap", "sequential_matcher",
+        "colmap", "exhaustive_matcher",
         "--database_path", str(database),
-        "--SequentialMatching.overlap", "12"  # Match each image with 12 neighbors
     ])
     
     # Reconstruction: Import features into model with known poses

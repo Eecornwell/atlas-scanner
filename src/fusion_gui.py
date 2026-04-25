@@ -34,8 +34,16 @@ class FusionCaptureGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("ATLAS - Automated Terrestrial LiDAR Acquisition System")
-        self.root.geometry('1400x900+50+50')
-        self.root.minsize(1000, 600)
+
+        # Fit initial window to screen — leave a small margin for taskbars
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        win_w = min(1400, sw - 40)
+        win_h = min(900, sh - 60)
+        self.root.geometry(f'{win_w}x{win_h}+20+20')
+        # Allow the window to shrink as far as the screen allows
+        self.root.minsize(min(600, sw), min(400, sh))
+        self._small_screen = sw < 1100 or sh < 700
         
         # Get script directory for relative paths
         self.script_dir = pathlib.Path(__file__).parent.resolve()
@@ -48,6 +56,7 @@ class FusionCaptureGUI:
         self.is_running = False
         self.scan_count = 0
         self._pending_viewer_html = None
+        self._latest_thumb_photo = None
         
         # Setup GUI
         self.setup_gui()
@@ -60,37 +69,71 @@ class FusionCaptureGUI:
         main_frame = ttk.Frame(self.root, padding="5")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         
-        # Create left and right panels for better space utilization
-        left_panel = ttk.Frame(main_frame)
-        left_panel.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
-        
+        # Create left and right panels for better space utilization.
+        # The left panel is a scrollable canvas so content is never clipped on
+        # small screens — a scrollbar appears only when needed.
+        left_scroll_frame = ttk.Frame(main_frame)
+        left_scroll_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
+        left_scroll_frame.rowconfigure(0, weight=1)
+        left_scroll_frame.columnconfigure(0, weight=1)
+
+        left_canvas = tk.Canvas(left_scroll_frame, highlightthickness=0)
+        left_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        left_scrollbar = ttk.Scrollbar(left_scroll_frame, orient=tk.VERTICAL, command=left_canvas.yview)
+        left_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_panel = ttk.Frame(left_canvas)
+        _left_window = left_canvas.create_window((0, 0), window=left_panel, anchor='nw')
+
+        def _on_left_panel_configure(event):
+            left_canvas.configure(scrollregion=left_canvas.bbox('all'))
+            # Show/hide scrollbar based on whether content overflows
+            if left_panel.winfo_reqheight() > left_canvas.winfo_height():
+                left_scrollbar.grid()
+            else:
+                left_scrollbar.grid_remove()
+        left_panel.bind('<Configure>', _on_left_panel_configure)
+
+        def _on_left_canvas_configure(event):
+            left_canvas.itemconfig(_left_window, width=event.width)
+        left_canvas.bind('<Configure>', _on_left_canvas_configure)
+
+        # Mouse-wheel scrolling on the left panel
+        def _on_mousewheel(event):
+            left_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        left_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        left_canvas.bind_all('<Button-4>', lambda e: left_canvas.yview_scroll(-1, 'units'))
+        left_canvas.bind_all('<Button-5>', lambda e: left_canvas.yview_scroll(1, 'units'))
+
         right_panel = ttk.Frame(main_frame)
         right_panel.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         
-        # Left panel: Logo and title (smaller)
-        try:
-            # Use script directory for logo path
-            logo_path = self.script_dir / '..' / 'assets' / 'media' / 'atlas_logo_app.png'
-            logo_image = Image.open(logo_path)
-            aspect_ratio = logo_image.width / logo_image.height
-            new_width = int(100 * aspect_ratio)  # Reduced from 150 to 100
-            logo_image = logo_image.resize((new_width, 100), Image.LANCZOS)
-            self.logo_photo = ImageTk.PhotoImage(logo_image)
-            logo_label = ttk.Label(left_panel, image=self.logo_photo)
-            logo_label.grid(row=0, column=0, pady=(0, 5))
-        except Exception as e:
-            pass  # Skip logo if not found
+        # Left panel: Logo — hidden on small screens to save vertical space
+        if not self._small_screen:
+            try:
+                logo_path = self.script_dir / '..' / 'assets' / 'media' / 'atlas_logo_app.png'
+                logo_image = Image.open(logo_path)
+                aspect_ratio = logo_image.width / logo_image.height
+                new_width = int(80 * aspect_ratio)
+                logo_image = logo_image.resize((new_width, 80), Image.LANCZOS)
+                self.logo_photo = ImageTk.PhotoImage(logo_image)
+                logo_label = ttk.Label(left_panel, image=self.logo_photo)
+                logo_label.grid(row=0, column=0, pady=(0, 4))
+            except Exception:
+                pass  # Skip logo if not found
         
         # Status frame (compact)
-        status_frame = ttk.LabelFrame(left_panel, text="Status", padding="5")
-        status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 12))
+        _pady_section = (0, 6) if self._small_screen else (0, 12)
+        status_frame = ttk.LabelFrame(left_panel, text="Status", padding="3" if self._small_screen else "5")
+        status_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=_pady_section)
         
         self.status_label = ttk.Label(status_frame, text="Ready to start", foreground="blue")
         self.status_label.grid(row=0, column=0, sticky=tk.W)
         
         # Control buttons frame (vertical layout for compactness)
-        control_frame = ttk.LabelFrame(left_panel, text="Controls", padding="8")
-        control_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 12))
+        control_frame = ttk.LabelFrame(left_panel, text="Controls", padding="4" if self._small_screen else "8")
+        control_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=_pady_section)
 
         # Mode selectors
         mode_frame = ttk.Frame(control_frame)
@@ -106,42 +149,58 @@ class FusionCaptureGUI:
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
                      state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+        self.stationary_wait_var = tk.BooleanVar(value=True)
+        self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
+                        variable=self.stationary_wait_var)
+        self.stationary_wait_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
-                        variable=self.bag_only_var).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.bag_only_var).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
                                       command=self.start_fusion, style="Accent.TButton")
-        self.start_button.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 2))
+        self.start_button.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 2))
         
-        # Larger capture button for easier pressing on small screens
-        self.capture_button = ttk.Button(control_frame, text="CAPTURE SCAN", 
+        # Capture button — reduced height on small screens
+        _capture_ipady = 10 if self._small_screen else 30
+        self.capture_button = ttk.Button(control_frame, text="CAPTURE SCAN",
                                         command=self.capture_scan, state="disabled",
                                         style="Large.TButton")
-        self.capture_button.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 2), ipady=30)
-        self.capture_button.configure(width=15)  # Make it wider
+        self.capture_button.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 2), ipady=_capture_ipady)
+        self.capture_button.configure(width=15)
         
         self.stop_button = ttk.Button(control_frame, text="Stop System", 
                                      command=self.stop_fusion, state="disabled")
-        self.stop_button.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        self.stop_button.grid(row=4, column=0, sticky=(tk.W, tk.E))
         
         # Scan info frame (compact)
-        info_frame = ttk.LabelFrame(left_panel, text="Scan Info", padding="5")
-        info_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=(0, 12))
+        info_frame = ttk.LabelFrame(left_panel, text="Scan Info", padding="3" if self._small_screen else "5")
+        info_frame.grid(row=4, column=0, sticky=(tk.W, tk.E), pady=_pady_section)
         
         ttk.Label(info_frame, text="Scans:").grid(row=0, column=0, sticky=tk.W)
         self.scan_count_label = ttk.Label(info_frame, text="0", font=('Arial', 12, 'bold'))
         self.scan_count_label.grid(row=0, column=1, sticky=tk.W, padx=(5, 0))
         
         ttk.Label(info_frame, text="Output:").grid(row=1, column=0, sticky=tk.W)
-        self.output_dir_label = ttk.Label(info_frame, text="Not started", foreground="gray", wraplength=200)
+        self.output_dir_label = ttk.Label(info_frame, text="Not started", foreground="gray",
+                                           wraplength=160 if self._small_screen else 200)
         self.output_dir_label.grid(row=1, column=1, sticky=tk.W, padx=(5, 0))
+
+        # Latest scan thumbnail
+        thumb_frame = ttk.LabelFrame(left_panel, text="Latest Scan", padding="3" if self._small_screen else "5")
+        thumb_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=_pady_section)
+        thumb_frame.columnconfigure(0, weight=1)
+        self.thumb_label = ttk.Label(thumb_frame, text="No scan yet", foreground="gray", anchor='center')
+        self.thumb_label.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
         # Right panel: tabbed view — RViz2 | System Log
         notebook = ttk.Notebook(right_panel)
         notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
 
-        self.rviz_frame = tk.Frame(notebook, bg='black', width=800, height=600)
+        _rviz_w = max(400, self.root.winfo_screenwidth() - 320)
+        _rviz_h = max(300, self.root.winfo_screenheight() - 160)
+        self.rviz_frame = tk.Frame(notebook, bg='black', width=_rviz_w, height=_rviz_h)
         self.rviz_frame.pack_propagate(False)
         self.rviz_frame.grid_propagate(False)
         self.rviz_frame.update_idletasks()
@@ -229,6 +288,8 @@ class FusionCaptureGUI:
         self.scan_count_label.config(text="0")
         self._session_log_attached = False
         self.scan_dir = None
+        self._latest_thumb_photo = None
+        self.thumb_label.config(image='', text='No scan yet', foreground='gray')
         self._stale_rviz_wids = set()  # clear stale window IDs so new RViz can be found
         self.rviz_process = None
         self.rviz_win_id = None
@@ -310,6 +371,8 @@ class FusionCaptureGUI:
                    '--capture', self.capture_mode_var.get()]
             if self.bag_only_var.get():
                 cmd.append('--bag-only')
+            if self.capture_mode_var.get() == 'stationary' and not self.stationary_wait_var.get():
+                cmd.append('--no-stationary-wait')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -433,6 +496,13 @@ class FusionCaptureGUI:
         self.web_viewer_process = embed_viewer(self.rviz_frame, ply_path)
         self.log_message('✓ 3D viewer loaded in panel')
         self.update_status('Session complete — 3D viewer ready', 'blue')
+
+    def _on_capture_mode_changed(self, *_):
+        """Enable/disable stationary-only options when capture mode changes."""
+        if self.capture_mode_var.get() == 'stationary':
+            self.stationary_wait_cb.config(state='normal')
+        else:
+            self.stationary_wait_cb.config(state='disabled')
 
     def _is_continuous_mode(self):
         return self.capture_mode_var.get() == 'continuous'
@@ -653,11 +723,42 @@ sys.exit(0 if ok[0] else 4)
         self.scan_count += 1
         self.scan_count_label.config(text=str(self.scan_count))
         self.log_message(f"✓ Scan {self.scan_count} completed successfully!")
-        
+
+        # Update thumbnail with the latest fisheye image
+        if hasattr(self, 'scan_dir') and self.scan_dir:
+            threading.Thread(target=self._load_latest_thumbnail, daemon=True).start()
+
         # Re-enable capture button after scan completion
         self.capture_button.config(state="normal")
         if self._check_disk_space():
             self.update_status("System Ready - Ready to capture scans", "green")
+
+    def _load_latest_thumbnail(self):
+        """Find the most recent fisheye image and update the thumbnail."""
+        try:
+            scan_path = pathlib.Path(self.scan_dir)
+            images = sorted(scan_path.glob('fusion_scan_*/fisheye_*.jpg'), key=lambda p: p.stat().st_mtime)
+            if not images:
+                images = sorted(scan_path.glob('fusion_scan_*/dual_fisheye_*.jpg'), key=lambda p: p.stat().st_mtime)
+            if not images:
+                return
+            img = Image.open(images[-1])
+            thumb_w = 200 if not self._small_screen else 160
+            ratio = thumb_w / img.width
+            thumb_h = int(img.height * ratio)
+            # Do all PIL work in background thread, convert to RGB to avoid mode issues
+            img = img.convert('RGB').resize((thumb_w, thumb_h), Image.LANCZOS)
+            # ImageTk.PhotoImage must be created on the main thread — pass the PIL image
+            def _update(img=img):
+                try:
+                    photo = ImageTk.PhotoImage(img)
+                    self._latest_thumb_photo = photo
+                    self.thumb_label.config(image=photo, text='')
+                except Exception:
+                    pass
+            self.root.after(0, _update)
+        except Exception:
+            pass
         
     def capture_scan(self):
         """Trigger a scan capture"""
@@ -860,6 +961,7 @@ def main():
     app = FusionCaptureGUI(root)
     app.camera_mode_var.set(args.camera if args.camera else default_camera)
     app.capture_mode_var.set(args.capture if args.capture else default_capture)
+    app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     try:

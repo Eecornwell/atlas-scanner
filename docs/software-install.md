@@ -248,6 +248,13 @@ sudo ufw allow from 192.168.1.186 &&
 sudo apt install net-tools &&
 sudo ifconfig enp2s0 192.168.1.50
 
+# Increase UDP receive buffer permanently so the lidar point cloud stream
+# (4MB/s at 10Hz) never drops packets between capture node invocations.
+# Without this the 208KB default fills in <1s and scans after the first fail.
+echo 'net.core.rmem_max=33554432
+net.core.rmem_default=33554432' | sudo tee /etc/sysctl.d/99-atlas-udp.conf
+sudo sysctl -p /etc/sysctl.d/99-atlas-udp.conf
+
 # If wired shows "connecting",
 # Apply Network Settings to Wired:
 # Static IP 192.168.1.50
@@ -257,15 +264,10 @@ sudo ifconfig enp2s0 192.168.1.50
 vi ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/MID360_config.json
 
 # Configure FastDDS profiles
-# Replace the IP below if your wired interface uses a different 192.168.1.x address.
-# Both profiles use SHM + UDP restricted to the wired LiDAR interface, preventing
-# WiFi/Docker interfaces from being used for sensor traffic.
 # fastdds_atlas.xml  — used by long-running driver processes (LiDAR, RKO-LIO, camera).
-# fastdds_capture.xml — used by short-lived capture processes (identical transport config).
-HOST_IP="192.168.1.50"   # change if your wired IP differs
-sed -i "s|<address>192\.168\.1\.[0-9]*</address>|<address>$HOST_IP</address>|g" \
-    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_atlas.xml \
-    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_capture.xml
+# fastdds_capture.xml — used by short-lived capture processes (participantID=50 to avoid
+#                       SHM port collisions with the persistent decoder process).
+# No IP address substitution needed — all profiles use default SHM+UDP transports.
 
 # Check with Livox Viewer First to confirm can connect to lidar_configs
 cd ~/atlas_ws &&
@@ -397,6 +399,95 @@ fi
 # Copy RViz config with odometry visualization to livox driver (source location for symlink-install)
 cp ~/atlas_ws/src/atlas-scanner/src/install/display_point_cloud_ROS2.rviz \
    ~/atlas_ws/src/livox_ros_driver2/config/display_point_cloud_ROS2.rviz
+
+# Patch rko_lio node.cpp to:
+# 1. Expose max_lidar_buffer_size as a ROS parameter (value set to 5 in rko_lio_config_robust.yaml)
+#    to keep the registration queue small and prevent stale frame replay.
+# 2. Pop the oldest frame when the buffer is full so the registration loop never
+#    stalls and TF publishing continues uninterrupted.
+# 3. Add max_lidar_buffer_size to the launch file's configurable_parameters so
+#    it is passed through from the YAML config to the node.
+python3 - <<'PYEOF'
+import pathlib, re
+path = pathlib.Path('/home/orion/atlas_ws/src/rko_lio/rko_lio/ros/node.cpp')
+content = path.read_text()
+if 'max_lidar_buffer_size' in content:
+    print('✓ rko_lio buffer patches already present')
+else:
+    # Expose parameter
+    content = content.replace(
+        '  // manually, if, define extrinsics',
+        '  max_lidar_buffer_size =\n      static_cast<size_t>(node->declare_parameter<int>("max_lidar_buffer_size", static_cast<int>(max_lidar_buffer_size)));\n\n  // manually, if, define extrinsics')
+    # Pop oldest on overflow
+    content = content.replace(
+        '      RCLCPP_WARN_STREAM(node->get_logger(), "Registration lidar buffer limit reached. Dropping frame.");\n      sync_condition_variable.notify_one();\n      return;',
+        '      RCLCPP_WARN_STREAM(node->get_logger(), "Registration lidar buffer limit reached. Dropping frame.");\n      lidar_buffer.pop();\n      sync_condition_variable.notify_one();\n      return;')
+    path.write_text(content)
+    print('✓ rko_lio buffer patches applied')
+PYEOF
+
+# Add max_lidar_buffer_size to rko_lio launch file configurable_parameters
+python3 - <<'PYEOF'
+import pathlib
+path = pathlib.Path('/home/orion/atlas_ws/src/rko_lio/launch/odometry.launch.py')
+content = path.read_text()
+if 'max_lidar_buffer_size' in content:
+    print('✓ rko_lio launch parameter already present')
+else:
+    content = content.replace(
+        '    {\n        "name": "min_beta",',
+        '    {\n        "name": "min_beta",\n    },\n    {\n        "name": "max_lidar_buffer_size",\n        "default": "50",\n        "type": "int",\n        "description": "Max lidar frames buffered for registration.",\n    },\n    {')
+    path.write_text(content)
+    print('✓ rko_lio launch parameter added')
+PYEOF
+
+# Patch insta360 decoder to self-recover from corrupt H.264 streams instead of
+# requiring an external process restart between scans.
+# The decoder now flushes its codec context after 5 consecutive decode errors
+# and waits for the next I-frame automatically.
+python3 - <<'PYEOF'
+import re, pathlib
+path = pathlib.Path('/home/orion/atlas_ws/src/insta360_ros_driver/src/decoder.cpp')
+content = path.read_text()
+
+# Check if patch already applied
+if 'consecutive_errors_' in content:
+    print('✓ Decoder self-recovery patch already present')
+else:
+    # Add fields and ResetDecoder after i_frame_only_
+    content = content.replace(
+        '    bool i_frame_only_ = false;',
+        '''    bool i_frame_only_ = false;
+    int consecutive_errors_ = 0;
+    static constexpr int kMaxConsecutiveErrors = 5;
+
+    void ResetDecoder() {
+        if (codec_ctx_) { avcodec_flush_buffers(codec_ctx_); }
+        if (sws_ctx_) { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
+        bgr_frame_.release();
+        consecutive_errors_ = 0;
+        RCLCPP_INFO(this->get_logger(), "Decoder reset — waiting for next I-frame");
+    }''')
+    # Add error tracking in DecodeAndDisplayPacket
+    content = content.replace(
+        '        int ret = avcodec_send_packet(codec_ctx_, packet);\n        if (ret < 0) {\n            return;\n        }\n\n        while (ret >= 0) {\n            ret = avcodec_receive_frame(codec_ctx_, hw_frame_);\n            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {\n                return;\n            } else if (ret < 0) {\n                return;\n            }',
+        '''        int ret = avcodec_send_packet(codec_ctx_, packet);
+        if (ret < 0) {
+            if (++consecutive_errors_ >= kMaxConsecutiveErrors) { ResetDecoder(); }
+            return;
+        }
+
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(codec_ctx_, hw_frame_);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { return; }
+            else if (ret < 0) {
+                if (++consecutive_errors_ >= kMaxConsecutiveErrors) { ResetDecoder(); }
+                return;
+            }
+            consecutive_errors_ = 0;''')
+    path.write_text(content)
+    print('✓ Decoder self-recovery patch applied')
+PYEOF
 
 # Final build of all ROS packages
 cd ~/atlas_ws &&

@@ -10,8 +10,8 @@ map_topic: /rko_lio/local_map
 
 # Reduced frequency to prevent overload
 # Note: rko_lio publishes odom once per LiDAR frame (publish_freq is not a node parameter)
-publish_local_map: true
-publish_deskewed_scan: true
+publish_local_map: false
+publish_deskewed_scan: false
 invert_odom_tf: false
 
 # Forum settings + robustness tweaks
@@ -23,12 +23,13 @@ extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 # Conservative processing parameters
 voxel_size: 0.2              # 0.2m: denser map than 0.3m, better ICP correspondences
 max_points_per_voxel: 10
-max_range: 20.0
+max_range: 10.0
 min_range: 0.3
 max_correspondance_distance: 1.0  # 5x voxel_size; large enough to survive IMU prediction error
-convergence_criterion: 0.0001
+convergence_criterion: 0.001
 max_num_threads: 0           # 0 = use all available cores
 max_expected_jerk: 1.0
 min_beta: 50.0               # reduced from 200: let geometry override IMU when they disagree
-double_downsample: false     # use full voxel_size keypoints for ICP; double_downsample=true used 1.5x=0.3m keypoints which were too sparse
+double_downsample: false     # use full voxel_size keypoints for ICP
+max_lidar_buffer_size: 5     # keep queue tiny so stale frames are dropped quickly, not replayed
 

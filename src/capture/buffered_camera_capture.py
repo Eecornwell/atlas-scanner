@@ -56,11 +56,11 @@ class BufferedCameraCapture(Node):
 
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
         lidar_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=20)
-        image_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
-        odom_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST, depth=10)
+        image_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
+        odom_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
         self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, image_qos)
-        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, image_qos)
+        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, 10)  # use default QoS to match decoder publisher
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, odom_qos)
 
         print(f"✓ Buffered capture initialized")
@@ -320,6 +320,12 @@ def main():
     except rclpy.executors.ExternalShutdownException:
         pass
     finally:
+        # Destroy lidar subscription first to avoid sending DDS teardown
+        # notifications that flood the lidar driver's SHM port on exit.
+        try:
+            node.destroy_subscription(node.lidar_sub)
+        except Exception:
+            pass
         executor.shutdown(timeout_sec=0.5)
         spin_thread.join(timeout=1.0)
         node.destroy_node()

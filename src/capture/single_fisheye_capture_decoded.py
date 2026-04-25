@@ -225,6 +225,7 @@ def main():
     spin_thread.start()
     time.sleep(2.0)  # allow DDS participant discovery to complete before checking buffers
     _t_start = time.time()
+    _both_ready_since = None
     while time.time() - _t_start < 10.0:
         time.sleep(0.1)
         with node.buffer_lock:
@@ -232,7 +233,13 @@ def main():
         with node.image_lock:
             cam_ok = node.latest_image is not None
         if lidar_ok and cam_ok:
-            break
+            if _both_ready_since is None:
+                _both_ready_since = time.time()
+            elif time.time() - _both_ready_since >= 0.5:
+                # Both sources stable for 500ms — safe to proceed
+                break
+        else:
+            _both_ready_since = None  # reset if either drops out
 
     _failed = False
     try:
@@ -284,6 +291,12 @@ def main():
     except rclpy.executors.ExternalShutdownException:
         pass
     finally:
+        # Destroy lidar subscription first to avoid sending DDS teardown
+        # notifications that flood the lidar driver's SHM port on exit.
+        try:
+            node.destroy_subscription(node.lidar_sub)
+        except Exception:
+            pass
         executor.shutdown(timeout_sec=0.5)
         spin_thread.join(timeout=1.0)
         node.destroy_node()

@@ -2,15 +2,15 @@
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <transport_descriptors>
         <transport_descriptor>
-            <transport_id>capture_udp</transport_id>
+            <transport_id>camera_udp</transport_id>
             <type>UDPv4</type>
         </transport_descriptor>
     </transport_descriptors>
-    <participant profile_name="capture_participant" is_default_profile="true">
+    <participant profile_name="camera_participant" is_default_profile="true">
         <rtps>
             <useBuiltinTransports>false</useBuiltinTransports>
             <userTransports>
-                <transport_id>capture_udp</transport_id>
+                <transport_id>camera_udp</transport_id>
             </userTransports>
         </rtps>
     </participant>

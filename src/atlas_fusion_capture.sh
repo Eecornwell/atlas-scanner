@@ -17,6 +17,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
 CAPTURE_MODE="stationary"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
+STATIONARY_WAIT=true              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
@@ -26,6 +27,7 @@ while [[ $# -gt 0 ]]; do
         --interval) CONTINUOUS_INTERVAL="$2"; shift 2 ;;
         --bag-only) BAG_ONLY=true; shift ;;
         --no-sync-benchmark) RUN_SYNC_BENCHMARK=false; shift ;;
+        --no-stationary-wait) STATIONARY_WAIT=false; shift ;;
         *) shift ;;
     esac
 done
@@ -60,7 +62,16 @@ mkdir -p data/synchronized_scans
 # Increase UDP receive buffer to prevent Livox MID360 packet drops under load.
 # Default 208KB is insufficient for ~2-4MB/s point cloud UDP stream; 32MB gives
 # enough headroom during rosbag compression bursts between scans.
-sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=33554432 > /dev/null 2>&1 || true
+# Increase UDP receive buffer to prevent packet drops on the lidar topic.
+# Try sudo first; fall back to writing directly if we have permission.
+if ! sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=33554432 > /dev/null 2>&1; then
+    echo 33554432 | sudo tee /proc/sys/net/core/rmem_max > /dev/null 2>&1 || true
+    echo 33554432 | sudo tee /proc/sys/net/core/rmem_default > /dev/null 2>&1 || true
+fi
+_cur_rmem=$(cat /proc/sys/net/core/rmem_max 2>/dev/null || echo 0)
+if [ "$_cur_rmem" -lt 4194304 ]; then
+    echo "⚠ UDP receive buffer is small ($_cur_rmem bytes) — lidar packets may be dropped between scans"
+fi
 SCAN_DIR="data/synchronized_scans/sync_fusion_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$SCAN_DIR"
 
@@ -573,6 +584,7 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
         sleep 2
     fi
 
+    > /tmp/rko_lio.log
     ros2 launch rko_lio odometry.launch.py \
         config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/rko_lio_config_robust.yaml" \
         rviz:=false > /tmp/rko_lio.log 2>&1 &
@@ -636,7 +648,7 @@ for _cam_attempt in 1 2 3; do
     _IMU_FILTER="false"
     [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
     > /tmp/camera.log  # clear log for this attempt
-    env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+    env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
         equirectangular:=false \
         imu_filter:=${_IMU_FILTER} > /tmp/camera.log 2>&1 &
     CAMERA_PID=$!
@@ -662,7 +674,16 @@ for _cam_attempt in 1 2 3; do
         # is in a bad state and this attempt should be treated as a failure.
         _iframe_topic="/dual_fisheye/image/compressed"
         [ "$CAMERA_MODE" = "single_fisheye" ] && _iframe_topic="/dual_fisheye/image"
-        if ! timeout 10 ros2 topic echo "$_iframe_topic" --once > /dev/null 2>&1; then
+        # Check publisher count without spawning a new DDS participant (ros2 topic echo
+        # floods the MID360 UDP path and is slow to discover). Instead poll the topic
+        # info which uses the existing daemon's graph cache.
+        _cam_data_ok=false
+        for _cw in $(seq 1 20); do
+            _pub=$(ros2 topic info "$_iframe_topic" 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
+            [ "${_pub:-0}" -gt 0 ] && { _cam_data_ok=true; break; }
+            sleep 0.5
+        done
+        if [ "$_cam_data_ok" = "false" ]; then
             echo "⚠ Camera attempt $_cam_attempt: no data on $_iframe_topic within 10s"
             _stream_ready=false
             _pkill "insta360_ros_driver"
@@ -693,6 +714,8 @@ if [ "$CAMERA_STARTED" = "false" ]; then
 fi
 echo "✓ Camera data confirmed"
 touch /tmp/.insta360_session_ran  # sentinel: firmware needs settle time before next session
+# Truncate camera log now so pre-ready decoder errors don't pollute per-scan health checks
+> /tmp/camera.log
 
 FUSION_READY="true"
 
@@ -752,7 +775,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
                 _usb_reset_camera
                 for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
                 [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
                     equirectangular:=false imu_filter:=true > /tmp/camera.log 2>&1 &
                 CAMERA_PID=$!
                 echo "✓ Camera driver restarted (pid $CAMERA_PID)"
@@ -779,7 +802,7 @@ else
     # ── Stationary mode ──────────────────────────────────────────────────────
     # Keep the camera stream alive between scans - the Insta360 SDK closes the
     # connection if no subscriber consumes frames for ~40s.
-    env -u FASTRTPS_DEFAULT_PROFILES_FILE python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/camera_keepalive.py" "$CAMERA_MODE" &
+    env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/camera_keepalive.py" "$CAMERA_MODE" &
     KEEPALIVE_PID=$!
     PIDS+=($KEEPALIVE_PID)
 
@@ -796,7 +819,7 @@ else
                 _usb_reset_camera
                 for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
                 [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-                env -u FASTRTPS_DEFAULT_PROFILES_FILE ros2 launch insta360_ros_driver bringup.launch.xml \
+                env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
                     equirectangular:=false imu_filter:=false > /tmp/camera.log 2>&1 &
                 CAMERA_PID=$!
                 for _sw in $(seq 1 70); do
@@ -805,7 +828,13 @@ else
                 done
                 _iframe_topic="/dual_fisheye/image/compressed"
                 [ "$CAMERA_MODE" = "single_fisheye" ] && _iframe_topic="/dual_fisheye/image"
-                if ! timeout 10 ros2 topic echo "$_iframe_topic" --once > /dev/null 2>&1; then
+                _cam_data_ok=false
+                for _cw in $(seq 1 20); do
+                    _pub=$(ros2 topic info "$_iframe_topic" 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
+                    [ "${_pub:-0}" -gt 0 ] && { _cam_data_ok=true; break; }
+                    sleep 0.5
+                done
+                if [ "$_cam_data_ok" = "false" ]; then
                     echo "⚠ Camera watchdog: no data on $_iframe_topic within 10s, will retry next cycle"
                     _pkill "insta360_ros_driver"
                     _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
@@ -860,13 +889,12 @@ else
         mkdir -p "$INDIVIDUAL_SCAN_DIR"
 
         # Verify LiDAR is alive and actively publishing.
-        # Use publisher count only — ros2 topic echo spawns a new DDS participant
-        # whose discovery multicast floods the MID360's UDP receive path and can
-        # cause it to drop its own heartbeat, killing the driver.
+        # Avoid ros2 topic info/echo — both spawn a temporary DDS participant whose
+        # discovery multicast can flood the MID360 UDP path and kill the driver.
+        # Instead check: (1) driver process is alive, (2) log shows it is publishing.
         _lidar_ok=false
-        if kill -0 $LIDAR_PID 2>/dev/null; then
-            _pub_count=$(ros2 topic info /livox/lidar 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
-            [ "${_pub_count:-0}" -gt 0 ] && _lidar_ok=true
+        if kill -0 $LIDAR_PID 2>/dev/null && grep -q "livox/lidar publish" /tmp/lidar.log 2>/dev/null; then
+            _lidar_ok=true
         fi
         if [ "$_lidar_ok" = "false" ]; then
             echo "⚠ LiDAR driver died, restarting..."
@@ -913,6 +941,41 @@ else
             sleep 3
         fi
 
+        # Check decoder health for single_fisheye — if it's stuck on corrupt
+        # H.264 frames since the last scan, restart it. The log is truncated at
+        # session ready so only post-ready errors are counted.
+        if [ "$CAMERA_MODE" = "single_fisheye" ]; then
+            _decoder_pid=$(pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" | head -1)
+            if [ -n "$_decoder_pid" ]; then
+                _recent_errors=$(grep -c "non-existing PPS\|decode_slice_header error\|no frame" /tmp/camera.log 2>/dev/null)
+                _recent_errors=${_recent_errors:-0}
+                if [ "$_recent_errors" -gt 10 ]; then
+                    echo "⚠ Decoder stuck on corrupt H.264 stream ($_recent_errors errors), restarting..."
+                    kill -TERM "$_decoder_pid" 2>/dev/null
+                    for _dw in $(seq 1 20); do
+                        kill -0 "$_decoder_pid" 2>/dev/null || break
+                        sleep 0.1
+                    done
+                    kill -0 "$_decoder_pid" 2>/dev/null && kill -KILL "$_decoder_pid" 2>/dev/null || true
+                    for _dw in $(seq 1 20); do
+                        pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" > /dev/null 2>&1 && break
+                        sleep 0.5
+                    done
+                    sleep 5
+                    # Truncate log again so errors from this restart don't carry forward
+                    > /tmp/camera.log
+                    echo "✓ Decoder restarted"
+                fi
+            fi
+        fi
+
+        # Optional settle wait before starting the rosbag — gives the scanner
+        # time to stop moving after the trigger before recording begins.
+        if [ "$STATIONARY_WAIT" = "true" ]; then
+            echo "Waiting 3s for scanner to settle..."
+            sleep 3
+        fi
+
         # Start per-scan rosbag immediately before capture so idle setup time
         # between scans is not recorded — keeps bag sizes proportional to the
         # ~4s capture window rather than the full inter-scan gap.
@@ -926,7 +989,11 @@ else
             --compression-mode file --compression-format zstd \
             --max-cache-size 100000000 $TOPICS_TO_RECORD > "$ROSBAG_DIR.log" 2>&1 &
         ROSBAG_PID=$!
+        # Wait briefly for setsid to establish the new process group before reading PGID
+        sleep 0.1
         ROSBAG_PGID=$(ps -o pgid= -p $ROSBAG_PID 2>/dev/null | tr -d ' ')
+        # Safety check: never send kill to PGID 0 or the lidar driver's group
+        [ -z "$ROSBAG_PGID" ] || [ "$ROSBAG_PGID" = "0" ] || [ "$ROSBAG_PGID" = "$LIDAR_PGID" ] && ROSBAG_PGID=""
         # Wait for bag recorder to subscribe to all topics (max 5s)
         _bag_wait=0
         while [ $_bag_wait -lt 10 ]; do
@@ -942,16 +1009,11 @@ else
         # so polling fuser would never clear — use a fixed wait matching the capture
         # script's 2s exit sleep instead.
         sleep 2
-        for _shm in /dev/shm/fastrtps_port* /dev/shm/sem.fastrtps_port*; do
-            [ -e "$_shm" ] || continue
-            fuser "$_shm" > /dev/null 2>&1 || rm -f "$_shm"
-        done
-        # Remove _el files whose port file no longer exists
-        for _el in /dev/shm/fastrtps_port*_el; do
-            [ -e "$_el" ] || continue
-            _port="${_el%_el}"
-            [ -e "$_port" ] || rm -f "$_el"
-        done
+        # Note: inter-scan SHM cleanup removed — selectively removing port files
+        # while session processes are live causes lidar/decoder ports to be deleted
+        # during the brief window when a process releases its _el lock for DDS
+        # participant activity. Full SHM cleanup only happens at session startup
+        # after all processes are confirmed dead.
         if [ "$CAMERA_MODE" = "single_fisheye" ]; then
             FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \

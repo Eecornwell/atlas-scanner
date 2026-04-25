@@ -26,26 +26,29 @@ def embed_viewer(parent_frame, ply_path):
         tk.Label(canvas, text='Empty point cloud', fg='white', bg='#1a1a1a').pack()
         return stop_event
 
-    parent_frame.update_idletasks()
-    w = max(parent_frame.winfo_width(), 800)
-    h = max(parent_frame.winfo_height(), 600)
-
-    renderer = o3d.visualization.rendering.OffscreenRenderer(w, h)
-    renderer.scene.set_background([0.1, 0.1, 0.1, 1.0])
-    mat = o3d.visualization.rendering.MaterialRecord()
-    mat.shader = 'defaultUnlit'
-    mat.point_size = 2.0
-    renderer.scene.add_geometry('pcd', pcd, mat)
-
     bounds = pcd.get_axis_aligned_bounding_box()
     center = np.asarray(bounds.get_center(), dtype=np.float32)
     extent = float(np.linalg.norm(bounds.get_extent()))
 
     state = {'drag': None, 'last': (0, 0), 'theta': 0.3, 'phi': 1.2, 'zoom': 1.0,
-             'pan': [0.0, 0.0], 'dirty': True, 'w': w, 'h': h}
+             'pan': [0.0, 0.0], 'dirty': True, 'w': 0, 'h': 0}
     img_ref = [None]
+    renderer_box = [None]  # deferred until canvas has real dimensions
+
+    def _make_renderer(w, h):
+        r = o3d.visualization.rendering.OffscreenRenderer(w, h)
+        r.scene.set_background([0.1, 0.1, 0.1, 1.0])
+        mat = o3d.visualization.rendering.MaterialRecord()
+        mat.shader = 'defaultUnlit'
+        mat.point_size = 2.0
+        r.scene.add_geometry('pcd', pcd, mat)
+        renderer_box[0] = r
+        state['w'], state['h'] = w, h
+        _update_camera()
 
     def _update_camera():
+        if renderer_box[0] is None:
+            return
         t, p, z = state['theta'], state['phi'], state['zoom']
         dist = extent * 1.5 * z
         eye = center + np.array([
@@ -53,10 +56,8 @@ def embed_viewer(parent_frame, ply_path):
             dist * np.sin(p) * np.sin(t),
             dist * np.cos(p),
         ], dtype=np.float32)
-        renderer.scene.camera.look_at(center.tolist(), eye.tolist(), [0, 0, 1])
+        renderer_box[0].scene.camera.look_at(center.tolist(), eye.tolist(), [0, 0, 1])
         state['dirty'] = True
-
-    _update_camera()
 
     def _tick():
         if stop_event.is_set():
@@ -64,12 +65,14 @@ def embed_viewer(parent_frame, ply_path):
         cw = canvas.winfo_width()
         ch = canvas.winfo_height()
         if cw > 10 and ch > 10:
-            if (cw, ch) != (state['w'], state['h']):
+            if renderer_box[0] is None:
+                _make_renderer(cw, ch)
+            elif (cw, ch) != (state['w'], state['h']):
                 state['w'], state['h'] = cw, ch
-                renderer.resize(cw, ch)
+                renderer_box[0].resize(cw, ch)
                 state['dirty'] = True
-            if state['dirty']:
-                buf = renderer.render_to_image()
+            if state['dirty'] and renderer_box[0] is not None:
+                buf = renderer_box[0].render_to_image()
                 arr = np.asarray(buf)
                 photo = ImageTk.PhotoImage(Image.fromarray(arr))
                 img_ref[0] = photo
