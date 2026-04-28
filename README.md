@@ -9,7 +9,7 @@
   > *Note: See `Hardware Build` section below for component estimates at the time of writing this.*
 
 ## Technical Approach
-![ATLAS Scanner](assets/media/atlas-scanner.jpg "ATLAS Scanner")
+![ATLAS Scanner](assets/media/atlas-splat.gif "ATLAS Scanner")
 ### Hardware
 - LiDAR w/ IMU
     - [Livox Mid360](https://www.livoxtech.com/mid-360)
