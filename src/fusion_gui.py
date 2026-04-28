@@ -99,29 +99,39 @@ class FusionCaptureGUI:
             left_canvas.itemconfig(_left_window, width=event.width)
         left_canvas.bind('<Configure>', _on_left_canvas_configure)
 
-        # Mouse-wheel scrolling on the left panel
+        # Mouse-wheel scrolling on the left panel only
         def _on_mousewheel(event):
             left_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-        left_canvas.bind_all('<MouseWheel>', _on_mousewheel)
-        left_canvas.bind_all('<Button-4>', lambda e: left_canvas.yview_scroll(-1, 'units'))
-        left_canvas.bind_all('<Button-5>', lambda e: left_canvas.yview_scroll(1, 'units'))
+        def _on_button4(event):
+            left_canvas.yview_scroll(-1, 'units')
+        def _on_button5(event):
+            left_canvas.yview_scroll(1, 'units')
+
+        left_scroll_frame.bind('<Enter>', lambda e: (
+            left_canvas.bind_all('<MouseWheel>', _on_mousewheel),
+            left_canvas.bind_all('<Button-4>', _on_button4),
+            left_canvas.bind_all('<Button-5>', _on_button5)))
+        left_scroll_frame.bind('<Leave>', lambda e: (
+            left_canvas.unbind_all('<MouseWheel>'),
+            left_canvas.unbind_all('<Button-4>'),
+            left_canvas.unbind_all('<Button-5>')))
 
         right_panel = ttk.Frame(main_frame)
         right_panel.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         
-        # Left panel: Logo — hidden on small screens to save vertical space
-        if not self._small_screen:
-            try:
-                logo_path = self.script_dir / '..' / 'assets' / 'media' / 'atlas_logo_app.png'
-                logo_image = Image.open(logo_path)
-                aspect_ratio = logo_image.width / logo_image.height
-                new_width = int(80 * aspect_ratio)
-                logo_image = logo_image.resize((new_width, 80), Image.LANCZOS)
-                self.logo_photo = ImageTk.PhotoImage(logo_image)
-                logo_label = ttk.Label(left_panel, image=self.logo_photo)
-                logo_label.grid(row=0, column=0, pady=(0, 4))
-            except Exception:
-                pass  # Skip logo if not found
+        # Left panel: Logo — scaled smaller on small screens
+        try:
+            logo_path = self.script_dir / '..' / 'assets' / 'media' / 'atlas_logo_app.png'
+            logo_image = Image.open(logo_path)
+            aspect_ratio = logo_image.width / logo_image.height
+            logo_h = 50 if self._small_screen else 80
+            new_width = int(logo_h * aspect_ratio)
+            logo_image = logo_image.resize((new_width, logo_h), Image.LANCZOS)
+            self.logo_photo = ImageTk.PhotoImage(logo_image)
+            logo_label = ttk.Label(left_panel, image=self.logo_photo)
+            logo_label.grid(row=0, column=0, pady=(0, 4))
+        except Exception:
+            pass  # Skip logo if not found
         
         # Status frame (compact)
         _pady_section = (0, 6) if self._small_screen else (0, 12)

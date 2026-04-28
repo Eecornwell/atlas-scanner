@@ -139,26 +139,18 @@ def export_to_colmap(session_dir):
             with open(traj_file, 'r') as f:
                 traj = json.load(f)
             
-            # Use camera_pose when available for proper alignment with images
+            # Always derive camera pose from lidar_pose + calibration.
+            # camera_pose in the JSON may be stale (not updated by ICP refinement
+            # in older sessions), so recompute it from lidar_pose every time.
             if 'current_pose' in traj:
                 pose_data = traj['current_pose']
                 timestamp = pose_data.get('timestamp', 0.0)
-                cam_quat_xyzw = None
-                quat_xyzw = [0.0, 0.0, 0.0, 1.0]
 
-                if 'camera_pose' in pose_data:
-                    p = pose_data['camera_pose']
-                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
-                    cam_quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
-                elif 'lidar_pose' in pose_data:
-                    # Fallback to lidar pose if camera pose not available
-                    p = pose_data['lidar_pose']
-                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
-                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
-                else:
-                    p = pose_data
-                    pos_xyz = [p['position']['x'], p['position']['y'], p['position']['z']]
-                    quat_xyzw = [p['orientation']['x'], p['orientation']['y'], p['orientation']['z'], p['orientation']['w']]
+                lp = pose_data.get('lidar_pose') or pose_data
+                pos_xyz = [lp['position']['x'], lp['position']['y'], lp['position']['z']]
+                quat_xyzw = [lp['orientation']['x'], lp['orientation']['y'],
+                             lp['orientation']['z'], lp['orientation']['w']]
+                cam_quat_xyzw = None  # always use lidar_pose + calibration
             elif 'poses' in traj and traj['poses']:
                 p = traj['poses'][-1]
                 timestamp = p.get('timestamp', 0.0)

@@ -34,11 +34,13 @@ FACES_IN_CAM = np.array([
 ], dtype=float)
 
 
-def erp_to_perspective(erp_img, fov_deg, R_face_w2c, R_cam_w2c_ros, output_size=1024):
+def erp_to_perspective(erp_img, fov_deg, R_face_w2c, R_cam_w2c_ros, output_size=1024,
+                       interpolation=cv2.INTER_CUBIC):
     """Sample a perspective face from an ERP image.
     R_face_w2c: face camera w2c in COLMAP world (rows=[right,down,look]).
     R_cam_w2c_ros: Actually c2w! (misnamed for backward compatibility)
     Rays: persp cam -> COLMAP world -> ROS world -> ERP cam.
+    Use interpolation=cv2.INTER_NEAREST for binary masks to preserve exact values.
     """
     h, w = erp_img.shape[:2]
     f = output_size / (2 * np.tan(np.radians(fov_deg) / 2))
@@ -52,7 +54,7 @@ def erp_to_perspective(erp_img, fov_deg, R_face_w2c, R_cam_w2c_ros, output_size=
     lat = np.arcsin(np.clip(-rays_erp[...,1] / np.linalg.norm(rays_erp, axis=-1), -1, 1))
     erp_u = ((lon + np.pi) / (2*np.pi) * w).astype(np.float32)
     erp_v = ((np.pi/2 - lat) / np.pi * h).astype(np.float32)
-    return cv2.remap(erp_img, erp_u, erp_v, cv2.INTER_CUBIC, borderMode=cv2.BORDER_WRAP)
+    return cv2.remap(erp_img, erp_u, erp_v, interpolation, borderMode=cv2.BORDER_WRAP)
 
 def convert_erp_to_perspectives(session_dir):
     """Convert all ERP images to perspective projections"""
@@ -191,8 +193,10 @@ def convert_erp_to_perspectives(session_dir):
 
             persp_mask = None
             if erp_mask is not None:
-                persp_mask = erp_to_perspective(erp_mask, fov_deg=90, R_face_w2c=R_face_w2c, R_cam_w2c_ros=R_cam_c2w_ros)
-                _, persp_mask = cv2.threshold(persp_mask, 127, 255, cv2.THRESH_BINARY)
+                persp_mask = erp_to_perspective(erp_mask, fov_deg=90, R_face_w2c=R_face_w2c,
+                                                R_cam_w2c_ros=R_cam_c2w_ros,
+                                                interpolation=cv2.INTER_NEAREST)
+                # No threshold needed — INTER_NEAREST preserves exact 0/255 values
                 valid_ratio = np.count_nonzero(persp_mask) / persp_mask.size
                 if valid_ratio < 0.05:
                     print(f"  Skipped (blank): {out_name} ({valid_ratio*100:.1f}% valid)")
@@ -227,8 +231,8 @@ def convert_erp_to_perspectives(session_dir):
     
     print(f"\n✓ Generated {len(perspective_images)} perspective images")
     
-    # Save metadata
-    metadata_file = persp_dir / "metadata.json"
+    # Save metadata outside the images directory so COLMAP doesn't try to process it
+    metadata_file = colmap_dir / "perspective_metadata.json"
     with open(metadata_file, 'w') as f:
         json.dump(perspective_images, f, indent=2)
     
@@ -248,8 +252,10 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
     if database.exists():
         database.unlink()
     
-    # Load metadata to create rig configuration
-    metadata_file = persp_dir / "metadata.json"
+    # Load metadata — check new location first, fall back to old location in images dir
+    metadata_file = colmap_dir / "perspective_metadata.json"
+    if not metadata_file.exists():
+        metadata_file = persp_dir / "metadata.json"
     with open(metadata_file) as f:
         metadata = json.load(f)
     

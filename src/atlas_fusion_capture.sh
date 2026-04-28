@@ -16,7 +16,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
 CAPTURE_MODE="stationary"         # stationary | continuous
-CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
+CONTINUOUS_INTERVAL=2             # seconds between captures (continuous mode only)
 STATIONARY_WAIT=true              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
