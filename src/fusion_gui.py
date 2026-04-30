@@ -738,9 +738,10 @@ sys.exit(0 if ok[0] else 4)
         if hasattr(self, 'scan_dir') and self.scan_dir:
             threading.Thread(target=self._load_latest_thumbnail, daemon=True).start()
 
-        # Re-enable capture button after scan completion
-        self.capture_button.config(state="normal")
-        if self._check_disk_space():
+        # Re-enable capture button after scan completion (only if system still running)
+        if self.is_running:
+            self.capture_button.config(state="normal")
+        if self.is_running and self._check_disk_space():
             self.update_status("System Ready - Ready to capture scans", "green")
 
     def _load_latest_thumbnail(self):
@@ -761,6 +762,8 @@ sys.exit(0 if ok[0] else 4)
             # ImageTk.PhotoImage must be created on the main thread — pass the PIL image
             def _update(img=img):
                 try:
+                    if not self.root.winfo_exists():
+                        return
                     photo = ImageTk.PhotoImage(img)
                     self._latest_thumb_photo = photo
                     self.thumb_label.config(image=photo, text='')
