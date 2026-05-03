@@ -7,8 +7,11 @@
 """
 Calibration transformation that properly handles coordinate systems.
 
-The calibration tool provides T_lidar_camera (camera → lidar transform).
-For projection, we need T_camera_lidar (lidar → camera transform).
+direct_visual_lidar_calibration outputs T_lidar_camera: maps a point in
+camera frame to lidar frame (camera -> lidar).
+
+For projection we need T_camera_lidar: maps a lidar point into camera frame
+(lidar -> camera). This is obtained by inverting T_lidar_camera.
 
 Key insight: T_camera_lidar = inverse(T_lidar_camera)
 """
@@ -40,11 +43,10 @@ def calibration_transform(root_path, use_existing=False):
     with open(calib_path, 'r') as f:
         calib_data = json.load(f)
     
-    # direct_visual_lidar_calibration optimises T_camera_lidar (lidar->camera) but
-    # writes it under the misleading key "T_lidar_camera" in calib.json.
-    # Read it directly as T_camera_lidar — no inversion needed.
+    # direct_visual_lidar_calibration outputs T_lidar_camera (camera->lidar).
+    # For projection we need T_camera_lidar (lidar->camera) = inv(T_lidar_camera).
     if 'results' in calib_data:
-        vec = calib_data['results']['T_lidar_camera']  # actually T_camera_lidar
+        vec = calib_data['results']['T_lidar_camera']
         Tx, Ty, Tz, Qx, Qy, Qz, Qw = vec
     elif 'T_lidar_camera' in calib_data:
         T_matrix = np.array(calib_data['T_lidar_camera'])
@@ -53,17 +55,18 @@ def calibration_transform(root_path, use_existing=False):
         Qx, Qy, Qz, Qw = rot.as_quat()
     else:
         raise ValueError("Invalid calib.json format")
-    
-    print("\n=== CALIBRATION TOOL OUTPUT (T_camera_lidar, lidar->camera) ===")
+
+    print("\n=== CALIBRATION TOOL OUTPUT (T_lidar_camera, camera->lidar) ===")
     print(f"Translation: [{Tx:.4f}, {Ty:.4f}, {Tz:.4f}]")
     print(f"Quaternion: [{Qx:.4f}, {Qy:.4f}, {Qz:.4f}, {Qw:.4f}]")
+
+    # Invert to get T_camera_lidar (lidar->camera) for projection
+    T_lidar_camera_mat = np.eye(4)
+    T_lidar_camera_mat[:3, :3] = R.from_quat([Qx, Qy, Qz, Qw]).as_matrix()
+    T_lidar_camera_mat[:3, 3] = [Tx, Ty, Tz]
+    T_camera_lidar_mat = np.linalg.inv(T_lidar_camera_mat)
     
-    # This IS T_camera_lidar — use directly, no inversion
-    T_camera_lidar_mat = np.eye(4)
-    T_camera_lidar_mat[:3, :3] = R.from_quat([Qx, Qy, Qz, Qw]).as_matrix()
-    T_camera_lidar_mat[:3, 3] = [Tx, Ty, Tz]
-    
-    print("\nT_camera_lidar matrix (lidar->camera):")
+    print("\nT_camera_lidar matrix (lidar->camera, after inversion):")
     print(T_camera_lidar_mat)
     
     R_camera_lidar = T_camera_lidar_mat[:3, :3]

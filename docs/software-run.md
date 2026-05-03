@@ -99,6 +99,28 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py
 # Use --camera-mode dual_fisheye if the session was captured with dual_fisheye mode
 ```
 
+### Reprocess an existing session with a new calibration
+
+If the extrinsic calibration has been updated (e.g. after re-running `coordinate_transform.py`), use this to re-color point clouds and regenerate COLMAP poses from the corrected `fusion_calibration.yaml` without re-capturing:
+
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reprocess_session.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+```
+
+Optional flags:
+```bash
+--skip-coloring   # skip re-coloring, only redo COLMAP export
+--skip-colmap     # skip COLMAP export, only redo point cloud coloring
+```
+
+To reprocess all sessions at once:
+```bash
+for session in ~/atlas_ws/data/synchronized_scans/sync_fusion_*; do
+    python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reprocess_session.py "$session"
+done
+```
+
 ### Merge scans using trajectory poses
 ```bash
 cd ~/atlas_ws && source install/setup.bash
