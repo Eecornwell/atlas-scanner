@@ -90,6 +90,13 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
                 root_ply = f"{output_dir}/{total_count:06d}.ply"
                 shutil.copy2(src_ply, root_ply)
                 
+                # Store source scan_dir and PLY frame so generate_intensity_images knows
+                # whether to undo the trajectory pose before projecting
+                import json as _json
+                is_world_frame = ply_files[0].name == 'world_lidar.ply'
+                with open(f"{output_dir}/{total_count:06d}_source.json", 'w') as sf:
+                    _json.dump({'scan_dir': str(fusion_dir), 'world_frame': is_world_frame}, sf)
+                
                 # Create timestamp entry
                 timestamps.append({
                     "image_id": total_count,

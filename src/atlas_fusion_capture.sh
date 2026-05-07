@@ -289,11 +289,8 @@ cleanup() {
         fi
 
         if [ "$EXPORT_COLMAP" = "true" ]; then
-            echo "Exporting session to COLMAP format..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/export_to_colmap.py" "$SCAN_DIR"
-            if [ $? -eq 0 ]; then
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/erp_to_perspective_colmap.py" "$SCAN_DIR"
-            fi
+            echo "Exporting session to COLMAP format (panorama SfM)..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR"
         fi
 
         echo "Complete. Scans saved in: $SCAN_DIR"

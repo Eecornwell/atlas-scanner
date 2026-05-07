@@ -125,10 +125,8 @@
             ```
             ![Superglue Example](../assets/media/superglue-example.png)
 
-    6. Seed `calib.json` with the current calibration as the initial guess, then run calibration
+    6. Run calibration using the initial guess from step 5
         ```bash
-        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
-
         cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
         ./calibrate --data_path ~/atlas_ws/output \
             --nid_bins 32 \
@@ -136,7 +134,10 @@
         ```
         > *Note: Check the overlay in the viewer using the `blend` slider. When satisfied, save the result.*
 
-        > *Note: If this is a first-time calibration with no existing yaml, skip the seed step and use the initial guess from step 5 directly.*
+        > *Note: If you want to start from the current known-good calibration instead of the auto initial guess (e.g. for fine refinement), run `seed_calib.py` first:*
+        > ```bash
+        > python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
+        > ```
 
     7. Extract and apply new calibration
         ```bash

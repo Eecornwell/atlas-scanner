@@ -309,8 +309,10 @@ class FusionCaptureGUI:
         if self.web_viewer_process:
             self.web_viewer_process.set()
             self.web_viewer_process = None
-        for child in self.rviz_frame.winfo_children():
-            child.destroy()
+            # Give the _tick loop one cycle to see stop_event before we destroy the canvas
+            self.root.after(100, self._clear_viewer_frame)
+        else:
+            self._clear_viewer_frame()
         
         self.log_message("Starting Automated Terrestrial LiDAR Acquisition System (ATLAS)...")
         self.update_status("Starting system...", "orange")
@@ -422,11 +424,9 @@ class FusionCaptureGUI:
                         self.root.after(0, self._system_ready)
                     elif "Press ENTER to capture" in line:
                         self.root.after(0, self._system_ready)
-                    elif "Scan" in line and "completed" in line:
+                    elif line.startswith("✓ Scan") and "completed:" in line:
                         self.root.after(0, self._scan_completed)
                     elif "✓ Scan saved to:" in line:
-                        self.root.after(0, self._scan_completed)
-                    elif "Scan capture complete" in line:
                         self.root.after(0, self._scan_completed)
                     elif "_viewer.html" in line or ("3D viewer" in line and ".html" in line):
                         import re
@@ -506,6 +506,14 @@ class FusionCaptureGUI:
         self.web_viewer_process = embed_viewer(self.rviz_frame, ply_path)
         self.log_message('✓ 3D viewer loaded in panel')
         self.update_status('Session complete — 3D viewer ready', 'blue')
+
+    def _clear_viewer_frame(self):
+        """Destroy all children of rviz_frame safely."""
+        for child in self.rviz_frame.winfo_children():
+            try:
+                child.destroy()
+            except Exception:
+                pass
 
     def _on_capture_mode_changed(self, *_):
         """Enable/disable stationary-only options when capture mode changes."""
@@ -744,23 +752,54 @@ sys.exit(0 if ok[0] else 4)
             self.update_status("System Ready - Ready to capture scans", "green")
 
     def _load_latest_thumbnail(self):
-        """Find the most recent fisheye image and update the thumbnail."""
+        """Find the most recent captured image and update the thumbnail."""
+        import time as _time
         try:
+            if not self.scan_dir:
+                return
             scan_path = pathlib.Path(self.scan_dir)
-            images = sorted(scan_path.glob('fusion_scan_*/fisheye_*.jpg'), key=lambda p: p.stat().st_mtime)
-            if not images:
-                images = sorted(scan_path.glob('fusion_scan_*/dual_fisheye_*.jpg'), key=lambda p: p.stat().st_mtime)
+            if not scan_path.exists():
+                return
+            images = None
+            for pattern in [
+                'fusion_scan_*/equirect_*_masked.png',
+                'fusion_scan_*/equirect_dual_fisheye.jpg',
+                'fusion_scan_*/equirect_*.jpg',
+                'fusion_scan_*/dual_fisheye_*.png',
+                'fusion_scan_*/fisheye_*.jpg',
+                'fusion_scan_*/dual_fisheye_*.jpg',
+            ]:
+                try:
+                    found = sorted(scan_path.glob(pattern), key=lambda p: p.stat().st_mtime)
+                except Exception:
+                    continue
+                if found:
+                    images = found
+                    break
             if not images:
                 return
-            img = Image.open(images[-1])
+            img_path = images[-1]
+            # Wait for file to finish writing (size stable for 0.5s)
+            prev_size = -1
+            for _ in range(10):
+                try:
+                    cur_size = img_path.stat().st_size
+                except Exception:
+                    return
+                if cur_size == prev_size and cur_size > 0:
+                    break
+                prev_size = cur_size
+                _time.sleep(0.1)
+            img = Image.open(img_path)
+            img.load()  # force full decode before leaving background thread
             thumb_w = 200 if not self._small_screen else 160
             ratio = thumb_w / img.width
             thumb_h = int(img.height * ratio)
-            # Do all PIL work in background thread, convert to RGB to avoid mode issues
             img = img.convert('RGB').resize((thumb_w, thumb_h), Image.LANCZOS)
-            # ImageTk.PhotoImage must be created on the main thread — pass the PIL image
             def _update(img=img):
                 try:
+                    if not self.root.winfo_exists():
+                        return
                     photo = ImageTk.PhotoImage(img)
                     self._latest_thumb_photo = photo
                     self.thumb_label.config(image=photo, text='')
@@ -958,6 +997,7 @@ def main():
 
     log_path = _setup_logging()
     logging.info("fusion_gui starting")
+    logging.getLogger('PIL').setLevel(logging.WARNING)  # suppress PIL debug stream messages
 
     root = tk.Tk()
 

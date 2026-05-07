@@ -16,7 +16,7 @@ Installs camera and LiDAR drivers with optimized camera settings:
 - **Resolution**: 3840x1920 (high quality)
 - **ISO**: 600 (increased light sensitivity)
 - **Exposure (shutter speed)**: 1/120 (faster shutter, motion compensation)
-- **Bitrate**: 12 Mbps (reduced compression artifacts)
+- **Bitrate**: 30 Mbps (high quality, matched to 15 fps effective output)
 - **Scaling**: Lanczos interpolation (highest quality)
 - **JPEG Quality**: 100 (maximum)
 
@@ -178,7 +178,8 @@ sed -i '/SyncLocalTimeToCamera/d; /offset_time/d; /utc_time/d' ~/atlas_ws/src/in
 # - Scaling: Lanczos interpolation (highest quality)
 # - JPEG Quality: 100 (maximum)
 sed -i 's/RES_1920_960P30/RES_2560_1280P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
-sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i 's/param.video_bitrate = 1024 \* 1024 \* [0-9]*/param.video_bitrate = 1024 * 1024 * 30;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+sed -i "s/dual_fisheye_\${timestamp}.jpg/dual_fisheye_\${timestamp}.png/; s/cv2.imwrite(img_file, frame)/cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])/" ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
 sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
 sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
 sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
@@ -538,6 +539,49 @@ chmod +x ~/Desktop/ATLAS-Camera-Permissions.desktop
 ```
 
 > *Note: `Terminal=true` is set so you can see the output and confirm permissions were applied successfully.*
+
+---
+
+# Install pycolmap (required for panorama SfM pipeline, must match system colmap version)
+pip3 install pycolmap==3.14.0.dev0
+
+```
+
+</details>
+
+---
+
+## Post-Processing: Panorama SfM (COLMAP)
+
+The recommended pipeline uses ERP images directly with COLMAP's `SPHERICAL` camera model, a single-camera rig, and LiDAR pose priors from odometry.
+
+### New pipeline (recommended)
+
+Uses `panorama_sfm_colmap.py` — no cubemap conversion, ERP fed directly to COLMAP:
+
+```bash
+SESSION=~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+rm -rf $SESSION/colmap
+cd ~/atlas_ws/src/atlas-scanner/src/post_processing
+python3 panorama_sfm_colmap.py $SESSION
+```
+
+Options:
+- `--prior-std 0.05` — LiDAR pose prior std dev in metres (default: 0.05 m)
+- `--exhaustive` — use exhaustive matcher instead of sequential (slower, better for small sessions)
+- `--bundle-adjustment` — run bundle adjustment after pose_prior_mapper (refines poses)
+
+### Legacy pipeline
+
+Converts ERP to 6 perspective cubemap faces before running COLMAP:
+
+```bash
+SESSION=~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+rm -rf $SESSION/colmap
+cd ~/atlas_ws/src/atlas-scanner/src/post_processing
+python3 export_to_colmap.py $SESSION
+python3 erp_to_perspective_colmap.py $SESSION
+```
 
 ---
 

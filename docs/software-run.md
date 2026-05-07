@@ -13,7 +13,7 @@ SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
 ENABLE_ICP_ALIGNMENT=true      # ICP pose graph refinement on merged cloud
 BLEND_ERP_SEAMS=true           # dual_fisheye only: blend fisheye seams before coloring
-EXPORT_COLMAP=false            # export session to COLMAP format
+EXPORT_COLMAP=false            # run panorama SfM (COLMAP) after session
 CLEAN_POINTCLOUD=true          # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
 RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session (outputs to screen + sync_benchmark.json)
@@ -121,6 +121,21 @@ for session in ~/atlas_ws/data/synchronized_scans/sync_fusion_*; do
 done
 ```
 
+### Re-run COLMAP export only (fastest - uses existing colored point clouds)
+
+If you only need to regenerate the COLMAP reconstruction without re-coloring point clouds:
+
+```bash
+cd ~/atlas_ws/src/atlas-scanner/src/post_processing
+python3 panorama_sfm_colmap.py ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+```
+
+Alternatively, use `reprocess_session.py` with the `--skip-coloring` flag:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reprocess_session.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} --skip-coloring
+```
+
 ### Merge scans using trajectory poses
 ```bash
 cd ~/atlas_ws && source install/setup.bash
@@ -140,12 +155,23 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_pose
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/web_3d_viewer.py <PLY_FILE>
 ```
 
-### Re-run COLMAP export on an existing session
+### Re-run COLMAP panorama SfM on an existing session
+
+To completely regenerate the COLMAP reconstruction (removes existing COLMAP data first):
+
 ```bash
 SESSION=~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 rm -rf $SESSION/colmap
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/export_to_colmap.py $SESSION
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/erp_to_perspective_colmap.py $SESSION
+cd ~/atlas_ws/src/atlas-scanner/src/post_processing
+python3 panorama_sfm_colmap.py $SESSION
+```
+
+This uses the colmap `panorama_sfm.py` approach: ERP images are sliced into perspective tiles (SIMPLE_PINHOLE), grouped into a rig per panorama, and reconstructed with LiDAR pose priors via `pose_prior_mapper`. Bundle adjustment is enabled by default.
+
+Optional flags:
+```bash
+python3 panorama_sfm_colmap.py $SESSION --no-bundle-adjustment  # skip bundle adjustment (BA runs by default)
+python3 panorama_sfm_colmap.py $SESSION --exhaustive            # exhaustive matcher (slower, better for small sessions)
 ```
 
 ### Run synchronization benchmark on a session

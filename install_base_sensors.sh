@@ -130,8 +130,8 @@ echo "Applying camera quality improvements..."
 # 1. Update resolution to 3840x1920 (full native quality)
 sed -i 's/RES_2560_1280P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
-# 2. Increase bitrate to 12 Mbps for better quality
-sed -i 's/param.video_bitrate = 1024 \* 1024 \/ 2;/param.video_bitrate = 1024 * 1024 * 12;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
+# 2. Increase bitrate to 30 Mbps (matched to 15 fps effective output via skip_frame:=1)
+sed -i 's/param.video_bitrate = 1024 \* 1024 \* [0-9]*/param.video_bitrate = 1024 * 1024 * 30;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 # 3. Use high-quality Lanczos scaling instead of nearest neighbor
 sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
 # 4. Update equirectangular config for new resolution
@@ -145,8 +145,8 @@ sed -i 's/image_width: 1920/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/sr
 sed -i 's/image_height: 960/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
 sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
 sed -i 's/width=2560, height=1280/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
-# 6. Update JPEG quality to 100 in capture scripts
-sed -i 's/cv2.imwrite(img_file, cv_image)/cv2.imwrite(img_file, cv_image, [cv2.IMWRITE_JPEG_QUALITY, 100])/g' ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
+# 6. Save captured frames as lossless PNG to avoid double lossy compression on top of H.264 decode
+sed -i "s/dual_fisheye_\${timestamp}.jpg/dual_fisheye_\${timestamp}.png/; s/cv2.imwrite(img_file, frame)/cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])/" ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
 
 # Apply manual exposure control (1/120s ISO 600 for indoor use)
 # ISO and shutter are ROS params — override at launch time without recompiling

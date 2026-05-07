@@ -131,8 +131,8 @@ class BufferedCameraCapture(Node):
                 print("Error saving image: could not decode frame")
                 self.save_complete = True
                 return
-            img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.jpg')
-            cv2.imwrite(img_file, frame)
+            img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.png')
+            cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
             print(f"✓ Saved fisheye frame: {img_file}")
         except Exception as e:
             print(f"Error saving image: {e}")

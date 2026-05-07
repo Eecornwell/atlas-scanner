@@ -276,7 +276,24 @@ def register_pose_graph(session_dir, max_gyro=0.12):
             valid_scan_dirs.append(scan_dir)
 
     scan_dirs = valid_scan_dirs
-    
+
+    # Drop scans whose trajectory position is too close to an already-kept scan.
+    # Near-duplicate poses add no new geometry and produce degenerate baselines for
+    # Gaussian splatting. 10 cm is a safe minimum for a stationary scanner.
+    MIN_BASELINE_M = 0.10
+    kept_indices = []
+    kept_positions = []
+    for i, scan_dir in enumerate(scan_dirs):
+        pos = load_trajectory_pose(scan_dir)[:3, 3]
+        if not kept_positions or min(np.linalg.norm(pos - p) for p in kept_positions) >= MIN_BASELINE_M:
+            kept_indices.append(i)
+            kept_positions.append(pos)
+        else:
+            print(f"  Skipping {scan_dir.name}: too close to an existing scan (< {MIN_BASELINE_M*100:.0f}cm)")
+    scan_dirs   = [scan_dirs[i]   for i in kept_indices]
+    lidar_files = [lidar_files[i] for i in kept_indices]
+    ply_files   = [ply_files[i]   for i in kept_indices]
+
     if len(lidar_files) < 2:
         print(f"Need at least 2 point clouds, found {len(lidar_files)}")
         return

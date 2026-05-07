@@ -62,8 +62,13 @@ def embed_viewer(parent_frame, ply_path):
     def _tick():
         if stop_event.is_set():
             return
-        cw = canvas.winfo_width()
-        ch = canvas.winfo_height()
+        try:
+            if not canvas.winfo_exists():
+                return
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+        except tk.TclError:
+            return
         if cw > 10 and ch > 10:
             if renderer_box[0] is None:
                 _make_renderer(cw, ch)
@@ -76,10 +81,16 @@ def embed_viewer(parent_frame, ply_path):
                 arr = np.asarray(buf)
                 photo = ImageTk.PhotoImage(Image.fromarray(arr))
                 img_ref[0] = photo
-                canvas.delete('all')
-                canvas.create_image(0, 0, anchor='nw', image=photo)
+                try:
+                    canvas.delete('all')
+                    canvas.create_image(0, 0, anchor='nw', image=photo)
+                except tk.TclError:
+                    return
                 state['dirty'] = False
-        canvas.after(50, _tick)
+        try:
+            canvas.after(50, _tick)
+        except tk.TclError:
+            pass
 
     def _press(e):
         state['drag'] = 'left' if e.num == 1 else 'right'

@@ -72,6 +72,25 @@ def ros_pose_to_colmap_w2c(pos_xyz, quat_xyzw, T_camera_lidar, camera_quat_xyzw=
     q = R.from_matrix(R_w2c).as_quat()  # [x,y,z,w]
     return [q[3], q[0], q[1], q[2]], T.tolist()
 
+MIN_BASELINE_M = 0.10  # drop scans closer than this to any already-kept scan
+
+
+def _filter_by_baseline(images_data, min_dist):
+    """Greedy filter: keep a scan only if it is >= min_dist from all kept scans."""
+    kept, dropped = [], []
+    positions = []
+    for img in images_data:
+        pos = np.array([img['tx'], img['ty'], img['tz']])
+        if not positions or min(np.linalg.norm(pos - p) for p in positions) >= min_dist:
+            kept.append(img)
+            positions.append(pos)
+        else:
+            dropped.append(img['name'])
+    if dropped:
+        print(f"  Filtered {len(dropped)} near-duplicate scan(s) (baseline < {min_dist*100:.0f}cm): {dropped}")
+    return kept
+
+
 def export_to_colmap(session_dir):
     """Export scan session to COLMAP format"""
     session_path = Path(session_dir)
@@ -105,17 +124,11 @@ def export_to_colmap(session_dir):
     img_width = calib.get('image_width', 1920)
     img_height = calib.get('image_height', 960)
     
-    # Write cameras.txt (equirectangular camera model)
+    # Write cameras.txt (SPHERICAL model for equirectangular images - no params needed)
     with open(sparse_dir / "cameras.txt", 'w') as f:
         f.write("# Camera list with one line of data per camera:\n")
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
-        f.write(f"1 SIMPLE_RADIAL {img_width} {img_height} {img_width/2} {img_width/2} {img_height/2} 0\n")
-    
-    # Write rigs.txt (empty - not used)
-    with open(sparse_dir / "rigs.txt", 'w') as f:
-        f.write("# Rig configuration (empty)\n")
-    
-    # Note: frames.txt is not written - COLMAP doesn't use it in text format
+        f.write(f"1 SPHERICAL {img_width} {img_height}\n")
     # Collect images and poses
     images_data = []
     all_points = []
@@ -220,26 +233,27 @@ def export_to_colmap(session_dir):
             'name': image_name
         })
     
-    # Use merged_pointcloud.ply as the authoritative lidar source if available,
-    # otherwise fall back to accumulating per-scan colored clouds.
-    merged_src = session_path / "merged_pointcloud.ply"
-    if merged_src.exists():
-        all_points = load_ply_points(merged_src)
-        for p in all_points:
-            xyz = R_ROS2COLMAP @ np.array(p[:3])
-            p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
-        print(f"Using merged_pointcloud.ply ({len(all_points)} points)")
-    else:
-        for scan_dir in scan_dirs:
-            colored_ply = scan_dir / "world_colored_exact.ply"
-            if not colored_ply.exists():
-                colored_ply = scan_dir / "world_colored.ply"
-            if colored_ply.exists():
-                points = load_ply_points(colored_ply)
-                for p in points:
-                    xyz = R_ROS2COLMAP @ np.array(p[:3])
-                    p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
-                all_points.extend(points)
+    # Filter out scans that are too close to an already-kept scan
+    images_data = _filter_by_baseline(images_data, MIN_BASELINE_M)
+    
+    # Build mapping from image_id to scan_dir for point cloud filtering
+    kept_scan_dirs = [scan_dirs[img['image_id'] - 1] for img in images_data]
+
+    # Always rebuild point cloud from kept scans only (don't use merged_pointcloud.ply
+    # which contains all scans including filtered ones)
+    all_points = []
+    for scan_dir in kept_scan_dirs:
+        colored_ply = scan_dir / "world_colored_exact.ply"
+        if not colored_ply.exists():
+            colored_ply = scan_dir / "world_colored.ply"
+        if colored_ply.exists():
+            points = load_ply_points(colored_ply)
+            for p in points:
+                xyz = R_ROS2COLMAP @ np.array(p[:3])
+                p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+            all_points.extend(points)
+    
+    print(f"✓ Loaded {len(all_points)} points from {len(kept_scan_dirs)} kept scans")
     
     # Write images.txt
     with open(sparse_dir / "images.txt", 'w') as f:

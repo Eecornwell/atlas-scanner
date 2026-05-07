@@ -34,26 +34,26 @@ FACES_IN_CAM = np.array([
 ], dtype=float)
 
 
-def erp_to_perspective(erp_img, fov_deg, R_face_w2c, R_cam_w2c_ros, output_size=1024,
+def erp_to_perspective(erp_img, fov_deg, R_face_c2w_erp, output_size=1024,
                        interpolation=cv2.INTER_CUBIC):
     """Sample a perspective face from an ERP image.
-    R_face_w2c: face camera w2c in COLMAP world (rows=[right,down,look]).
-    R_cam_w2c_ros: Actually c2w! (misnamed for backward compatibility)
-    Rays: persp cam -> COLMAP world -> ROS world -> ERP cam.
-    Use interpolation=cv2.INTER_NEAREST for binary masks to preserve exact values.
+    R_face_c2w_erp: 3x3 rotation mapping face-camera axes directly to ERP spherical axes.
+    ERP convention (equirectangular.cpp initMapping):
+      X = cos(lat)*sin(lon), Y = sin(lat), Z = cos(lat)*cos(lon)
+      lon=0 (image centre) = front lens optical axis direction
+      Y-up = world up as seen by the ERP stitcher
     """
     h, w = erp_img.shape[:2]
     f = output_size / (2 * np.tan(np.radians(fov_deg) / 2))
     cx = cy = output_size / 2.0
     u, v = np.meshgrid(np.arange(output_size), np.arange(output_size))
-    rays_persp = np.stack([(u-cx)/f, (v-cy)/f, np.ones((output_size,output_size))], axis=-1)
-    rays_colmap = rays_persp @ R_face_w2c          # -> COLMAP world (row-vector)
-    rays_ros    = rays_colmap @ R_ROS2COLMAP        # -> ROS world
-    rays_erp    = rays_ros @ R_cam_w2c_ros          # -> ERP camera frame (row-vec: @ c2w, despite param name)
-    lon = np.arctan2(rays_erp[...,0], rays_erp[...,2])
-    lat = np.arcsin(np.clip(-rays_erp[...,1] / np.linalg.norm(rays_erp, axis=-1), -1, 1))
-    erp_u = ((lon + np.pi) / (2*np.pi) * w).astype(np.float32)
-    erp_v = ((np.pi/2 - lat) / np.pi * h).astype(np.float32)
+    rays_face = np.stack([(u - cx) / f, (v - cy) / f, np.ones((output_size, output_size))], axis=0).reshape(3, -1)
+    rays_erp = (R_face_c2w_erp @ rays_face).reshape(3, output_size, output_size)
+    X, Y, Z = rays_erp[0], rays_erp[1], rays_erp[2]
+    lon = np.arctan2(X, Z)
+    lat = np.arcsin(np.clip(Y / np.linalg.norm(rays_erp, axis=0), -1, 1))
+    erp_u = ((lon + np.pi) / (2 * np.pi) * w).astype(np.float32)
+    erp_v = ((np.pi / 2 - lat) / np.pi * h).astype(np.float32)
     return cv2.remap(erp_img, erp_u, erp_v, interpolation, borderMode=cv2.BORDER_WRAP)
 
 def convert_erp_to_perspectives(session_dir):
@@ -171,30 +171,30 @@ def convert_erp_to_perspectives(session_dir):
         base_name = erp_file.stem
         pose = poses.get(erp_file.name, None)
 
-        # Compute shared camera w2c in COLMAP world and camera center
+        # R_cam_c2w_ros: camera frame to ROS world (for COLMAP pose computation)
+        # For ERP sampling, rays only need to be in ERP spherical frame.
+        # ERP spherical frame IS the camera frame: lon=0/lat=0 = camera +Z (front lens axis).
+        # So R_face_c2w_erp just rotates from face-cam to ERP-cam = R_face_in_cam.T
+        # (FACES_IN_CAM rows are [right,down,look] in cam frame, so .T gives c2w columns)
         if pose:
-            cam_q_ros = pose.get('cam_quat_ros') or [0,0,0,1]
-            R_cam_c2w_col = R_ROS2COLMAP @ R.from_quat(cam_q_ros).as_matrix()
-            R_cam_w2c_col = R_cam_c2w_col.T
-            R_cam_c2w_ros = R.from_quat(cam_q_ros).as_matrix()  # c2w, not w2c!
+            cam_q_ros = pose.get('cam_quat_ros') or [0, 0, 0, 1]
+            R_cam_c2w_ros = R.from_quat(cam_q_ros).as_matrix()
             qw, qx, qy, qz = pose['quat']
             R_erp_w2c = R.from_quat([qx, qy, qz, qw]).as_matrix()
             camera_center = -R_erp_w2c.T @ np.array(pose['trans'])
         else:
-            R_cam_w2c_col = np.eye(3)
             R_cam_c2w_ros = np.eye(3)
             camera_center = None
 
         for i, R_face_in_cam in enumerate(FACES_IN_CAM):
-            # R_face_w2c: face camera w2c in COLMAP world
-            R_face_w2c = R_face_in_cam @ R_cam_w2c_col
-            persp_img = erp_to_perspective(erp_img, fov_deg=90, R_face_w2c=R_face_w2c, R_cam_w2c_ros=R_cam_c2w_ros)
+            R_face_in_cam = np.array(R_face_in_cam)
+            R_face_c2w_erp = R_face_in_cam.T          # face-cam -> ERP-cam (= ERP spherical frame)
+            persp_img = erp_to_perspective(erp_img, fov_deg=90, R_face_c2w_erp=R_face_c2w_erp)
             out_name = f"{base_name}_view{i:02d}.png"
 
             persp_mask = None
             if erp_mask is not None:
-                persp_mask = erp_to_perspective(erp_mask, fov_deg=90, R_face_w2c=R_face_w2c,
-                                                R_cam_w2c_ros=R_cam_c2w_ros,
+                persp_mask = erp_to_perspective(erp_mask, fov_deg=90, R_face_c2w_erp=R_face_c2w_erp,
                                                 interpolation=cv2.INTER_NEAREST)
                 # No threshold needed — INTER_NEAREST preserves exact 0/255 values
                 valid_ratio = np.count_nonzero(persp_mask) / persp_mask.size
@@ -208,9 +208,10 @@ def convert_erp_to_perspectives(session_dir):
             print(f"  Saved: {out_name}")
 
             if camera_center is not None:
-                T_face = -R_face_w2c @ camera_center
-                q = R.from_matrix(R_face_w2c).as_quat()  # [x,y,z,w]
-                # COLMAP requires qw >= 0; negate if needed (same rotation, different sign)
+                R_face_c2w_ros = R_cam_c2w_ros @ R_face_in_cam.T
+                R_face_w2c_col = R_ROS2COLMAP @ R_face_c2w_ros.T
+                T_face = -R_face_w2c_col @ (R_ROS2COLMAP @ camera_center)
+                q = R.from_matrix(R_face_w2c_col).as_quat()
                 if q[3] < 0:
                     q = -q
                 persp_quat = [q[3], q[0], q[1], q[2]]
@@ -238,7 +239,7 @@ def convert_erp_to_perspectives(session_dir):
     
     return persp_dir
 
-def run_colmap_on_perspectives(persp_dir, session_dir):
+def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=False):
     """Run COLMAP reconstruction on perspective images with known poses"""
     session_path = Path(session_dir).expanduser()
     colmap_dir = session_path / "colmap"
@@ -372,9 +373,41 @@ def run_colmap_on_perspectives(persp_dir, session_dir):
         "--clear_points", "1",
     ])
 
-    # Skip bundle adjustment - it modifies poses even with refine_rig_from_world=0
-    # Use triangulated model directly with known poses
-    print("\n4. Skipping bundle adjustment (preserving known poses)...")
+    # Optional: Bundle adjustment to refine poses and structure
+    if enable_bundle_adjustment:
+        print("\n4. Running bundle adjustment...")
+        
+        # Save pre-BA poses for comparison
+        pre_ba_dir = output_dir / "pre_bundle_adjustment"
+        pre_ba_dir.mkdir(exist_ok=True)
+        import shutil
+        shutil.copy(output_model_dir / "cameras.bin", pre_ba_dir / "cameras.bin")
+        shutil.copy(output_model_dir / "images.bin", pre_ba_dir / "images.bin")
+        shutil.copy(output_model_dir / "points3D.bin", pre_ba_dir / "points3D.bin")
+        print("  Saved pre-BA poses to pre_bundle_adjustment/")
+        
+        ba_output = output_model_dir
+        
+        # More aggressive BA settings for better convergence
+        subprocess.run([
+            "colmap", "bundle_adjuster",
+            "--input_path", str(output_model_dir),
+            "--output_path", str(ba_output),
+            # Keep intrinsics fixed (analytically exact)
+            "--BundleAdjustment.refine_focal_length", "0",
+            "--BundleAdjustment.refine_principal_point", "0",
+            "--BundleAdjustment.refine_extra_params", "0",
+            # Solver settings for better convergence
+            "--BundleAdjustmentCeres.max_num_iterations", "200",  # Increased from 50
+            "--BundleAdjustmentCeres.max_linear_solver_iterations", "500",  # Increased from 200
+            "--BundleAdjustmentCeres.function_tolerance", "1e-6",  # Tighter convergence
+            "--BundleAdjustmentCeres.gradient_tolerance", "1e-10",  # Tighter convergence
+            "--BundleAdjustmentCeres.parameter_tolerance", "1e-8",  # Tighter convergence
+        ])
+        print("  ✓ Bundle adjustment complete (refined camera poses and 3D points)")
+    else:
+        # Skip bundle adjustment - preserve exact LiDAR odometry poses
+        print("\n4. Skipping bundle adjustment (preserving known poses)...")
     if not any(output_model_dir.iterdir()):
         print("  No triangulation output")
         return False
@@ -506,14 +539,16 @@ def compare_point_clouds(original_path, reconstructed_path):
         print(f"  Recovery rate: {ratio:.1f}%")
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        print("Usage: python3 erp_to_perspective_colmap.py <session_directory>")
-        sys.exit(1)
-    
-    session_dir = sys.argv[1]
+    import argparse
+    parser = argparse.ArgumentParser(description='Convert ERP images to perspective and run COLMAP')
+    parser.add_argument('session_directory', help='Path to session directory')
+    parser.add_argument('--bundle-adjustment', action='store_true',
+                        help='Run bundle adjustment to refine poses (default: preserve exact LiDAR poses)')
+    args = parser.parse_args()
     
     # Convert ERP to perspective
-    persp_dir = convert_erp_to_perspectives(session_dir)
+    persp_dir = convert_erp_to_perspectives(args.session_directory)
     
     # Run COLMAP
-    run_colmap_on_perspectives(persp_dir, session_dir)
+    run_colmap_on_perspectives(persp_dir, args.session_directory, 
+                              enable_bundle_adjustment=args.bundle_adjustment)
