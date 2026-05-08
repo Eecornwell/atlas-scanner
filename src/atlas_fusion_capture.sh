@@ -15,7 +15,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"      # dual_fisheye | single_fisheye
-CAPTURE_MODE="stationary"         # stationary | continuous
+CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=2             # seconds between captures (continuous mode only)
 STATIONARY_WAIT=true              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 
@@ -37,7 +37,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
 ENABLE_ICP_ALIGNMENT=true
-EXPORT_COLMAP=false
+EXPORT_COLMAP=true
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # voxel downsample in metres (0 = skip)

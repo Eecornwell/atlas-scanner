@@ -337,6 +337,167 @@ def write_init_model_bin(colmap_dir, panoramas):
     return sparse_dir
 
 
+def write_rig_bin(output_dir, db_path, panoramas):
+    """Write rigs.bin and frames.bin into the sparse model so bundle_adjuster
+    treats each panorama as a rigid rig body."""
+    conn = sqlite3.connect(str(db_path))
+
+    # Read rig from DB
+    rig_row = conn.execute('SELECT rig_id, ref_sensor_id, ref_sensor_type FROM rigs LIMIT 1').fetchone()
+    if rig_row is None:
+        conn.close()
+        return
+    rig_id, ref_sensor_id, ref_sensor_type = rig_row
+
+    non_ref_sensors = conn.execute(
+        'SELECT sensor_id, sensor_type, sensor_from_rig FROM rig_sensors WHERE rig_id=?',
+        (rig_id,)
+    ).fetchall()
+
+    # Read frames and their image IDs
+    frames = conn.execute('SELECT frame_id, rig_id FROM frames ORDER BY frame_id').fetchall()
+    frame_data = {}
+    for frame_id, _ in frames:
+        data = conn.execute(
+            'SELECT sensor_type, sensor_id, data_id FROM frame_data WHERE frame_id=?',
+            (frame_id,)
+        ).fetchall()
+        frame_data[frame_id] = data
+
+    # Read image poses from images.bin to get rig_from_world for each frame
+    # Use the ref sensor image pose as the rig pose
+    img_poses = {}
+    with open(output_dir / 'images.bin', 'rb') as f:
+        n = struct.unpack('Q', f.read(8))[0]
+        for _ in range(n):
+            img_id = struct.unpack('I', f.read(4))[0]
+            qw, qx, qy, qz = struct.unpack('dddd', f.read(32))
+            tx, ty, tz = struct.unpack('ddd', f.read(24))
+            cam_id = struct.unpack('I', f.read(4))[0]
+            name = b''
+            while True:
+                c = f.read(1)
+                if c == b'\x00': break
+                name += c
+            n_pts = struct.unpack('Q', f.read(8))[0]
+            f.read(n_pts * 24)
+            img_poses[img_id] = (qw, qx, qy, qz, tx, ty, tz)
+
+    conn.close()
+
+    SENSOR_TYPE_CAMERA = 0
+
+    # rigs.bin: num_rigs, then for each rig:
+    # rig_id(u32), num_sensors(u32), ref_type(i32), ref_id(u32),
+    # then for each non-ref: type(i32), id(u32), has_pose(u8), [qw,qx,qy,qz,tx,ty,tz](7xf64)
+    with open(output_dir / 'rigs.bin', 'wb') as f:
+        f.write(struct.pack('Q', 1))  # 1 rig
+        f.write(struct.pack('I', rig_id))
+        num_sensors = 1 + len(non_ref_sensors)  # ref + non-ref
+        f.write(struct.pack('I', num_sensors))
+        f.write(struct.pack('i', ref_sensor_type))
+        f.write(struct.pack('I', ref_sensor_id))
+        for sensor_id, sensor_type, sensor_from_rig_blob in non_ref_sensors:
+            f.write(struct.pack('i', sensor_type))
+            f.write(struct.pack('I', sensor_id))
+            if sensor_from_rig_blob:
+                f.write(struct.pack('B', 1))
+                # blob is 7 doubles: qw,qx,qy,qz,tx,ty,tz
+                vals = struct.unpack('ddddddd', sensor_from_rig_blob)
+                for v in vals:
+                    f.write(struct.pack('d', v))
+            else:
+                f.write(struct.pack('B', 0))
+
+    # frames.bin: num_frames(u64), then for each frame with pose:
+    # frame_id(u32), rig_id(u32), qw,qx,qy,qz,tx,ty,tz(7xf64),
+    # num_data(u32), then for each: sensor_type(i32), sensor_id(u32), data_id(u64)
+    # Frame pose = ref sensor image pose (rig_from_world)
+    frames_with_pose = []
+    for frame_id, _ in frames:
+        data = frame_data[frame_id]
+        # Find ref sensor image_id
+        ref_img_id = next((d[2] for d in data
+                           if d[0] == ref_sensor_type and d[1] == ref_sensor_id), None)
+        if ref_img_id and ref_img_id in img_poses:
+            frames_with_pose.append((frame_id, data, img_poses[ref_img_id]))
+
+    with open(output_dir / 'frames.bin', 'wb') as f:
+        f.write(struct.pack('Q', len(frames_with_pose)))
+        for frame_id, data, (qw, qx, qy, qz, tx, ty, tz) in frames_with_pose:
+            f.write(struct.pack('I', frame_id))
+            f.write(struct.pack('I', rig_id))
+            for v in (qw, qx, qy, qz, tx, ty, tz):
+                f.write(struct.pack('d', v))
+            f.write(struct.pack('I', len(data)))
+            for sensor_type, sensor_id, data_id in data:
+                f.write(struct.pack('i', sensor_type))
+                f.write(struct.pack('I', sensor_id))
+                f.write(struct.pack('Q', data_id))
+
+    print(f"  Wrote rigs.bin ({1} rig, {len(frames_with_pose)} frames)")
+
+
+    """Remove rig/frame tables so point_triangulator treats images independently."""
+    conn = sqlite3.connect(str(db_path))
+    conn.execute('DELETE FROM rig_sensors')
+    conn.execute('DELETE FROM frame_data')
+    conn.execute('DELETE FROM frames')
+    conn.execute('DELETE FROM rigs')
+    conn.commit()
+    conn.close()
+
+
+def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
+    """Merge LiDAR (ROS world frame) and COLMAP point clouds into COLMAP frame."""
+    import open3d as o3d
+
+    def read_ply(path):
+        pcd = o3d.io.read_point_cloud(str(path))
+        pts = np.asarray(pcd.points)
+        cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
+               else np.zeros((len(pts), 3), int)
+        return [[*pts[i].tolist(), *cols[i].tolist()] for i in range(len(pts))]
+
+    lidar_pts = read_ply(lidar_ply)
+    if transform_lidar:
+        for p in lidar_pts:
+            xyz = R_ROS2COLMAP @ [p[0], p[1], p[2]]
+            p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+
+    colmap_pts = read_ply(colmap_ply)
+    all_pts = lidar_pts + colmap_pts
+
+    with open(output_ply, 'w') as f:
+        f.write('ply\nformat ascii 1.0\n')
+        f.write(f'element vertex {len(all_pts)}\n')
+        f.write('property float x\nproperty float y\nproperty float z\n')
+        f.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
+        for p in all_pts:
+            f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(p[3])} {int(p[4])} {int(p[5])}\n')
+
+    print(f'✓ Merged {len(lidar_pts)} lidar + {len(colmap_pts)} COLMAP points -> {output_ply}')
+    return all_pts
+
+
+def _write_merged_to_points3d(output_dir, merged_ply):
+    """Write merged PLY points back into points3D.bin for use in Gaussian splatting."""
+    import open3d as o3d
+    pcd = o3d.io.read_point_cloud(str(merged_ply))
+    pts = np.asarray(pcd.points)
+    cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
+           else np.zeros((len(pts), 3), int)
+    with open(output_dir / 'points3D.bin', 'wb') as f:
+        f.write(struct.pack('Q', len(pts)))
+        for i in range(len(pts)):
+            f.write(struct.pack('Q', i + 1))           # point3D_id
+            f.write(struct.pack('ddd', *pts[i]))        # xyz
+            f.write(struct.pack('BBB', *cols[i]))       # rgb
+            f.write(struct.pack('d', 0.0))              # error
+            f.write(struct.pack('Q', 0))                # track length = 0
+    print(f'✓ Wrote {len(pts)} merged points to points3D.bin')
+
+
 def _strip_rig_from_db(db_path):
     """Remove rig/frame tables so point_triangulator treats images independently."""
     conn = sqlite3.connect(str(db_path))
@@ -348,7 +509,7 @@ def _strip_rig_from_db(db_path):
     conn.close()
 
 
-def run_pipeline(session_dir, exhaustive=False, bundle_adjustment=True):
+def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True):
     session_path = Path(session_dir).expanduser()
     colmap_dir = session_path / 'colmap'
     colmap_dir.mkdir(exist_ok=True)
@@ -425,7 +586,17 @@ def run_pipeline(session_dir, exhaustive=False, bundle_adjustment=True):
     ], check=True)
 
     if bundle_adjustment:
-        print("7. Running bundle adjustment...")
+        print("7. Restoring rig for bundle adjustment...")
+        subprocess.run([
+            'colmap', 'rig_configurator',
+            '--database_path', str(db_path),
+            '--rig_config_path', str(rig_config_path),
+        ], check=True)
+
+        print("8. Writing rig into sparse model...")
+        write_rig_bin(output_dir, db_path, panoramas)
+
+        print("9. Running rig-aware bundle adjustment...")
         subprocess.run([
             'colmap', 'bundle_adjuster',
             '--input_path', str(output_dir),
@@ -434,6 +605,8 @@ def run_pipeline(session_dir, exhaustive=False, bundle_adjustment=True):
             '--BundleAdjustment.refine_principal_point', '0',
             '--BundleAdjustment.refine_extra_params', '0',
             '--BundleAdjustment.refine_sensor_from_rig', '0',
+            '--BundleAdjustment.refine_rig_from_world', '1',
+            '--BundleAdjustmentCeres.max_num_iterations', '500',
         ], check=True)
 
     print(f"\n✓ Reconstruction complete: {output_dir}")
@@ -447,6 +620,17 @@ def run_pipeline(session_dir, exhaustive=False, bundle_adjustment=True):
     if ply_out.exists():
         print(f"✓ Exported PLY: {ply_out}")
 
+    # Merge LiDAR point cloud with COLMAP reconstruction
+    session_aligned = session_path / 'merged_aligned_colored.ply'
+    session_merged  = session_path / 'merged_pointcloud.ply'
+    lidar_ply = session_aligned if session_aligned.exists() else \
+                session_merged  if session_merged.exists()  else None
+
+    if lidar_ply and ply_out.exists():
+        merged_ply = colmap_dir / 'sparse' / 'merged.ply'
+        _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True)
+        _write_merged_to_points3d(output_dir, merged_ply)
+
     return True
 
 
@@ -456,11 +640,12 @@ if __name__ == '__main__':
         description='Panorama SfM: perspective tiles + rig + triangulation (panorama_sfm.py style)'
     )
     parser.add_argument('session_directory')
-    parser.add_argument('--exhaustive', action='store_true',
-                        help='Use exhaustive matcher instead of sequential')
+    parser.add_argument('--sequential', dest='exhaustive', action='store_false',
+                        help='Use sequential matcher instead of exhaustive')
+    parser.set_defaults(exhaustive=True)
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
-                        help='Skip bundle adjustment after triangulation')
+                        help='Skip rig-aware bundle adjustment')
     parser.set_defaults(bundle_adjustment=True)
     args = parser.parse_args()
 

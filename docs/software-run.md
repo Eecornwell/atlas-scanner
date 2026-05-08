@@ -166,12 +166,12 @@ cd ~/atlas_ws/src/atlas-scanner/src/post_processing
 python3 panorama_sfm_colmap.py $SESSION
 ```
 
-This uses the colmap `panorama_sfm.py` approach: ERP images are sliced into perspective tiles (SIMPLE_PINHOLE), grouped into a rig per panorama, and reconstructed with LiDAR pose priors via `pose_prior_mapper`. Bundle adjustment is enabled by default.
+This uses the colmap `panorama_sfm.py` approach: ERP images are sliced into perspective tiles (SIMPLE_PINHOLE), grouped into a rig per panorama, triangulated with known LiDAR poses, and refined with rig-aware bundle adjustment. Exhaustive matching is used by default since sessions are sparse.
 
 Optional flags:
 ```bash
-python3 panorama_sfm_colmap.py $SESSION --no-bundle-adjustment  # skip bundle adjustment (BA runs by default)
-python3 panorama_sfm_colmap.py $SESSION --exhaustive            # exhaustive matcher (slower, better for small sessions)
+python3 panorama_sfm_colmap.py $SESSION --sequential        # sequential matcher (faster, for large sessions)
+python3 panorama_sfm_colmap.py $SESSION --no-bundle-adjustment  # skip rig-aware bundle adjustment
 ```
 
 ### Run synchronization benchmark on a session

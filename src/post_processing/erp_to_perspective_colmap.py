@@ -437,27 +437,33 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
             shutil.copy(model_dir / "images.bin", camera_only_dir / "images.bin")
             print(f"✓ Saved camera-only reconstruction to: {camera_only_dir}")
 
-            # Use aligned point cloud if available
+            # Use aligned point cloud if available.
+            # session_merged/session_aligned are in ROS world space -> need R_ROS2COLMAP.
+            # sparse.ply (lidar_ply) is already in COLMAP world space -> no transform needed.
             session_aligned = Path(session_dir) / "merged_aligned_colored.ply"
             session_merged = Path(session_dir) / "merged_pointcloud.ply"
             lidar_ply = colmap_dir / "init_sparse" / "0" / "sparse.ply"
             
-            # All source files are in ROS coordinates and need transformation
             if session_aligned.exists():
                 base_ply = session_aligned
+                base_ply_needs_transform = True
             elif session_merged.exists():
                 base_ply = session_merged
+                base_ply_needs_transform = True
             elif lidar_ply.exists():
                 base_ply = lidar_ply
+                base_ply_needs_transform = False  # sparse.ply already in COLMAP space
             else:
                 base_ply = None
+                base_ply_needs_transform = False
             
             if lidar_ply.exists():
                 compare_point_clouds(lidar_ply, ply_output)
             
             merged_ply = output_dir / "merged.ply"
             if base_ply:
-                merged_pts = merge_point_clouds(base_ply, ply_output, merged_ply)
+                merged_pts = merge_point_clouds(base_ply, ply_output, merged_ply,
+                                                transform_lidar=base_ply_needs_transform)
                 
                 # Write merged points back to points3D.bin
                 import struct
@@ -475,10 +481,11 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     
     return False
 
-def merge_point_clouds(lidar_ply, colmap_ply, output_ply):
+def merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
     """Merge lidar and COLMAP point clouds in COLMAP coordinate frame.
-    Lidar points (ROS frame) are transformed to COLMAP frame before merging.
-    COLMAP points are already in COLMAP frame.
+    transform_lidar: set True if lidar_ply is in ROS world space (needs R_ROS2COLMAP).
+                     set False if lidar_ply is already in COLMAP world space (e.g. sparse.ply).
+    COLMAP points are always already in COLMAP frame.
     """
     import numpy as np
     import open3d as o3d
@@ -492,10 +499,11 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply):
     R_ROS2COLMAP = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=float)
 
     lidar_pts = read_ply(lidar_ply)
-    # Transform lidar points (ROS frame) into COLMAP world frame
-    for p in lidar_pts:
-        xyz = R_ROS2COLMAP @ [p[0], p[1], p[2]]
-        p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+    # Transform lidar points into COLMAP world frame only if needed
+    if transform_lidar:
+        for p in lidar_pts:
+            xyz = R_ROS2COLMAP @ [p[0], p[1], p[2]]
+            p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
 
     colmap_pts = read_ply(colmap_ply)
     all_pts = lidar_pts + colmap_pts
