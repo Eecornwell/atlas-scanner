@@ -1,4 +1,4 @@
-# RKO-LIO Continuous Mode Configuration - Minimal CPU/memory footprint
+# RKO-LIO Continuous Mode Configuration - Handheld scanner
 imu_topic: /livox/imu
 lidar_topic: /livox/lidar
 base_frame: base_link
@@ -8,23 +8,26 @@ odom_frame: odom
 odom_topic: /rko_lio/odometry
 map_topic: /rko_lio/local_map
 
-# Publish at LiDAR rate for good pose interpolation at camera frame rate
-publish_freq: 10.0
-publish_local_map: false       # nobody reads this during continuous recording
-publish_deskewed_scan: false   # nobody reads this during continuous recording
+publish_local_map: false
+publish_deskewed_scan: false
 invert_odom_tf: false
 
 deskew: true
-initialization_phase: true
+# initialization_phase: false — scanner is picked up immediately, no static gravity estimate
+initialization_phase: false
 extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
-voxel_size: 0.5
+voxel_size: 0.2
 max_points_per_voxel: 10
 max_range: 20.0
 min_range: 0.3
 max_correspondance_distance: 0.5
 convergence_criterion: 0.0001
-max_num_threads: 4             # 0 = use all available cores
-max_expected_jerk: 3.0
-min_beta: 200.0
+max_num_threads: 0
+# Use IMU orientation regularization with a moderate weight so the gyro
+# drives orientation even when LiDAR scan matching is unreliable (fast motion).
+# min_beta: -1.0 disabled it entirely, causing near-zero rotation output.
+# 1.0 is low enough to not fight handheld motion but high enough to track rotation.
+max_expected_jerk: 20.0
+min_beta: 1.0

@@ -55,7 +55,7 @@ def build_T(cfg, dr=0.0, dp=0.0, dy=0.0, dtx=0.0, dty=0.0, dtz=0.0):
     return T
 
 
-def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size=800):
+def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size=800, flip_erp=False):
     Ry = R.from_euler('y', look_lon_deg, degrees=True).as_matrix()
     Rx = R.from_euler('x', -look_lat_deg, degrees=True).as_matrix()
     R_look = Rx @ Ry
@@ -80,7 +80,15 @@ def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size
     lat_bg = -np.arcsin(np.clip(rw[..., 1], -1, 1))
     lon_bg = np.arctan2(rw[..., 0], rw[..., 2])
     eu = (w * (0.5 + lon_bg / (2 * np.pi))).astype(int).clip(0, w - 1)
-    ev = (h * (0.5 - lat_bg / np.pi)).astype(int).clip(0, h - 1)
+    if flip_erp:
+        # SDK stitch ERP: lat=arcsin(Y), lon=atan2(Z,X)+pi/2
+        Xr = rw[..., 0]; Yr = rw[..., 1]; Zr = rw[..., 2]
+        lat_bg = np.arcsin(np.clip(-Yr, -1, 1))
+        lon_bg = np.arctan2(Xr, Zr)
+        eu = (w * (0.5 + lon_bg / (2 * np.pi))).astype(int) % w
+        ev = (h * (0.5 - lat_bg / np.pi)).astype(int).clip(0, h - 1)
+    else:
+        ev = (h * (0.5 - lat_bg / np.pi)).astype(int).clip(0, h - 1)
     bg = erp[ev, eu]
 
     if len(dist_v) == 0:
@@ -94,7 +102,7 @@ def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size
     return cv2.addWeighted(bg, 0.35, overlay, 0.65, 0)
 
 
-def generate_grid(erp, pts, cfg, dr, dp, dy, dtx, dty, dtz, views, size=600):
+def generate_grid(erp, pts, cfg, dr, dp, dy, dtx, dty, dtz, views, size=600, flip_erp=False):
     T = build_T(cfg, dr, dp, dy, dtx, dty, dtz)
     pts_h = np.hstack([pts, np.ones((len(pts), 1))])
     pts_cam = (T @ pts_h.T).T[:, :3]
@@ -104,7 +112,7 @@ def generate_grid(erp, pts, cfg, dr, dp, dy, dtx, dty, dtz, views, size=600):
 
     panels = []
     for name, lon, lat in views:
-        p = persp_overlay(erp, pts_cam, dist, lon, lat, size=size)
+        p = persp_overlay(erp, pts_cam, dist, lon, lat, size=size, flip_erp=flip_erp)
         cv2.putText(p, name, (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         panels.append(p)
 
@@ -184,6 +192,10 @@ def main():
     views = [('back-left', -135, 0), ('back-left-down', -135, -20),
              ('back-right', 135, 0), ('back-right-down', 135, -20)]
 
+    # SDK stitch views: lidar coverage concentrated at lon=±135, lat=-30 to +30
+    sdk_views = [('lon+135', 135, 0), ('lon-135', -135, 0),
+                 ('lon+90',   90, 0), ('lon-90',   -90, 0)]
+
     if args.verify:
         if args.scan_dir:
             # Single explicit scan dir — original behaviour
@@ -193,7 +205,9 @@ def main():
             sources = []
             for i in range(3):
                 p = OUTPUT_DIR / f'{i:06d}.ply'
-                q = OUTPUT_DIR / f'{i:06d}.png'
+                q = OUTPUT_DIR / 'images' / f'{i:06d}.png'  # full-res RGB (root PNG is grayscale after generate_intensity_images)
+                if not q.exists():
+                    q = OUTPUT_DIR / f'{i:06d}.png'
                 if p.exists() and q.exists():
                     sources.append((p, q, f'scan {i:06d}'))
             if not sources:
@@ -210,7 +224,16 @@ def main():
                 print(f'Could not load image: {s_img}, skipping')
                 continue
             s_erp = cv2.cvtColor(s_raw, cv2.COLOR_GRAY2BGR) if s_raw.ndim == 2 else s_raw
-            g = generate_grid(s_erp, s_pts, cfg, 0, 0, 0, 0, 0, 0, views)
+            # Detect SDK stitch from sidecar
+            import json as _json
+            sidecar = OUTPUT_DIR / f'{Path(s_ply).stem}_source.json'
+            is_sdk = False
+            if sidecar.exists():
+                sd = _json.load(open(sidecar))
+                scan_path = Path(sd.get('scan_dir', ''))
+                is_sdk = bool(list(scan_path.glob('*.insp'))) if scan_path.is_dir() else False
+            active_views = sdk_views if is_sdk else views
+            g = generate_grid(s_erp, s_pts, cfg, 0, 0, 0, 0, 0, 0, active_views, flip_erp=is_sdk)
             cv2.putText(g, label, (10, g.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
             scan_grids.append(g)

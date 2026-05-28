@@ -262,7 +262,7 @@ def estimate_imu_sync(session_dir: str, axis: str = "z",
     if t_livox is None:
         print("✗ /livox/imu not found in bag"); sys.exit(1)
     if t_cam is None:
-        print("✗ Camera IMU not found in bag — check /imu/data_raw is recorded"); sys.exit(1)
+        print("  ⚠ Camera IMU not found in bag — skipping IMU sync (expected in SDK stitch mode)"); sys.exit(0)
 
     ax = {"x": 0, "y": 1, "z": 2}[axis]
 

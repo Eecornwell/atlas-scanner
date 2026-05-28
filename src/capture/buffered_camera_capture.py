@@ -37,13 +37,14 @@ def _write_ply_binary(path, pts):
 
 
 class BufferedCameraCapture(Node):
-    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0, context=None):
+    def __init__(self, output_dir=".", buffer_size=10, scan_duration=2.0, context=None, lidar_only=False):
         super().__init__('buffered_camera_capture', context=context)
         self.bridge = CvBridge()
         self.captured = False
         self.output_dir = output_dir
         self.buffer_size = buffer_size
         self.scan_duration = scan_duration
+        self.lidar_only = lidar_only
 
         self.lidar_buffer = deque(maxlen=buffer_size)
         self.odom_buffer = deque(maxlen=buffer_size * 3)
@@ -59,8 +60,12 @@ class BufferedCameraCapture(Node):
         image_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         odom_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.lidar_sub = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_cb, lidar_qos)
-        self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, image_qos)
-        self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, 10)  # use default QoS to match decoder publisher
+        if not lidar_only:
+            self.image_sub = self.create_subscription(CompressedImage, '/dual_fisheye/image/compressed', self.image_cb, image_qos)
+            self.image_raw_sub = self.create_subscription(Image, '/dual_fisheye/image', self.image_raw_cb, 10)
+        else:
+            self.image_sub = None
+            self.image_raw_sub = None
         self.odom_sub = self.create_subscription(Odometry, '/rko_lio/odometry', self.odom_cb, odom_qos)
 
         print(f"✓ Buffered capture initialized")
@@ -127,13 +132,14 @@ class BufferedCameraCapture(Node):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         try:
-            if frame is None:
-                print("Error saving image: could not decode frame")
-                self.save_complete = True
-                return
-            img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.png')
-            cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-            print(f"✓ Saved fisheye frame: {img_file}")
+            if not self.lidar_only:
+                if frame is None:
+                    print("Error saving image: could not decode frame")
+                    self.save_complete = True
+                    return
+                img_file = os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.png')
+                cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                print(f"✓ Saved fisheye frame: {img_file}")
         except Exception as e:
             print(f"Error saving image: {e}")
             self.save_complete = True
@@ -250,6 +256,7 @@ def main():
     output_dir = sys.argv[1] if len(sys.argv) > 1 else "."
     buffer_size = 15 if len(sys.argv) <= 2 else int(sys.argv[2])
     scan_duration = 2.0 if len(sys.argv) <= 3 else float(sys.argv[3])
+    lidar_only = '--lidar-only' in sys.argv
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -258,7 +265,10 @@ def main():
     # poison this node's DDS context and cause ExternalShutdownException.
     ctx = rclpy.Context()
     rclpy.init(context=ctx)
-    node = BufferedCameraCapture(output_dir, buffer_size, scan_duration, context=ctx)
+    node = BufferedCameraCapture(output_dir, buffer_size, scan_duration, context=ctx, lidar_only=lidar_only)
+    if lidar_only:
+        # No camera subscription — trigger capture as soon as LiDAR buffer fills
+        node.latest_frame = True  # sentinel so the buffers_ready check in lidar_cb fires
     executor = rclpy.executors.SingleThreadedExecutor(context=ctx)
     executor.add_node(node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)

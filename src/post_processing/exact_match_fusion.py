@@ -11,8 +11,19 @@ Key: The calibration tool uses:
   lon = atan2(bearing[0], bearing[2])  # X forward, Z right
   lat = -asin(bearing[1])              # Y up
 
-Our previous scripts used:
-  azimuth = atan2(y_cam, x_cam)  # WRONG convention!
+The input is always sensor_lidar.ply (sensor frame) — the ERP image is also
+in sensor frame (the camera is rigidly attached to the scanner), so
+T_camera_lidar maps sensor-frame LiDAR points directly into the camera frame.
+
+In SDK stitch continuous mode, sensor_lidar.ply is motion-compensated to the
+capture-time sensor frame by reconstruct_from_bag.py, so it already matches
+the ERP orientation. No world-frame transform is needed or correct here —
+applying T_capture_inv would introduce a yaw error equal to the scanner's
+world-frame heading at each scan.
+
+The resulting sensor_colored_exact.ply is in sensor frame. The posegraph /
+merge step applies the trajectory pose (T_world_lidar) to bring it to world
+frame, exactly as in stationary mode.
 """
 
 import numpy as np
@@ -48,24 +59,23 @@ def load_points(ply_file):
             return np.array(pts)
 
 def exact_match_calibration_tool(scan_dir):
-    # Find files
-    sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir) 
-                      if 'sensor_lidar' in f and f.endswith('.ply')), None)
-    
-    # Find image - prefer blended masked, then masked, then regular
+    # Always use sensor_lidar.ply — it is in the same frame as the ERP image.
+    # In SDK stitch continuous mode, sensor_lidar.ply is already motion-compensated
+    # to the capture-time sensor frame by reconstruct_from_bag.py.
+    sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir)
+                       if 'sensor_lidar' in f and f.endswith('.ply')), None)
+
+    # Find image - prefer masked PNG, then regular ERP JPG
     mask_file = None
     image_file = None
-    
     for f in os.listdir(scan_dir):
-        # Skip raw backups
         if '_raw' in f:
             continue
-        # Prefer masked PNG (which should be blended if blend script ran)
         if f.endswith('_masked.png'):
             mask_file = os.path.join(scan_dir, f)
         elif ('equirect' in f or 'equirectangular' in f) and f.endswith('.jpg'):
             image_file = os.path.join(scan_dir, f)
-    
+
     if mask_file and os.path.exists(mask_file):
         image = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED)
         if image is not None and image.ndim == 3 and image.shape[2] == 4:
@@ -79,141 +89,171 @@ def exact_match_calibration_tool(scan_dir):
         alpha_mask = None
     else:
         image = None
-    
+
     if sensor_ply is None or image is None:
         print("Missing sensor PLY or image")
         return False
-    
+
     points = load_points(sensor_ply)
     if points.ndim < 2 or len(points) == 0:
         print("Empty point cloud, skipping")
         return False
     img_height, img_width = image.shape[:2]
-    
+
     # Load calibration
     config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'fusion_calibration.yaml')
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-    
-    # Get transformation (this is T_camera_lidar from inverted calib.json)
-    roll = config['roll_offset']
+
+    roll  = config['roll_offset']
     pitch = config['pitch_offset']
-    yaw = config['yaw_offset']
-    
-    t_x = config['x_offset']
-    t_y = config['y_offset']
-    t_z = config['z_offset']
-    
+    yaw   = config['yaw_offset']
+    t_x   = config['x_offset']
+    t_y   = config['y_offset']
+    t_z   = config['z_offset']
     skip_rate = config.get('skip_rate', 1)
-    
+
     print(f"Transformation (T_camera_lidar):")
     print(f"  Translation: [{t_x:.4f}, {t_y:.4f}, {t_z:.4f}]")
     print(f"  Rotation (RPY): [{roll:.4f}, {pitch:.4f}, {yaw:.4f}]")
     print(f"  Using exact calibration tool projection (no offsets/flips)")
-    
-    # Apply skip rate
+
     if skip_rate > 1:
         points = points[::skip_rate]
-    
-    # Filter points
-    distances = np.linalg.norm(points, axis=1)
-    valid_mask = (distances > 0.8) & (distances < 8.0) & (points[:, 2] > 0.05)
-    points = points[valid_mask]
-    
-    print(f"Processing {len(points)} points...")
-    
-    # Build T_camera_lidar matrix
+
+    # Build T_camera_lidar: sensor LiDAR frame -> camera frame
     R_matrix = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
     T_camera_lidar = np.eye(4)
     T_camera_lidar[:3, :3] = R_matrix
     T_camera_lidar[:3, 3] = [t_x, t_y, t_z]
-    
-    # Transform points to camera frame (EXACTLY like calibration tool)
-    points_homogeneous = np.hstack([points, np.ones((len(points), 1))])
-    points_camera = (T_camera_lidar @ points_homogeneous.T).T[:, :3]
-    
-    # EXACT projection from calibration tool (equirectangular.hpp)
-    # bearing = point_3d.normalized()
+
+    # The Insta360 SDK stitcher's ERP orientation is locked to the camera's
+    # orientation at timelapse start (first shutter event). Use the pose at
+    # that moment as T_ref, then T_eis = inv(T_ref) @ Tn transforms scan_N's
+    # points into the ERP's reference frame.
+    import json as _json
+    scan_traj = os.path.join(scan_dir, 'trajectory.json')
+    session_dir_path = os.path.dirname(scan_dir)
+    ref_pose_file = os.path.join(session_dir_path, '.sdk_stitch_ref_pose.json')
+    scan001_erp   = os.path.join(session_dir_path, 'fusion_scan_001', 'equirect_dual_fisheye.jpg')
+    sentinel      = os.path.join(session_dir_path, '.sdk_stitch_continuous')
+    is_scan001 = (os.path.basename(scan_dir) == 'fusion_scan_001')
+    T_eis = None
+    if os.path.exists(sentinel) and os.path.exists(scan_traj):
+        try:
+            def _load_T_from_traj(p):
+                lp = _json.loads(open(p).read())['current_pose']['lidar_pose']
+                q = [lp['orientation'][k] for k in 'xyzw']
+                T = np.eye(4)
+                T[:3,:3] = R.from_quat(q).as_matrix()
+                T[:3,3] = [lp['position'][k] for k in 'xyz']
+                return T
+            def _load_T_from_ref(p):
+                d = _json.loads(open(p).read())
+                q = [d['orientation'][k] for k in 'xyzw']
+                T = np.eye(4)
+                T[:3,:3] = R.from_quat(q).as_matrix()
+                T[:3,3] = [d['position'][k] for k in 'xyz']
+                return T
+            # Use ref_pose_file if available, else fall back to scan_001 trajectory
+            if os.path.exists(ref_pose_file):
+                T_ref = _load_T_from_ref(ref_pose_file)
+            else:
+                scan001_traj = os.path.join(session_dir_path, 'fusion_scan_001', 'trajectory.json')
+                T_ref = _load_T_from_traj(scan001_traj)
+            Tn = _load_T_from_traj(scan_traj)
+            T_eis = np.linalg.inv(T_ref) @ Tn
+        except Exception:
+            pass
+    # The Insta360 SDK stitcher's ERP orientation drifts per shot.
+    # Only scan_001's ERP has a known correct orientation (it IS the reference).
+    # For all other scans: rotate points by T_eis into scan_001's frame,
+    # then project into scan_001's own masked ERP.
+    if T_eis is not None and not is_scan001 and os.path.exists(scan001_erp):
+        # Use scan_001's masked PNG if available, else plain ERP
+        scan001_mask = os.path.join(session_dir_path, 'fusion_scan_001',
+                                    'equirect_dual_fisheye_masked.png')
+        if os.path.exists(scan001_mask):
+            image = cv2.imread(scan001_mask, cv2.IMREAD_UNCHANGED)
+            if image is not None and image.ndim == 3 and image.shape[2] == 4:
+                alpha_mask = image[:, :, 3] >= 128
+                image = image[:, :, :3]
+            else:
+                image = cv2.imread(scan001_mask)
+                alpha_mask = None
+        else:
+            image = cv2.imread(scan001_erp)
+            alpha_mask = None
+        if image is None:
+            image = cv2.imread(scan001_erp)
+            alpha_mask = None
+        img_height, img_width = image.shape[:2]
+
+    # Filter points
+    distances = np.linalg.norm(points, axis=1)
+    valid_mask = (distances > 0.8) & (distances < 8.0) & (points[:, 2] > 0.05)
+    points = points[valid_mask]
+
+    print(f"Processing {len(points)} points...")
+
+    # Apply T_eis to rotate points into scan_001's sensor frame before projection.
+    # Output PLY positions use original sensor-frame coordinates (unchanged).
+    if T_eis is not None:
+        pts_h = np.hstack([points, np.ones((len(points), 1))])
+        points_for_proj = (T_eis @ pts_h.T).T[:, :3]
+    else:
+        points_for_proj = points
+    points_h = np.hstack([points_for_proj, np.ones((len(points_for_proj), 1))])
+    points_camera = (T_camera_lidar @ points_h.T).T[:, :3]
+
+    # Equirectangular projection (matches direct_visual_lidar_calibration)
     bearing = points_camera / np.linalg.norm(points_camera, axis=1, keepdims=True)
-    
-    # lat = -asin(bearing[1])
-    # lon = atan2(bearing[0], bearing[2])
     lat = -np.arcsin(np.clip(bearing[:, 1], -1, 1))
     lon = np.arctan2(bearing[:, 0], bearing[:, 2])
-    
-    # x = width * (0.5 + lon / (2*PI))
-    # y = height * (0.5 - lat / PI)
-    u = img_width * (0.5 + lon / (2 * np.pi))
+    u = img_width  * (0.5 + lon / (2 * np.pi))
     v = img_height * (0.5 - lat / np.pi)
-    
+
     print(f"Projection range: u=[{u.min():.1f}, {u.max():.1f}], v=[{v.min():.1f}, {v.max():.1f}]")
-    
-    # Filter valid pixels
+
     valid_pixels = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
-    
-    # Remove transparent pixels
+
     if alpha_mask is not None:
         u_int = np.clip(np.round(u).astype(int), 0, img_width - 1)
         v_int = np.clip(np.round(v).astype(int), 0, img_height - 1)
-        non_alpha = alpha_mask[v_int, u_int]
-        valid_pixels = valid_pixels & non_alpha
-    
+        valid_pixels = valid_pixels & alpha_mask[v_int, u_int]
+
     valid_points = points[valid_pixels]
     valid_u = u[valid_pixels]
     valid_v = v[valid_pixels]
-    
+
     print(f"Valid projections: {len(valid_points)} points")
-    
-    # Sample colors
+
     u_int = np.clip(np.round(valid_u).astype(int), 0, img_width - 1)
     v_int = np.clip(np.round(valid_v).astype(int), 0, img_height - 1)
     colors = image[v_int, u_int][:, [2, 1, 0]]  # BGR to RGB
-    
-    # Save sensor-frame colored points
+
+    def write_ply(path, pts, cols):
+        with open(path, 'w') as f:
+            f.write('ply\nformat ascii 1.0\n')
+            f.write(f'element vertex {len(pts)}\n')
+            f.write('property float x\nproperty float y\nproperty float z\n')
+            f.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
+            for i in range(len(pts)):
+                x, y, z = pts[i]
+                r, g, b = cols[i]
+                f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
+
     sensor_output = os.path.join(scan_dir, "sensor_colored_exact.ply")
-    with open(sensor_output, 'w') as f:
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {len(valid_points)}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        f.write('property uchar red\n')
-        f.write('property uchar green\n')
-        f.write('property uchar blue\n')
-        f.write('end_header\n')
-        
-        for i in range(len(valid_points)):
-            x, y, z = valid_points[i]
-            r, g, b = colors[i]
-            f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
-    
-    print(f"✓ Saved sensor-frame colored points to {sensor_output}")
-    
-    # Also save as world_colored_exact.ply for backward compatibility
-    # (Note: despite the name, these are still sensor coordinates!)
-    output_file = os.path.join(scan_dir, "world_colored_exact.ply")
-    with open(output_file, 'w') as f:
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {len(valid_points)}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        f.write('property uchar red\n')
-        f.write('property uchar green\n')
-        f.write('property uchar blue\n')
-        f.write('end_header\n')
-        
-        for i in range(len(valid_points)):
-            x, y, z = valid_points[i]
-            r, g, b = colors[i]
-            f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
+    write_ply(sensor_output, valid_points, colors)
+    print(f"\u2713 Saved sensor-frame colored points to {sensor_output}")
+
+    # world_colored_exact.ply: same sensor-frame data (world transform applied by posegraph/merge)
+    world_output = os.path.join(scan_dir, "world_colored_exact.ply")
+    write_ply(world_output, valid_points, colors)
     return True
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 exact_match_fusion.py <scan_directory>")
         sys.exit(1)
-    
     exact_match_calibration_tool(sys.argv[1])

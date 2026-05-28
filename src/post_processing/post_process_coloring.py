@@ -17,13 +17,15 @@ def process_scan_coloring(scan_dir, use_exact=False):
     sensor_ply = scan_path / "sensor_lidar.ply"
     equirect_imgs = list(scan_path.glob("equirect_*.jpg"))
     
-    # Determine which PLY to use
-    if world_ply.exists():
-        lidar_ply = world_ply
-        ply_type = "world"
-    elif sensor_ply.exists():
+    # Always use sensor_lidar.ply for coloring — exact_match_fusion.py assumes
+    # sensor frame (T_camera_lidar maps sensor->camera directly).
+    # world_lidar.ply is in world frame and requires a different transform chain.
+    if sensor_ply.exists():
         lidar_ply = sensor_ply
         ply_type = "sensor"
+    elif world_ply.exists():
+        lidar_ply = world_ply
+        ply_type = "world"
     else:
         print(f"No LiDAR PLY found in {scan_dir}")
         return False

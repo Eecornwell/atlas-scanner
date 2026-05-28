@@ -26,6 +26,54 @@ RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session (outputs
 | `single_fisheye` | `continuous` | Walking capture, auto-captures every N seconds |
 | `dual_fisheye` | `continuous` | Walking capture with full 360° images |
 
+### SDK Stitch Mode (`USE_SDK_STITCH`)
+
+When `CAMERA_MODE=dual_fisheye`, an additional option enables high-quality ERP stitching via the Insta360 MediaSDK:
+
+```bash
+USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (dual_fisheye only)
+```
+
+| Mode | ERP source | Quality | Notes |
+|---|---|---|---|
+| `USE_SDK_STITCH=false` | ROS driver (real-time) | Good | Standard path, camera IMU available |
+| `USE_SDK_STITCH=true` | Insta360 MediaSDK (post-session) | Best | Higher quality stitching, no camera IMU in bag |
+
+**How it works:**
+
+- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `~/insta360-dev/`) takes ownership of the USB device and runs a timelapse session at `CONTINUOUS_INTERVAL` seconds.
+- During the session, `insta360_capture` polls the camera for new `.insp` raw files and downloads them to the session directory in the background. Shutter events are written as `.shutter_event` files only when a confirmed `.insp` file is found — not synthetically from elapsed time.
+- After the session ends, `insta360_capture` continues polling until no new files appear in two consecutive passes, ensuring all buffered photos are downloaded before post-processing begins.
+- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG by `insta360_stitch` (also from `~/insta360-dev/`) during reconstruction.
+- The `shutter_event_publisher.py` node watches for `.shutter_event` files and publishes them on `/camera/shutter_time`, which is recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
+
+**ERP orientation and EIS correction (continuous mode):**
+
+The Insta360 SDK stitcher locks all ERPs in a timelapse session to the camera's orientation at the first shutter event (timelapse start). This means every ERP shares the same reference frame as the first shot — it is not body-fixed per shot and not gravity-stabilised.
+
+To correct for this, `exact_match_fusion.py` applies an EIS rotation when the `.sdk_stitch_continuous` sentinel file is present:
+
+1. The odometry pose at timelapse start is saved to `.sdk_stitch_ref_pose.json` by `reconstruct_from_bag.py`.
+2. For each scan N (except scan_001), `T_eis = inv(T_ref) @ T_N` is computed and applied to the LiDAR points before UV projection.
+3. All scans project into scan_001's masked ERP (`equirect_dual_fisheye_masked.png`), which has the correct orientation reference and masks the scanner body (nadir region).
+
+**Building the SDK daemon:**
+
+```bash
+cd ~/insta360-dev && bash build.sh
+# Produces: build/insta360_capture  build/insta360_stitch
+```
+
+**Manually reconstruct an SDK-stitch session:**
+
+```bash
+cd ~/atlas_ws && source install/setup.bash
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    --camera-mode dual_fisheye --sdk-stitch \
+    --interval 3.0 --lidar-window 0.3
+```
+
 ## Normal Operation
 
 - Ensure sensors are connected

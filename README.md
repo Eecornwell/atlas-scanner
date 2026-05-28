@@ -79,10 +79,12 @@
             - ~30Hz (throttled to 15fps in continuous mode before recording)
         - /dual_fisheye/image/compressed_15fps
             - ~15Hz (continuous mode only — throttled topic used for bag recording)
+        - /camera/shutter_time
+            - per-shot (SDK stitch mode only — published when a confirmed .insp file is downloaded)
         - /imu/data_raw
-            - ~60Hz (camera IMU, raw — recorded to dedicated IMU bag in continuous mode)
+            - ~60Hz (camera IMU, raw — recorded to dedicated IMU bag in continuous mode; not available in SDK stitch mode)
         - /imu/data
-            - ~60Hz (camera IMU, Madgwick-filtered — continuous mode only)
+            - ~60Hz (camera IMU, Madgwick-filtered — continuous mode only; not available in SDK stitch mode)
     - Mapping
         - /rko_lio/odometry
             - ~10Hz
@@ -114,6 +116,7 @@
 | Terrestrial mode (time-lapse scans) | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
 | Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                           |
 | Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images               |
+| SDK stitch mode (high-quality ERP)  | Yes       | Insta360 MediaSDK stitcher produces full 5760×2880 ERPs; requires `USE_SDK_STITCH=true` and `dual_fisheye` mode  |
 | Sample gallery                      | Future    | Providing outputs to view various datasets taken with the scanner                                                |
 | Remote capture capability           | Future    | Enable ability to remotely trigger a scan on the device                                                          |
 
@@ -134,6 +137,8 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
+
+- An optional SDK stitch mode (`USE_SDK_STITCH=true`, `dual_fisheye` only) replaces the ROS camera driver with the Insta360 MediaSDK daemon (`insta360_capture`). The daemon runs a timelapse, downloads `.insp` raw files during and after the session, and stitches them to full 5760×2880 ERPs in post-processing. Camera IMU is not available in this mode. See [Running the Software](docs/software-run.md) for details.
 
 - Acquisition is camera-triggered — the system waits for a valid camera frame before proceeding, making image availability the primary bottleneck
 
@@ -187,9 +192,9 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - `imu_sync.py` — reads both IMU gyroscope streams from the dedicated IMU bag (falling back to the main bag), reconstructs monotonic camera IMU timestamps, auto-selects the best-correlated axis pair, and estimates any residual clock offset via FFT cross-correlation. If confidence ≥ 0.7 the offset is written to `sync_offset.json`; otherwise `delta_t_s` is written as `0.0` so the file is a safe no-op. Run automatically before reconstruction in continuous mode
 
-- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. Extracts camera frames as scan centres, filters centres outside the odometry window, applies per-frame motion compensation, and writes a sensor-frame `sensor_lidar.ply` and `trajectory.json` per scan
+- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. Extracts camera frames as scan centres, filters centres outside the odometry window, applies per-frame motion compensation, and writes a sensor-frame `sensor_lidar.ply` and `trajectory.json` per scan. In SDK stitch mode (`--sdk-stitch`), scan centres come from `/camera/shutter_time` bag messages (precise shutter times) rather than camera image frames; the odometry pose at the first shutter is saved to `.sdk_stitch_ref_pose.json` for EIS correction downstream.
 
-- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded
+- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded. In SDK stitch continuous mode (`.sdk_stitch_continuous` sentinel present), applies EIS correction: rotates each scan's points by `T_eis = inv(T_ref) @ T_N` before UV projection and samples from scan_001's masked ERP, which has the correct orientation reference for the entire session.
 
 - `align_scan_session_posegraph.py` — pre-transforms each scan's colored cloud into world frame using its trajectory pose, then runs Open3D pose-graph ICP (50 mm voxels, 750 mm coarse search radius) to refine inter-scan alignment. Writes `trajectory_icp_refined.json` with corrected poses
 

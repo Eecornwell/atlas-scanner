@@ -159,7 +159,7 @@ class FusionCaptureGUI:
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
                      state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
-        self.stationary_wait_var = tk.BooleanVar(value=True)
+        self.stationary_wait_var = tk.BooleanVar(value=False)
         self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
                         variable=self.stationary_wait_var)
         self.stationary_wait_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
@@ -307,10 +307,11 @@ class FusionCaptureGUI:
         self._rviz_search_start = time.monotonic()  # reset so PID filter uses new session time
         # Clear any web viewer or previous RViz content from the viewer frame
         if self.web_viewer_process:
-            self.web_viewer_process.set()
+            self.web_viewer_process.set()  # signal _tick to stop and release GL context
             self.web_viewer_process = None
-            # Give the _tick loop one cycle to see stop_event before we destroy the canvas
-            self.root.after(100, self._clear_viewer_frame)
+            # Wait two tick cycles (2 × 50ms) for the renderer to be released
+            # before destroying the canvas, then clear on the next after() call.
+            self.root.after(150, self._clear_viewer_frame)
         else:
             self._clear_viewer_frame()
         
@@ -383,26 +384,30 @@ class FusionCaptureGUI:
                    '--capture', self.capture_mode_var.get()]
             if self.bag_only_var.get():
                 cmd.append('--bag-only')
-            if self.capture_mode_var.get() == 'stationary' and not self.stationary_wait_var.get():
-                cmd.append('--no-stationary-wait')
+            if self.capture_mode_var.get() == 'stationary' and self.stationary_wait_var.get():
+                cmd.append('--stationary-wait')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True,
+                bufsize=0,
                 env=env,
                 preexec_fn=os.setsid  # Create new process group
             )
-            
+            # Wrap in a text reader that replaces undecodable bytes (e.g. raw
+            # libusb address bytes from the Insta360 SDK log) instead of raising.
+            import io
+            stdout_text = io.TextIOWrapper(
+                self.fusion_process.stdout, encoding='utf-8', errors='replace', line_buffering=True
+            )
+
             self.is_running = True
-            
+
             # Read output in real-time
             while self.fusion_process and self.is_running:
                 try:
-                    line = self.fusion_process.stdout.readline()
+                    line = stdout_text.readline()
                     if line == '':  # EOF
                         break
                     line = line.strip()
@@ -442,21 +447,20 @@ class FusionCaptureGUI:
                     )):
                         self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
                 except Exception as e:
-                    self.root.after(0, lambda: self.log_message(f"Error reading output: {e}"))
+                    self.root.after(0, lambda e=e: self.log_message(f"Error reading output: {e}"))
                     break
 
             # Process exited — drain any remaining output before resetting
-            if self.fusion_process:
-                try:
-                    remaining = self.fusion_process.stdout.read()
-                    if remaining:
-                        for line in remaining.splitlines():
-                            line = line.strip()
-                            if not line:
-                                continue
-                            self.root.after(0, lambda l=line: self.log_message(l))
-                except Exception:
-                    pass
+            try:
+                remaining = stdout_text.read()
+                if remaining:
+                    for line in remaining.splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        self.root.after(0, lambda l=line: self.log_message(l))
+            except Exception:
+                pass
 
             # Surface any error and reset buttons — only if stop_fusion hasn't
             # already scheduled _system_stopped via its own _wait_for_finish thread.
@@ -711,12 +715,14 @@ sys.exit(0 if ok[0] else 4)
         else:
             self.capture_button.config(state="normal")
 
-        # Extract output directory from logs
+        # Extract output directory from logs and set scan_dir
         log_content = self.log_text.get("1.0", tk.END)
         for line in log_content.split('\n'):
             if "Scans will be saved to:" in line:
                 output_dir = line.split("Scans will be saved to:")[-1].strip()
                 self.output_dir_label.config(text=output_dir, foreground="black")
+                if not self.scan_dir and output_dir:
+                    self.scan_dir = output_dir
                 try:
                     _add_session_log_handler(output_dir)
                 except Exception:
@@ -727,7 +733,9 @@ sys.exit(0 if ok[0] else 4)
         """Warn if free disk space on the data partition is below warn_gb."""
         import shutil
         try:
-            free_gb = shutil.disk_usage(str(self.script_dir)).free / 1e9
+            # Check the actual data directory, not the source directory
+            check_path = self.scan_dir if (hasattr(self, 'scan_dir') and self.scan_dir) else str(self.script_dir / '../../../data')
+            free_gb = shutil.disk_usage(check_path).free / 1e9
             if free_gb < warn_gb:
                 self.log_message(f"⚠ Low disk space: {free_gb:.1f} GB free — consider freeing space before next scan")
                 self.update_status(f"⚠ Low disk space ({free_gb:.1f} GB free)", "orange")
@@ -827,7 +835,7 @@ sys.exit(0 if ok[0] else 4)
                 trigger = pathlib.Path(self.scan_dir) / '.capture_trigger'
                 trigger.touch()
             if self.fusion_process and self.fusion_process.stdin:
-                self.fusion_process.stdin.write('\n')
+                self.fusion_process.stdin.write(b'\n')
                 self.fusion_process.stdin.flush()
         except Exception as e:
             self.log_message(f"Error triggering scan: {e}")
@@ -846,8 +854,8 @@ sys.exit(0 if ok[0] else 4)
         if proc:
             try:
                 if hasattr(self, 'scan_dir') and self.scan_dir:
-                    pathlib.Path(self.scan_dir, '.quit_trigger').touch()
-                proc.stdin.write('q\n')
+                    (pathlib.Path(self.scan_dir) / '.quit_trigger').touch()
+                proc.stdin.write(b'q\n')
                 proc.stdin.flush()
             except Exception as e:
                 self.log_message(f"Error sending stop signal: {e}")
@@ -967,10 +975,17 @@ def _setup_logging():
     return log_path
 
 def _add_session_log_handler(session_dir: str):
+    # Remove any previous session FileHandlers so old session dirs don't
+    # accumulate across restarts within the same GUI process.
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers[:]:
+        if isinstance(h, logging.FileHandler) and 'synchronized_scans' in h.baseFilename:
+            h.close()
+            root_logger.removeHandler(h)
     dest = pathlib.Path(session_dir) / 'gui.log'
     handler = logging.FileHandler(dest)
     handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
-    logging.getLogger().addHandler(handler)
+    root_logger.addHandler(handler)
     logging.info(f"GUI log also writing to {dest}")
 
 def main():
@@ -982,7 +997,7 @@ def main():
 
     # Read defaults from atlas_fusion_capture.sh if no CLI args given
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
-    default_camera, default_capture = 'dual_fisheye', 'continuous'
+    default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -990,6 +1005,8 @@ def main():
                 default_camera = line.split('=', 1)[1].split('#')[0].strip('"\' ')
             elif line.startswith('CAPTURE_MODE=') and '#' not in line.split('CAPTURE_MODE=')[0]:
                 default_capture = line.split('=', 1)[1].split('#')[0].strip('"\' ')
+            elif line.startswith('STATIONARY_WAIT=') and '#' not in line.split('STATIONARY_WAIT=')[0]:
+                default_stationary_wait = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             if line.startswith('while'):
                 break  # stop before the CLI override block
     except Exception:
@@ -1011,6 +1028,7 @@ def main():
     app = FusionCaptureGUI(root)
     app.camera_mode_var.set(args.camera if args.camera else default_camera)
     app.capture_mode_var.set(args.capture if args.capture else default_capture)
+    app.stationary_wait_var.set(default_stationary_wait)
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     

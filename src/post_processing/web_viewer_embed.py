@@ -61,6 +61,7 @@ def embed_viewer(parent_frame, ply_path):
 
     def _tick():
         if stop_event.is_set():
+            renderer_box[0] = None  # release GL context
             return
         try:
             if not canvas.winfo_exists():

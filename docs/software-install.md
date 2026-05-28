@@ -504,6 +504,61 @@ export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibrat
 
 ---
 
+## SDK Stitch Setup
+
+The SDK stitch capture mode (`USE_SDK_STITCH=true`, `dual_fisheye`) uses two binaries built from `~/insta360-dev/`: `insta360_capture` (timelapse session daemon) and `insta360_stitch` (offline `.insp` → ERP stitcher). Both require the Insta360 CameraSDK and MediaSDK.
+
+### 1. Install MediaSDK
+
+The MediaSDK `.deb` is bundled in the same zip as the CameraSDK:
+
+```bash
+# Unzip the SDK bundle (already done if you followed the CameraSDK steps above)
+unzip ~/Downloads/LinuxSDK20241128.zip -d ~/LinuxSDK20241128
+
+# Install the MediaSDK dev package
+sudo dpkg -i ~/LinuxSDK20241128/libMediaSDK-dev_2.0-6_amd64_ubuntu18.04.deb
+sudo ldconfig
+
+# Verify
+ldconfig -p | grep MediaSDK   # should show libMediaSDK.so
+```
+
+### 2. Build insta360_capture and insta360_stitch
+
+The source lives in `~/insta360-dev/` (a standalone directory, not inside the atlas-scanner repo). The build script compiles three binaries into `~/insta360-dev/build/`, which is where `atlas_fusion_capture.sh` expects them.
+
+```bash
+cd ~/insta360-dev
+bash build.sh
+
+# Verify
+ls ~/insta360-dev/build/insta360_capture
+ls ~/insta360-dev/build/insta360_stitch
+ls ~/insta360-dev/build/insta360_reset_clock
+```
+
+The `CMakeLists.txt` hardcodes the CameraSDK path to `~/LinuxSDK20241128/CameraSDK-20241120_183228--1.1.0-Linux`. If your SDK is extracted elsewhere, edit that path in `CMakeLists.txt` before building:
+
+```bash
+# Edit line 5 of CMakeLists.txt:
+set(CAMERA_SDK_DIR "/path/to/your/CameraSDK")
+```
+
+The MediaSDK headers and library are expected at system paths installed by the `.deb` above (`/usr/include`, `/usr/lib`).
+
+### 3. SDK stitch mask
+
+The SDK stitcher places ERP content in different pixel regions than the manual fisheye-to-ERP pipeline, so a dedicated LiDAR exclusion mask is required. It is already included in the repo:
+
+```
+~/atlas_ws/src/atlas-scanner/src/lidar_mask_dual_sdk.png
+```
+
+No additional steps are needed — `atlas_fusion_capture.sh` selects this mask automatically when `USE_SDK_STITCH=true` and `CAMERA_MODE=dual_fisheye`.
+
+---
+
 ## Desktop Shortcuts
 
 ### ATLAS GUI

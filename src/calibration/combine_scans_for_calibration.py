@@ -37,6 +37,11 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         if dual_raw.exists():
             equirect_files = [dual_raw]
 
+        # Prefer masked ERP for SuperGlue (excludes scanner body from feature detection)
+        masked = sorted(fusion_dir.glob('equirect_*_masked.png'))
+        if masked:
+            equirect_files = [masked[-1]]  # use most recent masked variant
+
         # Dual-fisheye fallback: synthesise ERP from dual_fisheye.jpg
         if not equirect_files:
             import sys as _sys
@@ -74,12 +79,28 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
             # Read with alpha channel if present
             img = cv2.imread(str(src_img), cv2.IMREAD_UNCHANGED)
             if img is not None:
-                # If image has alpha channel (masked), fill transparent areas with gray noise instead of black
+                # Full-res copy for post-processing reference
                 cv2.imwrite(dst_img, img)
-                
-                # Also copy to root directory for SuperGlue
+
+                # Downsample root copy for SuperGlue/SuperPoint — the matcher was
+                # trained on ~640px images and produces very few keypoints on
+                # 3840x1920 inputs. Scale to MATCHER_MAX_W preserving exact aspect
+                # ratio so calib.json intrinsics are derived from actual dimensions.
+                MATCHER_MAX_W = 2560
+                src_h, src_w = img.shape[:2]
+                scale = MATCHER_MAX_W / src_w
+                MATCHER_W = MATCHER_MAX_W
+                MATCHER_H = round(src_h * scale)
+                # Apply alpha mask to RGB before downsampling so masked regions
+                # (scanner body/tripod) are black and ignored by SuperPoint.
+                if img.ndim == 3 and img.shape[2] == 4:
+                    alpha = img[:, :, 3:4]
+                    img_rgb = (img[:, :, :3] * (alpha / 255.0)).astype(img.dtype)
+                else:
+                    img_rgb = img
+                img_small = cv2.resize(img_rgb, (MATCHER_W, MATCHER_H), interpolation=cv2.INTER_AREA)
                 root_img = f"{output_dir}/{total_count:06d}.png"
-                cv2.imwrite(root_img, img)
+                cv2.imwrite(root_img, img_small)
                 
                 # Copy PLY file
                 src_ply = ply_files[0]
@@ -112,10 +133,10 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         print("No valid scans found!")
         return 0
     
-    # Detect actual image dimensions from first copied image
+    # Detect matcher resolution from root PNG (downsampled for SuperGlue)
     import cv2 as _cv2
-    first_img = _cv2.imread(f"{output_dir}/images/000000.png")
-    img_h, img_w = first_img.shape[:2] if first_img is not None else (1280, 2560)
+    first_root = _cv2.imread(f"{output_dir}/000000.png")
+    img_h, img_w = first_root.shape[:2] if first_root is not None else (MATCHER_H, MATCHER_W)
 
     # Create metadata files
     bag_names = [f"{i:06d}" for i in range(total_count)]
@@ -124,7 +145,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         "camera": {
             "camera_model": "equirectangular",
             "distortion_coeffs": [],
-            "intrinsics": [img_w / 2.0, img_h / 2.0]
+            "intrinsics": [img_w, img_h]
         },
         "meta": {
             "bag_names": bag_names,
@@ -147,7 +168,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     metadata = {
         "camera_model": "equirectangular",
         "image_size": [img_w, img_h],
-        "camera_intrinsics": [img_w / 2.0, img_h / 2.0, img_w, img_h],
+        "camera_intrinsics": [img_w, img_h, img_w, img_h],
         "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0],
         "image_topic": "/equirectangular/image",
         "points_topic": "/livox/lidar",
@@ -182,7 +203,23 @@ if __name__ == '__main__':
         sys.exit(1)
 
     if os.path.exists(output_dir):
+        # Preserve calib.json if it contains valid calibration results
+        _calib_backup = None
+        _calib_path = os.path.join(output_dir, 'calib.json')
+        if os.path.exists(_calib_path):
+            import json as _json
+            try:
+                _c = _json.loads(open(_calib_path).read())
+                _vec = _c.get('results', {}).get('T_lidar_camera', [])
+                if len(_vec) == 7 and any(abs(v) > 1e-6 for v in _vec[:3] + _vec[4:]):
+                    _calib_backup = open(_calib_path).read()
+            except Exception:
+                pass
         shutil.rmtree(output_dir)
+        if _calib_backup:
+            os.makedirs(output_dir, exist_ok=True)
+            open(_calib_path, 'w').write(_calib_backup)
+            print(f"  Preserved existing calib.json")
 
     count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 10)
     

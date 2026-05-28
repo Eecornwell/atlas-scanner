@@ -250,13 +250,14 @@ def merge_scans_with_trajectory(session_dir):
             points_transformed = points
         else:
             T = pose_matrices[scan_dir.name]
-            # ICP-refined poses are already relative-to-first; raw odom poses need T_first_inv.
             if using_icp:
                 T_rel = T
+                pts_h = np.hstack([points, np.ones((len(points), 1))])
+                points_transformed = (T_rel @ pts_h.T).T[:, :3]
             else:
                 T_rel = np.linalg.inv(T_first) @ T
-            pts_h = np.hstack([points, np.ones((len(points), 1))])
-            points_transformed = (T_rel @ pts_h.T).T[:, :3]
+                pts_h = np.hstack([points, np.ones((len(points), 1))])
+                points_transformed = (T_rel @ pts_h.T).T[:, :3]
             t_rel = T[:3, 3] - t_ref
             print(f"  {scan_dir.name}: {len(points)} points  rel_t=[{t_rel[0]:.3f},{t_rel[1]:.3f},{t_rel[2]:.3f}]")
 
@@ -282,5 +283,4 @@ if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 merge_with_trajectory.py <session_directory>")
         sys.exit(1)
-    
     merge_scans_with_trajectory(sys.argv[1])

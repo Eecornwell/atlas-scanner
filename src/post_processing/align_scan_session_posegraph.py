@@ -156,31 +156,30 @@ def pairwise_icp(source, target, voxel_size, init_transform,
 
 def _load_imu_from_bag(session_path):
     """Load /livox/imu angular velocity from the session's IMU bag.
+    Checks session-level bags first (continuous mode), then per-scan bags
+    (stationary mode where each scan has its own rosbag subdirectory).
     Returns list of (timestamp, gyro_magnitude) or empty list if unavailable."""
     try:
         from rclpy.serialization import deserialize_message
         from rosidl_runtime_py.utilities import get_message
     except ImportError:
         return []
-    imu_bag = next(session_path.glob("rosbag_*_imu"), None) or \
-              next(session_path.glob("rosbag_*"), None)
-    if imu_bag is None:
+
+    # Collect candidate bag directories: session-level first, then per-scan
+    candidates = list(session_path.glob("rosbag_*_imu")) + \
+                 list(session_path.glob("rosbag_*")) + \
+                 [b for sd in sorted(session_path.glob("fusion_scan_*"))
+                  for b in sorted(sd.glob("rosbag_*"))]
+    if not candidates:
         return []
-    db3 = next(imu_bag.glob("*.db3"), None)
-    if db3 is None:
-        zstd = next(imu_bag.glob("*.db3.zstd"), None)
-        if zstd is None:
-            return []
-        import subprocess
-        out = str(zstd).replace(".zstd", "")
-        subprocess.run(["zstd", "-d", str(zstd), "-o", out, "-f"], capture_output=True)
-        db3 = Path(out)
-    try:
+
+    def _read_imu_db3(db3):
         con = sqlite3.connect(str(db3))
         topics = {r[0]: (r[1], r[2]) for r in con.execute("SELECT id, name, type FROM topics")}
         tid = next((tid for tid, (n, _) in topics.items() if "/livox/imu" in n), None)
         if tid is None:
-            con.close(); return []
+            con.close()
+            return []
         MsgType = get_message(topics[tid][1])
         rows = con.execute(
             "SELECT data, timestamp FROM messages WHERE topic_id=? ORDER BY timestamp", (tid,)
@@ -193,21 +192,44 @@ def _load_imu_from_bag(session_path):
             g = msg.angular_velocity
             result.append((stamp, (g.x**2 + g.y**2 + g.z**2) ** 0.5))
         return result
-    except Exception:
-        return []
+
+    all_samples = []
+    for imu_bag in candidates:
+        db3 = next(imu_bag.glob("*.db3"), None)
+        if db3 is None:
+            zstd = next(imu_bag.glob("*.db3.zstd"), None)
+            if zstd is None:
+                continue
+            import subprocess
+            out = str(zstd).replace(".zstd", "")
+            subprocess.run(["zstd", "-d", str(zstd), "-o", out, "-f"], capture_output=True)
+            db3 = Path(out)
+        try:
+            all_samples.extend(_read_imu_db3(db3))
+        except Exception:
+            continue
+
+    # Deduplicate by timestamp and sort
+    seen = set()
+    result = []
+    for ts, g in sorted(all_samples):
+        if ts not in seen:
+            seen.add(ts)
+            result.append((ts, g))
+    return result
 
 
-def _gyro_at(imu_data, t, window=0.5):
-    """90th-percentile gyro magnitude over a window centred on t.
-    More robust than mean (catches sustained rotation) without being thrown off
-    by brief vibration spikes that max would catch.
-    Returns None if no data."""
+def _gyro_at(imu_data, t, window=0.2):
+    """75th-percentile gyro magnitude over a window centred on t."""
     samples = [g for ts, g in imu_data if abs(ts - t) <= window / 2.0]
-    return float(np.percentile(samples, 90)) if samples else None
+    return float(np.percentile(samples, 75)) if samples else None
 
 
-def register_pose_graph(session_dir, max_gyro=0.12):
+def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     """Pose graph optimization with trajectory initialization."""
+
+    def pose_to_T_from_file(traj_file):
+        return load_trajectory_pose(Path(traj_file).parent)
     
     session_path = Path(session_dir)
     scan_dirs = sorted(session_path.glob("fusion_scan_*"))
@@ -254,23 +276,6 @@ def register_pose_graph(session_dir, max_gyro=0.12):
                         if gyro is not None and gyro > max_gyro:
                             print(f"  Skipping {scan_dir.name}: gyro={gyro:.3f} rad/s > {max_gyro:.2f}")
                             continue
-                        # Velocity filter: skip scans where scanner was translating fast.
-                        # Motion blur from translation degrades ICP just as much as rotation.
-                        full = traj.get('full_trajectory', [])
-                        if capture_time and full:
-                            times_arr = np.array([p['timestamp'] for p in full])
-                            idx = np.searchsorted(times_arr, float(capture_time))
-                            if 1 <= idx < len(full):
-                                p0, p1 = full[idx-1], full[idx]
-                                dt = p1['timestamp'] - p0['timestamp']
-                                if dt > 0:
-                                    vel = ((p1['position']['x']-p0['position']['x'])**2 +
-                                           (p1['position']['y']-p0['position']['y'])**2 +
-                                           (p1['position']['z']-p0['position']['z'])**2)**0.5 / dt
-                                    max_vel = 0.12  # m/s
-                                    if vel > max_vel:
-                                        print(f"  Skipping {scan_dir.name}: vel={vel:.3f} m/s > {max_vel:.2f}")
-                                        continue
             lidar_files.append(lidar)
             ply_files.append(colored)
             valid_scan_dirs.append(scan_dir)
@@ -305,13 +310,16 @@ def register_pose_graph(session_dir, max_gyro=0.12):
         traj_poses_abs.append(pose)
         print(f"Trajectory {scan_dir.name}: t=[{pose[0,3]:.3f}, {pose[1,3]:.3f}, {pose[2,3]:.3f}]")
 
+
     T_first_inv = np.linalg.inv(traj_poses_abs[0])
     trajectory_poses = [T_first_inv @ T for T in traj_poses_abs]
 
     # Preprocess world_lidar clouds.
     # world_lidar is in absolute odom world frame. Transform to relative-to-first-scan
     # frame (same as merge_with_trajectory.py) so ICP corrections are small residuals
-    # in a consistent upright frame.
+    # Use world_lidar.ply for ICP (already motion-compensated world frame).
+    # Transform to relative-to-first for ICP, then apply the same correction
+    # to the colored clouds (also transformed to relative-to-first via trajectory_poses).
     voxel_size = 0.05
     pcds = []
     pcds_colored = []
@@ -319,14 +327,12 @@ def register_pose_graph(session_dir, max_gyro=0.12):
         pcd = o3d.io.read_point_cloud(str(f))
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         pcd = pcd.voxel_down_sample(voxel_size)
-        # Transform to relative-to-first frame using T_first_inv
         pcd.transform(T_first_inv)
         pcd.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
         pcd.orient_normals_consistent_tangent_plane(30)
         pcds.append(pcd)
 
-        # Load colored cloud for fine-tuning — transform to same relative frame
         pcd_c = o3d.io.read_point_cloud(str(ply_files[i])).voxel_down_sample(voxel_size)
         pcd_c.transform(trajectory_poses[i])  # sensor -> relative-to-first
         pcd_c.estimate_normals(
@@ -335,95 +341,106 @@ def register_pose_graph(session_dir, max_gyro=0.12):
 
         print(f"Preprocessed {lidar_files[i].parent.name}: {len(pcd.points)} points  color={'yes' if pcd_c.has_colors() else 'no'}")
 
-    # Build pose graph — world_lidar clouds are already in world frame.
-    # ICP finds small residual corrections. Node poses start at identity.
-    print("\nBuilding pose graph...")
-    pose_graph = o3d.pipelines.registration.PoseGraph()
-    for _ in scan_dirs:
-        pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
+    # Iterative pose graph refinement — each pass uses the previous corrected poses
+    # as initialization, so ICP finds progressively smaller residuals.
+    for iteration in range(iterations):
+        print(f"\n=== Pose graph iteration {iteration+1}/{iterations} ===")
 
-    n_scans = len(pcds)
+        # Rebuild pcds from accumulated trajectory_poses on iterations > 0
+        if iteration > 0:
+            pcds = []
+            for i, f in enumerate(lidar_files):
+                pcd = o3d.io.read_point_cloud(str(f))
+                pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                pcd = pcd.voxel_down_sample(voxel_size)
+                pcd.transform(trajectory_poses[i])
+                pcd.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+                pcd.orient_normals_consistent_tangent_plane(30)
+                pcds.append(pcd)
 
-    # Sequential edges
-    for i in range(n_scans - 1):
-        print(f"\nRefining edge {i} -> {i+1} (sequential)")
-        result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, np.eye(4))
-        print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
-        T_icp = result.transformation
-        rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
-        trans_m = np.linalg.norm(T_icp[:3, 3])
-        if result.fitness < 0.30 or rot_deg > 5.0 or trans_m > 0.15:
+        n_scans = len(pcds)
+        pose_graph = o3d.pipelines.registration.PoseGraph()
+        for _ in scan_dirs:
+            pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
+
+        # Sequential edges.
+        # world_lidar.ply clouds are already in world frame and brought to
+        # relative-to-first by T_first_inv, so they are already roughly aligned.
+        # Use identity init — trajectory_poses include scanner tilt which is
+        # NOT present in world_lidar (motion-compensated per-frame).
+        seq_edge_fitnesses = []
+        for i in range(n_scans - 1):
+            print(f"\nRefining edge {i} -> {i+1} (sequential)")
+            result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, np.eye(4))
+            print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
+            T_icp = result.transformation
             if result.fitness < 0.30:
-                print(f"  ⚠ Low fitness ({result.fitness:.3f}) — using identity (trajectory pose)")
+                print(f"  ⚠ Low fitness ({result.fitness:.3f}) — using identity")
+                T_icp = np.eye(4)
             else:
-                print(f"  ⚠ ICP correction too large (rot={rot_deg:.1f}°, t={trans_m:.3f}m) — using identity")
-            T_icp = np.eye(4)
-        information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-            pcds[i], pcds[i+1], voxel_size * 2, T_icp)
-        information *= 10.0
-        pose_graph.edges.append(
-            o3d.pipelines.registration.PoseGraphEdge(
+                seq_edge_fitnesses.append(result.fitness)
+            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                pcds[i], pcds[i+1], voxel_size * 2, T_icp)
+            information *= 10.0
+            pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                 i, i+1, T_icp, information, uncertain=False))
 
-    # KNN loop-closure edges
-    centers = [np.mean(np.asarray(pcd.points), axis=0) for pcd in pcds]
-    added_pairs = {(i, i + 1) for i in range(n_scans - 1)}
-
-    for i in range(n_scans):
-        dists = sorted(
-            [(j, np.linalg.norm(centers[i] - centers[j]))
-             for j in range(n_scans) if abs(i - j) > 1],
-            key=lambda x: x[1])
-        for j, dist in dists[:2]:
-            if dist > 1.5:
-                break
-            pair = (min(i, j), max(i, j))
-            if pair in added_pairs:
-                continue
-            added_pairs.add(pair)
-            src, tgt = pair
-            print(f"\nRefining edge {src} -> {tgt} (KNN, dist={dist:.2f}m)")
-            result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, np.eye(4))
-            print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
-            if result.fitness > 0.35:
-                T_icp = result.transformation
-                rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
-                trans_m = np.linalg.norm(T_icp[:3, 3])
-                if rot_deg > 5.0 or trans_m > 0.15:
-                    print(f"  ⚠ Loop closure correction too large (rot={rot_deg:.1f}°, t={trans_m:.3f}m) — skipping")
+        # KNN loop-closure edges — use 3 neighbors and extend range to 2.0m
+        centers = [np.mean(np.asarray(pcd.points), axis=0) for pcd in pcds]
+        added_pairs = {(i, i+1) for i in range(n_scans - 1)}
+        for i in range(n_scans):
+            dists = sorted([(j, np.linalg.norm(centers[i] - centers[j]))
+                            for j in range(n_scans) if abs(i-j) > 1], key=lambda x: x[1])
+            for j, dist in dists[:3]:
+                if dist > 2.0:
+                    break
+                pair = (min(i,j), max(i,j))
+                if pair in added_pairs:
                     continue
-                information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
-                    pcds[src], pcds[tgt], voxel_size * 2, T_icp)
-                pose_graph.edges.append(
-                    o3d.pipelines.registration.PoseGraphEdge(
+                added_pairs.add(pair)
+                src, tgt = pair
+                print(f"\nLoop closure edge {src} -> {tgt} (dist={dist:.2f}m)")
+                result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, np.eye(4))
+                print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
+                if result.fitness > 0.35:
+                    T_icp = result.transformation
+                    information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                        pcds[src], pcds[tgt], voxel_size * 2, T_icp)
+                    pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                         src, tgt, T_icp, information, uncertain=True))
-    
-    print("\nSaving aligned results...")
-    # Compute average sequential edge quality from sanity-checked edges
-    seq_good = sum(1 for e in pose_graph.edges if not e.uncertain)
-    avg_seq_fitness = seq_good / max(n_scans - 1, 1)
-    print(f"Sequential edge quality: {seq_good}/{n_scans-1} passed sanity check")
-    # ICP corrections are in world frame (small residuals on already-aligned clouds).
-    # To get the final transform for sensor-frame colored clouds:
-    #   T_final = T_icp_correction @ trajectory_pose
-    # where trajectory_pose transforms sensor->world and T_icp_correction refines it.
-    if avg_seq_fitness < 0.5 or len(pose_graph.edges) < n_scans:
-        print("⚠ ICP edges unreliable — using trajectory poses directly (skipping optimization)")
-        icp_corrections = [np.eye(4)] * n_scans
-    else:
-        print(f"Optimizing pose graph ({len(pose_graph.nodes)} nodes, {len(pose_graph.edges)} edges)...")
-        option = o3d.pipelines.registration.GlobalOptimizationOption(
-            max_correspondence_distance=voxel_size * 2,
-            edge_prune_threshold=0.25,
-            reference_node=0,
-            preference_loop_closure=0.1)
-        o3d.pipelines.registration.global_optimization(
-            pose_graph,
-            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-            option)
-        print("Optimization complete!")
-        icp_corrections = [node.pose for node in pose_graph.nodes]
+
+        seq_good = sum(1 for e in pose_graph.edges if not e.uncertain)
+        mean_seq_fitness = np.mean(seq_edge_fitnesses) if seq_edge_fitnesses else 0.0
+        print(f"\nSequential edges: {seq_good}/{n_scans-1} passed  mean_fitness={mean_seq_fitness:.3f}")
+
+        if mean_seq_fitness < 0.30 or n_scans < 3:
+            print("⚠ Insufficient ICP quality — using trajectory poses directly")
+            icp_corrections = [np.eye(4)] * n_scans
+        else:
+            print(f"Optimizing pose graph ({len(pose_graph.nodes)} nodes, {len(pose_graph.edges)} edges)...")
+            option = o3d.pipelines.registration.GlobalOptimizationOption(
+                max_correspondence_distance=voxel_size * 2,
+                edge_prune_threshold=0.25,
+                reference_node=0,
+                preference_loop_closure=0.1)
+            o3d.pipelines.registration.global_optimization(
+                pose_graph,
+                o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+                o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+                option)
+            print("Optimization complete!")
+            icp_corrections = [node.pose for node in pose_graph.nodes]
+            for i, T_corr in enumerate(icp_corrections):
+                if i == 0:
+                    continue
+                rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_corr[:3,:3]) - 1) / 2, -1, 1)))
+                trans_m = np.linalg.norm(T_corr[:3, 3])
+                if rot_deg > 15.0 or trans_m > 0.5:
+                    print(f"  ⚠ {scan_dirs[i].name}: correction too large — reverting")
+                    icp_corrections[i] = np.eye(4)
+
+    # icp_corrections from pose graph nodes are the final corrections
 
     # Full transform for sensor-frame colored clouds:
     # T_final = T_icp_correction @ T_first_inv @ T_abs
@@ -491,12 +508,29 @@ def register_pose_graph(session_dir, max_gyro=0.12):
     print("\nCreating merged colored point cloud...")
     merged_colored = o3d.geometry.PointCloud()
 
+    # Include gyro-filtered scans with their full transforms
     for i, scan_dir in enumerate(scan_dirs):
         colored_file = next((scan_dir / n for n in COLORED_CANDIDATES if (scan_dir / n).exists()), None)
         if colored_file:
             pcd = o3d.io.read_point_cloud(str(colored_file))
             pcd.transform(full_transforms[i])
             merged_colored = merged_colored + pcd
+
+    # Include gyro-skipped scans using trajectory pose
+    all_scan_dirs = sorted(session_path.glob('fusion_scan_*'))
+    skipped_dirs = [d for d in all_scan_dirs if d not in scan_dirs]
+    for scan_dir in skipped_dirs:
+        colored_file = next((scan_dir / n for n in COLORED_CANDIDATES if (scan_dir / n).exists()), None)
+        if not colored_file:
+            continue
+        traj_file = scan_dir / 'trajectory.json'
+        if not traj_file.exists():
+            continue
+        T_abs = pose_to_T_from_file(traj_file)
+        T_rel = T_first_inv @ T_abs
+        pcd = o3d.io.read_point_cloud(str(colored_file))
+        pcd.transform(T_rel)
+        merged_colored = merged_colored + pcd
 
     if len(merged_colored.points) > 0:
         merged_colored = merged_colored.voxel_down_sample(0.005)
@@ -505,11 +539,13 @@ def register_pose_graph(session_dir, max_gyro=0.12):
         print(f"Merged: {merged_colored_file} ({len(merged_colored.points)} points)")
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: python align_scan_session_posegraph.py <session_dir>")
-        return
-
-    register_pose_graph(sys.argv[1])
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("session_dir")
+    parser.add_argument("--max-gyro", type=float, default=0.15)
+    parser.add_argument("--iterations", type=int, default=1)
+    args = parser.parse_args()
+    register_pose_graph(args.session_dir, max_gyro=args.max_gyro, iterations=args.iterations)
 
 if __name__ == "__main__":
     main()

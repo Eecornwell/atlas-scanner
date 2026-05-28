@@ -3,10 +3,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Orion. All rights reserved.
 #
-# Description: One-shot script that prints the translation and rotation values from a completed calib.json result. Used for manual inspection of calibration output.
+# Description: Extracts T_lidar_camera from calib.json, undoes the R_align pre-rotation
+# applied during lidar intensity image generation, and writes fusion_calibration.yaml.
 import json
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+# R_align applied in generate_intensity_images.py before projecting lidar points,
+# followed by a 180-degree image rotation. The effective transform seen by the tool is
+# R_align_eff = diag(-1,-1,1) @ R_align_proj = [[0,1,0],[0,0,1],[1,0,0]]
+# The tool finds R_found = R_align_eff @ T_cam_lidar_rot, so:
+# T_cam_lidar_rot = R_align_eff.T @ R_found
+R_ALIGN = np.array([[0,1,0],[0,0,1],[1,0,0]], dtype=float)
 
 # Load calibration results
 with open('/home/orion/atlas_ws/output/calib.json', 'r') as f:
@@ -23,13 +31,22 @@ else:
 tx, ty, tz = quat_trans[0], quat_trans[1], quat_trans[2]
 qx, qy, qz, qw = quat_trans[3], quat_trans[4], quat_trans[5], quat_trans[6]
 
-# Convert quaternion to rotation matrix then to Euler angles
-rotation = R.from_quat([qx, qy, qz, qw])
+# The tool outputs T_lidar_camera where the camera frame includes R_align.
+# Undo R_align to recover the true T_camera_lidar rotation:
+# T_lidar_camera_found = R_align @ T_cam_lidar, so T_cam_lidar = R_align.T @ T_lidar_camera_found
+# Then invert to get T_camera_lidar (what fusion_calibration.yaml expects).
+R_lc_found = R.from_quat([qx, qy, qz, qw]).as_matrix()
+R_lc_true = R_ALIGN.T @ R_lc_found
+# Invert to get T_camera_lidar
+R_cl = R_lc_true.T
+t_cl = -R_lc_true.T @ np.array([tx, ty, tz])
+
+rotation = R.from_matrix(R_cl)
 euler_rad = rotation.as_euler('xyz', degrees=False)
 euler_deg = rotation.as_euler('xyz', degrees=True)
 
 print("=== DIRECT VISUAL LIDAR CALIBRATION RESULTS ===")
-print(f"Translation (meters): x={tx:.4f}, y={ty:.4f}, z={tz:.4f}")
+print(f"Translation (meters): x={t_cl[0]:.4f}, y={t_cl[1]:.4f}, z={t_cl[2]:.4f}")
 print(f"Rotation (degrees): roll={euler_deg[0]:.2f}, pitch={euler_deg[1]:.2f}, yaw={euler_deg[2]:.2f}")
 print(f"Rotation (radians): roll={euler_rad[0]:.4f}, pitch={euler_rad[1]:.4f}, yaw={euler_rad[2]:.4f}")
 print()
@@ -43,9 +60,9 @@ manual_pitch_adjustment: 0.0
 manual_yaw_adjustment: 0.0
 azimuth_offset: 0.0
 elevation_offset: 0.0
-x_offset: {tx}
-y_offset: {ty}
-z_offset: {tz}
+x_offset: {t_cl[0]}
+y_offset: {t_cl[1]}
+z_offset: {t_cl[2]}
 flip_x: false
 flip_y: false
 image_width: 1920
