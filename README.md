@@ -113,7 +113,7 @@
 | Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for 3 seconds per scan (mostly used for calibration)           |
 | Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                                        |
 | Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                                 |
-| Terrestrial mode (time-lapse scans) | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
+| Terrestrial mode (interval scans)   | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
 | Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                           |
 | Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images               |
 | SDK stitch mode (high-quality ERP)  | Yes       | Insta360 MediaSDK stitcher produces full 5760×2880 ERPs; requires `USE_SDK_STITCH=true` and `dual_fisheye` mode  |

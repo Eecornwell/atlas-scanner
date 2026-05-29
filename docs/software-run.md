@@ -41,7 +41,7 @@ USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (du
 
 **How it works:**
 
-- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `~/insta360-dev/`) takes ownership of the USB device and runs a timelapse session at `CONTINUOUS_INTERVAL` seconds.
+- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `~/insta360-dev/`) takes ownership of the USB device and runs an interval shooting session at `CONTINUOUS_INTERVAL` seconds.
 - During the session, `insta360_capture` polls the camera for new `.insp` raw files and downloads them to the session directory in the background. Shutter events are written as `.shutter_event` files only when a confirmed `.insp` file is found — not synthetically from elapsed time.
 - After the session ends, `insta360_capture` continues polling until no new files appear in two consecutive passes, ensuring all buffered photos are downloaded before post-processing begins.
 - Each `.insp` file is stitched to a full 5760×2880 ERP JPEG by `insta360_stitch` (also from `~/insta360-dev/`) during reconstruction.
@@ -49,11 +49,11 @@ USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (du
 
 **ERP orientation and EIS correction (continuous mode):**
 
-The Insta360 SDK stitcher locks all ERPs in a timelapse session to the camera's orientation at the first shutter event (timelapse start). This means every ERP shares the same reference frame as the first shot — it is not body-fixed per shot and not gravity-stabilised.
+The Insta360 SDK stitcher locks all ERPs in an interval shooting session to the camera's orientation at the first shutter event (session start). This means every ERP shares the same reference frame as the first shot — it is not body-fixed per shot and not gravity-stabilised.
 
 To correct for this, `exact_match_fusion.py` applies an EIS rotation when the `.sdk_stitch_continuous` sentinel file is present:
 
-1. The odometry pose at timelapse start is saved to `.sdk_stitch_ref_pose.json` by `reconstruct_from_bag.py`.
+1. The odometry pose at session start is saved to `.sdk_stitch_ref_pose.json` by `reconstruct_from_bag.py`.
 2. For each scan N (except scan_001), `T_eis = inv(T_ref) @ T_N` is computed and applied to the LiDAR points before UV projection.
 3. All scans project into scan_001's masked ERP (`equirect_dual_fisheye_masked.png`), which has the correct orientation reference and masks the scanner body (nadir region).
 
