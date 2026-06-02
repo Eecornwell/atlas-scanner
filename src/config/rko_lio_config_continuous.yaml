@@ -13,8 +13,8 @@ publish_deskewed_scan: false
 invert_odom_tf: false
 
 deskew: true
-# initialization_phase: false — scanner is picked up immediately, no static gravity estimate
-initialization_phase: false
+# initialization_phase: true — let scanner settle for 1-2s for gravity estimate
+initialization_phase: true
 extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 

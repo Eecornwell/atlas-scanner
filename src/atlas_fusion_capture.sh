@@ -37,7 +37,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
-ENABLE_ICP_ALIGNMENT=false
+ENABLE_ICP_ALIGNMENT=true
 EXPORT_COLMAP=false
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images (ignored when USE_SDK_STITCH=true)
 USE_SDK_STITCH=true               # use Insta360 MediaSDK for ERP stitching (much better quality than manual fisheye_to_erp)
@@ -181,7 +181,7 @@ cleanup() {
                 _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
             fi
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.0 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
             # SDK stitch: re-run coloring after reconstruction so sensor_colored_exact.ply
             # is built from the freshly reconstructed sensor_lidar.ply, not stale data.
             if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then

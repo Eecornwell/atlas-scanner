@@ -440,7 +440,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
         mean_seq_fitness = np.mean(seq_edge_fitnesses) if seq_edge_fitnesses else 0.0
         print(f"\nSequential edges: {seq_good}/{n_scans-1} passed  mean_fitness={mean_seq_fitness:.3f}")
 
-        if mean_seq_fitness < 0.10 or n_scans < 3:
+        if mean_seq_fitness < 0.05 or n_scans < 3:
             print("⚠ Insufficient ICP quality — using trajectory poses directly")
             icp_corrections = list(trajectory_poses)
         else:
@@ -460,20 +460,28 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
                 ref.estimate_normals(
                     o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
 
-                # ICP from identity — cloud already in trajectory frame
-                # Use tight search radius so ICP only makes small residual corrections
-                # and cannot jump to wrong correspondences in symmetric room geometry.
+                # Two-stage ICP from identity — cloud already in trajectory frame.
+                # Stage 1: coarse pass with a wide search radius to handle trajectory
+                # drift up to ~50 cm (common in continuous handheld mode).
+                # Stage 2: fine pass at voxel_size to lock in sub-voxel accuracy.
+                coarse_dist = voxel_size * 8  # ~40 cm for voxel_size=0.05
                 result = o3d.pipelines.registration.registration_icp(
-                    pcds[i], ref, voxel_size, np.eye(4),
-                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    pcds[i], ref, coarse_dist, np.eye(4),
+                    o3d.pipelines.registration.TransformationEstimationPointToPoint(),
                     o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+                if result.fitness >= 0.15:
+                    loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 1.0)
+                    result = o3d.pipelines.registration.registration_icp(
+                        pcds[i], ref, voxel_size * 2, result.transformation,
+                        o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
+                        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
 
                 T_icp = result.transformation
                 rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
                 trans_m = np.linalg.norm(T_icp[:3, 3])
                 euler = np.degrees(Rotation.from_matrix(T_icp[:3,:3]).as_euler('xyz'))
 
-                if result.fitness < 0.25 or rot_deg > 20.0 or trans_m > 0.50:
+                if result.fitness < 0.15 or rot_deg > 20.0 or trans_m > 1.0:
                     print(f"  ⚠ {scan_dirs[i].name}: rejected fitness={result.fitness:.3f} rot={rot_deg:.1f}deg trans={trans_m*100:.0f}cm")
                     icp_corrections.append(trajectory_poses[i])
                 else:
