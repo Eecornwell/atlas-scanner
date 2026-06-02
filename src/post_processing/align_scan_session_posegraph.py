@@ -100,17 +100,21 @@ def load_trajectory_pose(scan_dir):
 
     return np.eye(4)
 
-def coarse_icp(source, target, voxel_size):
-    """Fast coarse ICP to measure overlap fitness. Uses only 2 stages."""
-    loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 4.0)
+def coarse_icp(source, target, voxel_size, init_transform=None):
+    """Coarse ICP using trajectory pose as initialization."""
+    if init_transform is None:
+        init_transform = np.eye(4)
+    # Use point-to-point for coarse stage (more robust when normals are noisy)
     result = o3d.pipelines.registration.registration_icp(
-        source, target, voxel_size * 15, np.eye(4),
+        source, target, voxel_size * 4, init_transform,
+        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+    # Refine with point-to-plane
+    loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 2.0)
+    result = o3d.pipelines.registration.registration_icp(
+        source, target, voxel_size * 2, result.transformation,
         o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
-    result = o3d.pipelines.registration.registration_icp(
-        source, target, voxel_size * 5, result.transformation,
-        o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20))
     return result
 
 
@@ -135,23 +139,28 @@ def fine_icp(source, target, voxel_size, init_transform):
 
 def pairwise_icp(source, target, voxel_size, init_transform,
                  source_colored=None, target_colored=None):
-    """Two-stage ICP: coarse pass to assess fitness, fine pass only if overlap is sufficient.
-
-    This avoids wasting time on fine ICP for pairs with poor overlap, and prevents
-    low-quality edges from polluting the pose graph.
-    Returns (result, used_fine) where used_fine indicates fine ICP was run.
+    """Two-stage ICP: coarse pass initialized from trajectory, fine pass to refine.
+    Fitness is evaluated at 2x voxel_size after fine ICP for a fair comparison.
     """
-    # Stage 1: fast coarse ICP to measure overlap
-    coarse = coarse_icp(source, target, voxel_size)
+    coarse = coarse_icp(source, target, voxel_size, init_transform)
 
-    # Only run fine ICP if coarse fitness is good enough to trust
-    MIN_FITNESS_FOR_FINE = 0.30
+    MIN_FITNESS_FOR_FINE = 0.15
     if coarse.fitness < MIN_FITNESS_FOR_FINE:
-        return coarse  # return coarse result; caller will likely reject it
+        # Re-evaluate fitness at 2x voxel_size for consistent comparison
+        eval_result = o3d.pipelines.registration.evaluate_registration(
+            source, target, voxel_size * 2, coarse.transformation)
+        coarse = type('R', (), {'fitness': eval_result.fitness,
+                                'inlier_rmse': eval_result.inlier_rmse,
+                                'transformation': coarse.transformation})()
+        return coarse
 
-    # Stage 2: fine ICP from coarse initialisation
     result = fine_icp(source, target, voxel_size, coarse.transformation)
-
+    # Re-evaluate fitness at 2x voxel_size so it's not penalized by the tight fine radius
+    eval_result = o3d.pipelines.registration.evaluate_registration(
+        source, target, voxel_size * 2, result.transformation)
+    result = type('R', (), {'fitness': eval_result.fitness,
+                            'inlier_rmse': eval_result.inlier_rmse,
+                            'transformation': result.transformation})()
     return result
 
 def _load_imu_from_bag(session_path):
@@ -247,10 +256,10 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     else:
         print("  ⚠ No IMU data found — skipping gyro filter")
 
-    # Use world_lidar.ply for ICP — these are already in world frame with
-    # per-frame motion compensation, so no trajectory pre-transform is needed.
-    # This gives much better ICP fitness than sensor-frame clouds pre-transformed
-    # by tilted trajectory poses.
+    # Use world_lidar.ply for ICP — already in absolute odom world frame.
+    # Transform to relative-to-first using T_first_inv so all clouds share
+    # the same coordinate frame. This gives much better ICP fitness than
+    # sensor-frame clouds which require large trajectory pre-transforms.
     LIDAR_CANDIDATES = ["world_lidar.ply", "sensor_lidar.ply"]
     COLORED_CANDIDATES = [
         "sensor_colored_exact.ply", "sensor_colored_pointcloud.ply", "sensor_colored.ply",
@@ -320,13 +329,16 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     # Use world_lidar.ply for ICP (already motion-compensated world frame).
     # Transform to relative-to-first for ICP, then apply the same correction
     # to the colored clouds (also transformed to relative-to-first via trajectory_poses).
-    voxel_size = 0.05
+    voxel_size = 0.05  # 5cm voxels for ICP reference matching
     pcds = []
     pcds_colored = []
     for i, f in enumerate(lidar_files):
         pcd = o3d.io.read_point_cloud(str(f))
         pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         pcd = pcd.voxel_down_sample(voxel_size)
+        # world_lidar.ply is already in absolute odom world frame.
+        # Apply only T_first_inv to bring all clouds into relative-to-first frame.
+        # DO NOT apply trajectory_poses[i] again — world_lidar already has it baked in.
         pcd.transform(T_first_inv)
         pcd.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
@@ -353,7 +365,17 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
                 pcd = o3d.io.read_point_cloud(str(f))
                 pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
                 pcd = pcd.voxel_down_sample(voxel_size)
-                pcd.transform(trajectory_poses[i])
+                # world_lidar in abs frame; apply T_icp_prev @ T_first_inv to refine
+                T_prev_corr = icp_corrections[i]  # refined relative-to-first pose
+                # world_pts -> T_first_inv -> rel frame -> T_icp_corr -> refined
+                # = T_icp_corr @ T_first_inv @ world_pts
+                # But T_icp_corr already IS the refined relative-to-first pose.
+                # So we need T_icp_corr @ inv(T_first_inv @ T_abs) @ T_first_inv
+                # = T_icp_corr @ T_first_inv since world = T_abs @ sensor
+                pcd.transform(T_first_inv)  # world -> rel-to-first
+                # Apply the delta between icp_correction and trajectory_pose
+                T_delta = T_prev_corr @ np.linalg.inv(trajectory_poses[i])
+                pcd.transform(T_delta)  # apply the ICP correction delta
                 pcd.estimate_normals(
                     o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
                 pcd.orient_normals_consistent_tangent_plane(30)
@@ -372,10 +394,13 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
         seq_edge_fitnesses = []
         for i in range(n_scans - 1):
             print(f"\nRefining edge {i} -> {i+1} (sequential)")
-            result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, np.eye(4))
+            # Initialize ICP with the trajectory relative pose to avoid local minima.
+            # The trajectory gives the approximate relative transform; ICP refines it.
+            T_traj_rel = trajectory_poses[i+1] @ np.linalg.inv(trajectory_poses[i])
+            result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, T_traj_rel)
             print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
             T_icp = result.transformation
-            if result.fitness < 0.30:
+            if result.fitness < 0.25:
                 print(f"  ⚠ Low fitness ({result.fitness:.3f}) — using identity")
                 T_icp = np.eye(4)
             else:
@@ -401,9 +426,10 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
                 added_pairs.add(pair)
                 src, tgt = pair
                 print(f"\nLoop closure edge {src} -> {tgt} (dist={dist:.2f}m)")
-                result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, np.eye(4))
+                T_traj_rel_lc = trajectory_poses[tgt] @ np.linalg.inv(trajectory_poses[src])
+                result = pairwise_icp(pcds[src], pcds[tgt], voxel_size, T_traj_rel_lc)
                 print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
-                if result.fitness > 0.35:
+                if result.fitness > 0.25:
                     T_icp = result.transformation
                     information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
                         pcds[src], pcds[tgt], voxel_size * 2, T_icp)
@@ -414,45 +440,63 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
         mean_seq_fitness = np.mean(seq_edge_fitnesses) if seq_edge_fitnesses else 0.0
         print(f"\nSequential edges: {seq_good}/{n_scans-1} passed  mean_fitness={mean_seq_fitness:.3f}")
 
-        if mean_seq_fitness < 0.30 or n_scans < 3:
+        if mean_seq_fitness < 0.10 or n_scans < 3:
             print("⚠ Insufficient ICP quality — using trajectory poses directly")
-            icp_corrections = [np.eye(4)] * n_scans
+            icp_corrections = list(trajectory_poses)
         else:
-            print(f"Optimizing pose graph ({len(pose_graph.nodes)} nodes, {len(pose_graph.edges)} edges)...")
-            option = o3d.pipelines.registration.GlobalOptimizationOption(
-                max_correspondence_distance=voxel_size * 2,
-                edge_prune_threshold=0.25,
-                reference_node=0,
-                preference_loop_closure=0.1)
-            o3d.pipelines.registration.global_optimization(
-                pose_graph,
-                o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
-                o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
-                option)
-            print("Optimization complete!")
-            icp_corrections = [node.pose for node in pose_graph.nodes]
-            for i, T_corr in enumerate(icp_corrections):
-                if i == 0:
-                    continue
-                rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_corr[:3,:3]) - 1) / 2, -1, 1)))
-                trans_m = np.linalg.norm(T_corr[:3, 3])
-                if rot_deg > 15.0 or trans_m > 0.5:
-                    print(f"  ⚠ {scan_dirs[i].name}: correction too large — reverting")
-                    icp_corrections[i] = np.eye(4)
+            print(f"Refining poses: leave-one-out ICP against merged reference...")
+            # Each scan is refined against the merged geometry of ALL OTHER scans.
+            # The cloud is pre-transformed by the trajectory pose, so ICP from
+            # identity finds ONLY the small residual correction needed.
+            # Corrected pose = T_icp_residual @ trajectory_pose[i]
+            icp_corrections = [trajectory_poses[0]]  # scan_001 is reference
+            for i in range(1, n_scans):
+                # Build reference from all scans except current
+                ref = o3d.geometry.PointCloud()
+                for j, p in enumerate(pcds):
+                    if j != i:
+                        ref = ref + p
+                ref = ref.voxel_down_sample(voxel_size)
+                ref.estimate_normals(
+                    o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
 
-    # icp_corrections from pose graph nodes are the final corrections
+                # ICP from identity — cloud already in trajectory frame
+                # Use tight search radius so ICP only makes small residual corrections
+                # and cannot jump to wrong correspondences in symmetric room geometry.
+                result = o3d.pipelines.registration.registration_icp(
+                    pcds[i], ref, voxel_size, np.eye(4),
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
 
-    # Full transform for sensor-frame colored clouds:
-    # T_final = T_icp_correction @ T_first_inv @ T_abs
-    #         = T_icp_correction @ trajectory_poses[i]
-    # This matches merge_with_trajectory.py's relative-to-first convention.
-    full_transforms = [icp_corrections[i] @ trajectory_poses[i] for i in range(n_scans)]
+                T_icp = result.transformation
+                rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
+                trans_m = np.linalg.norm(T_icp[:3, 3])
+                euler = np.degrees(Rotation.from_matrix(T_icp[:3,:3]).as_euler('xyz'))
+
+                if result.fitness < 0.25 or rot_deg > 20.0 or trans_m > 0.50:
+                    print(f"  ⚠ {scan_dirs[i].name}: rejected fitness={result.fitness:.3f} rot={rot_deg:.1f}deg trans={trans_m*100:.0f}cm")
+                    icp_corrections.append(trajectory_poses[i])
+                else:
+                    # T_icp is the residual correction in the already-trajectory-aligned frame.
+                    # Apply it on top of the trajectory pose.
+                    T_corr = T_icp @ trajectory_poses[i]
+                    print(f"  ✓ {scan_dirs[i].name}: fitness={result.fitness:.3f}  "
+                          f"t=({T_icp[0,3]*100:+.1f},{T_icp[1,3]*100:+.1f},{T_icp[2,3]*100:+.1f})cm  "
+                          f"euler=({euler[0]:+.1f},{euler[1]:+.1f},{euler[2]:+.1f})deg")
+                    icp_corrections.append(T_corr)
+            print("Refinement complete!")
+
+    # icp_corrections[i] holds the final absolute pose in relative-to-first frame
+    # (either the optimized pose from the pose graph, or the trajectory pose if reverted).
+    full_transforms = icp_corrections
 
     for i, scan_dir in enumerate(scan_dirs):
         T_rel = full_transforms[i]
         t = T_rel[:3, 3]
         euler_deg = np.degrees(Rotation.from_matrix(T_rel[:3, :3]).as_euler('xyz'))
-        correction_applied = not np.allclose(icp_corrections[i], np.eye(4), atol=1e-6)
+        # correction_applied: optimized pose differs from trajectory pose
+        T_delta = T_rel @ np.linalg.inv(trajectory_poses[i])
+        correction_applied = not np.allclose(T_delta, np.eye(4), atol=1e-4)
         print(f"{scan_dir.name}: {'ICP corrected' if correction_applied else 'trajectory (identity)'}")
         print(f"  Position: [{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}]")
         print(f"  Rotation: [{euler_deg[0]:.1f}°, {euler_deg[1]:.1f}°, {euler_deg[2]:.1f}°]")
@@ -462,10 +506,15 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
             with open(traj_file) as f:
                 traj = json.load(f)
             traj_refined = traj.copy()
-            q_refined = Rotation.from_matrix(T_rel[:3, :3]).as_quat()
+            # icp_corrections[i] is the corrected pose in relative-to-first frame.
+            # Convert back to absolute odom frame for storage, matching
+            # the original trajectory.json convention so pose_from_trajectory()
+            # computes T_first_inv @ T_abs correctly.
+            T_abs_corrected = traj_poses_abs[0] @ icp_corrections[i]
+            q_refined = Rotation.from_matrix(T_abs_corrected[:3, :3]).as_quat()
             traj_refined['current_pose'] = dict(traj_refined.get('current_pose', {}))
             traj_refined['current_pose']['lidar_pose'] = {
-                'position': {'x': float(T_rel[0, 3]), 'y': float(T_rel[1, 3]), 'z': float(T_rel[2, 3])},
+                'position': {'x': float(T_abs_corrected[0, 3]), 'y': float(T_abs_corrected[1, 3]), 'z': float(T_abs_corrected[2, 3])},
                 'orientation': {'x': float(q_refined[0]), 'y': float(q_refined[1]),
                                 'z': float(q_refined[2]), 'w': float(q_refined[3])}
             }

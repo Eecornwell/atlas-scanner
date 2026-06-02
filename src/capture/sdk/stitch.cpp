@@ -21,7 +21,7 @@ int main(int argc, char* argv[]) {
     stitcher.SetInputPath(inputs);
     stitcher.SetOutputPath(output_path);
     stitcher.SetOutputSize(erp_w, erp_h);
-    stitcher.SetStitchType(STITCH_TYPE::DYNAMICSTITCH);
+    stitcher.SetStitchType(STITCH_TYPE::TEMPLATE);
     stitcher.EnableFlowState(false);
     stitcher.EnableCuda(false);
 

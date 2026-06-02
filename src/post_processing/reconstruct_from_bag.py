@@ -873,21 +873,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 
-    # Write sentinel and ERP reference pose so exact_match_fusion.py applies EIS correction
+    # Write sentinel so downstream tools know this was an SDK stitch session
     if sdk_stitch and camera_mode == 'dual_fisheye':
         (session_path / '.sdk_stitch_continuous').touch()
-        # Write the pose at the first shutter time (timelapse start = ERP reference frame)
-        # This may be before the odom window, so interp_pose extrapolates from first odom.
-        if shutter_msgs and odom_msgs:
-            import json as _json
-            t_erp = shutter_msgs[0][1].data  # first shutter = timelapse start
-            t_ref, q_ref = interp_pose(odom_msgs, t_erp)
-            ref_pose = {
-                'orientation': {'x': float(q_ref[0]), 'y': float(q_ref[1]),
-                                'z': float(q_ref[2]), 'w': float(q_ref[3])},
-                'position':    {'x': float(t_ref[0]), 'y': float(t_ref[1]), 'z': float(t_ref[2])}
-            }
-            (session_path / '.sdk_stitch_ref_pose.json').write_text(_json.dumps(ref_pose))
     # --- ERP conversion + colorization ---
     pp = Path(__file__).resolve().parent
     sdk_stitch_bin = Path.home() / "insta360-dev/build/insta360_stitch"

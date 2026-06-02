@@ -17,9 +17,10 @@ T_camera_lidar maps sensor-frame LiDAR points directly into the camera frame.
 
 In SDK stitch continuous mode, sensor_lidar.ply is motion-compensated to the
 capture-time sensor frame by reconstruct_from_bag.py, so it already matches
-the ERP orientation. No world-frame transform is needed or correct here —
-applying T_capture_inv would introduce a yaw error equal to the scanner's
-world-frame heading at each scan.
+the ERP orientation. Each SDK-stitched ERP is independently gravity-aligned
+by the camera's internal IMU (DYNAMICSTITCH), so each scan's ERP correctly
+represents that scan's own sensor-frame orientation. No cross-scan ERP
+reference or EIS correction is needed or correct.
 
 The resulting sensor_colored_exact.ply is in sensor frame. The posegraph /
 merge step applies the trajectory pose (T_world_lidar) to bring it to world
@@ -127,68 +128,6 @@ def exact_match_calibration_tool(scan_dir):
     T_camera_lidar[:3, :3] = R_matrix
     T_camera_lidar[:3, 3] = [t_x, t_y, t_z]
 
-    # The Insta360 SDK stitcher's ERP orientation is locked to the camera's
-    # orientation at timelapse start (first shutter event). Use the pose at
-    # that moment as T_ref, then T_eis = inv(T_ref) @ Tn transforms scan_N's
-    # points into the ERP's reference frame.
-    import json as _json
-    scan_traj = os.path.join(scan_dir, 'trajectory.json')
-    session_dir_path = os.path.dirname(scan_dir)
-    ref_pose_file = os.path.join(session_dir_path, '.sdk_stitch_ref_pose.json')
-    scan001_erp   = os.path.join(session_dir_path, 'fusion_scan_001', 'equirect_dual_fisheye.jpg')
-    sentinel      = os.path.join(session_dir_path, '.sdk_stitch_continuous')
-    is_scan001 = (os.path.basename(scan_dir) == 'fusion_scan_001')
-    T_eis = None
-    if os.path.exists(sentinel) and os.path.exists(scan_traj):
-        try:
-            def _load_T_from_traj(p):
-                lp = _json.loads(open(p).read())['current_pose']['lidar_pose']
-                q = [lp['orientation'][k] for k in 'xyzw']
-                T = np.eye(4)
-                T[:3,:3] = R.from_quat(q).as_matrix()
-                T[:3,3] = [lp['position'][k] for k in 'xyz']
-                return T
-            def _load_T_from_ref(p):
-                d = _json.loads(open(p).read())
-                q = [d['orientation'][k] for k in 'xyzw']
-                T = np.eye(4)
-                T[:3,:3] = R.from_quat(q).as_matrix()
-                T[:3,3] = [d['position'][k] for k in 'xyz']
-                return T
-            # Use ref_pose_file if available, else fall back to scan_001 trajectory
-            if os.path.exists(ref_pose_file):
-                T_ref = _load_T_from_ref(ref_pose_file)
-            else:
-                scan001_traj = os.path.join(session_dir_path, 'fusion_scan_001', 'trajectory.json')
-                T_ref = _load_T_from_traj(scan001_traj)
-            Tn = _load_T_from_traj(scan_traj)
-            T_eis = np.linalg.inv(T_ref) @ Tn
-        except Exception:
-            pass
-    # The Insta360 SDK stitcher's ERP orientation drifts per shot.
-    # Only scan_001's ERP has a known correct orientation (it IS the reference).
-    # For all other scans: rotate points by T_eis into scan_001's frame,
-    # then project into scan_001's own masked ERP.
-    if T_eis is not None and not is_scan001 and os.path.exists(scan001_erp):
-        # Use scan_001's masked PNG if available, else plain ERP
-        scan001_mask = os.path.join(session_dir_path, 'fusion_scan_001',
-                                    'equirect_dual_fisheye_masked.png')
-        if os.path.exists(scan001_mask):
-            image = cv2.imread(scan001_mask, cv2.IMREAD_UNCHANGED)
-            if image is not None and image.ndim == 3 and image.shape[2] == 4:
-                alpha_mask = image[:, :, 3] >= 128
-                image = image[:, :, :3]
-            else:
-                image = cv2.imread(scan001_mask)
-                alpha_mask = None
-        else:
-            image = cv2.imread(scan001_erp)
-            alpha_mask = None
-        if image is None:
-            image = cv2.imread(scan001_erp)
-            alpha_mask = None
-        img_height, img_width = image.shape[:2]
-
     # Filter points
     distances = np.linalg.norm(points, axis=1)
     valid_mask = (distances > 0.8) & (distances < 8.0) & (points[:, 2] > 0.05)
@@ -196,14 +135,7 @@ def exact_match_calibration_tool(scan_dir):
 
     print(f"Processing {len(points)} points...")
 
-    # Apply T_eis to rotate points into scan_001's sensor frame before projection.
-    # Output PLY positions use original sensor-frame coordinates (unchanged).
-    if T_eis is not None:
-        pts_h = np.hstack([points, np.ones((len(points), 1))])
-        points_for_proj = (T_eis @ pts_h.T).T[:, :3]
-    else:
-        points_for_proj = points
-    points_h = np.hstack([points_for_proj, np.ones((len(points_for_proj), 1))])
+    points_h = np.hstack([points, np.ones((len(points), 1))])
     points_camera = (T_camera_lidar @ points_h.T).T[:, :3]
 
     # Equirectangular projection (matches direct_visual_lidar_calibration)

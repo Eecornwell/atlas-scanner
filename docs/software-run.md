@@ -7,7 +7,9 @@ Edit the settings at the top of `~/atlas_ws/src/atlas-scanner/src/atlas_fusion_c
 ```bash
 CAMERA_MODE="single_fisheye"   # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"      # stationary | continuous
-CONTINUOUS_INTERVAL=3          # seconds between captures (continuous mode only)
+CONTINUOUS_INTERVAL=5          # seconds between captures (continuous mode only;
+                               # SDK stitch dual_fisheye: effective interval is
+                               # download-limited to ~10s regardless of this setting)
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
@@ -39,30 +41,31 @@ USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (du
 | `USE_SDK_STITCH=false` | ROS driver (real-time) | Good | Standard path, camera IMU available |
 | `USE_SDK_STITCH=true` | Insta360 MediaSDK (post-session) | Best | Higher quality stitching, no camera IMU in bag |
 
-**How it works:**
+**How it works (continuous mode):**
 
-- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `~/insta360-dev/`) takes ownership of the USB device and runs an interval shooting session at `CONTINUOUS_INTERVAL` seconds.
-- During the session, `insta360_capture` polls the camera for new `.insp` raw files and downloads them to the session directory in the background. Shutter events are written as `.shutter_event` files only when a confirmed `.insp` file is found — not synthetically from elapsed time.
-- After the session ends, `insta360_capture` continues polling until no new files appear in two consecutive passes, ensuring all buffered photos are downloaded before post-processing begins.
-- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG by `insta360_stitch` (also from `~/insta360-dev/`) during reconstruction.
+- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `src/capture/sdk/`) takes ownership of the USB device.
+- In continuous mode, the daemon fires repeated `TakePhoto()` calls — one shot at a time, blocking until each download completes (~10s). This ensures each `.insp` file embeds its own per-shot IMU orientation data, which the SDK stitcher uses to produce an ERP correctly oriented to the camera’s physical frame at that exact moment. Using the SDK’s timelapse mode instead would fix the IMU reference at the first shot, causing ERP yaw drift as the scanner rotates and breaking color alignment.
+- Shutter time = `insp_rtc` (integer UTC second from `.insp` filename, from `SyncLocalTimeToCamera`) + `sync_frac` (sub-second offset of system clock at sync time). This gives <1 ms timing accuracy on the ROS system clock without hardware sync.
+- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG using `TEMPLATE` stitch mode (no gravity correction, camera-frame orientation) by `insta360_stitch` during reconstruction.
 - The `shutter_event_publisher.py` node watches for `.shutter_event` files and publishes them on `/camera/shutter_time`, which is recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
+- Because each `TakePhoto()` blocks for the USB download, the effective capture interval is ~10s regardless of `CONTINUOUS_INTERVAL`. The scanner should be held still for ~0.5s around each shot for best results.
 
-**ERP orientation and EIS correction (continuous mode):**
+**ERP orientation (continuous mode):**
 
-The Insta360 SDK stitcher locks all ERPs in an interval shooting session to the camera's orientation at the first shutter event (session start). This means every ERP shares the same reference frame as the first shot — it is not body-fixed per shot and not gravity-stabilised.
-
-To correct for this, `exact_match_fusion.py` applies an EIS rotation when the `.sdk_stitch_continuous` sentinel file is present:
-
-1. The odometry pose at session start is saved to `.sdk_stitch_ref_pose.json` by `reconstruct_from_bag.py`.
-2. For each scan N (except scan_001), `T_eis = inv(T_ref) @ T_N` is computed and applied to the LiDAR points before UV projection.
-3. All scans project into scan_001's masked ERP (`equirect_dual_fisheye_masked.png`), which has the correct orientation reference and masks the scanner body (nadir region).
+Each `.insp` file is stitched independently using `TEMPLATE` mode (no gravity/IMU stabilisation applied by the stitcher). The camera’s per-shot IMU orientation embedded in the `.insp` file orients the ERP to the camera’s physical frame at capture time — the same convention used during extrinsic calibration. No post-processing EIS correction is needed or applied.
 
 **Building the SDK daemon:**
 
+The source lives in `src/capture/sdk/`. Copy to `~/insta360-dev/` and build:
+
 ```bash
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
 cd ~/insta360-dev && bash build.sh
 # Produces: build/insta360_capture  build/insta360_stitch
 ```
+
+Re-run these commands after any update to `src/capture/sdk/main.cpp` or `stitch.cpp`.
 
 **Manually reconstruct an SDK-stitch session:**
 
@@ -71,7 +74,19 @@ cd ~/atlas_ws && source install/setup.bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
     --camera-mode dual_fisheye --sdk-stitch \
-    --interval 3.0 --lidar-window 0.3
+    --interval 5.0 --lidar-window 0.3
+```
+
+**Run ICP alignment on a session:**
+
+```bash
+# icp_correct.py: leave-one-out ICP using world_lidar.ply, 2cm voxel, 2 passes
+python3 /tmp/icp_correct.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 0.02 2
+# Writes trajectory_icp_refined.json for each scan
+# Then regenerate merged cloud:
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
 
 ## Normal Operation
@@ -191,16 +206,27 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
 
-### Merge scans with ICP alignment (pose graph refinement)
+### Merge scans with ICP alignment
 ```bash
 cd ~/atlas_ws && source install/setup.bash
-python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py \
-    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+python3 /tmp/icp_correct.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    0.02 2   # voxel_size=2cm, 2 passes
 ```
+
+Or via the capture script with `ENABLE_ICP_ALIGNMENT=true` (uses `align_scan_session_posegraph.py`).
 
 ### View a point cloud in the web viewer
 ```bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/web_3d_viewer.py <PLY_FILE>
+```
+
+### View per-scan alignment in the toggle viewer
+```bash
+# Shows each scan as a separate toggleable layer using its trajectory (or ICP-refined) pose.
+# Double-click a scan row to isolate it and inspect color-geometry alignment.
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/scan_toggle_viewer.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
 
 ### Re-run COLMAP panorama SfM on an existing session

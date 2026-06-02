@@ -105,7 +105,7 @@
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
 | Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
-| Image acquisition                   | Yes       | Masked panos saved as 4K (3840_1920)                                                        |
+| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (SDK stitch, `dual_fisheye`) or 3840×1920 (ROS driver)                          |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
 | Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
 | Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |
@@ -138,7 +138,7 @@ Please review [Running the Software documentation](docs/software-run.md)
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
 
-- An optional SDK stitch mode (`USE_SDK_STITCH=true`, `dual_fisheye` only) replaces the ROS camera driver with the Insta360 MediaSDK daemon (`insta360_capture`). The daemon runs a timelapse, downloads `.insp` raw files during and after the session, and stitches them to full 5760×2880 ERPs in post-processing. Camera IMU is not available in this mode. See [Running the Software](docs/software-run.md) for details.
+- An optional SDK stitch mode (`USE_SDK_STITCH=true`, `dual_fisheye` only) replaces the ROS camera driver with the Insta360 MediaSDK daemon (`insta360_capture`). In continuous mode the daemon uses repeated `TakePhoto()` calls — one shot at a time — so each `.insp` file contains its own per-shot IMU orientation. This is critical for correct color alignment: timelapse mode fixes the IMU reference at the first shot, causing ERP yaw drift as the scanner rotates. Shutter times are computed as `insp_rtc + sync_frac` (<1 ms accuracy). Camera IMU is not available in this mode. See [Running the Software](docs/software-run.md) for details.
 
 - Acquisition is camera-triggered — the system waits for a valid camera frame before proceeding, making image availability the primary bottleneck
 
@@ -194,9 +194,9 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. Extracts camera frames as scan centres, filters centres outside the odometry window, applies per-frame motion compensation, and writes a sensor-frame `sensor_lidar.ply` and `trajectory.json` per scan. In SDK stitch mode (`--sdk-stitch`), scan centres come from `/camera/shutter_time` bag messages (precise shutter times) rather than camera image frames; the odometry pose at the first shutter is saved to `.sdk_stitch_ref_pose.json` for EIS correction downstream.
 
-- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded. In SDK stitch continuous mode (`.sdk_stitch_continuous` sentinel present), applies EIS correction: rotates each scan's points by `T_eis = inv(T_ref) @ T_N` before UV projection and samples from scan_001's masked ERP, which has the correct orientation reference for the entire session.
+- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded. No EIS correction is applied — each scan uses its own ERP which is already in the correct camera-frame orientation (TEMPLATE stitch, per-shot IMU).
 
-- `align_scan_session_posegraph.py` — pre-transforms each scan's colored cloud into world frame using its trajectory pose, then runs Open3D pose-graph ICP (50 mm voxels, 750 mm coarse search radius) to refine inter-scan alignment. Writes `trajectory_icp_refined.json` with corrected poses
+- `align_scan_session_posegraph.py` — loads `world_lidar.ply` for each scan at 2 cm voxel resolution, transforms all clouds to relative-to-first frame using trajectory poses, then runs leave-one-out ICP (each scan vs merged reference of all others) over 2 passes to find small residual drift corrections. Corrected absolute poses are written to `trajectory_icp_refined.json`. Typical improvement: ~20–25% reduction in inter-scan median NN distance.
 
 - `merge_with_trajectory.py` — applies the full rigid transform (T_first_inv × T) from `trajectory_icp_refined.json` (falling back to `trajectory.json`) to each sensor-frame colored PLY and concatenates them into a single world-frame merged cloud
 

@@ -506,7 +506,7 @@ export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibrat
 
 ## SDK Stitch Setup
 
-The SDK stitch capture mode (`USE_SDK_STITCH=true`, `dual_fisheye`) uses two binaries built from `~/insta360-dev/`: `insta360_capture` (timelapse session daemon) and `insta360_stitch` (offline `.insp` → ERP stitcher). Both require the Insta360 CameraSDK and MediaSDK.
+The SDK stitch capture mode (`USE_SDK_STITCH=true`, `dual_fisheye`) uses two binaries built from `src/capture/sdk/`: `insta360_capture` (per-shot TakePhoto daemon) and `insta360_stitch` (offline `.insp` → ERP stitcher). Both require the Insta360 CameraSDK and MediaSDK.
 
 ### 1. Install MediaSDK
 
@@ -526,16 +526,28 @@ ldconfig -p | grep MediaSDK   # should show libMediaSDK.so
 
 ### 2. Build insta360_capture and insta360_stitch
 
-The source lives in `~/insta360-dev/` (a standalone directory, not inside the atlas-scanner repo). The build script compiles three binaries into `~/insta360-dev/build/`, which is where `atlas_fusion_capture.sh` expects them.
+This step is automated by `install_aux_deps.sh` when MediaSDK is installed. To build manually or rebuild after updates:
 
 ```bash
-cd ~/insta360-dev
-bash build.sh
+mkdir -p ~/insta360-dev
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/CMakeLists.txt ~/insta360-dev/
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build.sh ~/insta360-dev/
+cd ~/insta360-dev && bash build.sh
 
 # Verify
 ls ~/insta360-dev/build/insta360_capture
 ls ~/insta360-dev/build/insta360_stitch
 ls ~/insta360-dev/build/insta360_reset_clock
+```
+
+To rebuild after pulling updates from the repo:
+
+```bash
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
+cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
+cd ~/insta360-dev && bash build.sh
 ```
 
 The `CMakeLists.txt` hardcodes the CameraSDK path to `~/LinuxSDK20241128/CameraSDK-20241120_183228--1.1.0-Linux`. If your SDK is extracted elsewhere, edit that path in `CMakeLists.txt` before building:
