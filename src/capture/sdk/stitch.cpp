@@ -12,7 +12,7 @@ int main(int argc, char* argv[]) {
     std::string input_path = argv[1];
     std::string output_path = argv[2];
 
-    int erp_w = 3840, erp_h = 1920;
+    int erp_w = 5760, erp_h = 2880;
     if (auto* v = std::getenv("INSTA360_ERP_WIDTH")) erp_w = std::atoi(v);
     if (auto* v = std::getenv("INSTA360_ERP_HEIGHT")) erp_h = std::atoi(v);
 

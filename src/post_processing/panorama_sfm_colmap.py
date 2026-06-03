@@ -75,10 +75,33 @@ def _load_pose(scan_dir, T_camera_lidar):
     pose_data = traj.get('current_pose', {})
     if 'lidar_pose' in pose_data:
         lp = pose_data['lidar_pose']
-    elif 'poses' in traj and traj['poses']:
-        lp = traj['poses'][-1]
     else:
-        return None
+        # Fallback: interpolate from full_trajectory at capture_time
+        si = traj.get('scan_info', {})
+        capture_time = si.get('capture_time') or si.get('scan_request_time')
+        full = traj.get('full_trajectory', [])
+        if capture_time and full:
+            from scipy.spatial.transform import Slerp as _Slerp
+            times = np.array([p['timestamp'] for p in full])
+            idx = np.searchsorted(times, capture_time)
+            if 0 < idx < len(full):
+                p0, p1 = full[idx-1], full[idx]
+                alpha = (capture_time - times[idx-1]) / (times[idx] - times[idx-1])
+                pos0 = np.array([p0['position']['x'], p0['position']['y'], p0['position']['z']])
+                pos1 = np.array([p1['position']['x'], p1['position']['y'], p1['position']['z']])
+                q0 = [p0['orientation']['x'], p0['orientation']['y'], p0['orientation']['z'], p0['orientation']['w']]
+                q1 = [p1['orientation']['x'], p1['orientation']['y'], p1['orientation']['z'], p1['orientation']['w']]
+                r_interp = _Slerp([0.0, 1.0], R.from_quat([q0, q1]))(alpha)
+                lp = {'position': {'x': float(pos0[0]+alpha*(pos1[0]-pos0[0])),
+                                   'y': float(pos0[1]+alpha*(pos1[1]-pos0[1])),
+                                   'z': float(pos0[2]+alpha*(pos1[2]-pos0[2]))},
+                      'orientation': dict(zip('xyzw', r_interp.as_quat()))}
+            else:
+                lp = full[max(0, idx-1)]
+        elif full:
+            lp = full[-1]
+        else:
+            return None
     pos = np.array([lp['position']['x'], lp['position']['y'], lp['position']['z']])
     q_xyzw = [lp['orientation']['x'], lp['orientation']['y'],
                lp['orientation']['z'], lp['orientation']['w']]
@@ -436,16 +459,6 @@ def write_rig_bin(output_dir, db_path, panoramas):
                 f.write(struct.pack('Q', data_id))
 
     print(f"  Wrote rigs.bin ({1} rig, {len(frames_with_pose)} frames)")
-
-
-    """Remove rig/frame tables so point_triangulator treats images independently."""
-    conn = sqlite3.connect(str(db_path))
-    conn.execute('DELETE FROM rig_sensors')
-    conn.execute('DELETE FROM frame_data')
-    conn.execute('DELETE FROM frames')
-    conn.execute('DELETE FROM rigs')
-    conn.commit()
-    conn.close()
 
 
 def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):

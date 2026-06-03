@@ -37,7 +37,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
-ENABLE_ICP_ALIGNMENT=true
+ENABLE_ICP_ALIGNMENT=false
 EXPORT_COLMAP=false
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images (ignored when USE_SDK_STITCH=true)
 USE_SDK_STITCH=true               # use Insta360 MediaSDK for ERP stitching (much better quality than manual fisheye_to_erp)
@@ -156,6 +156,18 @@ cleanup() {
     _pkill "continuous_trajectory_recorder"
     _pkill "ros2 launch.*insta360"
     _pkill "python.*equirectangular"
+
+    # Wait for the SDK capture daemon to call StopTimeLapse and exit cleanly.
+    # It was deliberately excluded from PIDS so the loop above didn't kill it.
+    if [ -n "${SDK_CAPTURE_PID:-}" ] && kill -0 "$SDK_CAPTURE_PID" 2>/dev/null; then
+        echo "Waiting for SDK capture daemon to stop timelapse..."
+        for _w in $(seq 1 300); do
+            kill -0 "$SDK_CAPTURE_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
+        wait "$SDK_CAPTURE_PID" 2>/dev/null || true
+    fi
 
     if [ "$BAG_ONLY" = "true" ]; then
         echo "Bag-only mode: skipping post-processing. Bag saved in: $SCAN_DIR"
@@ -714,18 +726,13 @@ if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
     touch /tmp/.insta360_session_ran
     # Wait for any previous SDK daemon to fully release the USB device
     _wait_camera_dead
-    # Export interval before starting daemon — daemon reads INSTA360_INTERVAL_MS at startup
-    # to decide between timelapse (continuous) and single-shot (stationary) mode.
-    if [ "$CAPTURE_MODE" = "continuous" ]; then
-        export INSTA360_INTERVAL_MS=$(( CONTINUOUS_INTERVAL * 1000 ))
-    else
-        unset INSTA360_INTERVAL_MS
-    fi
     # Start the persistent SDK session daemon
+    export INSTA360_INTERVAL_MS=$(( CONTINUOUS_INTERVAL * 1000 ))
     INSTA360_SESSION_DIR="$SCAN_DIR" \
         ~/insta360-dev/build/insta360_capture > "$SCAN_DIR/sdk_capture.log" 2>&1 &
     SDK_CAPTURE_PID=$!
-    PIDS+=($SDK_CAPTURE_PID)
+    # Not added to PIDS — cleanup must not kill the daemon before StopTimeLapse runs.
+    # The shell waits for it to exit naturally after the download drain below.
     # Wait for the daemon to signal ready
     echo "Waiting for SDK camera session..."
     for _i in $(seq 1 60); do
@@ -867,19 +874,20 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     echo "  Press 'q' + ENTER when scanning is complete."
 
     if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-        # SDK timelapse interval mode: send one trigger to start, camera shoots
-        # automatically at CONTINUOUS_INTERVAL seconds. Much faster than TakePhoto().
-        # Send start trigger
+        # Continuous SDK mode: send session_dir as trigger — daemon starts timelapse
+        # at INSTA360_INTERVAL_MS. Firmware manages the shutter clock autonomously
+        # at the same PHOTO_SINGLE quality; StopTimeLapse at session end returns
+        # all shot URLs for background download.
         rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
         echo "$SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
         for _i in $(seq 1 100); do
             [ -f "$SCAN_DIR/.sdk_capture_done" ] && break
+            [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { echo "✗ SDK timelapse failed to start"; exit 1; }
             sleep 0.1
         done
         rm -f "$SCAN_DIR/.sdk_capture_done"
-        echo "✓ SDK timelapse capture started (interval=${CONTINUOUS_INTERVAL}s)"
-        # Start shutter event publisher — watches for .shutter_event files and
-        # publishes them on /camera/shutter_time so the bag records precise shutter times
+        echo "✓ SDK continuous capture started (interval=${CONTINUOUS_INTERVAL}s)"
+        # Start shutter event publisher — watches for capture_N.shutter_event files
         python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/shutter_event_publisher.py" \
             "$SCAN_DIR" > "$SCAN_DIR/shutter_publisher.log" 2>&1 &
         PIDS+=($!)
@@ -922,15 +930,21 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     done
     touch "$SCAN_DIR/.session_done"  # signal watchdog/trigger loop to exit
 
-    # For SDK stitch mode: wait for insta360_capture to finish all downloads
-    # before stopping the bag recorder, so .insp files are complete.
+    # For SDK stitch mode: wait for all background downloads to finish
+    # before stopping the bag recorder. The daemon writes .sdk_downloads_pending
+    # with the outstanding count; poll until it reaches 0.
     if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ] && [ -n "${SDK_CAPTURE_PID:-}" ]; then
-        echo "Waiting for SDK captures to complete..."
+        echo "Waiting for SDK to stop timelapse and complete downloads..."
         _sdk_wait=0
-        while kill -0 $SDK_CAPTURE_PID 2>/dev/null && [ $_sdk_wait -lt 1800 ]; do
+        while [ $_sdk_wait -lt 300 ]; do
+            # Daemon exits naturally after StopTimeLapse + drain completes
+            kill -0 $SDK_CAPTURE_PID 2>/dev/null || break
             sleep 1; _sdk_wait=$((_sdk_wait + 1))
         done
-        echo "✓ SDK captures complete"
+        # Hard kill only if daemon is still alive after 5 min
+        kill -0 $SDK_CAPTURE_PID 2>/dev/null && kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
+        wait $SDK_CAPTURE_PID 2>/dev/null || true
+        echo "✓ SDK capture daemon exited"
     fi
 
 else
@@ -1145,11 +1159,13 @@ else
         sleep 2
 
         if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-            # Signal the persistent SDK daemon to capture via a dedicated trigger file
+            # Signal the persistent SDK daemon to capture via a dedicated trigger file.
+            # .sdk_capture_done now fires when the shutter clicks, not when the download
+            # finishes, so the next scan can start immediately after ~1-2s.
             rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
             echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
-            # Wait for done/failed signal (max 120s)
-            for _i in $(seq 1 1200); do
+            # Wait for shutter-fired signal (max 30s — just the shutter, not the download)
+            for _i in $(seq 1 300); do
                 [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
                 [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
                 kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }

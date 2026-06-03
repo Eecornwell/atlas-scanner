@@ -28,3 +28,14 @@ set_target_properties(insta360_stitch PROPERTIES
     BUILD_RPATH "/usr/lib"
     INSTALL_RPATH "/usr/lib"
 )
+
+# Clock reset utility — syncs host system time to the camera RTC.
+# Useful when the camera's internal clock has drifted (e.g. year 2041 bug).
+add_executable(insta360_reset_clock reset_clock.cpp)
+target_include_directories(insta360_reset_clock PRIVATE ${CAMERA_SDK_DIR}/include /usr/include)
+target_link_directories(insta360_reset_clock PRIVATE ${CAMERA_SDK_DIR}/lib /usr/lib)
+target_link_libraries(insta360_reset_clock PRIVATE CameraSDK)
+set_target_properties(insta360_reset_clock PROPERTIES
+    BUILD_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"
+    INSTALL_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"
+)

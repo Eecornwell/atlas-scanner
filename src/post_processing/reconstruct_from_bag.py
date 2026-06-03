@@ -461,6 +461,19 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         import shutil as _shutil
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
+        # Promote .insp files from .sdk_shot_NNN/ subdirs to session root so
+        # all downstream globs find them in a flat layout.
+        for _shot_dir in sorted(session_path.glob('.sdk_shot_*')):
+            for _insp in sorted(_shot_dir.glob('*.insp')):
+                _dest = session_path / _insp.name
+                if not _dest.exists():
+                    _insp.rename(_dest)
+                _ct_src = _shot_dir / (_insp.name + '.capture_time')
+                if not _ct_src.exists():
+                    _ct_src = session_path / (_insp.name + '.capture_time')
+                _ct_dst = session_path / (_dest.name + '.capture_time')
+                if _ct_src.exists() and not _ct_dst.exists():
+                    _ct_src.rename(_ct_dst)
         # Remove 0-byte .insp files from failed downloads
         for _bad_insp in session_path.glob('*.insp'):
             if _bad_insp.stat().st_size < 100000:

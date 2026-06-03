@@ -7,9 +7,9 @@ Edit the settings at the top of `~/atlas_ws/src/atlas-scanner/src/atlas_fusion_c
 ```bash
 CAMERA_MODE="single_fisheye"   # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"      # stationary | continuous
-CONTINUOUS_INTERVAL=5          # seconds between captures (continuous mode only;
-                               # SDK stitch dual_fisheye: effective interval is
-                               # download-limited to ~10s regardless of this setting)
+CONTINUOUS_INTERVAL=5          # nominal seconds between captures (continuous mode only;
+                               # SDK stitch dual_fisheye: firmware enforces ~8s minimum
+                               # due to SD write time; downloads run concurrently via HTTP)
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
@@ -44,15 +44,15 @@ USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (du
 **How it works (continuous mode):**
 
 - The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `src/capture/sdk/`) takes ownership of the USB device.
-- In continuous mode, the daemon fires repeated `TakePhoto()` calls — one shot at a time, blocking until each download completes (~10s). This ensures each `.insp` file embeds its own per-shot IMU orientation data, which the SDK stitcher uses to produce an ERP correctly oriented to the camera’s physical frame at that exact moment. Using the SDK’s timelapse mode instead would fix the IMU reference at the first shot, causing ERP yaw drift as the scanner rotates and breaking color alignment.
-- Shutter time = `insp_rtc` (integer UTC second from `.insp` filename, from `SyncLocalTimeToCamera`) + `sync_frac` (sub-second offset of system clock at sync time). This gives <1 ms timing accuracy on the ROS system clock without hardware sync.
-- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG using `TEMPLATE` stitch mode (no gravity correction, camera-frame orientation) by `insta360_stitch` during reconstruction.
-- The `shutter_event_publisher.py` node watches for `.shutter_event` files and publishes them on `/camera/shutter_time`, which is recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
-- Because each `TakePhoto()` blocks for the USB download, the effective capture interval is ~10s regardless of `CONTINUOUS_INTERVAL`. The scanner should be held still for ~0.5s around each shot for best results.
+- In continuous mode, the daemon uses `TIMELAPSE_INTERVAL_SHOOTING` — the firmware manages the shutter clock autonomously at ~8s effective intervals (firmware minimum regardless of `CONTINUOUS_INTERVAL`). Each new shot is detected by polling `GetCameraFilesCount` every 200ms; when the count increments the shutter timestamp is recorded immediately (before the subsequent `GetCameraFilesList` call which takes ~4s), then the `.insp` file is downloaded via HTTP GET to the camera's built-in file server while the session is still active.
+- Shutter time = `t_count_increment - SD_write_latency (0.20s)`. The count increments when the SD write completes (~200ms after the shutter fires), giving ~100ms timing accuracy on the ROS system clock.
+- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG using `TEMPLATE` stitch mode (fixed factory calibration, identical geometry to single-shot mode) by `insta360_stitch` during reconstruction.
+- The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes them on `/camera/shutter_time`, which is recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
+- The effective capture rate is ~8s per shot (firmware SD write minimum). Camera IMU is not available in this mode.
 
 **ERP orientation (continuous mode):**
 
-Each `.insp` file is stitched independently using `TEMPLATE` mode (no gravity/IMU stabilisation applied by the stitcher). The camera’s per-shot IMU orientation embedded in the `.insp` file orients the ERP to the camera’s physical frame at capture time — the same convention used during extrinsic calibration. No post-processing EIS correction is needed or applied.
+Each `.insp` file is stitched independently using `TEMPLATE` mode (fixed factory calibration seam lines). `TEMPLATE` stitch geometry is identical between timelapse and single-shot firmware modes — the seam placement does not depend on the capture mode. No post-processing EIS correction is needed or applied.
 
 **Building the SDK daemon:**
 
