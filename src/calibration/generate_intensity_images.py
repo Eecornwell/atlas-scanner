@@ -137,23 +137,33 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                 except: pass
         origin, R_world_lidar = _load_trajectory_pose(scan_dir)
         if is_sdk_stitch:
-            # SDK ERP: same camera frame as single-fisheye but full sphere (no back-hemisphere filter)
-            # Use identical projection to the working dual-fisheye path: Yb=-Yc, lon=atan2(Xc,Zc)
+            # SDK stitch: identity projection (no rotation).
+            # Project raw lidar XYZ directly into ERP using standard spherical:
+            #   lon = atan2(Y, X),  lat = asin(Z / r)
+            #   u = W * (0.5 + lon / (2*pi)),  v = H * (0.5 - lat / pi)
+            # This gives a raw intensity image for visual landmark comparison.
             if origin is not None and R_world_lidar is not None and is_world_frame:
                 pts_lidar = (R_world_lidar.T @ (points - origin).T).T
             else:
                 pts_lidar = points
-            pts_h   = np.hstack([pts_lidar, np.ones((len(pts_lidar), 1))])
-            pts_cam = (T_cam_lidar @ pts_h.T).T[:, :3]
-            norm_c = np.linalg.norm(pts_cam, axis=1).clip(1e-6)
-            Xc = pts_cam[:, 0] / norm_c
-            Yc = pts_cam[:, 1] / norm_c
-            Zc = pts_cam[:, 2] / norm_c
-            lon = np.arctan2(Xc, Zc)
-            lat = np.arcsin(np.clip(-Yc, -1, 1))
-            u = (out_w * (0.5 + lon / (2 * np.pi))).astype(int) % out_w
-            v = (out_h * (0.5 - lat / np.pi)).astype(int)
-            orig_indices = np.arange(len(pts_cam))
+            norm_c = np.sqrt((pts_lidar**2).sum(axis=1)).clip(1e-6)
+            X = pts_lidar[:, 0] / norm_c
+            Y = pts_lidar[:, 1] / norm_c
+            Z = pts_lidar[:, 2] / norm_c
+            orig_indices = np.arange(len(pts_lidar))
+            lon = np.arctan2(Y, X)
+            lat = np.arcsin(np.clip(Z, -1, 1))
+            # Insta360 SDK stitch ERP: pitched 90° forward vs standard.
+            # Apply R_y(-90) to coords: X_new = -Z, Y_new = Y, Z_new = X
+            # Then project with lon=atan2(Y_new, X_new), lat=asin(Z_new/r)
+            X_new = -Z
+            Y_new = Y
+            Z_new = X
+            lon2 = np.arctan2(Y_new, X_new)
+            lat2 = np.arcsin(np.clip(Z_new, -1, 1))
+            u = (out_w * (0.5 - lon2 / (2 * np.pi))).astype(int) % out_w
+            v = (out_h * (0.5 - lat2 / np.pi)).astype(int)
+            v = np.clip(v, 0, out_h - 1)
         else:
             if origin is not None and R_world_lidar is not None and is_world_frame:
                 # world_lidar.ply: undo full pose (rotation + translation) back to sensor frame
@@ -201,6 +211,10 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     range_image = np.zeros((out_h, out_w), dtype=np.float32)
     indices_image = np.full((out_h, out_w), -1, dtype=np.int32)
 
+    if len(intensities) == 0:
+        print(f"No valid points after projection for {ply_file}")
+        return False
+
     if intensities.max() > 1.0:
         intensities = intensities / 255.0
 
@@ -227,7 +241,7 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # For both sensor-frame and camera-frame paths the lidar projects into the
     # outer strips (|lon|>90deg); zero the middle zone to match the camera ERP.
     is_dual = (width == 2560)
-    suppress_middle = not is_dual and not is_sdk_stitch
+    suppress_middle = not is_dual or is_sdk_stitch
     mid_start, mid_end = out_w // 4, out_w * 3 // 4
     BOUNDARY_MARGIN = 12
     # Expand the suppressed zone by the boundary margin before inpainting
@@ -272,20 +286,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # regions outside the lidar FOV are zeroed in both the lidar intensity image
     # and the camera image before SuperGlue runs. This prevents keypoints from
     # being detected in blurry/fake inpainted areas that have no real lidar data.
-    if is_sdk_stitch:
-        # Use the actual point v-range to define the hemisphere boundary analytically.
-        # The blind spot is everything above the topmost projected point row.
-        v_min_pts = int(v2.min()) if len(v2) else 0
-        blind_spot_row = max(0, v_min_pts - BOUNDARY_MARGIN)
-        intensity_image[:blind_spot_row, :] = 0
-        indices_image[:blind_spot_row, :] = -1
-        coverage_mask = np.zeros((out_h, out_w), dtype=np.uint8)
-        coverage_mask[blind_spot_row:, :] = 255
-        feather = np.ones((out_h, out_w), dtype=np.float32)
-        feather[:blind_spot_row, :] = 0
-    else:
-        coverage_mask = None
-        feather = None
+    coverage_mask = None
+    feather = None
 
     if coverage_mask is not None:
         intensity_image = (intensity_image.astype(np.float32) * feather).clip(0, 255).astype(np.uint8)
@@ -305,23 +307,18 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         cam_src = src_erp or camera_image
         cam = cv2.imread(cam_src, cv2.IMREAD_UNCHANGED)
         if cam is not None:
-            cam_out = cam if (is_dual or is_sdk_stitch) else remap_to_strips(cam)
+            cam_out = cam if is_dual else remap_to_strips(cam)
             cam_gray = cv2.cvtColor(cam_out, cv2.COLOR_BGR2GRAY) if cam_out.ndim == 3 else cam_out
-            # SDK stitch: skip the static body mask — the scanner body position shifts
-            # with every capture (FlowState only corrects roll, not yaw/tilt), so a
-            # static mask is always misaligned. The dynamic coverage mask built from
-            # the projected lidar points already restricts both images to the valid
-            # shared region, making the static mask redundant and harmful.
-            if not is_sdk_stitch:
-                mask_path_src = 'lidar_mask_dual.png' if is_dual else 'lidar_mask_single.png'
+            if not is_dual:
+                mask_path_src = 'lidar_mask_dual.png' if (is_sdk_stitch or width > 2560) else 'lidar_mask_single.png'
                 mask_path = Path(__file__).parent.parent / mask_path_src
                 lidar_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                 if lidar_mask is not None:
                     lidar_mask = cv2.resize(lidar_mask, (cam_gray.shape[1], cam_gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                     cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=lidar_mask)
             cam_gray = cv2.resize(cam_gray, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            # Zero middle zone only for manual dual fisheye (black zone between strips)
-            if not is_dual and not is_sdk_stitch:
+            # Zero middle zone for non-dual (front lens has no lidar overlap)
+            if not is_dual:
                 mid_s_lr = out_w // 4
                 mid_e_lr = out_w * 3 // 4
                 cam_gray[:, max(0, mid_s_lr - BOUNDARY_MARGIN):min(out_w, mid_e_lr + BOUNDARY_MARGIN)] = 0

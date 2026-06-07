@@ -37,7 +37,7 @@ BAG_ONLY=${BAG_ONLY:-false}
 
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
-ENABLE_ICP_ALIGNMENT=false
+ENABLE_ICP_ALIGNMENT=true
 EXPORT_COLMAP=false
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images (ignored when USE_SDK_STITCH=true)
 USE_SDK_STITCH=true               # use Insta360 MediaSDK for ERP stitching (much better quality than manual fisheye_to_erp)
@@ -221,21 +221,32 @@ cleanup() {
         # Coloring
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
             if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
+                # Promote .insp files from .sdk_shot_N/ into fusion_scan_NNN/ by capture order
+                _scan_idx=0
+                for _shot_dir in $(ls -d "$SCAN_DIR"/.sdk_shot_* 2>/dev/null | sort -t_ -k2 -n); do
+                    _scan_idx=$((_scan_idx + 1))
+                    _target_scan="$SCAN_DIR/fusion_scan_$(printf '%03d' $_scan_idx)"
+                    [ -d "$_target_scan" ] || continue
+                    for _insp in "$_shot_dir"/*.insp; do
+                        [ -f "$_insp" ] || continue
+                        [ "$(stat -c%s "$_insp" 2>/dev/null)" -lt 100000 ] && continue
+                        mv "$_insp" "$_target_scan/" 2>/dev/null
+                        # Move capture_time sidecar too
+                        [ -f "${_insp}.capture_time" ] && mv "${_insp}.capture_time" "$_target_scan/" 2>/dev/null
+                    done
+                done
+
                 # SDK stitching: use MediaSDK for high-quality ERP from .insp files
                 echo "Converting fisheye images to ERP (SDK stitcher)..."
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
                     [ -d "$scan_dir" ] || continue
                     # If we have a raw .insp file, stitch it directly
-                    INSP_FILE=$(find "$scan_dir" -name "*.insp" | head -1)
+                    INSP_FILE=$(find "$scan_dir" -maxdepth 1 -name "*.insp" | head -1)
                     if [ -n "$INSP_FILE" ]; then
                         ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
                             || echo "  Warning: SDK stitch failed for $(basename $scan_dir), skipping"
                     else
-                        # Fallback: extract from bag and stitch
-                        BAG_DIR=$(find "$scan_dir" -maxdepth 1 -name "rosbag_*" -type d 2>/dev/null | grep -v '_imu$' | head -1)
-                        [ -z "$BAG_DIR" ] && continue
-                        python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
-                            "$BAG_DIR" "$scan_dir" --dual || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
+                        echo "  Warning: No .insp file for $(basename $scan_dir), skipping"
                     fi
                 done
                 # SDK stitcher handles seam blending internally, no need for blend_erp_seams

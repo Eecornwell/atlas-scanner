@@ -162,9 +162,6 @@ def main():
         if lid_erp.shape != cam_erp.shape:
             lid_erp = cv2.resize(lid_erp, (cam_erp.shape[1], cam_erp.shape[0]), interpolation=cv2.INTER_AREA)
 
-        if is_sdk:
-            lid_erp = np.roll(np.flipud(np.fliplr(lid_erp)), lid_erp.shape[1] // 2, axis=1)
-
         H, W = cam_erp.shape
         matching = Matching(config).eval().to(device)
         keys = ['keypoints', 'scores', 'descriptors']

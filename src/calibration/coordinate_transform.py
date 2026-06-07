@@ -38,7 +38,37 @@ def calibration_transform(root_path, use_existing=False):
     calib_path = '/home/orion/atlas_ws/output/calib.json'
     
     if not os.path.exists(calib_path):
-        raise FileNotFoundError(f"calib.json not found at: {calib_path}")
+        if os.path.exists(config_path):
+            print(f"⚠ calib.json not found — keeping existing fusion_calibration.yaml")
+            print_calibration_comparison(root_path)
+            return
+        # Truly fresh environment: write identity so the session can proceed
+        print(f"⚠ calib.json not found at: {calib_path}")
+        print("  Writing identity calibration (no extrinsic correction).")
+        print("  Run direct_visual_lidar_calibration to generate calib.json.")
+        config = {
+            'roll_offset': 0.0,
+            'pitch_offset': 0.0,
+            'yaw_offset': 0.0,
+            'manual_roll_adjustment': 0.0,
+            'manual_pitch_adjustment': 0.0,
+            'manual_yaw_adjustment': 0.0,
+            'azimuth_offset': 0.0,
+            'elevation_offset': 0.0,
+            'x_offset': 0.0,
+            'y_offset': 0.0,
+            'z_offset': 0.0,
+            'flip_x': False,
+            'flip_y': False,
+            'image_width': 5760,
+            'image_height': 2880,
+            'use_fisheye': False,
+            'skip_rate': 1,
+        }
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        print(f"  ✓ Wrote identity calibration to: {config_path}")
+        return
     
     with open(calib_path, 'r') as f:
         calib_data = json.load(f)

@@ -10,7 +10,7 @@
     ```
 
 ## Fisheye to Equirectangular Calibration
-> *Note: This step is required for both `single_fisheye` and `dual_fisheye` modes. Both modes use the equirectangular pipeline for ERP projection and point cloud coloring. Using dual cameras will increase coverage, but will also tax the system. Calibrating the two fisheye cameras together can sometimes be tricky due to blind spots being introduced.*
+> *Note: This step is required for both `single_fisheye` and only required for `dual_fisheye` mode if `USE_SDK_STITCH` is false. Both modes use the equirectangular pipeline for ERP projection and point cloud coloring. Using dual cameras will increase coverage, but will also tax the system. Calibrating the two fisheye cameras together can sometimes be tricky due to blind spots being introduced.*
 - This calibration will transform the fisheye lens(es) into equirectangular frames
 - Equirectangular calibration file location
     - `~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml`
