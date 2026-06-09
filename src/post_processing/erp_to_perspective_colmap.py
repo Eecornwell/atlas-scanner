@@ -274,8 +274,9 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     print(f"  Found {len(mask_files)} mask files")
 
     # Camera intrinsics are analytically exact: f = output_size / (2*tan(fov/2))
-    # Keep these in sync with erp_to_perspective(output_size, fov_deg) above.
-    _output_size = 1024
+    # Derive output_size from the first rendered tile on disk.
+    _first_tile = next(persp_dir.rglob("*.png"), None)
+    _output_size = cv2.imread(str(_first_tile)).shape[1] if _first_tile else 1024
     _fov_deg = 90
     _f = _output_size / (2 * np.tan(np.radians(_fov_deg) / 2))
     _c = _output_size / 2.0

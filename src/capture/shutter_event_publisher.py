@@ -25,9 +25,8 @@ class ShutterEventPublisher(Node):
         self.get_logger().info(f'Watching {session_dir} for shutter events')
 
     def poll(self):
-        # Watch for both legacy *.shutter_event and new capture_N.shutter_event names
-        for f in list(self.session_dir.glob('*.shutter_event')) + \
-                  list(self.session_dir.glob('capture_*.shutter_event')):
+        # Watch fusion_scan_*/ subdirs for capture_N.shutter_event files
+        for f in self.session_dir.glob('fusion_scan_*/capture_*.shutter_event'):
             try:
                 val = float(f.read_text().strip())
             except Exception:

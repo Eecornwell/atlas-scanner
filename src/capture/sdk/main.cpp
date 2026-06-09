@@ -64,6 +64,11 @@ static std::queue<DownloadJob> g_dl_queue;
 static std::atomic<int>        g_dl_pending{0};
 static std::atomic<bool>       g_dl_stop{false};
 static std::string             g_http_base;
+// Serialises all USB/HTTP operations so GetCameraFilesList and http_download
+// never run concurrently. Contention caused GetCameraFilesList to block for
+// 21s while a download was in progress, starving the timer thread and making
+// it appear the firmware had stopped shooting.
+static std::mutex              g_usb_mutex;
 
 static double now_sec() {
     return static_cast<double>(
@@ -72,7 +77,11 @@ static double now_sec() {
 }
 
 static void write_shutter_event(const std::string& session_dir, int index, double t) {
-    std::ofstream se(session_dir + "/capture_" + std::to_string(index) + ".shutter_event");
+    // Write into the individual scan folder (1-based) so files stay organised.
+    std::string scan_dir = session_dir + "/fusion_scan_" +
+        [](int n){ char buf[8]; std::snprintf(buf, sizeof(buf), "%03d", n); return std::string(buf); }(index + 1);
+    fs::create_directories(scan_dir);
+    std::ofstream se(scan_dir + "/capture_" + std::to_string(index) + ".shutter_event");
     se << std::fixed << std::setprecision(6) << t;
 }
 
@@ -101,7 +110,11 @@ static void download_worker() {
             job = g_dl_queue.front(); g_dl_queue.pop();
         }
         std::cout << "[dl] " << fs::path(job.remote_path).filename().string() << " -> " << job.local_path << std::endl;
-        bool ok = http_download(job.remote_path, job.local_path);
+        bool ok;
+        {
+            std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+            ok = http_download(job.remote_path, job.local_path);
+        }
         if (!ok) {
             std::cerr << "[dl] failed: " << job.remote_path << std::endl;
         } else {
@@ -174,7 +187,11 @@ int main(int argc, char* argv[]) {
 
     bool opened = false;
     for (int attempt = 1; attempt <= 5 && !opened; ++attempt) {
-        if (attempt > 1) { std::this_thread::sleep_for(std::chrono::seconds((attempt-1)*3)); }
+        if (attempt > 1) {
+            int wait = (attempt - 1) * 3;
+            std::cerr << "Retrying Open() in " << wait << "s (attempt " << attempt << "/5)..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(wait));
+        }
         if (open_session(cam)) { opened = true; }
         else { delete cam; cam = new ins_camera::Camera(g_list[0].info); cam->SetTimeout(20000); }
     }
@@ -336,8 +353,15 @@ int main(int argc, char* argv[]) {
                     double t_count = now_sec();
                     double host_t  = t_count - 0.20;
 
-                    // New file detected — get the Camera03 .insp path
-                    auto all_files = cam->GetCameraFilesList();
+                    // New file detected — get the Camera03 .insp path.
+                    // Hold g_usb_mutex so this doesn't race with http_download
+                    // in the download worker — concurrent USB/HTTP calls caused
+                    // GetCameraFilesList to block for 21s, starving the timer.
+                    std::vector<std::string> all_files;
+                    {
+                        std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+                        all_files = cam->GetCameraFilesList();
+                    }
                     auto photo_files = filter_photo_files(all_files);
                     std::string new_remote;
                     for (auto it = photo_files.rbegin(); it != photo_files.rend(); ++it) {

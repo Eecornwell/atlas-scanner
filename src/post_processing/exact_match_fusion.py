@@ -117,7 +117,6 @@ def exact_match_calibration_tool(scan_dir):
     print(f"Transformation (T_camera_lidar):")
     print(f"  Translation: [{t_x:.4f}, {t_y:.4f}, {t_z:.4f}]")
     print(f"  Rotation (RPY): [{roll:.4f}, {pitch:.4f}, {yaw:.4f}]")
-    print(f"  Using exact calibration tool projection (no offsets/flips)")
 
     if skip_rate > 1:
         points = points[::skip_rate]

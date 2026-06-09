@@ -33,7 +33,17 @@ import pathlib
 class FusionCaptureGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("ATLAS - Automated Terrestrial LiDAR Acquisition System")
+        self.root.title("ATLAS")
+
+        # Set window icon (taskbar + title bar)
+        try:
+            import pathlib as _pl
+            _icon_path = _pl.Path(__file__).parent.parent / 'assets/media/atlas_icon_256.png'
+            _icon = tk.PhotoImage(file=str(_icon_path))
+            self.root.iconphoto(True, _icon)
+            self._icon_ref = _icon  # prevent GC
+        except Exception:
+            pass
 
         # Fit initial window to screen — leave a small margin for taskbars
         sw = root.winfo_screenwidth()
@@ -166,6 +176,12 @@ class FusionCaptureGUI:
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
                         variable=self.bag_only_var).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.icp_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
+                        variable=self.icp_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.colmap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="Export COLMAP model",
+                        variable=self.colmap_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -220,6 +236,50 @@ class FusionCaptureGUI:
         self.log_text = scrolledtext.ScrolledText(log_tab, font=('Consolas', 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
         notebook.add(log_tab, text="System Log")
+
+        # ── Post-Processing tab ──────────────────────────────────────────────
+        pp_tab = ttk.Frame(notebook, padding="8")
+        notebook.add(pp_tab, text="Post-Processing")
+
+        # Session picker
+        sess_frame = ttk.LabelFrame(pp_tab, text="Session", padding="5")
+        sess_frame.pack(fill=tk.X, pady=(0, 6))
+        self._pp_session_var = tk.StringVar(value="(use current session)")
+        ttk.Entry(sess_frame, textvariable=self._pp_session_var, width=52).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(sess_frame, text="Browse…", command=self._pp_browse).pack(side=tk.LEFT, padx=(4, 0))
+
+        # Buttons grid
+        btn_frame = ttk.Frame(pp_tab)
+        btn_frame.pack(fill=tk.BOTH, expand=True)
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+
+        def _pp_btn(row, col, label, cmd):
+            ttk.Button(btn_frame, text=label, command=cmd).grid(
+                row=row, column=col, sticky=(tk.W, tk.E), padx=3, pady=3)
+
+        _pp_btn(0, 0, "Run Post-Processing",          self._pp_run_reconstruct)
+        _pp_btn(0, 1, "Recolor with New Calibration",  self._pp_reprocess)
+        _pp_btn(1, 0, "ICP Alignment",                  self._pp_icp)
+        _pp_btn(1, 1, "Merge (Trajectory Only)",        self._pp_merge_traj)
+        _pp_btn(2, 0, "Export COLMAP Model",            self._pp_colmap)
+        _pp_btn(2, 1, "View Point Cloud (Web)",         self._pp_web_viewer)
+        _pp_btn(3, 0, "Per-Scan Alignment Viewer",      self._pp_toggle_viewer)
+        _pp_btn(3, 1, "Run Sync Benchmark",             self._pp_sync_benchmark)
+
+        # Output log for post-processing tab
+        self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
+        self._pp_log.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        _pp_menu = tk.Menu(self.root, tearoff=0)
+        _pp_menu.add_command(label="Copy",       command=lambda: self._pp_log.event_generate('<<Copy>>'))
+        _pp_menu.add_command(label="Select All",  command=lambda: self._pp_log.tag_add(tk.SEL, '1.0', tk.END))
+        _pp_menu.add_command(label="Clear Log",   command=lambda: (self._pp_log.config(state='normal'),
+                                                                    self._pp_log.delete('1.0', tk.END),
+                                                                    self._pp_log.config(state='disabled')))
+        self._pp_log.bind('<Button-3>', lambda e: (_pp_menu.tk_popup(e.x_root, e.y_root),
+                                                   _pp_menu.grab_release()))
+        # ─────────────────────────────────────────────────────────────────────
+
         notebook.select(1)
 
         # Switch to log tab on new message if viewer is active, badge the tab
@@ -386,6 +446,8 @@ class FusionCaptureGUI:
                 cmd.append('--bag-only')
             if self.capture_mode_var.get() == 'stationary' and self.stationary_wait_var.get():
                 cmd.append('--stationary-wait')
+            cmd.append('--icp' if self.icp_var.get() else '--no-icp')
+            cmd.append('--colmap' if self.colmap_var.get() else '--no-colmap')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -420,6 +482,7 @@ class FusionCaptureGUI:
                         if m:
                             session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
                             self.scan_dir = str(session_dir.resolve())
+                            self._pp_session_var.set(self.scan_dir)
                             try:
                                 _add_session_log_handler(self.scan_dir)
                                 self._session_log_attached = True
@@ -712,6 +775,8 @@ sys.exit(0 if ok[0] else 4)
         if self._is_continuous_mode():
             self.capture_button.config(state="disabled")
             self.update_status("Continuous mode — press Stop when done", "green")
+            self._seen_shutter_events = set()
+            self.root.after(1000, self._continuous_poll)
         else:
             self.capture_button.config(state="normal")
 
@@ -913,6 +978,116 @@ sys.exit(0 if ok[0] else 4)
         except Exception as e:
             self.log_message(f"Warning: Could not clean up all processes: {e}")
     
+    def _continuous_poll(self):
+        """Poll for new shutter events during continuous capture and update scan count."""
+        if not self.is_running or not self._is_continuous_mode():
+            return
+        if hasattr(self, 'scan_dir') and self.scan_dir:
+            import pathlib
+            seen = getattr(self, '_seen_shutter_events', set())
+            for se in pathlib.Path(self.scan_dir).glob('fusion_scan_*/capture_*.shutter_event'):
+                if str(se) not in seen:
+                    seen.add(str(se))
+                    self.scan_count += 1
+                    self.scan_count_label.config(text=str(self.scan_count))
+                    self.log_message(f"📷 Shot {self.scan_count} captured")
+            self._seen_shutter_events = seen
+        self.root.after(1000, self._continuous_poll)
+
+    # ── Post-Processing tab helpers ───────────────────────────────────────────
+
+    def _pp_session(self):
+        """Return the session directory to operate on."""
+        val = self._pp_session_var.get().strip()
+        if val and val != "(use current session)":
+            return val
+        return getattr(self, 'scan_dir', None)
+
+    def _pp_browse(self):
+        import tkinter.filedialog as _fd
+        d = _fd.askdirectory(title="Select session directory",
+                             initialdir=str(self.script_dir / '../../../data/synchronized_scans'))
+        if d:
+            self._pp_session_var.set(d)
+
+    def _pp_log_write(self, text):
+        self._pp_log.config(state='normal')
+        self._pp_log.insert(tk.END, text)
+        self._pp_log.see(tk.END)
+        self._pp_log.config(state='disabled')
+
+    def _pp_run(self, label, cmd):
+        """Run a post-processing command in a background thread, streaming output to _pp_log."""
+        sess = self._pp_session()
+        if not sess:
+            self._pp_log_write("\n[!] No session selected.\n")
+            return
+        self._pp_log_write(f"\n>> {label}\n   {' '.join(cmd)}\n")
+        def _run():
+            import subprocess as _sp
+            try:
+                proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
+                                  env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+                for line in proc.stdout:
+                    self.root.after(0, self._pp_log_write, line)
+                proc.wait()
+                self.root.after(0, self._pp_log_write,
+                                f"{'Done' if proc.returncode == 0 else 'FAILED'} (exit {proc.returncode})\n")
+            except Exception as e:
+                self.root.after(0, self._pp_log_write, f"Error: {e}\n")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _pp_run_reconstruct(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        if not any(p.is_dir() and not str(p).endswith('_imu')
+                   for p in pathlib.Path(sess).glob('rosbag_*')):
+            self._pp_log_write("\n[!] No rosbag found in session.\n")
+            self._pp_log_write("    The bag may have been deleted after processing.\n")
+            self._pp_log_write("    Other utilities (ICP, merge, COLMAP, viewer) can still run on this session.\n")
+            return
+        self._pp_run("Run Post-Processing", ['python3', str(self.script_dir / 'post_processing/reconstruct_from_bag.py'), sess])
+
+    def _pp_reprocess(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Recolor with New Calibration", ['python3', str(self.script_dir / 'post_processing/reprocess_session.py'), sess])
+
+    def _pp_icp(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("ICP Alignment", ['python3', str(self.script_dir / 'post_processing/align_scan_session_posegraph.py'), sess, '--iterations', '1'])
+
+    def _pp_merge_traj(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Merge (Trajectory Only)", ['python3', str(self.script_dir / 'post_processing/merge_trajectory_only.py'), sess])
+
+    def _pp_colmap(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Export COLMAP Model", ['python3', str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess])
+
+    def _pp_web_viewer(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        ply = next((str(p) for p in sorted(pathlib.Path(sess).glob('*.ply'), key=lambda p: p.stat().st_mtime, reverse=True)), None)
+        if not ply: self._pp_log_write("\n[!] No .ply file found in session.\n"); return
+        self._pp_run("View Point Cloud (Web)", ['python3', str(self.script_dir / 'post_processing/web_3d_viewer.py'), ply])
+
+    def _pp_toggle_viewer(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Per-Scan Alignment Viewer", ['python3', str(self.script_dir / 'post_processing/scan_toggle_viewer.py'), sess])
+
+    def _pp_sync_benchmark(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Sync Benchmark", ['python3', str(self.script_dir / 'post_processing/sync_benchmark.py'),
+                                        sess, '--out', str(pathlib.Path(sess) / 'sync_benchmark.json')])
+
+    # ───────────────────────────────────────────────────────────────
+
     def _system_stopped(self):
         """Called when system is stopped"""
         if not self.is_running and self.fusion_process is None:
@@ -998,6 +1173,7 @@ def main():
     # Read defaults from atlas_fusion_capture.sh if no CLI args given
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
+    default_icp, default_colmap = False, False
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -1007,6 +1183,10 @@ def main():
                 default_capture = line.split('=', 1)[1].split('#')[0].strip('"\' ')
             elif line.startswith('STATIONARY_WAIT=') and '#' not in line.split('STATIONARY_WAIT=')[0]:
                 default_stationary_wait = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('ENABLE_ICP_ALIGNMENT=') and '#' not in line.split('ENABLE_ICP_ALIGNMENT=')[0]:
+                default_icp = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('EXPORT_COLMAP=') and '#' not in line.split('EXPORT_COLMAP=')[0]:
+                default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             if line.startswith('while'):
                 break  # stop before the CLI override block
     except Exception:
@@ -1016,7 +1196,7 @@ def main():
     logging.info("fusion_gui starting")
     logging.getLogger('PIL').setLevel(logging.WARNING)  # suppress PIL debug stream messages
 
-    root = tk.Tk()
+    root = tk.Tk(className='ATLAS')
 
     # Configure style for better appearance
     style = ttk.Style()
@@ -1029,6 +1209,8 @@ def main():
     app.camera_mode_var.set(args.camera if args.camera else default_camera)
     app.capture_mode_var.set(args.capture if args.capture else default_capture)
     app.stationary_wait_var.set(default_stationary_wait)
+    app.icp_var.set(default_icp)
+    app.colmap_var.set(default_colmap)
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     

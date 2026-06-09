@@ -46,7 +46,6 @@ REF_FACE = 0  # ceiling is ref — must be first in cameras array for rig_config
 FACES_360 = list(range(NUM_FACES))
 # FACES_180: all faces except 'back' (index 3) which points away from the single fisheye lens
 FACES_180 = [i for i in range(NUM_FACES) if FACES[i]['name'] != 'back']
-TILE_SIZE = 1024
 FOV_DEG = 90.0
 MIN_BASELINE_M = 0.10
 
@@ -132,27 +131,26 @@ def _find_erp_image(scan_dir):
     return None, False
 
 
-def _erp_to_perspective(erp_img, cam_from_pano_r, interpolation=cv2.INTER_LINEAR):
-    """Sample a perspective tile from an ERP image.
-    Follows panorama_sfm.py exactly: rays in cam frame -> rotate to pano frame
-    -> project to spherical UV. No world pose involved.
-    """
+def _tile_size_for_erp(erp_w):
+    """Nearest power-of-two to erp_w/4, clamped to [512, 2048]."""
+    p = int(2 ** round(np.log2(erp_w / 4)))
+    return max(512, min(2048, p))
+
+
+def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LINEAR):
+    """Sample a perspective tile from an ERP image."""
     pano_h, pano_w = erp_img.shape[:2]
-    f = TILE_SIZE / (2 * np.tan(np.radians(FOV_DEG) / 2))
-    c = TILE_SIZE / 2.0
-    # Pixel centers at +0.5 offset (COLMAP convention)
-    x, y = np.meshgrid(np.arange(TILE_SIZE) + 0.5, np.arange(TILE_SIZE) + 0.5)
-    # Unproject to rays in camera frame, normalize
-    rays_cam = np.stack([(x - c) / f, (y - c) / f, np.ones((TILE_SIZE, TILE_SIZE))], axis=-1)
+    f = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
+    c = tile_size / 2.0
+    x, y = np.meshgrid(np.arange(tile_size) + 0.5, np.arange(tile_size) + 0.5)
+    rays_cam = np.stack([(x - c) / f, (y - c) / f, np.ones((tile_size, tile_size))], axis=-1)
     rays_cam /= np.linalg.norm(rays_cam, axis=-1, keepdims=True)
-    # Rotate rays into panorama frame: rays_pano = rays_cam @ cam_from_pano_r
     rays_pano = rays_cam.reshape(-1, 3) @ cam_from_pano_r
-    # Project to spherical UV (panorama_sfm.py spherical_img_from_cam)
     r = rays_pano.T
     yaw = np.arctan2(r[0], r[2])
     pitch = -np.arctan2(r[1], np.linalg.norm(r[[0, 2]], axis=0))
-    u = ((1 + yaw / np.pi) / 2 * pano_w - 0.5).astype(np.float32).reshape(TILE_SIZE, TILE_SIZE)
-    v = ((1 - pitch * 2 / np.pi) / 2 * pano_h - 0.5).astype(np.float32).reshape(TILE_SIZE, TILE_SIZE)
+    u = ((1 + yaw / np.pi) / 2 * pano_w - 0.5).astype(np.float32).reshape(tile_size, tile_size)
+    v = ((1 - pitch * 2 / np.pi) / 2 * pano_h - 0.5).astype(np.float32).reshape(tile_size, tile_size)
     return cv2.remap(erp_img, u, v, interpolation, borderMode=cv2.BORDER_WRAP)
 
 
@@ -202,7 +200,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     panoramas = kept
     print(f"  Kept {len(panoramas)} panoramas after baseline filter")
 
-    f_px = TILE_SIZE / (2 * np.tan(np.radians(FOV_DEG) / 2))
+    _probe_img = cv2.imread(str(panoramas[0]['erp_src']), cv2.IMREAD_UNCHANGED)
+    tile_size = _tile_size_for_erp(_probe_img.shape[1]) if _probe_img is not None else 1024
+    f_px = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
+    print(f"  ERP width: {_probe_img.shape[1] if _probe_img is not None else '?'}px "
+          f"-> tile_size: {tile_size}px  f_px: {f_px:.1f}")
 
     for pano_idx, pano in enumerate(panoramas, start=1):
         erp_img = cv2.imread(str(pano['erp_src']), cv2.IMREAD_UNCHANGED)
@@ -215,11 +217,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         tiles = []
         for face_idx in active_faces:
             cam_from_pano_r = FACES_CAM_FROM_PANO[face_idx]
-            tile = _erp_to_perspective(erp_img, cam_from_pano_r)
+            tile = _erp_to_perspective(erp_img, cam_from_pano_r, tile_size)
 
             tile_mask = None
             if erp_mask is not None:
-                tile_mask = _erp_to_perspective(erp_mask, cam_from_pano_r,
+                tile_mask = _erp_to_perspective(erp_mask, cam_from_pano_r, tile_size,
                                                 interpolation=cv2.INTER_NEAREST)
                 if np.count_nonzero(tile_mask) / tile_mask.size < 0.05:
                     continue
@@ -243,6 +245,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
         pano['tiles'] = tiles
         pano['f_px'] = f_px
+        pano['tile_size'] = tile_size
         pano['active_faces'] = active_faces
 
     print(f"  Generated tiles for {len(panoramas)} panoramas")
@@ -252,7 +255,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 def write_rig_config(colmap_dir, panoramas):
     """Write rig_config.json for rig_configurator CLI."""
     f_px = panoramas[0]['f_px']
-    c = TILE_SIZE / 2.0
+    c = panoramas[0]['tile_size'] / 2.0
 
     # Only include faces that have images in the DB
     db_path = colmap_dir / 'database.db'
@@ -540,7 +543,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True):
         db_path.unlink()
 
     f_px = panoramas[0]['f_px']
-    c = TILE_SIZE / 2.0
+    c = panoramas[0]['tile_size'] / 2.0
 
     print("2. Extracting features (SIMPLE_PINHOLE, one camera per face folder)...")
     mask_dir = colmap_dir / 'masks'

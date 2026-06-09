@@ -29,6 +29,10 @@ while [[ $# -gt 0 ]]; do
         --no-sync-benchmark) RUN_SYNC_BENCHMARK=false; shift ;;
         --stationary-wait) STATIONARY_WAIT=true; shift ;;
         --no-stationary-wait) STATIONARY_WAIT=false; shift ;;
+        --icp) ENABLE_ICP_ALIGNMENT=true; shift ;;
+        --no-icp) ENABLE_ICP_ALIGNMENT=false; shift ;;
+        --colmap) EXPORT_COLMAP=true; shift ;;
+        --no-colmap) EXPORT_COLMAP=false; shift ;;
         *) shift ;;
     esac
 done
@@ -37,8 +41,8 @@ BAG_ONLY=${BAG_ONLY:-false}
 
 SAVE_E57=false
 USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
-ENABLE_ICP_ALIGNMENT=true
-EXPORT_COLMAP=false
+ENABLE_ICP_ALIGNMENT=${ENABLE_ICP_ALIGNMENT:-false}
+EXPORT_COLMAP=${EXPORT_COLMAP:-false}
 BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images (ignored when USE_SDK_STITCH=true)
 USE_SDK_STITCH=true               # use Insta360 MediaSDK for ERP stitching (much better quality than manual fisheye_to_erp)
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
@@ -221,7 +225,8 @@ cleanup() {
         # Coloring
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
             if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                # Promote .insp files from .sdk_shot_N/ into fusion_scan_NNN/ by capture order
+                # Promote .insp files into fusion_scan_NNN/ by capture order.
+                # Source 1: .sdk_shot_N/ subdirectories (older capture method)
                 _scan_idx=0
                 for _shot_dir in $(ls -d "$SCAN_DIR"/.sdk_shot_* 2>/dev/null | sort -t_ -k2 -n); do
                     _scan_idx=$((_scan_idx + 1))
@@ -231,10 +236,23 @@ cleanup() {
                         [ -f "$_insp" ] || continue
                         [ "$(stat -c%s "$_insp" 2>/dev/null)" -lt 100000 ] && continue
                         mv "$_insp" "$_target_scan/" 2>/dev/null
-                        # Move capture_time sidecar too
                         [ -f "${_insp}.capture_time" ] && mv "${_insp}.capture_time" "$_target_scan/" 2>/dev/null
                     done
                 done
+                # Source 2: .insp files directly at session root (current capture method)
+                _root_insps=($(ls "$SCAN_DIR"/*.insp 2>/dev/null | sort))
+                if [ ${#_root_insps[@]} -gt 0 ]; then
+                    _scan_idx=0
+                    for _insp in "${_root_insps[@]}"; do
+                        [ -f "$_insp" ] || continue
+                        [ "$(stat -c%s "$_insp" 2>/dev/null)" -lt 100000 ] && continue
+                        _scan_idx=$((_scan_idx + 1))
+                        _target_scan="$SCAN_DIR/fusion_scan_$(printf '%03d' $_scan_idx)"
+                        [ -d "$_target_scan" ] || continue
+                        mv "$_insp" "$_target_scan/" 2>/dev/null
+                        [ -f "${_insp}.capture_time" ] && mv "${_insp}.capture_time" "$_target_scan/" 2>/dev/null
+                    done
+                fi
 
                 # SDK stitching: use MediaSDK for high-quality ERP from .insp files
                 echo "Converting fisheye images to ERP (SDK stitcher)..."
@@ -485,23 +503,23 @@ _wait_firmware_ready() {
         [ "$_sentinel_time" -lt "$_boot_time" ] && rm -f /tmp/.insta360_session_ran
     fi
     [ ! -f /tmp/.insta360_session_ran ] && return 0
-    echo "Waiting for camera firmware to reset..."
-    sleep 3
+    echo "Previous SDK session detected — force-resetting camera to clear firmware state..."
+    # A USB reset forces the firmware to restart its HTTP command server,
+    # clearing any stuck timelapse or capture state from the previous session.
+    _usb_force_reset_camera
     echo "✓ Camera firmware ready"
 }
 
-# USB-level reset of the Insta360 camera — clears any firmware streaming state
-# that survived an unclean SDK shutdown.
-# NOTE: The Insta360 ONE firmware shuts down (rather than re-enumerates) in
-# response to USBDEVFS_RESET, requiring a physical button press to recover.
-# Only reset if the device is already in a bad state (bConfigurationValue=0/empty).
+# USB-level reset — clears any firmware streaming state from an unclean shutdown.
+# Only resets if the device is in a bad state (bConfigurationValue=0/empty),
+# because USBDEVFS_RESET on a configured ONE X2 causes it to shut down rather
+# than re-enumerate, requiring a physical button press.
 _usb_reset_camera() {
     [ -e /dev/insta ] || return 0
     local _dev _busdev _cfg
     _dev=$(readlink -f /dev/insta 2>/dev/null) || return 0
     _busdev=$(udevadm info --query=path --name="$_dev" 2>/dev/null \
         | grep -oP '[0-9]+-[0-9.]+$')
-    # Check if device is already configured — if so, skip the reset entirely.
     _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
     if [ -n "$_cfg" ] && [ "$_cfg" != "0" ]; then
         echo "✓ Camera USB device already configured (bConfigurationValue=$_cfg), skipping reset"
@@ -517,7 +535,6 @@ try:
 except Exception as e:
     sys.exit(1)
 " 2>/dev/null || true
-    # Wait for device node to re-appear and bConfigurationValue to be set
     for _i in $(seq 1 15); do
         [ -e /dev/insta ] || { sleep 1; continue; }
         [ -d "/sys/bus/usb/devices/$_busdev" ] || { sleep 1; continue; }
@@ -527,11 +544,42 @@ except Exception as e:
     done
     _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
     if [ -n "$_cfg" ] && [ "$_cfg" != "0" ]; then
-        sleep 2  # allow firmware to settle
+        sleep 2
         return 0
     fi
     echo "  ⚠ USB reset could not enumerate device (bConfigurationValue='$_cfg') — driver may fail to connect"
 }
+
+# Force USB reset regardless of bConfigurationValue — used when the firmware's
+# HTTP command server is unresponsive (stuck in timelapse state from a previous
+# session). Unlike _usb_reset_camera, does not skip when configured=1.
+_usb_force_reset_camera() {
+    [ -e /dev/insta ] || return 0
+    local _dev _busdev _cfg
+    _dev=$(readlink -f /dev/insta 2>/dev/null) || return 0
+    _busdev=$(udevadm info --query=path --name="$_dev" 2>/dev/null \
+        | grep -oP '[0-9]+-[0-9.]+$')
+    echo "Force-resetting camera USB device ($_busdev) to clear firmware state..."
+    sudo python3 -c "
+import fcntl, struct, sys
+USBDEVFS_RESET = 0x5514
+try:
+    with open('$_dev', 'wb') as f:
+        fcntl.ioctl(f, USBDEVFS_RESET, 0)
+except Exception as e:
+    sys.exit(1)
+" 2>/dev/null || true
+    for _i in $(seq 1 20); do
+        [ -e /dev/insta ] || { sleep 1; continue; }
+        [ -d "/sys/bus/usb/devices/$_busdev" ] || { sleep 1; continue; }
+        _cfg=$(cat /sys/bus/usb/devices/$_busdev/bConfigurationValue 2>/dev/null | tr -d '[:space:]')
+        [ -n "$_cfg" ] && [ "$_cfg" != "0" ] && break
+        sleep 1
+    done
+    sleep 3
+    echo "✓ Camera USB reset complete"
+}
+
 
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
 _pkill "livox_ros_driver2" & _kpids=($!)
@@ -746,7 +794,7 @@ if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
     # The shell waits for it to exit naturally after the download drain below.
     # Wait for the daemon to signal ready
     echo "Waiting for SDK camera session..."
-    for _i in $(seq 1 60); do
+    for _i in $(seq 1 120); do
         [ -f "$SCAN_DIR/.sdk_ready" ] && break
         if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
             echo "✗ SDK capture daemon exited — check $SCAN_DIR/sdk_capture.log"
@@ -755,7 +803,25 @@ if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
         sleep 1
     done
     if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
-        echo "✗ SDK camera session timed out"; exit 1
+        echo "✗ SDK camera session timed out — force-resetting camera and retrying once..."
+        kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
+        wait $SDK_CAPTURE_PID 2>/dev/null || true
+        _usb_force_reset_camera
+        rm -f "$SCAN_DIR/.sdk_ready"
+        # One retry after force reset
+        INSTA360_SESSION_DIR="$SCAN_DIR" \
+            ~/insta360-dev/build/insta360_capture >> "$SCAN_DIR/sdk_capture.log" 2>&1 &
+        SDK_CAPTURE_PID=$!
+        for _i in $(seq 1 60); do
+            [ -f "$SCAN_DIR/.sdk_ready" ] && break
+            if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
+                echo "✗ SDK capture daemon exited on retry"; exit 1
+            fi
+            sleep 1
+        done
+        if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
+            echo "✗ SDK camera session timed out after force reset"; exit 1
+        fi
     fi
     echo "✓ SDK camera session ready"
 else

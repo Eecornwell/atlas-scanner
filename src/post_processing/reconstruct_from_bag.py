@@ -461,21 +461,22 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         import shutil as _shutil
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
-        # Promote .insp files from .sdk_shot_NNN/ subdirs to session root so
-        # all downstream globs find them in a flat layout.
-        for _shot_dir in sorted(session_path.glob('.sdk_shot_*')):
+        # Promote .insp files from .sdk_shot_N/ subdirs into fusion_scan_NNN/ by index.
+        for _shot_dir in sorted(session_path.glob('.sdk_shot_*'),
+                                key=lambda p: int(p.name.split('_')[-1])):
+            _idx = int(_shot_dir.name.split('_')[-1])
+            _scan_dir = session_path / f'fusion_scan_{_idx + 1:03d}'
+            _scan_dir.mkdir(exist_ok=True)
             for _insp in sorted(_shot_dir.glob('*.insp')):
-                _dest = session_path / _insp.name
+                _dest = _scan_dir / _insp.name
                 if not _dest.exists():
                     _insp.rename(_dest)
                 _ct_src = _shot_dir / (_insp.name + '.capture_time')
-                if not _ct_src.exists():
-                    _ct_src = session_path / (_insp.name + '.capture_time')
-                _ct_dst = session_path / (_dest.name + '.capture_time')
+                _ct_dst = _scan_dir / (_insp.name + '.capture_time')
                 if _ct_src.exists() and not _ct_dst.exists():
                     _ct_src.rename(_ct_dst)
-        # Remove 0-byte .insp files from failed downloads
-        for _bad_insp in session_path.glob('*.insp'):
+        # Remove corrupt .insp files from failed downloads
+        for _bad_insp in session_path.glob('fusion_scan_*/*.insp'):
             if _bad_insp.stat().st_size < 100000:
                 _bad_insp.unlink()
                 print(f"  Removed corrupt .insp: {_bad_insp.name}")
@@ -686,7 +687,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     print(f"  SDK stitch: {len(centres)} shutter times from bag (precise)")
             # Fallback: use .capture_time sidecars
             if not centres:
-                for _ts_f in sorted(session_path.glob('*.insp.capture_time')):
+                for _ts_f in sorted(session_path.glob('fusion_scan_*/*.insp.capture_time')):
                     try:
                         _ct = float(_ts_f.read_text().strip())
                         if t_start <= _ct <= t_end:
@@ -696,7 +697,6 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 if centres:
                     centres.sort(key=lambda x: x[0])
                     print(f"  SDK stitch: {len(centres)} .insp capture times as scan centres (fallback)")
-                # Remove stale scan dirs that exceed the number of .insp captures
                 # so old reconstructions don't pollute the new one.
                 existing = sorted(session_path.glob('fusion_scan_*'))
                 keep_count = len(centres)
@@ -941,46 +941,27 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     except Exception:
                         pass
                 best_insp, best_dt = None, float("inf")
-                # Build a map of insp_file -> timestamp from all available sources:
-                # 1. .insp.capture_time sidecars (most accurate, written after download)
-                # 2. .shutter_event files (written immediately, contain cam_rtc)
-                # 3. .insp filename itself (cam_rtc from SyncLocalTimeToCamera)
+                # .insp is now co-located in the scan folder
                 import calendar as _cal, datetime as _dt_mod
                 _insp_times = {}
-                for _ts_f in sorted(session_path.glob("*.insp.capture_time")):
+                for _ts_f in sorted(scan_dir.glob("*.insp.capture_time")):
                     try:
                         _insp_path = Path(str(_ts_f).replace(".capture_time", ""))
                         _insp_times[str(_insp_path)] = float(_ts_f.read_text().strip())
                     except Exception: pass
-                for _se_f in sorted(session_path.glob("*.shutter_event")):
-                    try:
-                        _se_t = float(_se_f.read_text().strip())
-                        # Match to nearest .insp by cam_rtc (within 2s)
-                        for _insp in sorted(session_path.glob("*.insp")):
-                            if str(_insp) not in _insp_times:
-                                _parts = _insp.stem.split("_")
-                                try:
-                                    _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], "%Y%m%d%H%M%S")
-                                    _cam_epoch = float(_cal.timegm(_cam_dt.timetuple()))
-                                    if abs(_cam_epoch - _se_t) < 15.0:
-                                        _insp_times[str(_insp)] = _se_t
-                                except Exception: pass
-                    except Exception: pass
-                # Also add any .insp files not yet covered using filename cam_rtc
-                for _insp in sorted(session_path.glob("*.insp")):
+                # Fallback: use .insp filename cam_rtc
+                for _insp in sorted(scan_dir.glob("*.insp")):
                     if str(_insp) not in _insp_times:
                         _parts = _insp.stem.split("_")
                         try:
                             _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], "%Y%m%d%H%M%S")
                             _insp_times[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
                         except Exception: pass
-                _ref = _scan_centre if _scan_centre else 0
                 for _insp_path_str, _ct in _insp_times.items():
                     _insp_p = Path(_insp_path_str)
-                    # Skip 0-byte or corrupt .insp files
                     if not _insp_p.exists() or _insp_p.stat().st_size < 100000:
                         continue
-                    _dt = abs(_ct - _ref)
+                    _dt = abs(_ct - _scan_centre) if _scan_centre else 0.0
                     if _dt < best_dt:
                         best_dt, best_insp = _dt, _insp_p
                 # Only use .insp if it's within half the capture interval
