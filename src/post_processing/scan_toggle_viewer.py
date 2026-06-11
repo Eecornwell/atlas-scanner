@@ -14,10 +14,20 @@ import numpy as np
 from pathlib import Path
 from scipy.spatial.transform import Rotation
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 def load_ply_colored(path, max_pts=8000):
     pts, cols = [], []
-    with open(path, 'rb') as f:
+    safe = _safe_data(path)
+    with open(safe, 'rb') as f:
         total = 0
         while True:
             line = f.readline().decode('ascii', errors='replace')
@@ -34,19 +44,24 @@ def load_ply_colored(path, max_pts=8000):
                     cols.append([int(parts[3]) / 255.0,
                                  int(parts[4]) / 255.0,
                                  int(parts[5]) / 255.0])
-                except Exception:
+                except (ValueError, IndexError):
                     pass
     return np.array(pts) if pts else None, np.array(cols) if cols else None
 
 
 def pose_from_trajectory(traj_file):
-    with open(traj_file) as f:
+    safe = _safe_data(traj_file)
+    with open(safe) as f:
         t = json.load(f)
     # Prefer ICP-refined if available
-    refined = Path(traj_file).parent / 'trajectory_icp_refined.json'
+    refined = safe.parent / 'trajectory_icp_refined.json'
     if refined.exists():
-        with open(refined) as f:
-            t = json.load(f)
+        try:
+            refined = _safe_data(refined)
+            with open(refined) as f:
+                t = json.load(f)
+        except ValueError:
+            pass
     lp = t['current_pose']['lidar_pose']
     q = [lp['orientation']['x'], lp['orientation']['y'],
          lp['orientation']['z'], lp['orientation']['w']]
@@ -58,7 +73,11 @@ def pose_from_trajectory(traj_file):
 
 
 def create_scan_toggle_viewer(session_dir, use_icp=False):
-    session = Path(session_dir)
+    try:
+        session = _safe_data(session_dir)
+    except ValueError as e:
+        print(f'Error: {e}')
+        return None
     scan_dirs = sorted(session.glob('fusion_scan_*'))
 
     if not scan_dirs:
@@ -73,12 +92,21 @@ def create_scan_toggle_viewer(session_dir, use_icp=False):
         traj_file = scan_dir / 'trajectory.json'
         if not traj_file.exists():
             continue
+        try:
+            traj_file = _safe_data(traj_file)
+        except ValueError:
+            continue
 
         # Find colored PLY - prefer world_colored (already in world frame)
         colored = next((scan_dir / n for n in [
             'world_colored_exact.ply', 'world_colored.ply',
             'sensor_colored_exact.ply', 'sensor_colored.ply'
         ] if (scan_dir / n).exists()), None)
+        if colored is not None:
+            try:
+                colored = _safe_data(colored)
+            except ValueError:
+                colored = None
 
         if colored is None:
             print(f'  Skipping {scan_dir.name}: no colored PLY')
@@ -134,7 +162,7 @@ def create_scan_toggle_viewer(session_dir, use_icp=False):
         for s in scans_js
     )
 
-    html_file = str(session / 'scan_toggle_viewer.html')
+    html_file = str(_safe_data(session / 'scan_toggle_viewer.html'))
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -308,7 +336,7 @@ animate();
 </body>
 </html>"""
 
-    with open(html_file, 'w') as f:
+    with open(_safe_data(html_file), 'w') as f:
         f.write(html)
 
     print(f'\n✓ Scan toggle viewer: {html_file}')
@@ -355,6 +383,11 @@ animate();
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print('Usage: python3 scan_toggle_viewer.py <session_dir>')
+        sys.exit(1)
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f'Error: {e}')
         sys.exit(1)
     result = create_scan_toggle_viewer(sys.argv[1])
     if result and os.environ.get('ATLAS_GUI_MODE'):

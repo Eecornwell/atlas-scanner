@@ -6,11 +6,35 @@
 # Description: Projects sensor-frame PLY point clouds onto a 2D intensity image for use as LiDAR input to the SuperGlue feature matcher during camera-LiDAR calibration.
 import numpy as np
 import cv2
+import os
 import sys
 import yaml
 import json
 from pathlib import Path
 from scipy.spatial.transform import Rotation
+
+_ALLOWED_OUTPUT = Path(os.path.expanduser("~/atlas_ws/output")).resolve()
+_ALLOWED_DATA   = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_output(p) -> Path:
+    """Resolve p and raise ValueError if it escapes the allowed output root."""
+    resolved = Path(p).resolve()
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'"
+        )
+    return resolved
+
+
+def _safe_data(p) -> Path:
+    """Resolve p and raise ValueError if it escapes the allowed data root."""
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside the allowed data root '{_ALLOWED_DATA}'"
+        )
+    return resolved
 
 CAM_LEFT = (0, 960)      # camera content left strip (cols)
 CAM_RIGHT = (2880, 3840) # camera content right strip (cols)
@@ -42,8 +66,16 @@ def _load_T_cam_lidar():
 
 def _load_trajectory_pose(scan_dir):
     """Return (origin, R_world_lidar) for a scan directory, or None if unavailable."""
-    traj_file = Path(scan_dir) / 'trajectory.json'
+    try:
+        safe_dir = _safe_data(scan_dir)
+    except ValueError:
+        return None, None
+    traj_file = safe_dir / 'trajectory.json'
     if not traj_file.exists():
+        return None, None
+    try:
+        traj_file = _safe_data(traj_file)
+    except ValueError:
         return None, None
     with open(traj_file) as f:
         traj = json.load(f)
@@ -60,14 +92,23 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # Auto-detect dimensions from the root PNG (matcher resolution, 640x320).
     # images/ holds the full-res copy; the root PNG is what SuperGlue actually reads.
     if camera_image is not None:
-        probe_path = Path(camera_image)
-        cam_probe = cv2.imread(str(probe_path))
-        if cam_probe is not None:
-            height, width = cam_probe.shape[:2]
+        try:
+            probe_path = _safe_output(camera_image)
+        except ValueError:
+            probe_path = None
+        if probe_path is not None:
+            cam_probe = cv2.imread(str(probe_path))
+            if cam_probe is not None:
+                height, width = cam_probe.shape[:2]
     points = []
     intensities = []
 
-    with open(ply_file, 'rb') as f:
+    try:
+        safe_ply = _safe_output(ply_file)
+    except ValueError as e:
+        print(f"Rejected PLY path: {e}")
+        return False
+    with open(safe_ply, 'rb') as f:
         header_lines = []
         while True:
             line = f.readline()
@@ -115,8 +156,12 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     #
     # Falls back to the original sensor-frame fixed-yaw projection if no
     # trajectory is available (e.g. standalone PLY without a scan directory).
-    use_camframe = Path(scan_dir).is_dir() if scan_dir else False
-    is_sdk_stitch = bool(scan_dir and list(Path(scan_dir).glob('*.insp')))
+    try:
+        _safe_scan_dir = _safe_data(scan_dir) if scan_dir else None
+    except ValueError:
+        _safe_scan_dir = None
+    use_camframe = _safe_scan_dir.is_dir() if _safe_scan_dir else False
+    is_sdk_stitch = bool(_safe_scan_dir and list(_safe_scan_dir.glob('*.insp')))
     T_cam_lidar = _load_T_cam_lidar()
     # SDK stitch: full ERP, project at full resolution. Manual: halve to match strip content.
     out_w, out_h = (width, height) if is_sdk_stitch else (width // 2, height // 2)
@@ -126,16 +171,17 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         # sensor_lidar.ply is already in sensor frame; world_lidar.ply needs trajectory undo.
         import json as _json
         is_world_frame = False  # default: sensor_lidar.ply (sensor frame)
-        if scan_dir:
-            for sf in sorted(Path(scan_dir).parent.parent.glob('*_source.json')):
+        if _safe_scan_dir:
+            for sf in sorted(_safe_scan_dir.parent.parent.glob('*_source.json')):
                 try:
+                    sf = _safe_output(sf)
                     with open(sf) as _f:
                         _sd = _json.load(_f)
                     if _sd.get('scan_dir') == scan_dir:
                         is_world_frame = _sd.get('world_frame', False)
                         break
                 except: pass
-        origin, R_world_lidar = _load_trajectory_pose(scan_dir)
+        origin, R_world_lidar = _load_trajectory_pose(_safe_scan_dir)
         if is_sdk_stitch:
             # SDK stitch: identity projection (no rotation).
             # Project raw lidar XYZ directly into ERP using standard spherical:
@@ -297,9 +343,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     cam_valid_row_limit = out_h  # default: all rows valid
     if camera_image is not None:
         src_erp = None
-        if scan_dir:
-            from pathlib import Path as _P
-            scan_path = _P(scan_dir)
+        if _safe_scan_dir:
+            scan_path = _safe_scan_dir
             candidates = sorted(scan_path.glob('equirect_*_masked.png')) or \
                          [f for f in sorted(scan_path.glob('equirect_*.jpg')) if '_masked' not in f.name]
             if candidates:
@@ -330,22 +375,30 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             if feather is not None:
                 cam_gray = (cam_gray.astype(np.float32) * feather).clip(0, 255).astype(np.uint8)
             # Write processed camera gray to a sidecar — never overwrite the source RGB
-            cam_gray_path = str(Path(camera_image).with_name(
-                Path(camera_image).stem + '_camera_gray.png'))
-            cv2.imwrite(cam_gray_path, cam_gray)
+            try:
+                cam_gray_path = str(_safe_output(
+                    Path(camera_image).with_name(
+                        Path(camera_image).stem + '_camera_gray.png')))
+            except ValueError:
+                cam_gray_path = None
+            if cam_gray_path:
+                cv2.imwrite(cam_gray_path, cam_gray)
             # Overwrite the root PNG SuperGlue reads with the masked grayscale
             if feather is not None:
-                cv2.imwrite(camera_image, cam_gray)
+                try:
+                    cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
+                except ValueError:
+                    pass
 
     # Zero lidar rows outside camera coverage (with same margin)
     intensity_image[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = 0
     indices_image[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = -1
 
-    cv2.imwrite(output_image, intensity_image)
+    cv2.imwrite(str(_safe_output(output_image)), intensity_image)
 
     # The indices image pixel (u,v) must map to the same 3D point as intensity pixel (u,v).
     indices_rgba = np.frombuffer(indices_image.astype(np.int32).tobytes(), dtype=np.uint8).reshape((out_h, out_w, 4))
-    cv2.imwrite(point_indices_image, indices_rgba)
+    cv2.imwrite(str(_safe_output(point_indices_image)), indices_rgba)
 
     print(f"✓ Generated {output_image}")
     print(f"✓ Generated {point_indices_image}")
@@ -356,7 +409,11 @@ if __name__ == "__main__":
         print("Usage: python3 generate_intensity_images.py <output_directory>")
         sys.exit(1)
 
-    output_dir = Path(sys.argv[1])
+    try:
+        output_dir = _safe_output(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     ply_files = sorted(output_dir.glob("*.ply"))
     if not ply_files:
@@ -367,17 +424,17 @@ if __name__ == "__main__":
 
     for ply_file in ply_files:
         base_name = ply_file.stem
-        output_image = output_dir / f"{base_name}_lidar_intensities.png"
-        point_indices_image = output_dir / f"{base_name}_lidar_indices.png"
+        output_image = str(_safe_output(output_dir / f"{base_name}_lidar_intensities.png"))
+        point_indices_image = str(_safe_output(output_dir / f"{base_name}_lidar_indices.png"))
         # Read source scan_dir from sidecar written by combine_scans_for_calibration.py
         import json as _json
-        sidecar = output_dir / f"{base_name}_source.json"
+        sidecar = _safe_output(output_dir / f"{base_name}_source.json")
         src_scan_dir = None
         if sidecar.exists():
             with open(sidecar) as sf:
                 src_scan_dir = _json.load(sf).get('scan_dir')
-        generate_intensity_image(str(ply_file), str(output_image), str(point_indices_image),
-                                 str(output_dir / f"{base_name}.png"), scan_dir=src_scan_dir)
+        generate_intensity_image(str(_safe_output(ply_file)), output_image, point_indices_image,
+                                 str(_safe_output(output_dir / f"{base_name}.png")), scan_dir=src_scan_dir)
 
     print(f"\n✓ Generated {len(ply_files)} intensity images (remapped to matching strips)")
     print("Now you can run SuperGlue:")

@@ -17,6 +17,18 @@ import subprocess
 import tempfile
 import argparse
 from pathlib import Path
+import os as _os
+
+_ALLOWED_DATA = Path(_os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 try:
     from rclpy.serialization import deserialize_message
@@ -27,21 +39,29 @@ except ImportError:
 
 
 def open_db3(bag_dir):
-    bag_path = Path(bag_dir)
+    bag_path = _safe_data(bag_dir)
     db3_files = sorted(bag_path.glob("*.db3"))
     if db3_files:
-        return sqlite3.connect(str(db3_files[0]))
+        return sqlite3.connect(str(_safe_data(db3_files[0])))
     zstd = sorted(bag_path.glob("*.db3.zstd"))
     if not zstd:
         raise FileNotFoundError(f"No .db3 file in {bag_dir}")
-    out = str(zstd[0]).replace(".zstd", "")
-    result = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"], capture_output=True)
+    safe_zstd = _safe_data(zstd[0])
+    out = str(safe_zstd).replace(".zstd", "")
+    _safe_data(out)
+    result = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", out, "-f"], capture_output=True)
     if result.returncode != 0:
         raise RuntimeError(f"zstd decompression failed for {zstd[0]}: {result.stderr.decode().strip() or result.stdout.decode().strip()}")
     return sqlite3.connect(out)
 
 
 def extract_and_convert(bag_dir, scan_dir, dual=True):
+    try:
+        _safe_data(bag_dir)
+        safe_scan = _safe_data(scan_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
     con = open_db3(bag_dir)
     topics = {r[0]: (r[1], r[2]) for r in con.execute("SELECT id, name, type FROM topics")}
 
@@ -68,7 +88,11 @@ def extract_and_convert(bag_dir, scan_dir, dual=True):
             tmp.write(bytes(msg.data))
         tmp_path = tmp.name
 
-    fisheye_path = os.path.join(scan_dir, 'dual_fisheye.jpg')
+    try:
+        fisheye_path = str(_safe_data(safe_scan / 'dual_fisheye.jpg'))
+    except ValueError as e:
+        print(f'Error: {e}')
+        return False
     # Try middle frame first (more likely clean I-frame), then fall back to scanning all frames
     for seek_frame in [max(0, len(rows) // 2), 0, max(0, len(rows) - 1)]:
         result = subprocess.run([
@@ -91,7 +115,11 @@ def extract_and_convert(bag_dir, scan_dir, dual=True):
 
     # Convert to ERP
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    erp_path = os.path.join(scan_dir, 'equirect_dual_fisheye.jpg')
+    try:
+        erp_path = str(_safe_data(safe_scan / 'equirect_dual_fisheye.jpg'))
+    except ValueError as e:
+        print(f'Error: {e}')
+        return False
     cmd = [sys.executable, os.path.join(script_dir, 'fisheye_to_erp.py'),
            fisheye_path, erp_path]
     if dual:
@@ -112,5 +140,11 @@ if __name__ == '__main__':
     parser.add_argument('--dual', action='store_true',
                         help='Apply dual-fisheye back-to-front calibration')
     args = parser.parse_args()
+    try:
+        _safe_data(args.bag_dir)
+        _safe_data(args.scan_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     ok = extract_and_convert(args.bag_dir, args.scan_dir, args.dual)
     sys.exit(0 if ok else 1)

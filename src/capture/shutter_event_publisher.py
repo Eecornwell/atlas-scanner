@@ -7,17 +7,27 @@
 # insta360_capture and publishes them as std_msgs/Float64 on /camera/shutter_time.
 # Re-publishes when a file is updated with a refined camera-RTC time.
 
+import os
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64
 import sys
 from pathlib import Path
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 class ShutterEventPublisher(Node):
     def __init__(self, session_dir):
         super().__init__('shutter_event_publisher')
-        self.session_dir = Path(session_dir)
+        self.session_dir = _safe_data(session_dir)
         self.pub = self.create_publisher(Float64, '/camera/shutter_time', 10)
         # Track: filename -> (last_value, published_value)
         self.file_state = {}
@@ -28,8 +38,9 @@ class ShutterEventPublisher(Node):
         # Watch fusion_scan_*/ subdirs for capture_N.shutter_event files
         for f in self.session_dir.glob('fusion_scan_*/capture_*.shutter_event'):
             try:
-                val = float(f.read_text().strip())
-            except Exception:
+                safe_f = _safe_data(f)
+                val = float(safe_f.read_text().strip())
+            except ValueError:
                 continue
 
             prev = self.file_state.get(str(f))
@@ -50,14 +61,21 @@ def main():
         sys.exit(1)
 
     rclpy.init()
-    node = ShutterEventPublisher(sys.argv[1])
+    try:
+        node = ShutterEventPublisher(sys.argv[1])
+    except ValueError as e:
+        print(f'Error: {e}')
+        sys.exit(1)
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, Exception):
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except rclpy.exceptions.InvalidHandle:
+            pass
 
 
 if __name__ == '__main__':

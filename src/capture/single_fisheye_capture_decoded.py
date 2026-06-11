@@ -21,11 +21,22 @@ import os
 import numpy as np
 from datetime import datetime
 from collections import deque
+from pathlib import Path
 import threading
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_scan(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 
 def _write_ply_binary(path, pts):
     """Write Nx3 or Nx4 float32 array as binary PLY."""
+    safe_path = _safe_scan(path)
     has_intensity = pts.ndim == 2 and pts.shape[1] >= 4
     header = (
         'ply\nformat binary_little_endian 1.0\n'
@@ -35,7 +46,7 @@ def _write_ply_binary(path, pts):
         + 'end_header\n'
     )
     cols = 4 if has_intensity else 3
-    with open(path, 'wb') as f:
+    with open(safe_path, 'wb') as f:
         f.write(header.encode())
         f.write(pts[:, :cols].astype(np.float32).tobytes())
 
@@ -179,7 +190,8 @@ class SingleFisheyeCaptureDecoded(Node):
                     closest_odom = self.last_odom
 
             pts = np.asarray(points, dtype=np.float32)
-            sensor_ply_file = os.path.join(self.output_dir, f'sensor_lidar_{timestamp}.ply')
+            sensor_ply_file = str(_safe_scan(
+                os.path.join(self.output_dir, f'sensor_lidar_{timestamp}.ply')))
             _write_ply_binary(sensor_ply_file, pts)
 
             if closest_odom:
@@ -196,7 +208,8 @@ class SingleFisheyeCaptureDecoded(Node):
                     ])
                     world_xyz = (R @ pts[:, :3].T).T + np.array([pos.x, pos.y, pos.z])
                     world_pts = np.hstack([world_xyz, pts[:, 3:4]]).astype(np.float32)
-                    world_ply_file = os.path.join(self.output_dir, f'world_lidar_{timestamp}.ply')
+                    world_ply_file = str(_safe_scan(
+                        os.path.join(self.output_dir, f'world_lidar_{timestamp}.ply')))
                     _write_ply_binary(world_ply_file, world_pts)
                     print(f"✓ Saved: {sensor_ply_file} + {world_ply_file}")
                     return
@@ -211,8 +224,28 @@ class SingleFisheyeCaptureDecoded(Node):
 
 def main():
     output_dir = sys.argv[1] if len(sys.argv) > 1 else "."
-    buffer_size = int(sys.argv[2]) if len(sys.argv) > 2 else 15
-    scan_duration = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+
+    try:
+        output_dir = str(_safe_scan(output_dir))
+    except ValueError as e:
+        print(f'Error: {e}')
+        sys.exit(1)
+
+    try:
+        buffer_size = int(sys.argv[2]) if len(sys.argv) > 2 else 15
+        if buffer_size < 1:
+            raise ValueError('buffer_size must be >= 1')
+    except ValueError as e:
+        print(f'Error: invalid buffer_size: {e}')
+        sys.exit(1)
+
+    try:
+        scan_duration = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+        if scan_duration <= 0.0:
+            raise ValueError('scan_duration must be > 0')
+    except ValueError as e:
+        print(f'Error: invalid scan_duration: {e}')
+        sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -275,7 +308,7 @@ def main():
             print("✗ Failed to extract fisheye image")
             raise RuntimeError("no_fisheye")
 
-        img_file = os.path.join(output_dir, f'fisheye_{timestamp}.jpg')
+        img_file = str(_safe_scan(os.path.join(output_dir, f'fisheye_{timestamp}.jpg')))
         cv2.imwrite(img_file, front_fisheye, [cv2.IMWRITE_JPEG_QUALITY, 95])
         print(f"✓ Saved fisheye image: {img_file} ({front_fisheye.shape[1]}x{front_fisheye.shape[0]})")
 
@@ -295,15 +328,19 @@ def main():
         # notifications that flood the lidar driver's SHM port on exit.
         try:
             node.destroy_subscription(node.lidar_sub)
-        except Exception:
+        except (AttributeError, rclpy.exceptions.InvalidHandle):
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error destroying lidar subscription: {e}')
         executor.shutdown(timeout_sec=0.5)
         spin_thread.join(timeout=1.0)
         node.destroy_node()
         try:
             rclpy.shutdown(context=ctx)
-        except Exception:
+        except rclpy.exceptions.InvalidHandle:
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error during rclpy shutdown: {e}')
         time.sleep(2.0)  # allow FastDDS to release SHM port locks before process exits
 
     if _failed:

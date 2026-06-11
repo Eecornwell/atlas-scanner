@@ -11,13 +11,35 @@ import json
 import numpy as np
 from pathlib import Path
 
+_ALLOWED_ROOT   = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+_ALLOWED_OUTPUT = Path(os.path.expanduser("~/atlas_ws/output")).resolve()
+
+
+def _safe_resolve(p: Path) -> Path:
+    """Resolve path and raise ValueError if it escapes the allowed data root."""
+    resolved = p.resolve()
+    if _ALLOWED_ROOT not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside the allowed root '{_ALLOWED_ROOT}'")
+    return resolved
+
+
+def _safe_output(output_dir: str, *parts) -> Path:
+    """Join parts onto output_dir, resolve, and confirm the result stays within
+    the allowed output root before returning the Path."""
+    resolved = Path(output_dir).joinpath(*parts).resolve()
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+        raise ValueError(f"Output path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'")
+    return resolved
+
+
 def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     """Combine multiple scan sessions into one calibration dataset"""
-    
-    os.makedirs(f"{output_dir}/images", exist_ok=True)
-    os.makedirs(f"{output_dir}/points", exist_ok=True)
-    
-    base_path = Path(base_dir)
+
+    out = _safe_output(output_dir)  # validates output_dir is within _ALLOWED_OUTPUT
+    os.makedirs(out / "images", exist_ok=True)
+    os.makedirs(out / "points", exist_ok=True)
+
+    base_path = _safe_resolve(Path(base_dir))
     
     # Find all fusion_scan directories
     fusion_dirs = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith('fusion_scan')])
@@ -72,8 +94,8 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
 
         if equirect_files and ply_files:
             # Copy and convert image to PNG (handle alpha channel if present)
-            src_img = equirect_files[0]
-            dst_img = f"{output_dir}/images/{total_count:06d}.png"
+                src_img = _safe_resolve(equirect_files[0])
+            dst_img = str(_safe_output(output_dir, "images", f"{total_count:06d}.png"))
             
             import cv2
             # Read with alpha channel if present
@@ -99,24 +121,24 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
                 else:
                     img_rgb = img
                 img_small = cv2.resize(img_rgb, (MATCHER_W, MATCHER_H), interpolation=cv2.INTER_AREA)
-                root_img = f"{output_dir}/{total_count:06d}.png"
+                root_img = str(_safe_output(output_dir, f"{total_count:06d}.png"))
                 cv2.imwrite(root_img, img_small)
-                
+
                 # Copy PLY file
-                src_ply = ply_files[0]
-                dst_ply = f"{output_dir}/points/{total_count:06d}.ply"
+                src_ply = _safe_resolve(ply_files[0])
+                dst_ply = str(_safe_output(output_dir, "points", f"{total_count:06d}.ply"))
                 shutil.copy2(src_ply, dst_ply)
-                
+
                 # Also copy to root directory
-                root_ply = f"{output_dir}/{total_count:06d}.ply"
+                root_ply = str(_safe_output(output_dir, f"{total_count:06d}.ply"))
                 shutil.copy2(src_ply, root_ply)
-                
+
                 # Store source scan_dir and PLY frame so generate_intensity_images knows
                 # whether to undo the trajectory pose before projecting
                 import json as _json
                 is_world_frame = ply_files[0].name == 'world_lidar.ply'
-                with open(f"{output_dir}/{total_count:06d}_source.json", 'w') as sf:
-                    _json.dump({'scan_dir': str(fusion_dir), 'world_frame': is_world_frame}, sf)
+                with open(_safe_output(output_dir, f"{total_count:06d}_source.json"), 'w') as sf:
+                    _json.dump({'scan_dir': str(_safe_resolve(fusion_dir)), 'world_frame': is_world_frame}, sf)
                 
                 # Create timestamp entry
                 timestamps.append({
@@ -135,7 +157,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     
     # Detect matcher resolution from root PNG (downsampled for SuperGlue)
     import cv2 as _cv2
-    first_root = _cv2.imread(f"{output_dir}/000000.png")
+    first_root = _cv2.imread(str(_safe_output(output_dir, "000000.png")))
     img_h, img_w = first_root.shape[:2] if first_root is not None else (MATCHER_H, MATCHER_W)
 
     # Create metadata files
@@ -161,9 +183,9 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         }
     }
     
-    with open(f"{output_dir}/calib.json", 'w') as f:
+    with open(_safe_output(output_dir, "calib.json"), 'w') as f:
         json.dump(calib_data, f, indent=2)
-    
+
     # Create preprocessing metadata
     metadata = {
         "camera_model": "equirectangular",
@@ -177,8 +199,8 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
         "num_points": total_count,
         "timestamps": timestamps
     }
-    
-    with open(f"{output_dir}/preprocessing_result.json", 'w') as f:
+
+    with open(_safe_output(output_dir, "preprocessing_result.json"), 'w') as f:
         json.dump(metadata, f, indent=2)
     
     print(f"\n✓ Combined calibration dataset created!")
@@ -202,23 +224,33 @@ if __name__ == '__main__':
         print(f"Error: Input directory {base_dir} does not exist")
         sys.exit(1)
 
+    try:
+        _safe_resolve(Path(base_dir))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     if os.path.exists(output_dir):
         # Preserve calib.json if it contains valid calibration results
         _calib_backup = None
-        _calib_path = os.path.join(output_dir, 'calib.json')
-        if os.path.exists(_calib_path):
+        try:
+            _calib_path = _safe_output(output_dir, 'calib.json')
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        if _calib_path.exists():
             import json as _json
             try:
-                _c = _json.loads(open(_calib_path).read())
+                _c = _json.loads(_calib_path.read_text())
                 _vec = _c.get('results', {}).get('T_lidar_camera', [])
                 if len(_vec) == 7 and any(abs(v) > 1e-6 for v in _vec[:3] + _vec[4:]):
-                    _calib_backup = open(_calib_path).read()
+                    _calib_backup = _calib_path.read_text()
             except Exception:
                 pass
         shutil.rmtree(output_dir)
         if _calib_backup:
             os.makedirs(output_dir, exist_ok=True)
-            open(_calib_path, 'w').write(_calib_backup)
+            _calib_path.write_text(_calib_backup)
             print(f"  Preserved existing calib.json")
 
     count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 10)

@@ -46,16 +46,30 @@ Note: world_lidar.ply files are NOT aligned as they're already in world frame.
 """
 
 import sys
+import os
 from pathlib import Path
 import open3d as o3d
 import numpy as np
 import json
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 def load_trajectory_pose(scan_dir):
     """Load initial trajectory pose from trajectory.json or metadata.json."""
     # Try trajectory.json first (newer format)
     trajectory_file = scan_dir / "trajectory.json"
     if trajectory_file.exists():
+        try:
+            trajectory_file = _safe_data(trajectory_file)
+        except ValueError:
+            return np.eye(4)
         with open(trajectory_file, 'r') as f:
             trajectory = json.load(f)
             if 'current_pose' in trajectory and 'lidar_pose' in trajectory['current_pose']:
@@ -74,6 +88,10 @@ def load_trajectory_pose(scan_dir):
     # Fallback to metadata.json (older format)
     metadata_file = scan_dir / "metadata.json"
     if metadata_file.exists():
+        try:
+            metadata_file = _safe_data(metadata_file)
+        except ValueError:
+            return np.eye(4)
         with open(metadata_file, 'r') as f:
             metadata = json.load(f)
             if 'trajectory_pose' in metadata:
@@ -203,6 +221,11 @@ def register_final_ba(session_dir):
     """
     
     session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
     
     # Find scan subdirectories
     scan_dirs = sorted(session_path.glob("fusion_scan_*"))
@@ -340,7 +363,11 @@ def main():
         print("Usage: python align_scan_session.py <session_dir>")
         print("Example: python align_scan_session.py ~/atlas_ws/data/synchronized_scans/sync_fusion_20260216_203306")
         return
-    
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     register_final_ba(sys.argv[1])
 
 if __name__ == "__main__":

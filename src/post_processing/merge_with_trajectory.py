@@ -13,16 +13,28 @@ Use R1.T @ R.T to align rotations (double transpose).
 
 import sys
 import json
+import os
 import numpy as np
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R, Slerp
+
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 def load_ply(ply_file):
     """Load colored points from PLY, skipping uncolored (black) points"""
     points = []
     colors = []
 
-    with open(ply_file, 'r') as f:
+    safe = _safe_data(ply_file)
+    with open(safe, 'r') as f:
         raw = f.read()
     lines = raw.split(r'\n') if ('\n' not in raw and r'\n' in raw) else raw.splitlines()
 
@@ -45,7 +57,11 @@ def load_ply(ply_file):
 
 def merge_scans_simple(session_dir):
     """Simple merge without trajectory - just concatenate all scans"""
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
     
     scan_dirs = sorted([d for d in session_path.iterdir() 
                        if d.is_dir() and d.name.startswith('fusion_scan_')])
@@ -88,7 +104,8 @@ def merge_scans_simple(session_dir):
 
 def save_ply(output_file, points, colors):
     """Save merged point cloud to PLY"""
-    with open(output_file, 'w') as f:
+    safe_out = _safe_data(output_file)
+    with open(safe_out, 'w') as f:
         f.write('ply\n')
         f.write('format ascii 1.0\n')
         f.write(f'element vertex {len(points)}\n')
@@ -170,7 +187,11 @@ def merge_scans_with_trajectory(session_dir):
     This cancels the scanner's absolute orientation so all scans share the
     first scan's coordinate frame.
     """
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
 
     scan_dirs = sorted([d for d in session_path.iterdir()
                         if d.is_dir() and d.name.startswith('fusion_scan_')])
@@ -204,6 +225,10 @@ def merge_scans_with_trajectory(session_dir):
         for fname in ("trajectory_icp_refined.json", "trajectory.json"):
             traj_file = scan_dir / fname
             if traj_file.exists():
+                try:
+                    traj_file = _safe_data(traj_file)
+                except ValueError:
+                    break
                 with open(traj_file) as f:
                     traj = json.load(f)
                 pose_matrices[scan_dir.name] = pose_matrix_from_trajectory(traj)
@@ -282,5 +307,10 @@ def merge_scans_with_trajectory(session_dir):
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 merge_with_trajectory.py <session_directory>")
+        sys.exit(1)
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
     merge_scans_with_trajectory(sys.argv[1])

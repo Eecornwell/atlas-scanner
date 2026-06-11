@@ -6,8 +6,18 @@
 # Description: Simplified single-pass seam blending for equirectangular images. Applies a linear gradient across a configurable pixel width at each seam.
 import cv2 as cv
 import numpy as np
+import os
 import sys
 from pathlib import Path
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 def blend_seam(img, seam_pos, seam_width=10):
     """Blend seam in-place at given position, single smooth transition"""
@@ -33,40 +43,52 @@ def blend_seam(img, seam_pos, seam_width=10):
 
 def blend_erp_seams(image_path, output_path=None):
     """Blend ERP image seams at 1/4 and 3/4 positions using simple weighted blending"""
-    img = cv.imread(str(image_path), cv.IMREAD_UNCHANGED)
-    if img is None:
-        print(f"Failed to load {image_path}")
+    try:
+        safe_image = _safe_data(image_path)
+    except ValueError as e:
+        print(f"Rejected: {e}")
         return False
-    
+    img = cv.imread(str(safe_image), cv.IMREAD_UNCHANGED)
+    if img is None:
+        print(f"Failed to load {safe_image}")
+        return False
+
     has_alpha = img.shape[2] == 4 if len(img.shape) == 3 else False
-    
+
     if has_alpha:
         alpha = img[:, :, 3]
         img_rgb = img[:, :, :3].astype(float)
     else:
         img_rgb = img.astype(float)
-    
-    backup_path = str(image_path).replace('.jpg', '_raw.jpg').replace('.png', '_raw.png')
-    if not Path(backup_path).exists():
+
+    _p = Path(safe_image)
+    backup_path = _p.with_name(
+        _p.stem + '_raw' + _p.suffix
+    )
+    try:
+        backup_path = _safe_data(backup_path)
+    except ValueError as e:
+        print(f"Rejected backup path: {e}")
+        return False
+    if not backup_path.exists():
         if has_alpha:
-            cv.imwrite(backup_path, np.dstack([np.clip(img_rgb, 0, 255).astype(np.uint8), alpha]))
+            cv.imwrite(str(backup_path), np.dstack([np.clip(img_rgb, 0, 255).astype(np.uint8), alpha]))
         else:
-            cv.imwrite(backup_path, np.clip(img_rgb, 0, 255).astype(np.uint8))
-    
+            cv.imwrite(str(backup_path), np.clip(img_rgb, 0, 255).astype(np.uint8))
+
     height, width = img_rgb.shape[:2]
     quarter = width // 4
     three_quarter = 3 * width // 4
-    
+
     # Blend at seam positions in-place
     img_rgb = blend_seam(img_rgb, quarter)
     img_rgb = blend_seam(img_rgb, three_quarter)
-    
+
     result = np.clip(img_rgb, 0, 255).astype(np.uint8)
-    
     if has_alpha:
         result = np.dstack([result, alpha])
-    
-    cv.imwrite(str(image_path), result)
+
+    cv.imwrite(str(safe_image), result)
     return True
 
 if __name__ == "__main__":
@@ -75,6 +97,11 @@ if __name__ == "__main__":
         sys.exit(1)
     
     path = Path(sys.argv[1])
+    try:
+        path = _safe_data(path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     
     if path.is_file():
         blend_erp_seams(path)

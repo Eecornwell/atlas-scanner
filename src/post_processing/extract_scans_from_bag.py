@@ -24,6 +24,18 @@ import argparse
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+import os as _os
+
+_ALLOWED_DATA = Path(_os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 from scipy.spatial.transform import Rotation
 
 from rclpy.serialization import deserialize_message
@@ -31,7 +43,7 @@ from rosidl_runtime_py.utilities import get_message
 
 
 def read_odometry(bag_dir):
-    bag_dir = Path(bag_dir)
+    bag_dir = _safe_data(bag_dir)
     db3_files = sorted(bag_dir.glob('*.db3'))
     if not db3_files:
         zstd_files = sorted(bag_dir.glob('*.db3.zstd'))
@@ -39,9 +51,11 @@ def read_odometry(bag_dir):
             print(f'✗ No .db3 file in {bag_dir}')
             sys.exit(1)
         import subprocess
-        db3_path = str(zstd_files[0]).replace('.zstd', '')
-        print(f'  Decompressing {zstd_files[0].name}...')
-        subprocess.run(['zstd', '-d', str(zstd_files[0]), '-o', db3_path, '-f'], check=True)
+        safe_zstd = _safe_data(zstd_files[0])
+        db3_path = str(safe_zstd).replace('.zstd', '')
+        _safe_data(db3_path)
+        print(f'  Decompressing {safe_zstd.name}...')
+        subprocess.run(['zstd', '-d', str(safe_zstd), '-o', db3_path, '-f'], check=True)
         db3_files = [Path(db3_path)]
 
     con = sqlite3.connect(str(db3_files[0]))
@@ -120,7 +134,8 @@ def write_trajectory_json(scan_name, scan_dir, capture_ts, odom_msg, all_odom, f
         'full_trajectory': full_traj,
     }
 
-    with open(os.path.join(scan_dir, 'trajectory.json'), 'w') as f:
+    traj_path = _safe_data(Path(scan_dir) / 'trajectory.json')
+    with open(traj_path, 'w') as f:
         json.dump(data, f, indent=2)
 
     return T
@@ -139,7 +154,11 @@ def get_scan_capture_time(scan_dir):
 
 
 def inject_poses(session_dir):
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     scan_dirs = sorted([d for d in session_path.iterdir()
                         if d.is_dir() and d.name.startswith('fusion_scan_')])
@@ -202,4 +221,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('session_dir')
     args = parser.parse_args()
+    try:
+        _safe_data(args.session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     inject_poses(args.session_dir)

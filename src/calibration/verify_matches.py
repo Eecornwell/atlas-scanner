@@ -11,9 +11,25 @@
 import sys
 import argparse
 import json
+import os
 import numpy as np
 import cv2
 from pathlib import Path
+
+_ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
+
+
+def _safe_output(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed output root '{_ALLOWED_OUTPUT}'")
+    return resolved
+
+
+def _safe_pair(pair: str) -> str:
+    if not pair or '/' in pair or '\\' in pair or '..' in pair:
+        raise ValueError(f"Invalid pair value: '{pair}'")
+    return pair
 
 
 def main():
@@ -22,16 +38,25 @@ def main():
     parser.add_argument('--pair', default='000000')
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir).expanduser().resolve()
-    pair = args.pair
+    try:
+        output_dir = _safe_output(Path(args.output_dir).expanduser().resolve())
+    except ValueError as e:
+        print(f'Error: {e}')
+        sys.exit(1)
 
-    d = json.load(open(output_dir / f'{pair}_matches.json'))
+    try:
+        pair = _safe_pair(args.pair)
+    except ValueError as e:
+        print(f'Error: {e}')
+        sys.exit(1)
+
+    d = json.load(open(_safe_output(output_dir / f'{pair}_matches.json')))
     kpts0 = np.array(d['kpts0']).reshape(-1, 2)
     kpts1 = np.array(d['kpts1']).reshape(-1, 2)
     matches = d['matches']
 
-    cam = cv2.imread(str(output_dir / f'{pair}.png'))  # root PNG - same as initial_guess_auto
-    lid = cv2.imread(str(output_dir / f'{pair}_lidar_intensities.png'), cv2.IMREAD_GRAYSCALE)
+    cam = cv2.imread(str(_safe_output(output_dir / f'{pair}.png')))  # root PNG - same as initial_guess_auto
+    lid = cv2.imread(str(_safe_output(output_dir / f'{pair}_lidar_intensities.png')), cv2.IMREAD_GRAYSCALE)
 
     print(f'Camera ERP size: {cam.shape[1]}x{cam.shape[0]}')
     print(f'Lidar intensity size: {lid.shape[1]}x{lid.shape[0]}')
@@ -79,12 +104,12 @@ def main():
     print('Green=OK  Orange=blank lidar pixel  Red=out of bounds')
 
     out = np.hstack([cam_small, lid_color])
-    out_path = f'/tmp/{pair}_verify.png'
-    cv2.imwrite(out_path, out)
+    out_path = _safe_output(output_dir / f'{pair}_verify.png')
+    cv2.imwrite(str(out_path), out)
     print(f'\nSaved: {out_path}')
 
     import subprocess
-    subprocess.Popen(['eog', out_path])
+    subprocess.Popen(['eog', str(out_path)])
 
 
 if __name__ == '__main__':

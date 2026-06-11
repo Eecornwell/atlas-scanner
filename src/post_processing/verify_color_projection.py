@@ -5,22 +5,37 @@ Shows the actual colors sampled from the ERP at each projected LiDAR point,
 overlaid on the ERP image. If colors match the underlying ERP content, the
 projection is correct.
 """
-import numpy as np, cv2, yaml, open3d as o3d, sys
+import numpy as np, cv2, yaml, open3d as o3d, sys, os
 from scipy.spatial.transform import Rotation
 from pathlib import Path
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+_ALLOWED_SRC  = Path(os.path.expanduser('~/atlas_ws/src')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
+
 def verify_color_projection(scan_dir, output_path=None):
-    scan = Path(scan_dir)
-    config = yaml.safe_load(open('/home/orion/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'))
+    try:
+        scan = _safe_data(scan_dir)
+    except ValueError as e:
+        print(f'Error: {e}'); return None
+    calib_path = (_ALLOWED_SRC / 'atlas-scanner/src/config/fusion_calibration.yaml').resolve()
+    config = yaml.safe_load(open(calib_path))
     R_mat = Rotation.from_euler('xyz', [config['roll_offset'], config['pitch_offset'], config['yaw_offset']]).as_matrix()
     T = np.eye(4); T[:3,:3] = R_mat; T[:3,3] = [config['x_offset'], config['y_offset'], config['z_offset']]
 
-    erp = cv2.imread(str(scan/'equirect_dual_fisheye.jpg'))
+    erp = cv2.imread(str(_safe_data(scan / 'equirect_dual_fisheye.jpg')))
     if erp is None:
         print(f'No ERP in {scan_dir}'); return
     h, w = erp.shape[:2]
 
-    pcd = o3d.io.read_point_cloud(str(scan/'sensor_lidar.ply'))
+    pcd = o3d.io.read_point_cloud(str(_safe_data(scan / 'sensor_lidar.ply')))
     pts = np.asarray(pcd.points)
     # Sample points at various distances
     dists = np.linalg.norm(pts, axis=1)
@@ -50,8 +65,11 @@ def verify_color_projection(scan_dir, output_path=None):
         cv2.circle(vis, (ui, vi), 8, (b, g, r), -1)
         cv2.circle(vis, (ui, vi), 8, (255,255,255), 1)
 
-    out = output_path or str(scan/'color_projection_check.jpg')
-    cv2.imwrite(out, vis)
+    try:
+        out = _safe_data(output_path) if output_path else _safe_data(scan / 'color_projection_check.jpg')
+    except ValueError as e:
+        print(f'Error: {e}'); return None
+    cv2.imwrite(str(out), vis)
     print(f'Saved {out}')
     print(f'If circles match the background color at their location -> projection is correct')
     print(f'If circles are wrong color -> timing or calibration issue')
@@ -59,7 +77,11 @@ def verify_color_projection(scan_dir, output_path=None):
 
 if __name__ == '__main__':
     scan_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
+    try:
+        _safe_data(scan_dir)
+    except ValueError as e:
+        print(f'Error: {e}'); sys.exit(1)
     out = verify_color_projection(scan_dir)
     if out:
-        import subprocess, os
-        subprocess.Popen(['eog', out], env=os.environ)
+        import subprocess
+        subprocess.Popen(['eog', str(out)], env=os.environ)

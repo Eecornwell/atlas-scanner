@@ -45,19 +45,20 @@ def main():
         pass
     except rclpy.executors.ExternalShutdownException:
         pass
-    except Exception as e:
-        if str(e):
-            print(f"Odometry bridge error: {e}")
     finally:
         try:
             bridge.destroy_node()
-        except:
+        except (AttributeError, rclpy.exceptions.InvalidHandle):
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error destroying node: {e}')
         try:
             if rclpy.ok():
                 rclpy.shutdown()
-        except:
+        except rclpy.exceptions.InvalidHandle:
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error during rclpy shutdown: {e}')
 
 if __name__ == '__main__':
     main()

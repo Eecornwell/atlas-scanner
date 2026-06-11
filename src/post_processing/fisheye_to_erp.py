@@ -16,10 +16,25 @@ import math
 import yaml
 import sys
 import os
+from pathlib import Path
+
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+_ALLOWED_SRC  = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
+
+
+def _safe_path(p, *roots) -> Path:
+    resolved = Path(p).resolve()
+    for root in roots:
+        if root in [resolved, *resolved.parents]:
+            return resolved
+    raise ValueError(
+        f"Path '{resolved}' is outside allowed roots")
+
 
 
 def load_erp_config(config_path):
-    with open(config_path, 'r') as f:
+    safe = _safe_path(config_path, _ALLOWED_SRC)
+    with open(safe, 'r') as f:
         cfg = yaml.safe_load(f)
     p = cfg.get('equirectangular_node', {}).get('ros__parameters', cfg)
     rot = p.get('rotation_deg', [0.0, 0.0, 0.0])
@@ -86,11 +101,17 @@ def build_maps(cfg, crop):
 
 
 def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
+    try:
+        safe_fisheye = _safe_path(fisheye_path, _ALLOWED_DATA)
+        safe_output  = _safe_path(output_path,  _ALLOWED_DATA)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return None
     cfg = load_erp_config(config_path)
     crop = cfg['crop_size']
     out_w, out_h = cfg['out_width'], cfg['out_height']
 
-    img = cv2.imread(fisheye_path)
+    img = cv2.imread(str(safe_fisheye))
     if img is None:
         print(f"Warning: Cannot read: {fisheye_path}, skipping")
         return None
@@ -138,9 +159,9 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
         remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)
 
-    cv2.imwrite(output_path, erp)
-    print(f"\u2713 ERP saved: {output_path} ({out_w}x{out_h})")
-    return output_path
+    cv2.imwrite(str(safe_output), erp)
+    print(f"\u2713 ERP saved: {safe_output} ({out_w}x{out_h})")
+    return str(safe_output)
 
 
 if __name__ == '__main__':
@@ -161,4 +182,10 @@ if __name__ == '__main__':
     else:
         cfg_path = os.path.join(cfg_dir, 'equirectangular.yaml')
 
+    try:
+        _safe_path(args.input, _ALLOWED_DATA)
+        _safe_path(args.output, _ALLOWED_DATA)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     fisheye_jpg_to_erp(args.input, cfg_path, args.output, dual=args.dual)

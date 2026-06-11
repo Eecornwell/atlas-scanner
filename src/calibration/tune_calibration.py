@@ -13,6 +13,7 @@ import cv2
 import yaml
 import sys
 import json
+import os
 import argparse
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
@@ -20,9 +21,36 @@ from scipy.spatial.transform import Rotation as R
 CALIB_PATH  = Path(__file__).parent.parent / 'config' / 'fusion_calibration.yaml'
 OUTPUT_DIR  = Path.home() / 'atlas_ws/output'
 
+_ALLOWED_DATA   = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+_ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
+
+
+def _safe_output(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed output root '{_ALLOWED_OUTPUT}'")
+    return resolved
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed data root '{_ALLOWED_DATA}'")
+    return resolved
+
+
+def _safe_scan(p) -> Path:
+    """Accept paths under either the data or output tree (scan dirs can be in either)."""
+    resolved = Path(p).resolve()
+    for root in (_ALLOWED_DATA, _ALLOWED_OUTPUT):
+        if root in [resolved, *resolved.parents]:
+            return resolved
+    raise ValueError(f"Path '{resolved}' is outside allowed roots")
+
 
 def load_ply(ply_file):
-    with open(ply_file, 'rb') as f:
+    safe = _safe_scan(ply_file)
+    with open(safe, 'rb') as f:
         header = b''
         while True:
             line = f.readline()
@@ -155,19 +183,23 @@ def main():
 
     # Resolve PLY and image sources
     if args.scan_dir:
-        scan_dir = Path(args.scan_dir)
+        try:
+            scan_dir = _safe_scan(args.scan_dir)
+        except ValueError as e:
+            print(f'Error: {e}')
+            sys.exit(1)
         ply_path = next(scan_dir.glob('sensor_lidar*.ply'), None)
         img_path = next((f for f in sorted(scan_dir.iterdir())
                          if 'equirect' in f.name and f.suffix == '.jpg'), None)
-        out_dir  = scan_dir / 'calib_sweep'
+        out_dir  = _safe_scan(scan_dir / 'calib_sweep')
         if ply_path is None or img_path is None:
             print(f'Missing sensor_lidar*.ply or equirect*.jpg in {scan_dir}')
             sys.exit(1)
     else:
         # Use calibration dataset directly from output/
-        ply_path = OUTPUT_DIR / '000000.ply'
-        img_path = OUTPUT_DIR / '000000.png'
-        out_dir  = OUTPUT_DIR / 'calib_sweep'
+        ply_path = _safe_output(OUTPUT_DIR / '000000.ply')
+        img_path = _safe_output(OUTPUT_DIR / '000000.png')
+        out_dir  = _safe_output(OUTPUT_DIR / 'calib_sweep')
         if not ply_path.exists():
             print(f'No {ply_path} — run combine_scans_for_calibration.py first')
             sys.exit(1)
@@ -204,10 +236,10 @@ def main():
             # Load up to 3 scans from output/ (000000, 000001, 000002)
             sources = []
             for i in range(3):
-                p = OUTPUT_DIR / f'{i:06d}.ply'
-                q = OUTPUT_DIR / 'images' / f'{i:06d}.png'  # full-res RGB (root PNG is grayscale after generate_intensity_images)
+                p = _safe_output(OUTPUT_DIR / f'{i:06d}.ply')
+                q = _safe_output(OUTPUT_DIR / 'images' / f'{i:06d}.png')  # full-res RGB (root PNG is grayscale after generate_intensity_images)
                 if not q.exists():
-                    q = OUTPUT_DIR / f'{i:06d}.png'
+                    q = _safe_output(OUTPUT_DIR / f'{i:06d}.png')
                 if p.exists() and q.exists():
                     sources.append((p, q, f'scan {i:06d}'))
             if not sources:
@@ -226,19 +258,22 @@ def main():
             s_erp = cv2.cvtColor(s_raw, cv2.COLOR_GRAY2BGR) if s_raw.ndim == 2 else s_raw
             # Detect SDK stitch from sidecar
             import json as _json
-            sidecar = OUTPUT_DIR / f'{Path(s_ply).stem}_source.json'
+            sidecar = _safe_output(OUTPUT_DIR / f'{Path(s_ply).stem}_source.json')
             is_sdk = False
             if sidecar.exists():
                 sd = _json.load(open(sidecar))
-                scan_path = Path(sd.get('scan_dir', ''))
-                is_sdk = bool(list(scan_path.glob('*.insp'))) if scan_path.is_dir() else False
+                try:
+                    scan_path = _safe_data(sd.get('scan_dir', ''))
+                    is_sdk = bool(list(scan_path.glob('*.insp'))) if scan_path.is_dir() else False
+                except ValueError:
+                    is_sdk = False
             active_views = sdk_views if is_sdk else views
             g = generate_grid(s_erp, s_pts, cfg, 0, 0, 0, 0, 0, 0, active_views, flip_erp=is_sdk)
             cv2.putText(g, label, (10, g.shape[0] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
             scan_grids.append(g)
 
-        out = out_dir / 'current.jpg'
+        out = _safe_output(out_dir / 'current.jpg')
         cv2.imwrite(str(out), np.vstack(scan_grids))
         print(f'\n✓ Saved current calibration overlay ({len(scan_grids)} scan(s)) -> {out}')
         return
@@ -259,7 +294,7 @@ def main():
         label = f'{args.axis}_{off:+.2f}{unit}'
         cv2.putText(grid, label, (10, grid.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
-        out = out_dir / f'{label}.jpg'
+        out = _safe_scan(out_dir / f'{label}.jpg')
         cv2.imwrite(str(out), grid)
         print(f'  {out.name}')
 

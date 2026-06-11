@@ -196,9 +196,9 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded. No EIS correction is applied — each scan uses its own ERP which is already in the correct camera-frame orientation (TEMPLATE stitch, per-shot IMU).
 
-- `align_scan_session_posegraph.py` — loads `world_lidar.ply` for each scan at 2 cm voxel resolution, transforms all clouds to relative-to-first frame using trajectory poses, then runs leave-one-out ICP (each scan vs merged reference of all others) over 2 passes to find small residual drift corrections. Corrected absolute poses are written to `trajectory_icp_refined.json`. Typical improvement: ~20–25% reduction in inter-scan median NN distance.
+- `align_scan_session_posegraph.py` — loads `world_lidar.ply` for each scan at 5 cm voxel resolution, transforms all clouds to relative-to-first frame using trajectory poses, then runs leave-one-out ICP (each scan vs merged reference of all others) over 1 pass by default to find small residual drift corrections. Corrected absolute poses are written to `trajectory_icp_refined.json`. Typical improvement: ~20–25% reduction in inter-scan median NN distance.
 
-- `merge_with_trajectory.py` — applies the full rigid transform (T_first_inv × T) from `trajectory_icp_refined.json` (falling back to `trajectory.json`) to each sensor-frame colored PLY and concatenates them into a single world-frame merged cloud
+- `merge_with_trajectory.py` — applies the full rigid transform from `trajectory_icp_refined.json` (falling back to `trajectory.json`) to each sensor-frame colored PLY and concatenates them into a single world-frame merged cloud. ICP-refined poses are already in relative-to-first frame and applied directly; raw trajectory poses are in absolute odom frame and have `T_first_inv` applied first.
 
 #### Process & Worker Management
 

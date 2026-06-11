@@ -15,12 +15,24 @@ import yaml
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
-
 CALIB_PATH = Path(__file__).parent.parent / 'config' / 'fusion_calibration.yaml'
+
+_ALLOWED_DATA   = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+_ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
+
+
+def _safe_scan(p) -> Path:
+    """Accept paths under the data or output tree."""
+    resolved = Path(p).resolve()
+    for root in (_ALLOWED_DATA, _ALLOWED_OUTPUT):
+        if root in [resolved, *resolved.parents]:
+            return resolved
+    raise ValueError(f"Path '{resolved}' is outside allowed roots")
 
 
 def load_ply_points(ply_file):
-    with open(ply_file, 'rb') as f:
+    safe = _safe_scan(ply_file)
+    with open(safe, 'rb') as f:
         header = b''
         while True:
             line = f.readline()
@@ -47,7 +59,11 @@ def load_ply_points(ply_file):
 
 
 def verify_calibration(scan_dir, output_path=None):
-    scan_dir = Path(scan_dir)
+    try:
+        scan_dir = _safe_scan(scan_dir)
+    except ValueError as e:
+        print(f'Error: {e}')
+        return False
 
     # Find sensor PLY
     sensor_ply = next((scan_dir / f for f in os.listdir(scan_dir)
@@ -55,12 +71,22 @@ def verify_calibration(scan_dir, output_path=None):
     if sensor_ply is None:
         print(f"No sensor_lidar*.ply found in {scan_dir}")
         return False
+    try:
+        sensor_ply = _safe_scan(sensor_ply)
+    except ValueError as e:
+        print(f'Error: {e}')
+        return False
 
     # Find ERP image — prefer unmasked jpg for clearest overlay
     image_path = next((scan_dir / f for f in sorted(os.listdir(scan_dir))
                        if ('equirect' in f) and f.endswith('.jpg')), None)
     if image_path is None:
         print(f"No equirect*.jpg found in {scan_dir}")
+        return False
+    try:
+        image_path = _safe_scan(image_path)
+    except ValueError as e:
+        print(f'Error: {e}')
         return False
 
     print(f"PLY:   {sensor_ply.name}")
@@ -130,6 +156,11 @@ def verify_calibration(scan_dir, output_path=None):
 
     if output_path is None:
         output_path = scan_dir / 'calib_verify_overlay.jpg'
+    try:
+        output_path = _safe_scan(output_path)
+    except ValueError as e:
+        print(f'Error: {e}')
+        return False
     cv2.imwrite(str(output_path), result)
     print(f"✓ Saved overlay ({len(u)} points projected) → {output_path}")
     print(f"  Blue=near, Red=far (continuous jet scale {d_min:.1f}m - {d_max:.1f}m)")
@@ -141,5 +172,11 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python3 verify_calibration.py <scan_dir> [output.jpg]")
         sys.exit(1)
-    output = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    output = None
+    if len(sys.argv) > 2:
+        try:
+            output = _safe_scan(sys.argv[2])
+        except ValueError as e:
+            print(f'Error: {e}')
+            sys.exit(1)
     verify_calibration(sys.argv[1], output)

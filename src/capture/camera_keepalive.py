@@ -19,10 +19,12 @@ executor = rclpy.executors.SingleThreadedExecutor(context=ctx)
 executor.add_node(node)
 try:
     executor.spin()
-except Exception:
+except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
     pass
 finally:
     try:
         rclpy.shutdown(context=ctx)
-    except Exception:
+    except rclpy.exceptions.InvalidHandle:
         pass
+    except Exception as e:
+        print(f'Warning: unexpected error during rclpy shutdown: {e}')

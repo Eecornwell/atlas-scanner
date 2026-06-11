@@ -10,12 +10,22 @@ Uses OpenCV and COLMAP CLI with camera mask support.
 """
 
 import sys
+import os
 import cv2
 import numpy as np
 from pathlib import Path
 import subprocess
 import json
 from scipy.spatial.transform import Rotation as R
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).expanduser().resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 R_ROS2COLMAP = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=float)
 
@@ -58,7 +68,11 @@ def erp_to_perspective(erp_img, fov_deg, R_face_c2w_erp, output_size=1024,
 
 def convert_erp_to_perspectives(session_dir):
     """Convert all ERP images to perspective projections"""
-    session_path = Path(session_dir).expanduser()
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return None
     colmap_dir = session_path / "colmap"
     erp_dir = colmap_dir / "pano_images"
     persp_dir = colmap_dir / "images"
@@ -107,6 +121,10 @@ def convert_erp_to_perspectives(session_dir):
         if not traj_file.exists():
             traj_file = scan_dir / 'trajectory.json'
         if not traj_file.exists():
+            continue
+        try:
+            traj_file = _safe_data(traj_file)
+        except ValueError:
             continue
         with open(traj_file) as f:
             traj = json.load(f)
@@ -233,15 +251,23 @@ def convert_erp_to_perspectives(session_dir):
     print(f"\n✓ Generated {len(perspective_images)} perspective images")
     
     # Save metadata outside the images directory so COLMAP doesn't try to process it
-    metadata_file = colmap_dir / "perspective_metadata.json"
-    with open(metadata_file, 'w') as f:
+    try:
+        metadata_file = _safe_data(colmap_dir / "perspective_metadata.json")
+    except ValueError as e:
+        print(f"Error: metadata write path rejected: {e}")
+        return None
+    with open(metadata_file, "w") as f:
         json.dump(perspective_images, f, indent=2)
-    
+
     return persp_dir
 
 def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=False):
     """Run COLMAP reconstruction on perspective images with known poses"""
-    session_path = Path(session_dir).expanduser()
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
     colmap_dir = session_path / "colmap"
     database = colmap_dir / "database.db"
     output_dir = colmap_dir / "sparse"
@@ -257,6 +283,11 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     metadata_file = colmap_dir / "perspective_metadata.json"
     if not metadata_file.exists():
         metadata_file = persp_dir / "metadata.json"
+    try:
+        metadata_file = _safe_data(metadata_file)
+    except ValueError as e:
+        print(f"Error: metadata path rejected: {e}")
+        return False
     with open(metadata_file) as f:
         metadata = json.load(f)
     
@@ -264,7 +295,12 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     persp_sparse_dir.mkdir(exist_ok=True)
 
     # Write empty points3D.txt (no prior 3D points)
-    with open(persp_sparse_dir / "points3D.txt", 'w') as f:
+    try:
+        points3d_file = _safe_data(persp_sparse_dir / "points3D.txt")
+    except ValueError as e:
+        print(f"Error: points3D.txt path rejected: {e}")
+        return False
+    with open(points3d_file, 'w') as f:
         pass
 
     # Feature extraction with per-image masks
@@ -282,16 +318,29 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     _c = _output_size / 2.0
     _camera_params = f"{_f},{_f},{_c},{_c}"
 
+    try:
+        safe_database = _safe_data(database)
+        safe_persp_dir = _safe_data(persp_dir)
+    except ValueError as e:
+        print(f"Error: COLMAP path rejected: {e}")
+        return False
+
     cmd = [
         "colmap", "feature_extractor",
-        "--database_path", str(database),
-        "--image_path", str(persp_dir),
+        "--database_path", str(safe_database),
+        "--image_path", str(safe_persp_dir),
         "--ImageReader.camera_model", "PINHOLE",
         "--ImageReader.single_camera_per_image", "1",
         "--ImageReader.camera_params", _camera_params,
     ]
     if mask_files:
-        cmd.extend(["--ImageReader.mask_path", str(mask_dir)])
+        try:
+            safe_mask_dir = _safe_data(mask_dir)
+        except ValueError as e:
+            print(f"Warning: mask path rejected, skipping masks: {e}")
+            safe_mask_dir = None
+        if safe_mask_dir:
+            cmd.extend(["--ImageReader.mask_path", str(safe_mask_dir)])
     subprocess.run(cmd)
 
     # Skip rig setup - not needed for triangulation with known poses
@@ -309,7 +358,14 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     metadata_map = {item['name']: item for item in metadata}
     
     # Write cameras.bin
-    with open(persp_sparse_dir / "cameras.bin", 'wb') as f:
+    try:
+        cameras_bin   = _safe_data(persp_sparse_dir / "cameras.bin")
+        images_bin    = _safe_data(persp_sparse_dir / "images.bin")
+        points3d_bin  = _safe_data(persp_sparse_dir / "points3D.bin")
+    except ValueError as e:
+        print(f"Error: sparse model path rejected: {e}")
+        return False
+    with open(cameras_bin, 'wb') as f:
         f.write(struct.pack('Q', len(db_cameras)))
         for cam_id, model, width, height, params_blob in db_cameras:
             f.write(struct.pack('I', cam_id))
@@ -318,7 +374,7 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
             f.write(params_blob)
     
     # Write images.bin in database order
-    with open(persp_sparse_dir / "images.bin", 'wb') as f:
+    with open(images_bin, 'wb') as f:
         f.write(struct.pack('Q', len(db_images)))
         for img_id, cam_id, name in db_images:
             item = metadata_map[name]
@@ -332,41 +388,58 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
             f.write(struct.pack('Q', 0))  # No points2D yet
     
     # Write empty points3D.bin
-    with open(persp_sparse_dir / "points3D.bin", 'wb') as f:
+    with open(points3d_bin, 'wb') as f:
         f.write(struct.pack('Q', 0))
 
-    # Feature matching - exhaustive matcher handles spatially scattered stationary
-    # poses correctly; sequential matcher assumes temporal ordering which doesn't apply here.
+    # Feature matching
     print("\n2. Matching features...")
+    try:
+        safe_database     = _safe_data(database)
+        safe_persp_dir    = _safe_data(persp_dir)
+        output_model_dir  = output_dir / "0"
+        output_model_dir.mkdir(parents=True, exist_ok=True)
+        safe_output_model = _safe_data(output_model_dir)
+    except ValueError as e:
+        print(f"Error: COLMAP path rejected: {e}")
+        return False
+
     subprocess.run([
         "colmap", "exhaustive_matcher",
-        "--database_path", str(database),
+        "--database_path", str(safe_database),
     ])
-    
+
     # Reconstruction: Import features into model with known poses
     print("\n3. Importing features with known poses...")
-    output_model_dir = output_dir / "0"
-    output_model_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Copy input model to output (preserves exact poses)
     import shutil
     for file in persp_sparse_dir.glob("*"):
         if file.is_file():
-            shutil.copy(file, output_model_dir / file.name)
-    
+            try:
+                safe_src = _safe_data(file)
+                safe_dst = _safe_data(safe_output_model / file.name)
+            except ValueError:
+                continue
+            shutil.copy(safe_src, safe_dst)
+
     # Write empty points3D.bin
-    with open(output_model_dir / "points3D.bin", 'wb') as f:
+    try:
+        out_points3d = _safe_data(safe_output_model / "points3D.bin")
+    except ValueError as e:
+        print(f"Error: points3D.bin path rejected: {e}")
+        return False
+    with open(out_points3d, 'wb') as f:
         f.write(struct.pack('Q', 0))  # 0 points
-    
+
     print("  Copied input model to preserve exact poses")
-    
+
     # Triangulate points with known poses
     subprocess.run([
         "colmap", "point_triangulator",
-        "--database_path", str(database),
-        "--image_path", str(persp_dir),
-        "--input_path", str(output_model_dir),
-        "--output_path", str(output_model_dir),
+        "--database_path", str(safe_database),
+        "--image_path", str(safe_persp_dir),
+        "--input_path", str(safe_output_model),
+        "--output_path", str(safe_output_model),
         "--Mapper.tri_min_angle", "1.0",
         "--Mapper.tri_merge_max_reproj_error", "16.0",
         "--Mapper.tri_complete_max_reproj_error", "16.0",
@@ -377,35 +450,40 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
     # Optional: Bundle adjustment to refine poses and structure
     if enable_bundle_adjustment:
         print("\n4. Running bundle adjustment...")
-        
+
         # Save pre-BA poses for comparison
         pre_ba_dir = output_dir / "pre_bundle_adjustment"
         pre_ba_dir.mkdir(exist_ok=True)
         import shutil
-        shutil.copy(output_model_dir / "cameras.bin", pre_ba_dir / "cameras.bin")
-        shutil.copy(output_model_dir / "images.bin", pre_ba_dir / "images.bin")
-        shutil.copy(output_model_dir / "points3D.bin", pre_ba_dir / "points3D.bin")
+        try:
+            safe_pre_ba = _safe_data(pre_ba_dir)
+        except ValueError as e:
+            print(f"Warning: pre-BA dir path rejected, skipping copy: {e}")
+            safe_pre_ba = None
+        if safe_pre_ba:
+            for fname in ("cameras.bin", "images.bin", "points3D.bin"):
+                try:
+                    shutil.copy(_safe_data(safe_output_model / fname),
+                                _safe_data(safe_pre_ba / fname))
+                except ValueError:
+                    pass
         print("  Saved pre-BA poses to pre_bundle_adjustment/")
-        
-        ba_output = output_model_dir
-        
+
         # More aggressive BA settings for better convergence
         subprocess.run([
             "colmap", "bundle_adjuster",
-            "--input_path", str(output_model_dir),
-            "--output_path", str(ba_output),
-            # Keep intrinsics fixed (analytically exact)
+            "--input_path", str(safe_output_model),
+            "--output_path", str(safe_output_model),
             "--BundleAdjustment.refine_focal_length", "0",
             "--BundleAdjustment.refine_principal_point", "0",
             "--BundleAdjustment.refine_extra_params", "0",
-            # Solver settings for better convergence
-            "--BundleAdjustmentCeres.max_num_iterations", "200",  # Increased from 50
-            "--BundleAdjustmentCeres.max_linear_solver_iterations", "500",  # Increased from 200
-            "--BundleAdjustmentCeres.function_tolerance", "1e-6",  # Tighter convergence
-            "--BundleAdjustmentCeres.gradient_tolerance", "1e-10",  # Tighter convergence
-            "--BundleAdjustmentCeres.parameter_tolerance", "1e-8",  # Tighter convergence
+            "--BundleAdjustmentCeres.max_num_iterations", "200",
+            "--BundleAdjustmentCeres.max_linear_solver_iterations", "500",
+            "--BundleAdjustmentCeres.function_tolerance", "1e-6",
+            "--BundleAdjustmentCeres.gradient_tolerance", "1e-10",
+            "--BundleAdjustmentCeres.parameter_tolerance", "1e-8",
         ])
-        print("  ✓ Bundle adjustment complete (refined camera poses and 3D points)")
+        print("  \u2713 Bundle adjustment complete (refined camera poses and 3D points)")
     else:
         # Skip bundle adjustment - preserve exact LiDAR odometry poses
         print("\n4. Skipping bundle adjustment (preserving known poses)...")
@@ -414,37 +492,51 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
         return False
 
     # Export to PLY
-    model_dir = output_model_dir
+    model_dir = safe_output_model
     if model_dir.exists() and any(model_dir.iterdir()):
         print(f"\n✓ Reconstruction complete: {model_dir}")
-        
-        ply_output = output_dir / "reconstructed.ply"
+
+        try:
+            ply_output   = _safe_data(output_dir / "reconstructed.ply")
+            cam_only_dir = _safe_data(output_dir / "camera_only")
+        except ValueError as e:
+            print(f"Error: export path rejected: {e}")
+            return False
+        cam_only_dir.mkdir(exist_ok=True)
+
         subprocess.run([
             "colmap", "model_converter",
             "--input_path", str(model_dir),
             "--output_path", str(ply_output),
             "--output_type", "PLY"
         ])
-        
+
         if ply_output.exists():
             print(f"✓ Exported to: {ply_output}")
-            
+
             # Save camera-only points3D.bin before merging
-            camera_only_dir = output_dir / "camera_only"
-            camera_only_dir.mkdir(exist_ok=True)
             import shutil
-            shutil.copy(model_dir / "points3D.bin", camera_only_dir / "points3D.bin")
-            shutil.copy(model_dir / "cameras.bin", camera_only_dir / "cameras.bin")
-            shutil.copy(model_dir / "images.bin", camera_only_dir / "images.bin")
-            print(f"✓ Saved camera-only reconstruction to: {camera_only_dir}")
+            for fname in ("points3D.bin", "cameras.bin", "images.bin"):
+                try:
+                    shutil.copy(_safe_data(model_dir / fname),
+                                _safe_data(cam_only_dir / fname))
+                except ValueError:
+                    pass
+            print(f"✓ Saved camera-only reconstruction to: {cam_only_dir}")
 
             # Use aligned point cloud if available.
             # session_merged/session_aligned are in ROS world space -> need R_ROS2COLMAP.
             # sparse.ply (lidar_ply) is already in COLMAP world space -> no transform needed.
-            session_aligned = Path(session_dir) / "merged_aligned_colored.ply"
-            session_merged = Path(session_dir) / "merged_pointcloud.ply"
-            lidar_ply = colmap_dir / "init_sparse" / "0" / "sparse.ply"
-            
+            try:
+                session_aligned = _safe_data(session_path / "merged_aligned_colored.ply")
+                session_merged  = _safe_data(session_path / "merged_pointcloud.ply")
+                lidar_ply       = _safe_data(colmap_dir / "init_sparse" / "0" / "sparse.ply")
+                merged_ply      = _safe_data(output_dir / "merged.ply")
+                points3d_out    = _safe_data(model_dir / "points3D.bin")
+            except ValueError as e:
+                print(f"Error: point cloud path rejected: {e}")
+                return False
+
             if session_aligned.exists():
                 base_ply = session_aligned
                 base_ply_needs_transform = True
@@ -453,22 +545,20 @@ def run_colmap_on_perspectives(persp_dir, session_dir, enable_bundle_adjustment=
                 base_ply_needs_transform = True
             elif lidar_ply.exists():
                 base_ply = lidar_ply
-                base_ply_needs_transform = False  # sparse.ply already in COLMAP space
+                base_ply_needs_transform = False
             else:
                 base_ply = None
                 base_ply_needs_transform = False
-            
+
             if lidar_ply.exists():
                 compare_point_clouds(lidar_ply, ply_output)
-            
-            merged_ply = output_dir / "merged.ply"
             if base_ply:
                 merged_pts = merge_point_clouds(base_ply, ply_output, merged_ply,
                                                 transform_lidar=base_ply_needs_transform)
-                
+
                 # Write merged points back to points3D.bin
                 import struct
-                with open(model_dir / "points3D.bin", 'wb') as f:
+                with open(points3d_out, 'wb') as f:
                     f.write(struct.pack('Q', len(merged_pts)))
                     for i, p in enumerate(merged_pts, start=1):
                         f.write(struct.pack('Q', i))
@@ -491,6 +581,14 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
     import numpy as np
     import open3d as o3d
 
+    try:
+        safe_lidar  = _safe_data(lidar_ply)
+        safe_colmap = _safe_data(colmap_ply)
+        safe_out    = _safe_data(output_ply)
+    except ValueError as e:
+        print(f"Error: merge_point_clouds path rejected: {e}")
+        return []
+
     def read_ply(path):
         pcd = o3d.io.read_point_cloud(str(path))
         pts = np.asarray(pcd.points)
@@ -499,17 +597,16 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
 
     R_ROS2COLMAP = np.array([[1,0,0],[0,0,-1],[0,1,0]], dtype=float)
 
-    lidar_pts = read_ply(lidar_ply)
-    # Transform lidar points into COLMAP world frame only if needed
+    lidar_pts = read_ply(safe_lidar)
     if transform_lidar:
         for p in lidar_pts:
             xyz = R_ROS2COLMAP @ [p[0], p[1], p[2]]
             p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
 
-    colmap_pts = read_ply(colmap_ply)
+    colmap_pts = read_ply(safe_colmap)
     all_pts = lidar_pts + colmap_pts
 
-    with open(output_ply, 'w') as f:
+    with open(safe_out, 'w') as f:
         f.write('ply\nformat ascii 1.0\n')
         f.write(f'element vertex {len(all_pts)}\n')
         f.write('property float x\nproperty float y\nproperty float z\n')
@@ -521,28 +618,40 @@ def merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
     return all_pts
 
 
+def _count_ply_points(path) -> int:
+    """Count vertices declared in a PLY header. Path is validated before opening."""
+    try:
+        safe_path = _safe_data(path)
+    except ValueError:
+        return 0
+    with open(safe_path, 'rb') as f:
+        for line in f:
+            try:
+                line_str = line.decode('utf-8').strip()
+                if line_str.startswith('element vertex'):
+                    return int(line_str.split()[2])
+            except (UnicodeDecodeError, ValueError, IndexError):
+                continue
+    return 0
+
+
 def compare_point_clouds(original_path, reconstructed_path):
     """Compare original and reconstructed point clouds"""
     print(f"\nComparing point clouds...")
-    
-    # Count points
-    def count_ply_points(path):
-        with open(path, 'rb') as f:
-            for line in f:
-                try:
-                    line_str = line.decode('utf-8').strip()
-                    if line_str.startswith('element vertex'):
-                        return int(line_str.split()[2])
-                except:
-                    continue
-        return 0
-    
-    orig_count = count_ply_points(original_path)
-    recon_count = count_ply_points(reconstructed_path)
-    
+
+    try:
+        safe_orig  = _safe_data(original_path)
+        safe_recon = _safe_data(reconstructed_path)
+    except ValueError as e:
+        print(f"Error: compare_point_clouds path rejected: {e}")
+        return
+
+    orig_count  = _count_ply_points(safe_orig)
+    recon_count = _count_ply_points(safe_recon)
+
     print(f"  Original sparse.ply: {orig_count} points")
     print(f"  Reconstructed: {recon_count} points")
-    
+
     if recon_count > 0:
         ratio = recon_count / orig_count * 100
         print(f"  Recovery rate: {ratio:.1f}%")
@@ -554,10 +663,16 @@ if __name__ == '__main__':
     parser.add_argument('--bundle-adjustment', action='store_true',
                         help='Run bundle adjustment to refine poses (default: preserve exact LiDAR poses)')
     args = parser.parse_args()
-    
+
+    try:
+        _safe_data(args.session_directory)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     # Convert ERP to perspective
     persp_dir = convert_erp_to_perspectives(args.session_directory)
-    
+
     # Run COLMAP
-    run_colmap_on_perspectives(persp_dir, args.session_directory, 
+    run_colmap_on_perspectives(persp_dir, args.session_directory,
                               enable_bundle_adjustment=args.bundle_adjustment)

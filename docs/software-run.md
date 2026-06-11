@@ -80,9 +80,9 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py
 **Run ICP alignment on a session:**
 
 ```bash
-# icp_correct.py: leave-one-out ICP using world_lidar.ply, 2cm voxel, 2 passes
-python3 /tmp/icp_correct.py \
-    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 0.02 2
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    --max-gyro 0.5 --iterations 1
 # Writes trajectory_icp_refined.json for each scan
 # Then regenerate merged cloud:
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.py \
@@ -209,9 +209,9 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
 ### Merge scans with ICP alignment
 ```bash
 cd ~/atlas_ws && source install/setup.bash
-python3 /tmp/icp_correct.py \
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
-    0.02 2   # voxel_size=2cm, 2 passes
+    --max-gyro 0.5 --iterations 1
 ```
 
 Or via the capture script with `ENABLE_ICP_ALIGNMENT=true` (uses `align_scan_session_posegraph.py`).

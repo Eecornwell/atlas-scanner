@@ -10,11 +10,23 @@ import os
 import sys
 import numpy as np
 import subprocess
+from pathlib import Path
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 def create_web_viewer(ply_file):
     """Create a web-based 3D viewer for the point cloud"""
     try:
-        pcd = o3d.io.read_point_cloud(ply_file)
+        safe_ply = _safe_data(ply_file)
+        pcd = o3d.io.read_point_cloud(str(safe_ply))
         if len(pcd.points) == 0:
             print("Point cloud is empty")
             return False
@@ -35,13 +47,14 @@ def create_web_viewer(ply_file):
         colors_js = ','.join([f'{c[0]:.3f},{c[1]:.3f},{c[2]:.3f}' for c in colors]) if colors is not None else None
         
         # Create persistent HTML file in the same directory as the PLY file
-        html_file = ply_file.replace('.ply', '_viewer.html')
+        html_file = str(_safe_data(safe_ply.with_suffix('').parent /
+                                   (safe_ply.stem + '_viewer.html')))
         
         # Add timestamp to force browser refresh
         import time
         timestamp = int(time.time())
         
-        with open(html_file, 'w') as f:
+        with open(_safe_data(html_file), 'w') as f:
             html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -157,6 +170,11 @@ def create_web_viewer(ply_file):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
+        try:
+            _safe_data(sys.argv[1])
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
         create_web_viewer(sys.argv[1])
     else:
         print("Usage: python web_3d_viewer.py <ply_file>")

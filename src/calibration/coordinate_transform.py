@@ -20,13 +20,28 @@ import json
 import yaml
 import os
 import numpy as np
+from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
+_ALLOWED_SRC = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
+
+
+def _safe_src(root_path: str, *parts) -> Path:
+    """Join parts onto root_path, resolve, and confirm the result stays within
+    the allowed source tree before returning the Path."""
+    resolved = Path(root_path).joinpath(*parts).resolve()
+    if _ALLOWED_SRC not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside the allowed source root '{_ALLOWED_SRC}'"
+        )
+    return resolved
+
+
 def calibration_transform(root_path, use_existing=False):
-    config_path = os.path.join(root_path, 'config', 'fusion_calibration.yaml')
+    config_path = _safe_src(root_path, 'config', 'fusion_calibration.yaml')
     
     if use_existing:
-        if os.path.exists(config_path):
+        if config_path.exists():
             print("Using existing fusion_calibration.yaml")
             print_calibration_comparison(root_path)
             return
@@ -38,7 +53,7 @@ def calibration_transform(root_path, use_existing=False):
     calib_path = '/home/orion/atlas_ws/output/calib.json'
     
     if not os.path.exists(calib_path):
-        if os.path.exists(config_path):
+        if config_path.exists():
             print(f"⚠ calib.json not found — keeping existing fusion_calibration.yaml")
             print_calibration_comparison(root_path)
             return
@@ -65,8 +80,8 @@ def calibration_transform(root_path, use_existing=False):
             'use_fisheye': False,
             'skip_rate': 1,
         }
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
         print(f"  ✓ Wrote identity calibration to: {config_path}")
         return
     
@@ -111,11 +126,10 @@ def calibration_transform(root_path, use_existing=False):
     
     # Load existing config to preserve manual adjustments
     existing_config = {}
-    if os.path.exists(config_path):
+    if config_path.exists():
         try:
-            with open(config_path, 'r') as f:
-                existing_config = yaml.safe_load(f) or {}
-        except:
+            existing_config = yaml.safe_load(config_path.read_text()) or {}
+        except Exception:
             pass
     
     # SDK stitch always outputs 5760x2880 (full sensor resolution).
@@ -146,20 +160,19 @@ def calibration_transform(root_path, use_existing=False):
     }
     
     # Save
-    with open(config_path, 'w') as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
     
     print(f"\n✓ Saved corrected calibration to: {config_path}")
 
 def print_calibration_comparison(root_path):
     """Compare old vs new transformation approach"""
-    config_path = os.path.join(root_path, 'config', 'fusion_calibration.yaml')
-    
-    if not os.path.exists(config_path):
+    config_path = _safe_src(root_path, 'config', 'fusion_calibration.yaml')
+
+    if not config_path.exists():
         return
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+
+    config = yaml.safe_load(config_path.read_text())
     
     print("\n=== CURRENT CALIBRATION VALUES ===")
     print(f"Roll:  {config.get('roll_offset', 0.0):.6f} rad")
@@ -177,5 +190,11 @@ if __name__ == "__main__":
     
     root_path = sys.argv[1]
     use_existing = len(sys.argv) > 2 and sys.argv[2] == "--use-existing"
-    
+
+    try:
+        _safe_src(root_path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     calibration_transform(root_path, use_existing)

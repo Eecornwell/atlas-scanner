@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <filesystem>
 #include <future>
 #include <chrono>
@@ -64,11 +65,14 @@ static std::queue<DownloadJob> g_dl_queue;
 static std::atomic<int>        g_dl_pending{0};
 static std::atomic<bool>       g_dl_stop{false};
 static std::string             g_http_base;
-// Serialises all USB/HTTP operations so GetCameraFilesList and http_download
-// never run concurrently. Contention caused GetCameraFilesList to block for
-// 21s while a download was in progress, starving the timer thread and making
-// it appear the firmware had stopped shooting.
+// Serialises all log writes so multi-statement << chains from different
+// threads never interleave on stdout/stderr (CWE-362).
+static std::mutex              g_log_mutex;
 static std::mutex              g_usb_mutex;
+
+// Thread-safe log helpers.
+#define LOG_OUT(msg) do { std::unique_lock<std::mutex> _lk(g_log_mutex); std::cout << msg << std::endl; } while(0)
+#define LOG_ERR(msg) do { std::unique_lock<std::mutex> _lk(g_log_mutex); std::cerr << msg << std::endl; } while(0)
 
 static double now_sec() {
     return static_cast<double>(
@@ -76,12 +80,27 @@ static double now_sec() {
             std::chrono::system_clock::now().time_since_epoch()).count()) / 1e6;
 }
 
+// Strip newlines, carriage returns and other ASCII control characters from
+// device-supplied strings before writing them to the log so a malicious
+// camera response cannot inject fake log lines (CWE-117).
+static std::string sanitise(std::string s) {
+    s.erase(std::remove_if(s.begin(), s.end(),
+        [](unsigned char c) { return c < 0x20 || c == 0x7f; }), s.end());
+    return s;
+}
+
 static void write_shutter_event(const std::string& session_dir, int index, double t) {
-    // Write into the individual scan folder (1-based) so files stay organised.
-    std::string scan_dir = session_dir + "/fusion_scan_" +
-        [](int n){ char buf[8]; std::snprintf(buf, sizeof(buf), "%03d", n); return std::string(buf); }(index + 1);
-    fs::create_directories(scan_dir);
-    std::ofstream se(scan_dir + "/capture_" + std::to_string(index) + ".shutter_event");
+    std::string safe_dir = sanitise(session_dir);
+    // Validate scan_dir stays within session_dir to prevent path traversal.
+    fs::path base  = fs::weakly_canonical(fs::path(safe_dir));
+    char idx_buf[8];
+    std::snprintf(idx_buf, sizeof(idx_buf), "%03d", index + 1);
+    fs::path scan  = fs::weakly_canonical(base / ("fusion_scan_" + std::string(idx_buf)));
+    if (scan.string().rfind(base.string(), 0) != 0) return;  // escapes session root
+    fs::create_directories(scan);
+    fs::path event = scan / ("capture_" + std::to_string(index) + ".shutter_event");
+    if (event.string().rfind(base.string(), 0) != 0) return;  // escapes session root
+    std::ofstream se(event);
     se << std::fixed << std::setprecision(6) << t;
 }
 
@@ -91,8 +110,25 @@ static bool http_download(const std::string& remote_path, const std::string& loc
         url += remote_path.substr(1);
     else
         url += remote_path;
-    std::string cmd = "curl -sf --max-time 60 -o '" + local_path + "' '" + url + "'";
-    int ret = std::system(cmd.c_str());
+
+    // Use fork+execvp instead of std::system so url and local_path are passed
+    // as discrete argv entries and never interpreted by a shell (CWE-78/117).
+    pid_t pid = fork();
+    if (pid < 0) { return false; }
+    if (pid == 0) {
+        // Child: exec curl directly — no shell, no injection risk.
+        const char* argv[] = {
+            "curl", "-sf", "--max-time", "60",
+            "-o", local_path.c_str(),
+            url.c_str(),
+            nullptr
+        };
+        execvp("curl", const_cast<char* const*>(argv));
+        _exit(127);  // execvp failed
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int ret = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (ret != 0) { std::remove(local_path.c_str()); return false; }
     struct stat st;
     if (stat(local_path.c_str(), &st) != 0 || st.st_size < 100000) {
@@ -104,21 +140,25 @@ static bool http_download(const std::string& remote_path, const std::string& loc
 static void download_worker() {
     while (!g_dl_stop.load()) {
         DownloadJob job;
+        bool has_job = false;
         {
             std::unique_lock<std::mutex> lk(g_dl_mutex);
-            if (g_dl_queue.empty()) { lk.unlock(); std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-            job = g_dl_queue.front(); g_dl_queue.pop();
-        }
-        std::cout << "[dl] " << fs::path(job.remote_path).filename().string() << " -> " << job.local_path << std::endl;
+            if (!g_dl_queue.empty()) {
+                job = g_dl_queue.front(); g_dl_queue.pop();
+                has_job = true;
+            }
+        }  // lock released here before any blocking work
+        if (!has_job) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+        LOG_OUT("[dl] " << sanitise(fs::path(job.remote_path).filename().string()) << " -> " << sanitise(job.local_path));
         bool ok;
         {
             std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
             ok = http_download(job.remote_path, job.local_path);
         }
         if (!ok) {
-            std::cerr << "[dl] failed: " << job.remote_path << std::endl;
+            LOG_ERR("[dl] failed: " << sanitise(job.remote_path));
         } else {
-            std::cout << "[dl] saved: " << job.local_path << std::endl;
+            LOG_OUT("[dl] saved: " << sanitise(job.local_path));
             std::ofstream ct(job.local_path + ".capture_time");
             ct << std::fixed << std::setprecision(6) << job.host_t;
             write_shutter_event(job.session_dir, job.index, job.host_t);
@@ -154,7 +194,7 @@ static std::vector<std::string> filter_photo_files(const std::vector<std::string
 
 static bool open_session(ins_camera::Camera* cam) {
     auto f = std::async(std::launch::async, [cam]() { return cam->Open(); });
-    if (f.wait_for(std::chrono::seconds(8)) != std::future_status::ready) { std::cerr << "Open() timed out" << std::endl; return false; }
+    if (f.wait_for(std::chrono::seconds(8)) != std::future_status::ready) { LOG_ERR("Open() timed out"); return false; }
     return f.get();
 }
 
@@ -167,20 +207,20 @@ static bool apply_camera_settings(ins_camera::Camera* cam) {
     auto cap = std::make_shared<ins_camera::CaptureSettings>();
     cap->SetWhiteBalance(ins_camera::PhotographyOptions_WhiteBalance_WB_4000K);
     if (!cam->SetCaptureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE, cap)) return false;
-    std::cout << "Camera settings applied: shutter=1/100s, WB=4000K" << std::endl;
+    LOG_OUT("Camera settings applied: shutter=1/100s, WB=4000K");
     return true;
 }
 
 int main(int argc, char* argv[]) {
     std::string session_dir = "./output";
-    if (auto* v = std::getenv("INSTA360_SESSION_DIR")) session_dir = v;
+    if (auto* v = std::getenv("INSTA360_SESSION_DIR")) session_dir = sanitise(v);
     if (session_dir.empty()) session_dir = "./output";
     if (session_dir[0] != '/') session_dir = fs::current_path().string() + "/" + session_dir;
     fs::create_directories(session_dir);
 
     g_list = g_discovery.GetAvailableDevices();
-    if (g_list.empty()) { std::cerr << "No camera found" << std::endl; _exit(1); }
-    std::cout << "Found camera: " << g_list[0].serial_number << " type=" << int(g_list[0].camera_type) << std::endl;
+    if (g_list.empty()) { LOG_ERR("No camera found"); _exit(1); }
+    LOG_OUT("Found camera: " << sanitise(g_list[0].serial_number) << " type=" << int(g_list[0].camera_type));
 
     auto* cam = new ins_camera::Camera(g_list[0].info);
     cam->SetTimeout(20000);
@@ -189,20 +229,20 @@ int main(int argc, char* argv[]) {
     for (int attempt = 1; attempt <= 5 && !opened; ++attempt) {
         if (attempt > 1) {
             int wait = (attempt - 1) * 3;
-            std::cerr << "Retrying Open() in " << wait << "s (attempt " << attempt << "/5)..." << std::endl;
+            LOG_ERR("Retrying Open() in " << wait << "s (attempt " << attempt << "/5)...");
             std::this_thread::sleep_for(std::chrono::seconds(wait));
         }
         if (open_session(cam)) { opened = true; }
         else { delete cam; cam = new ins_camera::Camera(g_list[0].info); cam->SetTimeout(20000); }
     }
-    if (!opened) { std::cerr << "Failed to open camera" << std::endl; _exit(1); }
-    std::cout << "Camera session open" << std::endl;
+    if (!opened) { LOG_ERR("Failed to open camera"); _exit(1); }
+    LOG_OUT("Camera session open");
 
     if (!apply_camera_settings(cam))
-        std::cerr << "Failed to apply settings — continuing with defaults" << std::endl;
+        LOG_ERR("Failed to apply settings — continuing with defaults");
 
     g_http_base = cam->GetHttpBaseUrl();
-    std::cout << "HTTP base: " << g_http_base << std::endl;
+    LOG_OUT("HTTP base: " << sanitise(g_http_base));
 
     std::thread dl_thread(download_worker);
     { std::ofstream f(session_dir + "/.sdk_ready"); }
@@ -227,7 +267,7 @@ int main(int argc, char* argv[]) {
         { std::ofstream pf(pending_path); pf << g_dl_pending.load(); }
 
         if (fs::exists(quit_path)) {
-            std::cout << "Session done — stopping timelapse..." << std::endl;
+            LOG_OUT("Session done — stopping timelapse...");
             if (timelapse_active) {
                 timer_stop.store(true);
                 if (timer_thread.joinable()) timer_thread.join();
@@ -239,7 +279,7 @@ int main(int argc, char* argv[]) {
                         double t_wait = (timer_timestamps.back() + 2.5) - now_sec();
                         if (t_wait > 0 && t_wait < (double)interval_s) {
                             lk.unlock();
-                            std::cout << "Waiting " << std::fixed << std::setprecision(1) << t_wait << "s for SD flush..." << std::endl;
+                            LOG_OUT("Waiting " << std::fixed << std::setprecision(1) << t_wait << "s for SD flush...");
                             std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long long>(t_wait * 1e6)));
                         }
                     }
@@ -253,7 +293,7 @@ int main(int argc, char* argv[]) {
                 std::vector<double> timestamps;
                 int n_shots;
                 { std::unique_lock<std::mutex> lk(timer_mutex); timestamps = timer_timestamps; n_shots = (int)timestamps.size(); }
-                std::cout << "Timer counted " << n_shots << " shots, OriginUrls has " << result.OriginUrls().size() << std::endl;
+                LOG_OUT("Timer counted " << n_shots << " shots, OriginUrls has " << result.OriginUrls().size());
 
                 // Recover any shots not already downloaded in-session via OriginUrls HTTP GET.
                 // Only the last shot is accessible post-stop; earlier shots were handled in-session.
@@ -277,7 +317,7 @@ int main(int argc, char* argv[]) {
                         double host_t = n_shots > 0 ? timestamps.back() : t_start + interval_s;
                         write_shutter_event(session_dir, last_idx, host_t);
                         queue_download(last_url, session_dir, last_idx, host_t);
-                        std::cout << "Recovery: last shot " << last_idx << " queued" << std::endl;
+                        LOG_OUT("Recovery: last shot " << last_idx << " queued");
                     }
                 }
                 capture_index += n_shots;
@@ -312,7 +352,7 @@ int main(int argc, char* argv[]) {
                 for (const auto& f : filter_photo_files(files))
                     pre_session_fnames.insert(fs::path(f).filename().string());
             }
-            std::cout << "Pre-session Camera03 .insp count: " << pre_session_fnames.size() << std::endl;
+            LOG_OUT("Pre-session Camera03 .insp count: " << pre_session_fnames.size());
 
             int base_count = 0;
             cam->GetCameraFilesCount(base_count);
@@ -378,9 +418,9 @@ int main(int argc, char* argv[]) {
                     write_shutter_event(session_dir, shot, host_t);
 
                     double t_det = now_sec();  // after GetCameraFilesList — for logging only
-                    std::cout << "[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
+                    LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
                               << host_t << " count_t=" << t_count << " gfls_dt=" << (t_det - t_count)
-                              << " url=" << fs::path(new_remote).filename().string() << std::endl;
+                              << " url=" << sanitise(fs::path(new_remote).filename().string()));
 
                     queue_download(new_remote, session_dir, shot, host_t);
                     last_count = new_count;
@@ -388,23 +428,23 @@ int main(int argc, char* argv[]) {
                 }
             });
 
-            std::cout << "Timelapse started (interval=" << interval_s << "s, t_start="
-                      << std::fixed << std::setprecision(3) << t_start << ")" << std::endl;
+            LOG_OUT("Timelapse started (interval=" << interval_s << "s, t_start="
+                      << std::fixed << std::setprecision(3) << t_start << ")");
             { std::ofstream df(done_path); df << "ok"; }
 
         } else {
             // --- Stationary mode: single shot ---
             fs::create_directories(trigger_content);
             if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
-                std::cerr << "SetPhotoSubMode failed (continuing)" << std::endl;
-            std::cout << "Taking photo " << capture_index << "..." << std::endl;
+                LOG_ERR("SetPhotoSubMode failed (continuing)");
+            LOG_OUT("Taking photo " << capture_index << "...");
             auto url = cam->TakePhoto();
             if (url.Empty() || !url.IsSingleOrigin()) { std::ofstream ff(failed_path); ff << "fail"; continue; }
             double host_t = now_sec();
             write_shutter_event(session_dir, capture_index, host_t);
             std::string remote_path = url.GetSingleOrigin();
             queue_download(remote_path, session_dir, capture_index, host_t);
-            std::cout << "Shot " << capture_index << " queued" << std::endl;
+            LOG_OUT("Shot " << capture_index << " queued");
             { std::ofstream df(done_path); df << "ok"; }
             ++capture_index;
         }

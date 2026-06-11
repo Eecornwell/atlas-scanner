@@ -17,13 +17,28 @@ Usage:
 
 import sys
 import argparse
+import os
 import numpy as np
 from pathlib import Path
 import open3d as o3d
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 def clean(input_path, voxel_size=0.01, nb_neighbors=20, std_ratio=2.0):
-    pcd = o3d.io.read_point_cloud(str(input_path))
+    try:
+        safe_input = _safe_data(input_path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return None
+    pcd = o3d.io.read_point_cloud(str(safe_input))
     n_before = len(pcd.points)
     print(f"  Input:  {n_before} points")
 
@@ -36,9 +51,14 @@ def clean(input_path, voxel_size=0.01, nb_neighbors=20, std_ratio=2.0):
         pcd = pcd.voxel_down_sample(voxel_size)
         print(f"  After voxel downsample ({voxel_size}m): {len(pcd.points)} points")
 
-    out_path = Path(input_path).with_stem(Path(input_path).stem + "_clean")
+    out_path = safe_input.with_stem(safe_input.stem + "_clean")
+    try:
+        out_path = _safe_data(out_path)
+    except ValueError as e:
+        print(f"Error: output path rejected: {e}")
+        return None
     o3d.io.write_point_cloud(str(out_path), pcd)
-    print(f"  ✓ Saved: {out_path.name}")
+    print(f"  \u2713 Saved: {out_path.name}")
     return str(out_path)
 
 
@@ -52,4 +72,9 @@ if __name__ == "__main__":
     parser.add_argument("--std-ratio", type=float, default=2.0,
                         help="Std-dev threshold for outlier removal (default 2.0)")
     args = parser.parse_args()
+    try:
+        _safe_data(args.input_ply)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     clean(args.input_ply, args.voxel, args.nb_neighbors, args.std_ratio)

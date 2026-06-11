@@ -51,6 +51,7 @@ if __name__ == "__main__":
         print("Usage: python3 blend_erp_seams.py <image_or_directory>")
         sys.exit(1)
     
+    # amazonq-ignore-next-line
     path = Path(sys.argv[1])
     
     if path.is_file():

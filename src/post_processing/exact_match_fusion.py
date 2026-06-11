@@ -32,10 +32,25 @@ import cv2
 import sys
 import os
 import yaml
+from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
+
 def load_points(ply_file):
-    with open(ply_file, 'rb') as f:
+    try:
+        safe = _safe_data(ply_file)
+    except ValueError as e:
+        raise ValueError(f"load_points: {e}") from e
+    with open(safe, 'rb') as f:
         header_bytes = b''
         while True:
             line = f.readline()
@@ -60,22 +75,33 @@ def load_points(ply_file):
             return np.array(pts)
 
 def exact_match_calibration_tool(scan_dir):
-    # Always use sensor_lidar.ply — it is in the same frame as the ERP image.
-    # In SDK stitch continuous mode, sensor_lidar.ply is already motion-compensated
-    # to the capture-time sensor frame by reconstruct_from_bag.py.
-    sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir)
-                       if 'sensor_lidar' in f and f.endswith('.ply')), None)
+    try:
+        safe_scan = _safe_data(scan_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
+
+    sensor_ply = next((
+        str(_safe_data(safe_scan / f))
+        for f in os.listdir(str(safe_scan))
+        if 'sensor_lidar' in f and f.endswith('.ply')
+        and _ALLOWED_DATA in [_safe_data(safe_scan / f), *_safe_data(safe_scan / f).parents]
+    ), None)
 
     # Find image - prefer masked PNG, then regular ERP JPG
     mask_file = None
     image_file = None
-    for f in os.listdir(scan_dir):
+    for f in os.listdir(str(safe_scan)):
         if '_raw' in f:
             continue
+        try:
+            candidate = _safe_data(safe_scan / f)
+        except ValueError:
+            continue
         if f.endswith('_masked.png'):
-            mask_file = os.path.join(scan_dir, f)
+            mask_file = str(candidate)
         elif ('equirect' in f or 'equirectangular' in f) and f.endswith('.jpg'):
-            image_file = os.path.join(scan_dir, f)
+            image_file = str(candidate)
 
     if mask_file and os.path.exists(mask_file):
         image = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED)
@@ -164,7 +190,12 @@ def exact_match_calibration_tool(scan_dir):
     colors = image[v_int, u_int][:, [2, 1, 0]]  # BGR to RGB
 
     def write_ply(path, pts, cols):
-        with open(path, 'w') as f:
+        try:
+            safe_path = _safe_data(path)
+        except ValueError as e:
+            print(f"Error: write_ply path rejected: {e}")
+            return
+        with open(safe_path, 'w') as f:
             f.write('ply\nformat ascii 1.0\n')
             f.write(f'element vertex {len(pts)}\n')
             f.write('property float x\nproperty float y\nproperty float z\n')
@@ -174,17 +205,22 @@ def exact_match_calibration_tool(scan_dir):
                 r, g, b = cols[i]
                 f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
 
-    sensor_output = os.path.join(scan_dir, "sensor_colored_exact.ply")
+    sensor_output = str(_safe_data(safe_scan / "sensor_colored_exact.ply"))
     write_ply(sensor_output, valid_points, colors)
     print(f"\u2713 Saved sensor-frame colored points to {sensor_output}")
 
     # world_colored_exact.ply: same sensor-frame data (world transform applied by posegraph/merge)
-    world_output = os.path.join(scan_dir, "world_colored_exact.ply")
+    world_output = str(_safe_data(safe_scan / "world_colored_exact.ply"))
     write_ply(world_output, valid_points, colors)
     return True
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 exact_match_fusion.py <scan_directory>")
+        sys.exit(1)
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
     exact_match_calibration_tool(sys.argv[1])

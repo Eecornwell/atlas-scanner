@@ -208,8 +208,10 @@ def main():
         node.destroy_node()
         try:
             rclpy.shutdown(context=ctx)
-        except Exception:
+        except rclpy.exceptions.InvalidHandle:
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error during rclpy shutdown: {e}')
         time.sleep(0.5)  # allow FastDDS to release SHM port locks before process exits
 
 if __name__ == '__main__':

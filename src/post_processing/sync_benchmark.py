@@ -39,9 +39,20 @@ import argparse
 import json
 import struct
 import subprocess
+import os
 from pathlib import Path
 
 import numpy as np
+
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 try:
     from rclpy.serialization import deserialize_message
@@ -65,17 +76,19 @@ IMU_SYNC_TARGET_MS = 10.0  # advertised IMU soft-sync target
 
 def open_db3(bag_dir: Path):
     """Returns (connection, tmp_path_or_None)."""
+    bag_dir = _safe_data(bag_dir)
     db3 = sorted(bag_dir.glob("*.db3"))
     if db3:
-        return sqlite3.connect(str(db3[0])), None
+        return sqlite3.connect(str(_safe_data(db3[0]))), None
     zstd = sorted(bag_dir.glob("*.db3.zstd"))
     if not zstd:
         raise FileNotFoundError(f"No .db3 in {bag_dir}")
-    out = Path(str(zstd[0]).replace(".zstd", ""))
-    r = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", str(out), "-f"],
+    safe_zstd = _safe_data(zstd[0])
+    out = _safe_data(Path(str(safe_zstd).replace(".zstd", "")))
+    r = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", str(out), "-f"],
                        capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError(f"zstd decompress failed: {zstd[0]}")
+        raise RuntimeError(f"zstd decompress failed: {safe_zstd}")
     return sqlite3.connect(str(out)), out
 
 
@@ -240,7 +253,10 @@ def jitter(stamps: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 
 def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
-    session = Path(session_dir)
+    try:
+        session = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}"); sys.exit(1)
 
     # Find bag: continuous mode has rosbag_* at session root;
     # stationary mode passes the scan dir so rosbag_* is one level down.
@@ -470,8 +486,12 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     print(f"\n  Overall: {overall}\n")
 
     if out_path:
-        Path(out_path).write_text(json.dumps(report, indent=2))
-        print(f"  Report saved: {out_path}")
+        try:
+            safe_out = _safe_data(out_path)
+        except ValueError as e:
+            print(f"Error: {e}"); return report
+        safe_out.write_text(json.dumps(report, indent=2))
+        print(f"  Report saved: {safe_out}")
 
     return report
 
@@ -482,4 +502,8 @@ if __name__ == "__main__":
     parser.add_argument("--walk-speed", type=float, default=0.5)
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
+    try:
+        _safe_data(args.session_dir)
+    except ValueError as e:
+        print(f"Error: {e}"); sys.exit(1)
     benchmark(args.session_dir, args.walk_speed, args.out)

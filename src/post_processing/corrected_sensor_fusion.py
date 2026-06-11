@@ -16,10 +16,22 @@ import cv2
 import sys
 import os
 import yaml
+from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
+
 def load_points(ply_file):
-    with open(ply_file, 'rb') as f:
+    safe = _safe_data(ply_file)
+    with open(safe, 'rb') as f:
         header_lines = []
         while True:
             line = f.readline()
@@ -43,19 +55,32 @@ def load_points(ply_file):
             return np.array(pts)
 
 def corrected_fusion(scan_dir):
+    try:
+        safe_scan = _safe_data(scan_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
+
     # Find files
-    sensor_ply = next((os.path.join(scan_dir, f) for f in os.listdir(scan_dir) 
-                      if 'sensor_lidar' in f and f.endswith('.ply')), None)
-    
+    sensor_ply = next((
+        str(_safe_data(safe_scan / f)) for f in os.listdir(str(safe_scan))
+        if 'sensor_lidar' in f and f.endswith('.ply')
+        and _ALLOWED_DATA in [_safe_data(safe_scan / f), *_safe_data(safe_scan / f).parents]
+    ), None)
+
     # Find masked ERP image first, fallback to regular image
     mask_file = None
     image_file = None
-    
-    for f in os.listdir(scan_dir):
+
+    for f in os.listdir(str(safe_scan)):
+        try:
+            candidate = _safe_data(safe_scan / f)
+        except ValueError:
+            continue
         if f.endswith('_masked.png'):
-            mask_file = os.path.join(scan_dir, f)
+            mask_file = str(candidate)
         elif ('equirect' in f or 'equirectangular' in f) and f.endswith('.jpg'):
-            image_file = os.path.join(scan_dir, f)
+            image_file = str(candidate)
     
     # Use masked image if available
     if mask_file and os.path.exists(mask_file):
@@ -191,7 +216,11 @@ def corrected_fusion(scan_dir):
     colors = image[v_int, u_int][:, [2, 1, 0]]  # BGR to RGB
     
     # Save colored point cloud
-    output_file = os.path.join(scan_dir, "world_colored.ply")
+    try:
+        output_file = str(_safe_data(safe_scan / "world_colored.ply"))
+    except ValueError as e:
+        print(f"Error: output path rejected: {e}")
+        return False
     with open(output_file, 'w') as f:
         f.write('ply\\nformat ascii 1.0\\n')
         f.write(f'element vertex {len(valid_points)}\\n')
@@ -211,5 +240,9 @@ if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 corrected_sensor_fusion.py <scan_directory>")
         sys.exit(1)
-    
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     corrected_fusion(sys.argv[1])

@@ -16,7 +16,8 @@ if _WAYLAND_DISPLAY and not os.environ.get('_ATLAS_REEXEC'):
     os.environ['_ATLAS_REEXEC'] = '1'
     os.environ['_ATLAS_WAYLAND_DISPLAY'] = _WAYLAND_DISPLAY
     os.environ.pop('WAYLAND_DISPLAY', None)
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Only pass the script path — drop all other argv to prevent argument injection
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -42,7 +43,7 @@ class FusionCaptureGUI:
             _icon = tk.PhotoImage(file=str(_icon_path))
             self.root.iconphoto(True, _icon)
             self._icon_ref = _icon  # prevent GC
-        except Exception:
+        except (FileNotFoundError, OSError, tk.TclError):
             pass
 
         # Fit initial window to screen — leave a small margin for taskbars
@@ -140,7 +141,7 @@ class FusionCaptureGUI:
             self.logo_photo = ImageTk.PhotoImage(logo_image)
             logo_label = ttk.Label(left_panel, image=self.logo_photo)
             logo_label.grid(row=0, column=0, pady=(0, 4))
-        except Exception:
+        except (FileNotFoundError, OSError, tk.TclError):
             pass  # Skip logo if not found
         
         # Status frame (compact)
@@ -406,7 +407,13 @@ class FusionCaptureGUI:
             # first-time setup).  Only invoke pkexec when the rule file is missing,
             # which means this is a fresh install and a one-time password prompt is
             # acceptable.
-            perm_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'setup_camera_permissions.sh')
+            perm_script = os.path.realpath(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'setup_camera_permissions.sh'))
+            # Validate the script resolves within the expected source tree
+            _src_root = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+            if not perm_script.startswith(_src_root + os.sep) and perm_script != _src_root:
+                self.log_message('⚠ Camera permissions script path is outside source tree — aborted')
+                return
             udev_rule = '/etc/udev/rules.d/99-insta.rules'
             dev_accessible = os.access('/dev/insta', os.R_OK | os.W_OK) if os.path.exists('/dev/insta') else False
             rule_installed = os.path.exists(udev_rule)
@@ -420,28 +427,46 @@ class FusionCaptureGUI:
                 def _run_perms():
                     try:
                         if rule_installed:
-                            # Rule exists but device not yet accessible — just trigger udev,
-                            # no password needed.
                             result = subprocess.run(
                                 ['udevadm', 'trigger', '--subsystem-match=usb'],
                                 text=True, timeout=10)
                             ok = result.returncode == 0
                         else:
-                            # First-time setup: need pkexec to install the udev rule.
-                            result = subprocess.run(['pkexec', 'bash', perm_script], text=True, timeout=120)
+                            if not os.access(perm_script, os.X_OK):
+                                os.chmod(perm_script, 0o755)
+                            result = subprocess.run(['pkexec', perm_script], text=True, timeout=120)
                             ok = result.returncode == 0
-                    except Exception:
+                    except subprocess.TimeoutExpired:
                         ok = False
+                        self.root.after(0, lambda: self.log_message('⚠ Camera permissions timed out'))
+                    except FileNotFoundError as e:
+                        ok = False
+                        self.root.after(0, lambda m=str(e): self.log_message(f'⚠ Camera permissions command not found: {m}'))
+                    except PermissionError as e:
+                        ok = False
+                        self.root.after(0, lambda m=str(e): self.log_message(f'⚠ Camera permissions denied: {m}'))
                     msg = "✓ Camera permissions set" if ok else "⚠ Camera permissions failed — check polkit/pkexec"
                     self.root.after(0, lambda m=msg: self.log_message(m))
                     perm_done.set()
 
                 threading.Thread(target=_run_perms, daemon=True).start()
 
+            # Validate GUI-supplied values before building the command
+            _VALID_CAMERA  = {'dual_fisheye', 'single_fisheye'}
+            _VALID_CAPTURE = {'stationary', 'continuous'}
+            camera_val  = self.camera_mode_var.get()
+            capture_val = self.capture_mode_var.get()
+            if camera_val not in _VALID_CAMERA:
+                self.log_message(f'Invalid camera mode: {camera_val!r}')
+                return
+            if capture_val not in _VALID_CAPTURE:
+                self.log_message(f'Invalid capture mode: {capture_val!r}')
+                return
+
             # Start the fusion script
             cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
-                   '--camera', self.camera_mode_var.get(),
-                   '--capture', self.capture_mode_var.get()]
+                   '--camera', camera_val,
+                   '--capture', capture_val]
             if self.bag_only_var.get():
                 cmd.append('--bag-only')
             if self.capture_mode_var.get() == 'stationary' and self.stationary_wait_var.get():
@@ -486,7 +511,7 @@ class FusionCaptureGUI:
                             try:
                                 _add_session_log_handler(self.scan_dir)
                                 self._session_log_attached = True
-                            except Exception:
+                            except (OSError, PermissionError):
                                 pass
                     if "FUSION CAPTURE READY" in line:
                         self.root.after(0, self._system_ready)
@@ -497,10 +522,13 @@ class FusionCaptureGUI:
                     elif "✓ Scan saved to:" in line:
                         self.root.after(0, self._scan_completed)
                     elif "_viewer.html" in line or ("3D viewer" in line and ".html" in line):
-                        import re
-                        m = re.search(r'(/[^\s]+_viewer\.html)', line)
+                        import re as _re, os as _os
+                        m = _re.search(r'(/[^\s]+_viewer\.html)', line)
                         if m:
-                            self._pending_viewer_html = m.group(1)
+                            _candidate = _os.path.realpath(m.group(1))
+                            _allowed = _os.path.realpath(_os.path.expanduser('~/atlas_ws/data'))
+                            if _candidate.startswith(_allowed + _os.sep) or _candidate == _allowed:
+                                self._pending_viewer_html = _candidate
                     elif "Session ended with no scans captured" in line:
                         self.root.after(0, lambda: self.update_status("No scans captured — stopped before triggering a scan", "orange"))
                     elif any(err in line for err in (
@@ -542,12 +570,22 @@ class FusionCaptureGUI:
             
     def embed_web_viewer(self, html_path):
         """Render the point cloud directly in the Viewer tab using Open3D offscreen renderer."""
+        import os as _os
+        _allowed = _os.path.realpath(_os.path.expanduser('~/atlas_ws/data'))
+        safe_html = _os.path.realpath(html_path)
+        if not (safe_html.startswith(_allowed + _os.sep) or safe_html == _allowed):
+            self.log_message(f'⚠ Viewer path outside allowed root: {html_path!r}')
+            return
+
         if self.web_viewer_process:
             self.web_viewer_process.set()  # stop previous viewer if any
             self.web_viewer_process = None
 
-        ply_path = html_path.replace('_viewer.html', '.ply')
-        if not os.path.exists(ply_path):
+        ply_path = _os.path.realpath(safe_html.replace('_viewer.html', '.ply'))
+        if not (ply_path.startswith(_allowed + _os.sep) or ply_path == _allowed):
+            self.log_message(f'⚠ PLY path outside allowed root: {ply_path!r}')
+            return
+        if not _os.path.exists(ply_path):
             self.log_message(f'⚠ PLY file not found: {ply_path}')
             return
 
@@ -694,6 +732,8 @@ sys.exit(0 if ok[0] else 4)
                                     capture_output=True, text=True)
             candidates = []
             for wid in result.stdout.strip().split():
+                if not wid.isdigit():
+                    continue  # skip any non-integer token from xdotool output
                 if wid in known_stale:
                     continue
                 name = subprocess.run(['xdotool', 'getwindowname', wid],
@@ -790,7 +830,7 @@ sys.exit(0 if ok[0] else 4)
                     self.scan_dir = output_dir
                 try:
                     _add_session_log_handler(output_dir)
-                except Exception:
+                except (OSError, PermissionError):
                     pass
                 break
                 
@@ -805,7 +845,7 @@ sys.exit(0 if ok[0] else 4)
                 self.log_message(f"⚠ Low disk space: {free_gb:.1f} GB free — consider freeing space before next scan")
                 self.update_status(f"⚠ Low disk space ({free_gb:.1f} GB free)", "orange")
                 return False
-        except Exception:
+        except OSError:
             pass
         return True
 
@@ -857,7 +897,7 @@ sys.exit(0 if ok[0] else 4)
             for _ in range(10):
                 try:
                     cur_size = img_path.stat().st_size
-                except Exception:
+                except OSError:
                     return
                 if cur_size == prev_size and cur_size > 0:
                     break
@@ -876,10 +916,10 @@ sys.exit(0 if ok[0] else 4)
                     photo = ImageTk.PhotoImage(img)
                     self._latest_thumb_photo = photo
                     self.thumb_label.config(image=photo, text='')
-                except Exception:
+                except (tk.TclError, OSError):
                     pass
             self.root.after(0, _update)
-        except Exception:
+        except (OSError, Image.UnidentifiedImageError):
             pass
         
     def capture_scan(self):
@@ -946,14 +986,14 @@ sys.exit(0 if ok[0] else 4)
                         log_path = pathlib.Path(self.scan_dir) / 'session.log'
                         if log_path.exists() and log_path.stat().st_mtime > last_output:
                             last_output = log_path.stat().st_mtime
-                except Exception:
+                except OSError:
                     pass
                 if time.monotonic() - last_output > SILENCE_LIMIT:
                     self.root.after(0, lambda: self.log_message(
                         f"Post-processing timeout ({SILENCE_LIMIT}s silence), force stopping..."))
                     try:
                         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                    except Exception:
+                    except (ProcessLookupError, PermissionError):
                         pass
                     break
                 time.sleep(2)
@@ -970,9 +1010,13 @@ sys.exit(0 if ok[0] else 4)
                 "livox_ros_driver2", "rko_lio", "static_transform_publisher",
                 "trajectory_recorder", "insta360_ros_driver/lib", "livox_ros_driver2/lib"
             ]
-            
+
+            import re as _re
             for process in processes_to_kill:
-                subprocess.run(["pkill", "-9", "-f", process], capture_output=True)
+                # Escape the pattern so regex metacharacters (., /) in process
+                # names are treated as literals rather than regex operators.
+                pattern = _re.escape(process)
+                subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
                 
             self.log_message("✓ ROS processes cleaned up")
         except Exception as e:
@@ -997,11 +1041,18 @@ sys.exit(0 if ok[0] else 4)
     # ── Post-Processing tab helpers ───────────────────────────────────────────
 
     def _pp_session(self):
-        """Return the session directory to operate on."""
+        """Return the validated session directory to operate on."""
+        import os as _os
+        _allowed = _os.path.realpath(_os.path.expanduser('~/atlas_ws/data'))
         val = self._pp_session_var.get().strip()
-        if val and val != "(use current session)":
-            return val
-        return getattr(self, 'scan_dir', None)
+        candidate = val if (val and val != "(use current session)") else getattr(self, 'scan_dir', None)
+        if not candidate:
+            return None
+        resolved = _os.path.realpath(candidate)
+        if not (resolved.startswith(_allowed + _os.sep) or resolved == _allowed):
+            self._pp_log_write(f"\n[!] Session path is outside allowed data root: {candidate!r}\n")
+            return None
+        return resolved
 
     def _pp_browse(self):
         import tkinter.filedialog as _fd
@@ -1022,19 +1073,47 @@ sys.exit(0 if ok[0] else 4)
         if not sess:
             self._pp_log_write("\n[!] No session selected.\n")
             return
-        self._pp_log_write(f"\n>> {label}\n   {' '.join(cmd)}\n")
+        safe_label = label.replace('\n', ' ').replace('\r', ' ')
+        safe_cmd   = ' '.join(a.replace('\n', ' ').replace('\r', ' ') for a in cmd)
+        self._pp_log_write(f"\n>> {safe_label}\n   {safe_cmd}\n")
         def _run():
             import subprocess as _sp
+            import os as _os
+            # Validate cmd[0] is the known-safe interpreter to prevent PATH hijacking.
+            _safe_interp = _os.path.realpath(sys.executable)
+            _actual_interp = _os.path.realpath(cmd[0]) if cmd else ''
+            if _actual_interp != _safe_interp:
+                self.root.after(0, self._pp_log_write,
+                                f"Error: rejected unsafe interpreter: {cmd[0]!r}\n")
+                return
             try:
+                # Build a minimal, explicit environment rather than inheriting
+                # os.environ wholesale — prevents PYTHONPATH, LD_PRELOAD and
+                # LD_LIBRARY_PATH from being used to hijack the subprocess.
+                _safe_env = {
+                    k: os.environ[k] for k in (
+                        'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                        'ROS_DISTRO', 'ROS_VERSION', 'AMENT_PREFIX_PATH',
+                        'COLCON_PREFIX_PATH', 'CMAKE_PREFIX_PATH',
+                        'LD_LIBRARY_PATH', 'PYTHONPATH',
+                        'DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
+                        'DBUS_SESSION_BUS_ADDRESS', '_ATLAS_WAYLAND_DISPLAY',
+                        'WAYLAND_DISPLAY',
+                    ) if k in os.environ
+                }
+                _safe_env['PYTHONUNBUFFERED'] = '1'
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
-                                  env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+                                  env=_safe_env)
                 for line in proc.stdout:
-                    self.root.after(0, self._pp_log_write, line)
+                    safe_line = line.replace('\r', '').rstrip('\n') + '\n'
+                    self.root.after(0, self._pp_log_write, safe_line)
                 proc.wait()
                 self.root.after(0, self._pp_log_write,
                                 f"{'Done' if proc.returncode == 0 else 'FAILED'} (exit {proc.returncode})\n")
-            except Exception as e:
-                self.root.after(0, self._pp_log_write, f"Error: {e}\n")
+            except FileNotFoundError as e:
+                self.root.after(0, self._pp_log_write, f"Error: command not found: {e}\n")
+            except PermissionError as e:
+                self.root.after(0, self._pp_log_write, f"Error: permission denied: {e}\n")
         threading.Thread(target=_run, daemon=True).start()
 
     def _pp_run_reconstruct(self):
@@ -1046,44 +1125,46 @@ sys.exit(0 if ok[0] else 4)
             self._pp_log_write("    The bag may have been deleted after processing.\n")
             self._pp_log_write("    Other utilities (ICP, merge, COLMAP, viewer) can still run on this session.\n")
             return
-        self._pp_run("Run Post-Processing", ['python3', str(self.script_dir / 'post_processing/reconstruct_from_bag.py'), sess])
+        self._pp_run("Run Post-Processing", [sys.executable, str(self.script_dir / 'post_processing/reconstruct_from_bag.py'), sess])
 
     def _pp_reprocess(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Recolor with New Calibration", ['python3', str(self.script_dir / 'post_processing/reprocess_session.py'), sess])
+        self._pp_run("Recolor with New Calibration", [sys.executable, str(self.script_dir / 'post_processing/reprocess_session.py'), sess])
 
     def _pp_icp(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("ICP Alignment", ['python3', str(self.script_dir / 'post_processing/align_scan_session_posegraph.py'), sess, '--iterations', '1'])
+        self._pp_run("ICP Alignment", [sys.executable, str(self.script_dir / 'post_processing/align_scan_session_posegraph.py'), sess, '--iterations', '1'])
 
     def _pp_merge_traj(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Merge (Trajectory Only)", ['python3', str(self.script_dir / 'post_processing/merge_trajectory_only.py'), sess])
+        self._pp_run("Merge (Trajectory Only)", [sys.executable, str(self.script_dir / 'post_processing/merge_trajectory_only.py'), sess])
 
     def _pp_colmap(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Export COLMAP Model", ['python3', str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess])
+        self._pp_run("Export COLMAP Model", [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess])
 
     def _pp_web_viewer(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        ply = next((str(p) for p in sorted(pathlib.Path(sess).glob('*.ply'), key=lambda p: p.stat().st_mtime, reverse=True)), None)
-        if not ply: self._pp_log_write("\n[!] No .ply file found in session.\n"); return
-        self._pp_run("View Point Cloud (Web)", ['python3', str(self.script_dir / 'post_processing/web_3d_viewer.py'), ply])
+        _allowed = pathlib.Path(sess).resolve()
+        ply_path = next((p for p in sorted(pathlib.Path(sess).glob('*.ply'), key=lambda p: p.stat().st_mtime, reverse=True)
+                         if _allowed in [p.resolve(), *p.resolve().parents]), None)
+        if not ply_path: self._pp_log_write("\n[!] No .ply file found in session.\n"); return
+        self._pp_run("View Point Cloud (Web)", [sys.executable, str(self.script_dir / 'post_processing/web_3d_viewer.py'), str(ply_path.resolve())])
 
     def _pp_toggle_viewer(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Per-Scan Alignment Viewer", ['python3', str(self.script_dir / 'post_processing/scan_toggle_viewer.py'), sess])
+        self._pp_run("Per-Scan Alignment Viewer", [sys.executable, str(self.script_dir / 'post_processing/scan_toggle_viewer.py'), sess])
 
     def _pp_sync_benchmark(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Sync Benchmark", ['python3', str(self.script_dir / 'post_processing/sync_benchmark.py'),
+        self._pp_run("Sync Benchmark", [sys.executable, str(self.script_dir / 'post_processing/sync_benchmark.py'),
                                         sess, '--out', str(pathlib.Path(sess) / 'sync_benchmark.json')])
 
     # ───────────────────────────────────────────────────────────────
@@ -1101,7 +1182,11 @@ sys.exit(0 if ok[0] else 4)
                 # Close the outer WM shell; rviz2 process will be killed by ROS shutdown
                 outer = getattr(self, 'rviz_outer_win_id', None)
                 if outer:
-                    subprocess.run(['xdotool', 'windowclose', outer], capture_output=True)
+                    # Validate outer is a pure decimal window ID before use
+                    if not str(outer).strip().isdigit():
+                        self.log_message(f'⚠ Skipping windowclose: invalid window ID {outer!r}')
+                    else:
+                        subprocess.run(['xdotool', 'windowclose', str(outer).strip()], capture_output=True)
                     if not hasattr(self, '_stale_rviz_wids'):
                         self._stale_rviz_wids = set()
                     self._stale_rviz_wids.add(outer)
@@ -1150,6 +1235,11 @@ def _setup_logging():
     return log_path
 
 def _add_session_log_handler(session_dir: str):
+    import os as _os
+    _allowed = _os.path.realpath(_os.path.expanduser('~/atlas_ws/data'))
+    resolved = _os.path.realpath(session_dir)
+    if not (resolved.startswith(_allowed + _os.sep) or resolved == _allowed):
+        raise ValueError(f"session_dir '{resolved}' is outside allowed root '{_allowed}'")
     # Remove any previous session FileHandlers so old session dirs don't
     # accumulate across restarts within the same GUI process.
     root_logger = logging.getLogger()
@@ -1157,7 +1247,10 @@ def _add_session_log_handler(session_dir: str):
         if isinstance(h, logging.FileHandler) and 'synchronized_scans' in h.baseFilename:
             h.close()
             root_logger.removeHandler(h)
-    dest = pathlib.Path(session_dir) / 'gui.log'
+    dest = pathlib.Path(resolved) / 'gui.log'
+    # Final check: confirm the log file itself stays within the allowed root
+    if not str(dest.resolve()).startswith(_allowed + _os.sep):
+        raise ValueError(f"Log file path '{dest}' is outside allowed root '{_allowed}'")
     handler = logging.FileHandler(dest)
     handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     root_logger.addHandler(handler)
@@ -1189,8 +1282,8 @@ def main():
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             if line.startswith('while'):
                 break  # stop before the CLI override block
-    except Exception:
-        pass
+    except OSError:
+        pass  # use hardcoded defaults if script is missing or unreadable
 
     log_path = _setup_logging()
     logging.info("fusion_gui starting")

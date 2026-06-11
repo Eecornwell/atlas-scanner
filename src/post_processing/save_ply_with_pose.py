@@ -8,7 +8,18 @@
 import numpy as np
 import json
 import sys
+import os
+from pathlib import Path
 from datetime import datetime
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 def save_ply_with_pose(points, filename, pose_data=None, colors=None):
     """Save PLY file with embedded pose data in header"""
@@ -59,7 +70,8 @@ def save_ply_with_pose(points, filename, pose_data=None, colors=None):
     header_lines.append("end_header")
     
     # Write file
-    with open(filename, 'w') as f:
+    safe_out = _safe_data(filename)
+    with open(safe_out, 'w') as f:
         # Write header
         for line in header_lines:
             f.write(line + '\n')
@@ -74,8 +86,9 @@ def save_ply_with_pose(points, filename, pose_data=None, colors=None):
 def extract_pose_from_ply(filename):
     """Extract pose data from PLY header comments"""
     pose_data = {}
-    
-    with open(filename, 'r') as f:
+
+    safe = _safe_data(filename)
+    with open(safe, 'r') as f:
         for line in f:
             line = line.strip()
             if line == "end_header":
@@ -132,37 +145,52 @@ def main():
     
     if sys.argv[1] == "--extract":
         # Extract pose from PLY
-        pose_data = extract_pose_from_ply(sys.argv[2])
+        try:
+            safe_extract = _safe_data(sys.argv[2])
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        pose_data = extract_pose_from_ply(safe_extract)
         print(json.dumps(pose_data, indent=2))
         return
-    
+
     input_ply = sys.argv[1]
     trajectory_json = sys.argv[2] if len(sys.argv) > 2 else None
     output_ply = sys.argv[3] if len(sys.argv) > 3 else input_ply.replace('.ply', '_with_pose.ply')
-    
+
+    try:
+        input_ply  = str(_safe_data(input_ply))
+        output_ply = str(_safe_data(output_ply))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     # Load trajectory data
     pose_data = None
     if trajectory_json and trajectory_json.endswith('.json'):
         try:
-            with open(trajectory_json, 'r') as f:
+            safe_traj = _safe_data(trajectory_json)
+            with open(safe_traj, 'r') as f:
                 trajectory_data = json.load(f)
             # Support both the enhanced recorder format and a bare pose dict
             if 'current_pose' in trajectory_data:
                 cp = trajectory_data['current_pose']
                 pose_data = cp.get('lidar_pose', cp)
-                # Ensure top-level position/orientation keys exist
                 if 'position' not in pose_data and 'position' in cp:
                     pose_data = cp
             else:
                 pose_data = trajectory_data.get('pose', trajectory_data)
-        except Exception as e:
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: Could not load trajectory data: {e}")
-    
+
     # Load PLY points (simple parser)
     points = []
     colors = None
-    
-    with open(input_ply, 'r') as f:
+
+    with open(_safe_data(input_ply), 'r') as f:
         in_header = True
         has_color = False
         

@@ -27,6 +27,16 @@ from pathlib import Path
 from datetime import datetime
 from scipy.spatial.transform import Rotation, Slerp
 
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
+
 import cv2
 
 try:
@@ -42,16 +52,18 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def open_db3(bag_dir):
-    bag_path = Path(bag_dir)
+    bag_path = _safe_data(bag_dir)
     db3_files = sorted(bag_path.glob("*.db3"))
     if db3_files:
-        return sqlite3.connect(str(db3_files[0]))
+        return sqlite3.connect(str(_safe_data(db3_files[0])))
     zstd = sorted(bag_path.glob("*.db3.zstd"))
     if not zstd:
         raise FileNotFoundError(f"No .db3 file in {bag_dir}")
-    out = str(zstd[0]).replace(".zstd", "")
+    safe_zstd = _safe_data(zstd[0])
+    out = str(safe_zstd).replace(".zstd", "")
+    _safe_data(out)
     print(f"  Decompressing {zstd[0].name}...")
-    result = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", out, "-f"],
+    result = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", out, "-f"],
                             capture_output=True)
     if result.returncode != 0 or not Path(out).exists():
         raise RuntimeError(
@@ -440,7 +452,11 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode):
 # ---------------------------------------------------------------------------
 
 def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single_fisheye", max_gyro=0.3, trim_ends=2, sdk_stitch=False):
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     # Continuous mode: single bag at session root
     bag_dirs = sorted(session_path.glob("rosbag_*"))
@@ -1024,4 +1040,9 @@ if __name__ == "__main__":
                         help="Use .insp capture times as scan centres (SDK stitch continuous mode)")
     args = parser.parse_args()
 
+    try:
+        _safe_data(args.session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     reconstruct(args.session_dir, args.interval, args.lidar_window, args.camera_mode, args.max_gyro, args.trim_ends, args.sdk_stitch)

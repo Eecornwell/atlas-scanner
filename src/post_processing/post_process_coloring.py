@@ -4,13 +4,28 @@
 # Copyright (c) 2026 Orion. All rights reserved.
 #
 # Description: Applies ERP-based point cloud coloring to a single scan directory, selecting between world-frame and sensor-frame PLY inputs automatically.
-import os
+import subprocess
 import sys
+import os
 from pathlib import Path
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 def process_scan_coloring(scan_dir, use_exact=False):
     """Apply coloring to a single scan directory"""
-    scan_path = Path(scan_dir)
+    try:
+        scan_path = _safe_data(scan_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
     
     # Find PLY and image files
     world_ply = scan_path / "world_lidar.ply"
@@ -40,9 +55,14 @@ def process_scan_coloring(scan_dir, use_exact=False):
     
     # Apply coloring using fusion script
     fusion_script = "exact_match_fusion.py" if use_exact else "sensor_fusion.py"
-    
+    script_path = Path(__file__).resolve().parent / fusion_script
+
     try:
-        os.system(f"cd /home/orion/atlas_ws && python3 src/atlas-scanner/src/post_processing/{fusion_script} '{scan_dir}'")
+        subprocess.run(
+            [sys.executable, str(script_path), str(scan_dir)],
+            check=False,
+            cwd="/home/orion/atlas_ws",
+        )
         
         # Check if colored PLY was created
         colored_candidates = [
@@ -65,7 +85,11 @@ def process_scan_coloring(scan_dir, use_exact=False):
 
 def post_process_session_coloring(session_dir, use_exact=False):
     """Apply coloring to all scans in a session directory"""
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
     if not session_path.exists():
         print(f"Session directory not found: {session_dir}")
         return
@@ -82,6 +106,10 @@ def post_process_session_coloring(session_dir, use_exact=False):
     
     success_count = 0
     for scan_dir in scan_dirs:
+        try:
+            _safe_data(scan_dir)
+        except ValueError:
+            continue
         if process_scan_coloring(scan_dir, use_exact):
             success_count += 1
     
@@ -91,6 +119,10 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python post_process_coloring.py <session_directory> [--use-exact]")
         sys.exit(1)
-    
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     use_exact = "--use-exact" in sys.argv
     post_process_session_coloring(sys.argv[1], use_exact)

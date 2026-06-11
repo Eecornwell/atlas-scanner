@@ -30,6 +30,15 @@ import cv2
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 # ROS world (X-forward, Y-left, Z-up) -> COLMAP world
 R_ROS2COLMAP = np.array([
     [ 1,  0,  0],
@@ -114,7 +123,10 @@ def _load_pose_from_scan(scan_dir):
         traj_file = scan_dir / "trajectory.json"
     if not traj_file.exists():
         return None
-
+    try:
+        traj_file = _safe_data(traj_file)
+    except ValueError:
+        return None
     with open(traj_file, 'r') as f:
         traj = json.load(f)
 
@@ -152,7 +164,11 @@ def _transform_scan_points_to_camera_world(points, pos_xyz, quat_xyzw, T_camera_
 
 def export_to_colmap(session_dir):
     """Export scan session to COLMAP format"""
-    session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
 
     # Create COLMAP directory structure
     colmap_dir = session_path / "colmap"
@@ -184,7 +200,14 @@ def export_to_colmap(session_dir):
     img_height = calib.get('image_height', 960)
 
     # Write cameras.txt (SPHERICAL model for equirectangular images)
-    with open(sparse_dir / "cameras.txt", 'w') as f:
+    try:
+        cameras_txt = _safe_data(sparse_dir / "cameras.txt")
+        images_txt  = _safe_data(sparse_dir / "images.txt")
+        points3d_txt = _safe_data(sparse_dir / "points3D.txt")
+    except ValueError as e:
+        print(f"Error: sparse model path rejected: {e}")
+        return
+    with open(cameras_txt, 'w') as f:
         f.write("# Camera list with one line of data per camera:\n")
         f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
         f.write(f"1 SPHERICAL {img_width} {img_height}\n")
@@ -285,7 +308,7 @@ def export_to_colmap(session_dir):
         img.pop('quat_xyzw', None)
 
     # Write images.txt
-    with open(sparse_dir / "images.txt", 'w') as f:
+    with open(images_txt, 'w') as f:
         f.write("# Image list with two lines of data per image:\n")
         f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
         f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
@@ -295,7 +318,7 @@ def export_to_colmap(session_dir):
             f.write("\n")  # Empty POINTS2D line
 
     # Write points3D.txt
-    with open(sparse_dir / "points3D.txt", 'w') as f:
+    with open(points3d_txt, 'w') as f:
         f.write("# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
         for i, p in enumerate(all_points, start=1):
             f.write(f"{i} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(p[3])} {int(p[4])} {int(p[5])} 0\n")
@@ -335,7 +358,11 @@ def _find_erp_image(scan_dir):
 def _load_ply_points_and_colors(ply_file):
     """Load points and colors from PLY file."""
     import open3d as o3d
-    pcd = o3d.io.read_point_cloud(str(ply_file))
+    try:
+        safe = _safe_data(ply_file)
+    except ValueError as e:
+        raise ValueError(f"_load_ply_points_and_colors: {e}") from e
+    pcd = o3d.io.read_point_cloud(str(safe))
     pts = np.asarray(pcd.points)
     if pcd.has_colors():
         cols = (np.asarray(pcd.colors) * 255).astype(int)
@@ -352,7 +379,12 @@ def load_ply_points(ply_file):
 
 def save_ply(output_file, points):
     """Save points to PLY file"""
-    with open(output_file, 'w') as f:
+    try:
+        safe_out = _safe_data(output_file)
+    except ValueError as e:
+        print(f"Error: save_ply path rejected: {e}")
+        return
+    with open(safe_out, 'w') as f:
         f.write('ply\n')
         f.write('format ascii 1.0\n')
         f.write(f'element vertex {len(points)}\n')
@@ -372,5 +404,9 @@ if __name__ == '__main__':
     if len(sys.argv) != 2:
         print("Usage: python3 export_to_colmap.py <session_directory>")
         sys.exit(1)
-
+    try:
+        _safe_data(sys.argv[1])
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     export_to_colmap(sys.argv[1])

@@ -8,6 +8,17 @@
 import numpy as np
 import json
 import sys
+import os
+from pathlib import Path
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 try:
     import pye57
@@ -59,8 +70,8 @@ def save_e57_with_pose(points, filename, pose_data=None, colors=None):
             # pye57 doesn't support modifying headers after creation
             # Pose data is preserved in PLY and JSON files
                 
-        except Exception as e:
-            pass  # Silently skip pose embedding
+        except (KeyError, TypeError, ValueError):
+            pass  # Silently skip pose embedding on malformed pose data
     e57.close()
     
     print(f"✓ Saved E57 file: {filename}")
@@ -69,8 +80,9 @@ def load_ply_points(filename):
     """Load points from PLY file"""
     points = []
     colors = []
-    
-    with open(filename, 'r') as f:
+
+    safe = _safe_data(filename)
+    with open(safe, 'r') as f:
         in_header = True
         has_color = False
         
@@ -105,15 +117,26 @@ def main():
     input_ply = sys.argv[1]
     trajectory_json = sys.argv[2] if len(sys.argv) > 2 else None
     output_e57 = sys.argv[3] if len(sys.argv) > 3 else input_ply.replace('.ply', '.e57')
-    
+
+    try:
+        input_ply = str(_safe_data(input_ply))
+        output_e57 = str(_safe_data(output_e57))
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     # Load trajectory data
     pose_data = None
     if trajectory_json and trajectory_json.endswith('.json'):
         try:
-            with open(trajectory_json, 'r') as f:
+            safe_traj = _safe_data(trajectory_json)
+            with open(safe_traj, 'r') as f:
                 trajectory_data = json.load(f)
                 pose_data = trajectory_data.get('pose', trajectory_data)
-        except Exception as e:
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except (OSError, json.JSONDecodeError) as e:
             print(f"Warning: Could not load trajectory data: {e}")
     
     # Load PLY points

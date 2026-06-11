@@ -12,12 +12,22 @@ Better for scan sets where not all scans overlap with the first scan.
 """
 
 import sys
+import os
 from pathlib import Path
 import open3d as o3d
 import numpy as np
 import json
 import sqlite3
 from scipy.spatial.transform import Rotation, Slerp
+
+_ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 
 def _interp_pose(full_traj, target_time):
@@ -68,6 +78,10 @@ def load_trajectory_pose(scan_dir):
     """Load pose using capture_time-interpolated lookup (matches merge_with_trajectory.py)."""
     traj_file = scan_dir / "trajectory.json"
     if traj_file.exists():
+        try:
+            traj_file = _safe_data(traj_file)
+        except ValueError:
+            return np.eye(4)
         with open(traj_file) as f:
             traj = json.load(f)
         si = traj.get('scan_info', {})
@@ -89,6 +103,10 @@ def load_trajectory_pose(scan_dir):
 
     metadata_file = scan_dir / "metadata.json"
     if metadata_file.exists():
+        try:
+            metadata_file = _safe_data(metadata_file)
+        except ValueError:
+            return np.eye(4)
         with open(metadata_file) as f:
             metadata = json.load(f)
         if 'trajectory_pose' in metadata:
@@ -241,6 +259,11 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
         return load_trajectory_pose(Path(traj_file).parent)
     
     session_path = Path(session_dir)
+    try:
+        session_path = _safe_data(session_path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return
     scan_dirs = sorted(session_path.glob("fusion_scan_*"))
     
     if len(scan_dirs) < 2:
@@ -276,6 +299,10 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
             if imu_data:
                 traj_file = scan_dir / "trajectory.json"
                 if traj_file.exists():
+                    try:
+                        traj_file = _safe_data(traj_file)
+                    except ValueError:
+                        continue
                     with open(traj_file) as f:
                         traj = json.load(f)
                     capture_time = traj.get('scan_info', {}).get('capture_time') or \
@@ -511,6 +538,10 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
 
         traj_file = scan_dir / "trajectory.json"
         if traj_file.exists():
+            try:
+                traj_file = _safe_data(traj_file)
+            except ValueError:
+                continue
             with open(traj_file) as f:
                 traj = json.load(f)
             traj_refined = traj.copy()
@@ -552,7 +583,11 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
             traj_refined['scan_info']['icp_refined'] = True
             traj_refined['scan_info']['icp_correction_applied'] = not np.allclose(
                 icp_corrections[i], np.eye(4), atol=1e-6)
-            with open(scan_dir / "trajectory_icp_refined.json", 'w') as f:
+            try:
+                out_file = _safe_data(scan_dir / "trajectory_icp_refined.json")
+            except ValueError:
+                continue
+            with open(out_file, 'w') as f:
                 json.dump(traj_refined, f, indent=2)
 
         colored_file = next((scan_dir / n for n in COLORED_CANDIDATES if (scan_dir / n).exists()), None)
@@ -602,6 +637,11 @@ def main():
     parser.add_argument("--max-gyro", type=float, default=0.15)
     parser.add_argument("--iterations", type=int, default=1)
     args = parser.parse_args()
+    try:
+        _safe_data(args.session_dir)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
     register_pose_graph(args.session_dir, max_gyro=args.max_gyro, iterations=args.iterations)
 
 if __name__ == "__main__":

@@ -8,15 +8,33 @@
 # flat-int format expected by initial_guess_auto.
 
 import json
+import os
 import sys
 import numpy as np
 from pathlib import Path
+
+_ALLOWED_OUTPUT = Path(os.path.expanduser("~/atlas_ws/output")).resolve()
+
+
+def _safe_output(p) -> Path:
+    """Resolve p and raise ValueError if it escapes the allowed output root."""
+    resolved = Path(p).resolve()
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'"
+        )
+    return resolved
+
 
 if len(sys.argv) != 2:
     print("Usage: python3 fix_matches.py <output_directory>")
     sys.exit(1)
 
-output_dir = Path(sys.argv[1])
+try:
+    output_dir = _safe_output(sys.argv[1])
+except ValueError as e:
+    print(f"Error: {e}")
+    sys.exit(1)
 
 for matches_file in sorted(output_dir.glob("*_matches.json")):
     with open(matches_file) as f:
@@ -31,7 +49,7 @@ for matches_file in sorted(output_dir.glob("*_matches.json")):
     stem = matches_file.stem.replace('_matches', '')
 
     # Load lidar image bounds
-    lid_path = output_dir / f'{stem}_lidar_intensities.png'
+    lid_path = _safe_output(output_dir / f'{stem}_lidar_intensities.png')
     lid_img = _cv2.imread(str(lid_path), _cv2.IMREAD_GRAYSCALE)
     lH, lW = lid_img.shape if lid_img is not None else (99999, 99999)
 
@@ -71,6 +89,6 @@ for matches_file in sorted(output_dir.glob("*_matches.json")):
         new_matches.append(len(new_kpts1) // 2 - 1)
         new_conf.append(float(conf_arr[i]) if i < len(conf_arr) else 1.0)
 
-    with open(matches_file, 'w') as f:
+    with open(_safe_output(matches_file), 'w') as f:
         json.dump({'kpts0': new_kpts0, 'kpts1': new_kpts1,
                    'matches': new_matches, 'confidence': new_conf}, f)

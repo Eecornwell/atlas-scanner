@@ -26,9 +26,21 @@ import struct
 import sqlite3
 import argparse
 import subprocess
+import os
 from pathlib import Path
 
 import numpy as np
+
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(
+            f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 
 try:
     from rclpy.serialization import deserialize_message
@@ -43,17 +55,19 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def open_db3(bag_dir: Path):
+    bag_dir = _safe_data(bag_dir)
     db3 = sorted(bag_dir.glob("*.db3"))
     if db3:
-        return sqlite3.connect(str(db3[0]))
+        return sqlite3.connect(str(_safe_data(db3[0])))
     zstd = sorted(bag_dir.glob("*.db3.zstd"))
     if not zstd:
         raise FileNotFoundError(f"No .db3 in {bag_dir}")
-    out = Path(str(zstd[0]).replace(".zstd", ""))
-    r = subprocess.run(["zstd", "-d", str(zstd[0]), "-o", str(out), "-f"],
+    safe_zstd = _safe_data(zstd[0])
+    out = _safe_data(Path(str(safe_zstd).replace(".zstd", "")))
+    r = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", str(out), "-f"],
                        capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError(f"zstd decompress failed: {zstd[0]}")
+        raise RuntimeError(f"zstd decompress failed: {safe_zstd}")
     return sqlite3.connect(str(out))
 
 
@@ -203,7 +217,10 @@ def estimate_offset(t_ref: np.ndarray, sig_ref: np.ndarray,
 
 def estimate_imu_sync(session_dir: str, axis: str = "z",
                       window_s: float = 0.0, out_name: str = "sync_offset.json"):
-    session = Path(session_dir)
+    try:
+        session = _safe_data(session_dir)
+    except ValueError as e:
+        print(f"Error: {e}"); sys.exit(1)
 
     bag_dirs = sorted(session.glob("rosbag_*"))
     if not bag_dirs:
@@ -314,7 +331,10 @@ def estimate_imu_sync(session_dir: str, axis: str = "z",
         "camera_hz":   camera_hz,
     }
 
-    out_path = bag_dir / out_name
+    try:
+        out_path = _safe_data(bag_dir / out_name)
+    except ValueError as e:
+        print(f"Error: output path rejected: {e}"); sys.exit(1)
     out_path.write_text(json.dumps(result, indent=2))
 
     # Warn if offset has shifted significantly from the previous session.
@@ -339,4 +359,8 @@ if __name__ == "__main__":
                         help="Seconds of data to use (0 = full bag)")
     parser.add_argument("--out",    default="sync_offset.json")
     args = parser.parse_args()
+    try:
+        _safe_data(args.session_dir)
+    except ValueError as e:
+        print(f"Error: {e}"); sys.exit(1)
     estimate_imu_sync(args.session_dir, args.axis, args.window, args.out)

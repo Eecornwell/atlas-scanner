@@ -206,12 +206,12 @@ class EnhancedTrajectoryRecorder(Node):
                         self.get_logger().error(f'Error processing trigger file {filename}: {e}')
                         try:
                             os.remove(trigger_file)
-                        except:
+                        except OSError:
                             pass
         except FileNotFoundError:
             pass  # Directory doesn't exist yet
-        except Exception as e:
-            pass  # Ignore other errors
+        except PermissionError as e:
+            self.get_logger().warn(f'Permission error scanning trigger directory: {e}')
     
     def get_pose_at_time(self, capture_time=None):
         """Interpolate pose at capture_time using SLERP/lerp. Falls back to nearest."""
@@ -358,5 +358,7 @@ if __name__ == '__main__':
         recorder.destroy_node()
         try:
             rclpy.shutdown()
-        except Exception:
+        except rclpy.exceptions.InvalidHandle:
             pass
+        except Exception as e:
+            print(f'Warning: unexpected error during rclpy shutdown: {e}')

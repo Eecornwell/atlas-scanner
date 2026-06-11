@@ -634,9 +634,8 @@ python3 panorama_sfm_colmap.py $SESSION
 ```
 
 Options:
-- `--prior-std 0.05` — LiDAR pose prior std dev in metres (default: 0.05 m)
-- `--exhaustive` — use exhaustive matcher instead of sequential (slower, better for small sessions)
-- `--bundle-adjustment` — run bundle adjustment after pose_prior_mapper (refines poses)
+- `--sequential` — use sequential matcher instead of exhaustive (faster, for large sessions)
+- `--no-bundle-adjustment` — skip rig-aware bundle adjustment
 
 ### Legacy pipeline
 

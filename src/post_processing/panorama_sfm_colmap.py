@@ -15,11 +15,31 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import os
 import numpy as np
 import yaml
 import cv2
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+
+_ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
+_ALLOWED_SRC  = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
+
+def _safe_src(p) -> Path:
+    resolved = Path(p).resolve()
+    for root in (_ALLOWED_SRC, _ALLOWED_DATA):
+        if root in [resolved, *resolved.parents]:
+            return resolved
+    raise ValueError(f"Path '{resolved}' is outside allowed roots")
+
 
 R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 
@@ -51,7 +71,7 @@ MIN_BASELINE_M = 0.10
 
 
 def _load_calibration():
-    calib_path = Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml"
+    calib_path = _safe_src(Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml")
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
     T_camera_lidar = np.eye(4)
@@ -68,6 +88,10 @@ def _load_pose(scan_dir, T_camera_lidar):
     if not traj_file.exists():
         traj_file = scan_dir / 'trajectory.json'
     if not traj_file.exists():
+        return None
+    try:
+        traj_file = _safe_data(traj_file)
+    except ValueError:
         return None
     with open(traj_file) as f:
         traj = json.load(f)
@@ -526,7 +550,11 @@ def _strip_rig_from_db(db_path):
 
 
 def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True):
-    session_path = Path(session_dir).expanduser()
+    try:
+        session_path = _safe_data(Path(session_dir).expanduser())
+    except ValueError as e:
+        print(f"Error: {e}")
+        return False
     colmap_dir = session_path / 'colmap'
     colmap_dir.mkdir(exist_ok=True)
 
@@ -665,6 +693,11 @@ if __name__ == '__main__':
     parser.set_defaults(bundle_adjustment=True)
     args = parser.parse_args()
 
+    try:
+        _safe_data(Path(args.session_directory).expanduser())
+    except ValueError as e:
+        print(f"Error: {e}")
+        import sys; sys.exit(1)
     run_pipeline(args.session_directory,
                  exhaustive=args.exhaustive,
                  bundle_adjustment=args.bundle_adjustment)
