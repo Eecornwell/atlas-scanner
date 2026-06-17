@@ -94,8 +94,9 @@ def read_topic(con, topics, name_fragment):
     for data, bag_ts_ns in rows:
         msg = deserialize_message(bytes(data), MsgType)
         # Prefer header stamp when available.
-        # For std_msgs/Float64 shutter_time messages, use msg.data as the stamp
-        # since it contains the actual shutter time and the message has no header.
+        # For std_msgs/Float64 shutter_time messages use msg.data which contains
+        # the host clock time of the count-increment detection — much closer to
+        # the actual shutter time than bag_ts_ns (which adds publisher polling delay).
         if hasattr(msg, "header"):
             stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         elif hasattr(msg, "data") and isinstance(msg.data, float) and msg.data > 1e9:
@@ -473,8 +474,26 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     # SDK stitch mode: delete stale fusion_scan_* dirs before opening the bag
     # so the coloring pipeline always uses freshly reconstructed sensor_lidar.ply.
+    # Preserve .insp files and .capture_time sidecars across the clear so the
+    # ERP stitching step can still find them after reconstruction.
     if sdk_stitch and camera_mode == 'dual_fisheye':
         import shutil as _shutil
+        # Save .insp files keyed by shot index before clearing
+        _saved_insp = {}  # idx -> list of (filename, bytes, capture_time_bytes_or_None)
+        for _scan_dir in sorted(session_path.glob('fusion_scan_*')):
+            try:
+                _idx = int(_scan_dir.name.split('_')[-1])
+            except ValueError:
+                continue
+            _files = []
+            for _insp in sorted(_scan_dir.glob('*.insp')):
+                if _insp.stat().st_size < 100000:
+                    continue
+                _ct_f = _scan_dir / (_insp.name + '.capture_time')
+                _ct_bytes = _ct_f.read_bytes() if _ct_f.exists() else None
+                _files.append((_insp.name, _insp.read_bytes(), _ct_bytes))
+            if _files:
+                _saved_insp[_idx] = _files
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
         # Promote .insp files from .sdk_shot_N/ subdirs into fusion_scan_NNN/ by index.
@@ -491,6 +510,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 _ct_dst = _scan_dir / (_insp.name + '.capture_time')
                 if _ct_src.exists() and not _ct_dst.exists():
                     _ct_src.rename(_ct_dst)
+        # Restore any .insp files that were in fusion_scan_* but not in .sdk_shot_*
+        for _idx, _files in _saved_insp.items():
+            _scan_dir = session_path / f'fusion_scan_{_idx:03d}'
+            _scan_dir.mkdir(exist_ok=True)
+            for _fname, _data, _ct_bytes in _files:
+                _dest = _scan_dir / _fname
+                if not _dest.exists():
+                    _dest.write_bytes(_data)
+                if _ct_bytes is not None and not (_scan_dir / (_fname + '.capture_time')).exists():
+                    (_scan_dir / (_fname + '.capture_time')).write_bytes(_ct_bytes)
         # Remove corrupt .insp files from failed downloads
         for _bad_insp in session_path.glob('fusion_scan_*/*.insp'):
             if _bad_insp.stat().st_size < 100000:
@@ -686,12 +715,12 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         centres = []
         if sdk_stitch and camera_mode == 'dual_fisheye':
             # Primary: read /camera/shutter_time messages recorded in the bag.
-            # msg.data contains the shutter time (either initial t_after estimate
-            # or refined cam_rtc). Use all unique values within the bag range.
+            # msg.data is the host clock time of count-increment detection,
+            # which is ~0-0.5s from the actual shutter time.
             if shutter_msgs:
                 seen_times = set()
                 for _bag_ts, msg in shutter_msgs:
-                    shutter_t = round(msg.data, 3)
+                    shutter_t = round(_bag_ts, 3)
                     # Skip if very close to an already-seen time (duplicate)
                     if any(abs(shutter_t - s) < 1.0 for s in seen_times):
                         continue
@@ -980,8 +1009,13 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _dt = abs(_ct - _scan_centre) if _scan_centre else 0.0
                     if _dt < best_dt:
                         best_dt, best_insp = _dt, _insp_p
-                # Only use .insp if it's within half the capture interval
-                if best_dt > (interval / 2.0 if interval else 1.5):
+                # If exactly one valid .insp is in this scan dir it was placed here
+                # by the promotion logic and is correct regardless of capture_time
+                # offset (which can lag bag_ts by several seconds on a full SD card).
+                _insp_direct = [p for p in scan_dir.glob('*.insp') if p.stat().st_size > 100000]
+                if len(_insp_direct) == 1:
+                    best_insp, best_dt = _insp_direct[0], 0.0
+                elif best_dt > (interval / 2.0 if interval else 1.5):
                     best_insp = None
                 if best_insp is not None and best_insp.exists():
                     result = subprocess.run(

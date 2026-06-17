@@ -488,43 +488,48 @@ def write_rig_bin(output_dir, db_path, panoramas):
     print(f"  Wrote rigs.bin ({1} rig, {len(frames_with_pose)} frames)")
 
 
-def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True):
+def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
+                        lidar_voxel_size=0.0):
     """Merge LiDAR (ROS world frame) and COLMAP point clouds into COLMAP frame."""
     import open3d as o3d
 
-    def read_ply(path):
-        pcd = o3d.io.read_point_cloud(str(path))
-        pts = np.asarray(pcd.points)
-        cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
-               else np.zeros((len(pts), 3), int)
-        return [[*pts[i].tolist(), *cols[i].tolist()] for i in range(len(pts))]
+    lidar_pcd = o3d.io.read_point_cloud(str(lidar_ply))
+    if lidar_voxel_size > 0:
+        before = len(lidar_pcd.points)
+        lidar_pcd = lidar_pcd.voxel_down_sample(lidar_voxel_size)
+        print(f'  LiDAR voxel downsample {lidar_voxel_size}m: {before} -> {len(lidar_pcd.points)} pts')
 
-    lidar_pts = read_ply(lidar_ply)
+    lidar_pts = np.asarray(lidar_pcd.points)
+    lidar_cols = (np.asarray(lidar_pcd.colors) * 255).astype(int) if lidar_pcd.has_colors() \
+                 else np.zeros((len(lidar_pts), 3), int)
     if transform_lidar:
-        for p in lidar_pts:
-            xyz = R_ROS2COLMAP @ [p[0], p[1], p[2]]
-            p[0], p[1], p[2] = xyz[0], xyz[1], xyz[2]
+        lidar_pts = (R_ROS2COLMAP @ lidar_pts.T).T
 
-    colmap_pts = read_ply(colmap_ply)
-    all_pts = lidar_pts + colmap_pts
+    colmap_pcd = o3d.io.read_point_cloud(str(colmap_ply))
+    colmap_pts = np.asarray(colmap_pcd.points)
+    colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) if colmap_pcd.has_colors() \
+                  else np.zeros((len(colmap_pts), 3), int)
+
+    all_pts  = np.vstack([lidar_pts,  colmap_pts])
+    all_cols = np.vstack([lidar_cols, colmap_cols])
 
     with open(output_ply, 'w') as f:
         f.write('ply\nformat ascii 1.0\n')
         f.write(f'element vertex {len(all_pts)}\n')
         f.write('property float x\nproperty float y\nproperty float z\n')
         f.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
-        for p in all_pts:
-            f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(p[3])} {int(p[4])} {int(p[5])}\n')
+        for p, c in zip(all_pts, all_cols):
+            f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n')
 
     print(f'✓ Merged {len(lidar_pts)} lidar + {len(colmap_pts)} COLMAP points -> {output_ply}')
-    return all_pts
+    return all_pts, all_cols
 
 
 def _write_merged_to_points3d(output_dir, merged_ply):
     """Write merged PLY points back into points3D.bin for use in Gaussian splatting."""
     import open3d as o3d
     pcd = o3d.io.read_point_cloud(str(merged_ply))
-    pts = np.asarray(pcd.points)
+    pts  = np.asarray(pcd.points)
     cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
            else np.zeros((len(pts), 3), int)
     with open(output_dir / 'points3D.bin', 'wb') as f:
@@ -549,7 +554,8 @@ def _strip_rig_from_db(db_path):
     conn.close()
 
 
-def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True):
+def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
+                 lidar_voxel_size=0.0):
     try:
         session_path = _safe_data(Path(session_dir).expanduser())
     except ValueError as e:
@@ -672,7 +678,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True):
 
     if lidar_ply and ply_out.exists():
         merged_ply = colmap_dir / 'sparse' / 'merged.ply'
-        _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True)
+        _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
+                            lidar_voxel_size=lidar_voxel_size)
         _write_merged_to_points3d(output_dir, merged_ply)
 
     return True
@@ -686,6 +693,9 @@ if __name__ == '__main__':
     parser.add_argument('session_directory')
     parser.add_argument('--sequential', dest='exhaustive', action='store_false',
                         help='Use sequential matcher instead of exhaustive')
+    parser.add_argument('--lidar-voxel-size', type=float, default=0.0,
+                        help='Voxel downsample size for LiDAR cloud before merging '
+                             'with COLMAP points (metres, 0 = no downsampling)')
     parser.set_defaults(exhaustive=True)
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
@@ -700,4 +710,5 @@ if __name__ == '__main__':
         import sys; sys.exit(1)
     run_pipeline(args.session_directory,
                  exhaustive=args.exhaustive,
-                 bundle_adjustment=args.bundle_adjustment)
+                 bundle_adjustment=args.bundle_adjustment,
+                 lidar_voxel_size=args.lidar_voxel_size)

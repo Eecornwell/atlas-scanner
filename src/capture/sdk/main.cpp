@@ -52,18 +52,6 @@ namespace fs = std::filesystem;
 static ins_camera::DeviceDiscovery g_discovery;
 static std::vector<ins_camera::DeviceDescriptor> g_list;
 
-struct DownloadJob {
-    std::string remote_path;  // e.g. /DCIM/Camera03/IMG_xxx.insp
-    std::string local_path;
-    std::string session_dir;
-    int         index;
-    double      host_t;
-};
-
-static std::mutex              g_dl_mutex;
-static std::queue<DownloadJob> g_dl_queue;
-static std::atomic<int>        g_dl_pending{0};
-static std::atomic<bool>       g_dl_stop{false};
 static std::string             g_http_base;
 // Serialises all log writes so multi-statement << chains from different
 // threads never interleave on stdout/stderr (CWE-362).
@@ -137,56 +125,18 @@ static bool http_download(const std::string& remote_path, const std::string& loc
     return true;
 }
 
-static void download_worker() {
-    while (!g_dl_stop.load()) {
-        DownloadJob job;
-        bool has_job = false;
-        {
-            std::unique_lock<std::mutex> lk(g_dl_mutex);
-            if (!g_dl_queue.empty()) {
-                job = g_dl_queue.front(); g_dl_queue.pop();
-                has_job = true;
-            }
-        }  // lock released here before any blocking work
-        if (!has_job) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-        LOG_OUT("[dl] " << sanitise(fs::path(job.remote_path).filename().string()) << " -> " << sanitise(job.local_path));
-        bool ok;
-        {
-            std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
-            ok = http_download(job.remote_path, job.local_path);
-        }
-        if (!ok) {
-            LOG_ERR("[dl] failed: " << sanitise(job.remote_path));
-        } else {
-            LOG_OUT("[dl] saved: " << sanitise(job.local_path));
-            std::ofstream ct(job.local_path + ".capture_time");
-            ct << std::fixed << std::setprecision(6) << job.host_t;
-            write_shutter_event(job.session_dir, job.index, job.host_t);
-        }
-        g_dl_pending.fetch_sub(1);
-    }
-}
-
-static void queue_download(const std::string& remote_path, const std::string& session_dir,
-                            int index, double host_t) {
-    std::string shot_dir  = session_dir + "/.sdk_shot_" + std::to_string(index);
-    fs::create_directories(shot_dir);
-    std::string local_path = shot_dir + "/" + fs::path(remote_path).filename().string();
-    std::unique_lock<std::mutex> lk(g_dl_mutex);
-    g_dl_queue.push({remote_path, local_path, session_dir, index, host_t});
-    g_dl_pending.fetch_add(1);
-}
-
-// Return only .insp files from Camera03 (our timelapse photos).
-// Filters out background .insv files from Camera01 and other directories.
+// Return only .insp files from Camera directories (timelapse photos).
+// Filters out background .insv video files. Accepts Camera03, Camera04, etc.
 static std::vector<std::string> filter_photo_files(const std::vector<std::string>& all_files) {
     std::vector<std::string> result;
     for (const auto& f : all_files) {
         std::string ext = fs::path(f).extension().string();
-        bool is_insp = (ext == ".insp");
-        bool is_cam03 = (f.find("Camera03") != std::string::npos ||
-                         f.find("camera03") != std::string::npos);
-        if (is_insp && is_cam03)
+        if (ext != ".insp") continue;
+        // Accept any CameraNN directory (timelapse uses Camera03 or Camera04
+        // depending on firmware version)
+        std::string fl = f;
+        std::transform(fl.begin(), fl.end(), fl.begin(), ::tolower);
+        if (fl.find("camera") != std::string::npos)
             result.push_back(f);
     }
     return result;
@@ -244,7 +194,6 @@ int main(int argc, char* argv[]) {
     g_http_base = cam->GetHttpBaseUrl();
     LOG_OUT("HTTP base: " << sanitise(g_http_base));
 
-    std::thread dl_thread(download_worker);
     { std::ofstream f(session_dir + "/.sdk_ready"); }
 
     const std::string trigger_path = session_dir + "/.sdk_capture_trigger";
@@ -264,7 +213,7 @@ int main(int argc, char* argv[]) {
     std::thread         timer_thread;
 
     while (true) {
-        { std::ofstream pf(pending_path); pf << g_dl_pending.load(); }
+        { std::ofstream pf(pending_path); pf << 0; }
 
         if (fs::exists(quit_path)) {
             LOG_OUT("Session done — stopping timelapse...");
@@ -295,36 +244,75 @@ int main(int argc, char* argv[]) {
                 { std::unique_lock<std::mutex> lk(timer_mutex); timestamps = timer_timestamps; n_shots = (int)timestamps.size(); }
                 LOG_OUT("Timer counted " << n_shots << " shots, OriginUrls has " << result.OriginUrls().size());
 
-                // Recover any shots not already downloaded in-session via OriginUrls HTTP GET.
-                // Only the last shot is accessible post-stop; earlier shots were handled in-session.
+                // Recover shots using OriginUrls() for the last shot, then
+                // reconstruct earlier shot URLs by decrementing the sequence
+                // number. Within a session all shots share the same date prefix
+                // and the sequence decrements: last=NNN, prev=NNN-1, etc.
                 if (!result.OriginUrls().empty()) {
-                    std::string last_url = result.OriginUrls().back();
-                    // Check if already downloaded
-                    std::string fname = fs::path(last_url).filename().string();
-                    bool already = false;
-                    for (int i = 0; i < n_shots; ++i) {
-                        std::string shot_dir = session_dir + "/.sdk_shot_" + std::to_string(capture_index + i);
-                        if (fs::exists(shot_dir)) {
-                            for (auto& e : fs::directory_iterator(shot_dir)) {
-                                if (e.path().filename().string() == fname && fs::file_size(e.path()) > 100000) { already = true; break; }
-                            }
-                        }
-                        if (already) break;
+                    std::string last_url  = result.OriginUrls().back();
+                    std::string last_path = fs::path(last_url).parent_path().string(); // /DCIM/Camera03
+                    std::string last_name = fs::path(last_url).stem().string();        // IMG_YYYYMMDD_HHMMSS_00_NNN
+                    std::string last_ext  = fs::path(last_url).extension().string();   // .insp
+
+                    // Parse sequence number from last filename
+                    // Format: IMG_YYYYMMDD_HHMMSS_00_NNN
+                    int last_seq = -1;
+                    auto sep = last_name.rfind('_');
+                    if (sep != std::string::npos) {
+                        try { last_seq = std::stoi(last_name.substr(sep + 1)); }
+                        catch (...) {}
                     }
-                    if (!already) {
-                        // Last shot not downloaded yet — get it now (HTTP session still open)
-                        int last_idx = capture_index + n_shots - 1;
-                        double host_t = n_shots > 0 ? timestamps.back() : t_start + interval_s;
-                        write_shutter_event(session_dir, last_idx, host_t);
-                        queue_download(last_url, session_dir, last_idx, host_t);
-                        LOG_OUT("Recovery: last shot " << last_idx << " queued");
+                    std::string prefix = (sep != std::string::npos) ? last_name.substr(0, sep + 1) : "";
+
+                    int total = std::max(n_shots, 1);
+                    LOG_OUT("Recovery: " << total << " shots via URL reconstruction (last_seq=" << last_seq << ")");
+
+                    for (int i = 0; i < total; ++i) {
+                        int abs_shot = capture_index + i;
+                        // Check if already downloaded in-session
+                        bool already = false;
+                        std::string sd = session_dir + "/.sdk_shot_" + std::to_string(abs_shot);
+                        if (fs::exists(sd)) {
+                            for (auto& e : fs::directory_iterator(sd))
+                                if (fs::file_size(e.path()) > 100000) { already = true; break; }
+                        }
+                        if (already) continue;
+
+                        // Construct URL: earlier shots have lower seq numbers
+                        // shot i=0 is oldest, i=total-1 is last_seq
+                        int seq = -1;
+                        std::string url;
+                        if (last_seq >= 0 && !prefix.empty()) {
+                            seq = (last_seq - (total - 1 - i) + 1000) % 1000;
+                            char seq_buf[8];
+                            std::snprintf(seq_buf, sizeof(seq_buf), "%03d", seq);
+                            std::string fname = prefix + seq_buf + last_ext;
+                            url = last_path + "/" + fname;
+                        } else {
+                            if (i == total - 1) url = last_url; // fallback: only last shot
+                            else continue;
+                        }
+
+                        double host_t = (i < (int)timestamps.size())
+                            ? timestamps[i]
+                            : t_start + interval_s * (i + 1);
+
+                        fs::create_directories(sd);
+                        std::string local_path = sd + "/" + fs::path(url).filename().string();
+                        LOG_OUT("[recovery] shot " << abs_shot << " seq=" << seq << " <- " << sanitise(fs::path(url).filename().string()));
+                        bool ok = http_download(url, local_path);
+                        if (ok && fs::exists(local_path) && fs::file_size(local_path) > 100000) {
+                            std::ofstream ct(local_path + ".capture_time");
+                            ct << std::fixed << std::setprecision(6) << host_t;
+                            write_shutter_event(session_dir, abs_shot, host_t);
+                            LOG_OUT("[recovery] saved: " << sanitise(local_path));
+                        } else {
+                            LOG_ERR("[recovery] failed seq=" << seq << ": " << sanitise(url));
+                            if (fs::exists(local_path)) fs::remove(local_path);
+                        }
                     }
                 }
-                capture_index += n_shots;
-            }
-            while (g_dl_pending.load() > 0) {
-                { std::ofstream pf(pending_path); pf << g_dl_pending.load(); }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                capture_index += std::max(n_shots, !result.OriginUrls().empty() ? 1 : 0);
             }
             { std::ofstream pf(pending_path); pf << 0; }
             break;
@@ -345,21 +333,23 @@ int main(int argc, char* argv[]) {
             if (auto* v = std::getenv("INSTA360_INTERVAL_MS"))
                 interval_s = std::max(3, std::atoi(v) / 1000);
 
-            // Snapshot Camera03 .insp files before session starts
-            std::set<std::string> pre_session_fnames;
+            // Snapshot all existing .insp paths before the timelapse starts so
+            // we can identify the new file written for each shot by exclusion.
+            std::set<std::string> pre_session_paths;
             {
-                auto files = cam->GetCameraFilesList();
-                for (const auto& f : filter_photo_files(files))
-                    pre_session_fnames.insert(fs::path(f).filename().string());
+                std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+                auto seed = cam->GetCameraFilesList();
+                for (const auto& f : filter_photo_files(seed))
+                    pre_session_paths.insert(f);
             }
-            LOG_OUT("Pre-session Camera03 .insp count: " << pre_session_fnames.size());
+            LOG_OUT("Pre-session .insp count: " << pre_session_paths.size());
 
             int base_count = 0;
             cam->GetCameraFilesCount(base_count);
 
             ins_camera::TimelapseParam params{};
             params.mode      = ins_camera::CameraTimelapseMode::TIMELAPSE_INTERVAL_SHOOTING;
-            params.duration  = 0;
+            params.duration  = 86400;  // 24h ceiling — StopTimeLapse ends it early
             params.lapseTime = interval_s * 1000;
             if (!cam->SetTimeLapseOption(params)) { std::ofstream ff(failed_path); ff << "fail"; continue; }
 
@@ -373,13 +363,12 @@ int main(int argc, char* argv[]) {
             { std::unique_lock<std::mutex> lk(timer_mutex); timer_timestamps.clear(); }
             capture_index = 0;
 
-            timer_thread = std::thread([&, base_count, pre_session_fnames]() mutable {
+            timer_thread = std::thread([&, base_count, pre_session_paths]() mutable {
                 int shot = 0;
                 int last_count = base_count;
+                std::set<std::string> seen_paths = pre_session_paths;
 
                 while (!timer_stop.load()) {
-                    // Poll file count every 200ms — no fixed sleep based on interval.
-                    // The firmware fires at its own rate; we just detect each new file.
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     if (timer_stop.load()) break;
 
@@ -387,42 +376,66 @@ int main(int argc, char* argv[]) {
                     cam->GetCameraFilesCount(new_count);
                     if (new_count <= last_count) continue;
 
-                    // Record timestamp immediately when count increments —
-                    // BEFORE GetCameraFilesList which takes ~1.2s to return.
-                    // Actual shutter = t_count_increment - SD_write_latency (~0.2s).
                     double t_count = now_sec();
                     double host_t  = t_count - 0.20;
 
-                    // New file detected — get the Camera03 .insp path.
-                    // Hold g_usb_mutex so this doesn't race with http_download
-                    // in the download worker — concurrent USB/HTTP calls caused
-                    // GetCameraFilesList to block for 21s, starving the timer.
-                    std::vector<std::string> all_files;
-                    {
-                        std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
-                        all_files = cam->GetCameraFilesList();
+                    // Ignore increments before expected shutter time —
+                    // background camera writes (video, housekeeping) not shots.
+                    double t_expected = t_start + (shot + 1) * (double)interval_s;
+                    if (host_t < t_expected - 0.5) {
+                        LOG_OUT("[timer] ignoring early count increment at t=" << std::fixed
+                            << std::setprecision(3) << host_t << " (expected shot " << shot
+                            << " at " << t_expected << ")");
+                        continue;
                     }
-                    auto photo_files = filter_photo_files(all_files);
+
+                    // Find the one new .insp file not present before this shot.
+                    // Poll briefly to allow SD write to complete.
                     std::string new_remote;
-                    for (auto it = photo_files.rbegin(); it != photo_files.rend(); ++it) {
-                        std::string fname = fs::path(*it).filename().string();
-                        if (pre_session_fnames.find(fname) == pre_session_fnames.end()) {
-                            new_remote = *it;
-                            pre_session_fnames.insert(fname);
-                            break;
+                    for (int attempt = 0; attempt < 10 && new_remote.empty(); ++attempt) {
+                        if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        std::vector<std::string> all_files;
+                        {
+                            std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+                            all_files = cam->GetCameraFilesList();
+                        }
+                        for (const auto& f : filter_photo_files(all_files)) {
+                            if (seen_paths.find(f) == seen_paths.end()) {
+                                new_remote = f;
+                                seen_paths.insert(f);
+                                break;
+                            }
                         }
                     }
-                    if (new_remote.empty()) continue;  // not a Camera03 .insp
 
                     { std::unique_lock<std::mutex> lk(timer_mutex); timer_timestamps.push_back(host_t); }
                     write_shutter_event(session_dir, shot, host_t);
 
-                    double t_det = now_sec();  // after GetCameraFilesList — for logging only
-                    LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
-                              << host_t << " count_t=" << t_count << " gfls_dt=" << (t_det - t_count)
-                              << " url=" << sanitise(fs::path(new_remote).filename().string()));
-
-                    queue_download(new_remote, session_dir, shot, host_t);
+                    if (!new_remote.empty()) {
+                        // Download synchronously so the file is fetched while it is
+                        // still the current HTTP-accessible shot (within this interval).
+                        std::string shot_dir   = session_dir + "/.sdk_shot_" + std::to_string(shot);
+                        fs::create_directories(shot_dir);
+                        std::string local_path = shot_dir + "/" + fs::path(new_remote).filename().string();
+                        LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
+                                  << host_t << " url=" << sanitise(fs::path(new_remote).filename().string()));
+                        bool ok;
+                        {
+                            std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+                            ok = http_download(new_remote, local_path);
+                        }
+                        if (ok) {
+                            std::ofstream ct(local_path + ".capture_time");
+                            ct << std::fixed << std::setprecision(6) << host_t;
+                            write_shutter_event(session_dir, shot, host_t);
+                            LOG_OUT("[timer] saved: " << sanitise(local_path));
+                        } else {
+                            LOG_ERR("[timer] download failed: " << sanitise(new_remote));
+                        }
+                    } else {
+                        LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
+                                  << host_t << " (no new file found — deferred to recovery)");
+                    }
                     last_count = new_count;
                     ++shot;
                 }
@@ -443,17 +456,30 @@ int main(int argc, char* argv[]) {
             double host_t = now_sec();
             write_shutter_event(session_dir, capture_index, host_t);
             std::string remote_path = url.GetSingleOrigin();
-            queue_download(remote_path, session_dir, capture_index, host_t);
-            LOG_OUT("Shot " << capture_index << " queued");
+            std::string shot_dir   = session_dir + "/.sdk_shot_" + std::to_string(capture_index);
+            fs::create_directories(shot_dir);
+            std::string local_path = shot_dir + "/" + fs::path(remote_path).filename().string();
+            LOG_OUT("Taking photo " << capture_index << " — downloading...");
+            bool ok;
+            {
+                std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
+                ok = http_download(remote_path, local_path);
+            }
+            if (ok) {
+                std::ofstream ct(local_path + ".capture_time");
+                ct << std::fixed << std::setprecision(6) << host_t;
+                write_shutter_event(session_dir, capture_index, host_t);
+                LOG_OUT("Shot " << capture_index << " saved");
+            } else {
+                LOG_ERR("Shot " << capture_index << " download failed: " << sanitise(remote_path));
+            }
             { std::ofstream df(done_path); df << "ok"; }
             ++capture_index;
         }
     }
 
-    g_dl_stop.store(true);
     timer_stop.store(true);
     if (timer_thread.joinable()) timer_thread.join();
-    dl_thread.join();
     cam->Close();
     delete cam;
     return 0;

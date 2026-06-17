@@ -19,6 +19,10 @@ CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 
+CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
+DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
+COLMAP_LIDAR_VOXEL_SIZE=0.20      # LiDAR downsample before COLMAP merge in metres (0 = skip)
+
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -33,20 +37,10 @@ while [[ $# -gt 0 ]]; do
         --no-icp) ENABLE_ICP_ALIGNMENT=false; shift ;;
         --colmap) EXPORT_COLMAP=true; shift ;;
         --no-colmap) EXPORT_COLMAP=false; shift ;;
+        --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
-
-BAG_ONLY=${BAG_ONLY:-false}
-
-SAVE_E57=false
-USE_EXISTING_CALIBRATION=false    # if true, won't reload calibration from ~/atlas_ws/output/calib.json
-ENABLE_ICP_ALIGNMENT=${ENABLE_ICP_ALIGNMENT:-false}
-EXPORT_COLMAP=${EXPORT_COLMAP:-false}
-BLEND_ERP_SEAMS=true              # dual_fisheye only: blend fisheye seams in ERP images (ignored when USE_SDK_STITCH=true)
-USE_SDK_STITCH=true               # use Insta360 MediaSDK for ERP stitching (much better quality than manual fisheye_to_erp)
-CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
-DOWNSAMPLE_VOXEL_SIZE=0.03        # voxel downsample in metres (0 = skip)
 RUN_SYNC_BENCHMARK=true
 
 ENABLE_POST_PROCESSING_BAGS=false
@@ -376,7 +370,9 @@ cleanup() {
 
         if [ "$EXPORT_COLMAP" = "true" ]; then
             echo "Exporting session to COLMAP format (panorama SfM)..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR"
+            _colmap_args=""
+            [ "${COLMAP_LIDAR_VOXEL_SIZE:-0}" != "0" ] && _colmap_args="--lidar-voxel-size ${COLMAP_LIDAR_VOXEL_SIZE}"
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" $_colmap_args
         fi
 
         echo "Complete. Scans saved in: $SCAN_DIR"
@@ -999,6 +995,11 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
         if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
             # GUI mode: poll for quit trigger file
             [ -f "$SCAN_DIR/.quit_trigger" ] && rm -f "$SCAN_DIR/.quit_trigger" && break
+            # Stop automatically if the SDK daemon crashed
+            if [ -n "${SDK_CAPTURE_PID:-}" ] && ! kill -0 "$SDK_CAPTURE_PID" 2>/dev/null; then
+                echo "⚠ SDK capture daemon exited unexpectedly — stopping session"
+                break
+            fi
             sleep 0.2
         else
             read -r _input < /dev/tty 2>/dev/null

@@ -181,6 +181,7 @@ class FusionCaptureGUI:
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
                         variable=self.icp_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.colmap_var = tk.BooleanVar(value=False)
+        self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
                         variable=self.colmap_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
@@ -1145,7 +1146,13 @@ sys.exit(0 if ok[0] else 4)
     def _pp_colmap(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        self._pp_run("Export COLMAP Model", [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess])
+        cmd = [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess]
+        voxel = getattr(self, 'colmap_lidar_voxel_size', 0.0)
+        if voxel > 0:
+            cmd += ['--lidar-voxel-size', str(voxel)]
+        else:
+            self._pp_log_write(f"  (COLMAP_LIDAR_VOXEL_SIZE={voxel} — no LiDAR downsampling)\n")
+        self._pp_run("Export COLMAP Model", cmd)
 
     def _pp_web_viewer(self):
         sess = self._pp_session()
@@ -1266,7 +1273,7 @@ def main():
     # Read defaults from atlas_fusion_capture.sh if no CLI args given
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
-    default_icp, default_colmap = False, False
+    default_icp, default_colmap, default_colmap_lidar_voxel = False, False, 0.0
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -1280,6 +1287,9 @@ def main():
                 default_icp = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('EXPORT_COLMAP=') and '#' not in line.split('EXPORT_COLMAP=')[0]:
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
+                try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
+                except ValueError: pass
             if line.startswith('while'):
                 break  # stop before the CLI override block
     except OSError:
@@ -1304,6 +1314,7 @@ def main():
     app.stationary_wait_var.set(default_stationary_wait)
     app.icp_var.set(default_icp)
     app.colmap_var.set(default_colmap)
+    app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
