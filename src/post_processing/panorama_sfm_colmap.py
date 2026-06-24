@@ -466,7 +466,6 @@ def write_rig_bin(output_dir, db_path, panoramas):
     frames_with_pose = []
     for frame_id, _ in frames:
         data = frame_data[frame_id]
-        # Find ref sensor image_id
         ref_img_id = next((d[2] for d in data
                            if d[0] == ref_sensor_type and d[1] == ref_sensor_id), None)
         if ref_img_id and ref_img_id in img_poses:
@@ -526,21 +525,43 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
 
 
 def _write_merged_to_points3d(output_dir, merged_ply):
-    """Write merged PLY points back into points3D.bin for use in Gaussian splatting."""
+    """Append LiDAR PLY points into points3D.bin, preserving existing triangulated points."""
     import open3d as o3d
     pcd = o3d.io.read_point_cloud(str(merged_ply))
     pts  = np.asarray(pcd.points)
     cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
            else np.zeros((len(pts), 3), int)
-    with open(output_dir / 'points3D.bin', 'wb') as f:
-        f.write(struct.pack('Q', len(pts)))
-        for i in range(len(pts)):
-            f.write(struct.pack('Q', i + 1))           # point3D_id
-            f.write(struct.pack('ddd', *pts[i]))        # xyz
-            f.write(struct.pack('BBB', *cols[i]))       # rgb
-            f.write(struct.pack('d', 0.0))              # error
-            f.write(struct.pack('Q', 0))                # track length = 0
-    print(f'✓ Wrote {len(pts)} merged points to points3D.bin')
+
+    # Read existing triangulated points so we don't discard them.
+    existing = []
+    p3d_bin = output_dir / 'points3D.bin'
+    if p3d_bin.exists():
+        with open(p3d_bin, 'rb') as f:
+            n_exist = struct.unpack('Q', f.read(8))[0]
+            for _ in range(n_exist):
+                raw_id   = f.read(8)
+                raw_xyz  = f.read(24)
+                raw_rgb  = f.read(3)
+                raw_err  = f.read(8)
+                tl       = struct.unpack('Q', f.read(8))[0]
+                raw_trk  = f.read(tl * 8)
+                if tl > 0:  # keep only real SfM points
+                    existing.append((raw_id, raw_xyz, raw_rgb, raw_err,
+                                     struct.pack('Q', tl), raw_trk))
+
+    n_sfm   = len(existing)
+    n_lidar = len(pts)
+    with open(p3d_bin, 'wb') as f:
+        f.write(struct.pack('Q', n_sfm + n_lidar))
+        for raw_id, raw_xyz, raw_rgb, raw_err, raw_tl, raw_trk in existing:
+            f.write(raw_id + raw_xyz + raw_rgb + raw_err + raw_tl + raw_trk)
+        for i in range(n_lidar):
+            f.write(struct.pack('Q', n_sfm + i + 1))
+            f.write(struct.pack('ddd', *pts[i]))
+            f.write(struct.pack('BBB', *cols[i]))
+            f.write(struct.pack('d', 0.0))
+            f.write(struct.pack('Q', 0))  # track_len=0 marks LiDAR-injected
+    print(f'✓ points3D.bin: {n_sfm} SfM + {n_lidar} LiDAR = {n_sfm + n_lidar} total')
 
 
 def _strip_rig_from_db(db_path):
@@ -620,6 +641,12 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
 
     output_dir = colmap_dir / 'sparse' / '0'
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Remove stale rig binaries from any previous BA run — point_triangulator
+    # must not see rigs.bin/frames.bin or it crashes on dangling image IDs.
+    for _stale in ('rigs.bin', 'frames.bin'):
+        _p = output_dir / _stale
+        if _p.exists():
+            _p.unlink()
 
     print("6. Triangulating points with known poses...")
     subprocess.run([
@@ -670,17 +697,97 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
     if ply_out.exists():
         print(f"✓ Exported PLY: {ply_out}")
 
-    # Merge LiDAR point cloud with COLMAP reconstruction
-    session_aligned = session_path / 'merged_aligned_colored.ply'
-    session_merged  = session_path / 'merged_pointcloud.ply'
-    lidar_ply = session_aligned if session_aligned.exists() else \
-                session_merged  if session_merged.exists()  else None
+    # Merge LiDAR point cloud with COLMAP reconstruction.
+    # Positions from sensor_lidar.ply (200k pts, same as depth images).
+    # Colors from sensor_colored_exact.ply via nearest-neighbour transfer.
+    # This guarantees points3D.bin is consistent with depth images.
+    print("  Building per-scan LiDAR cloud for points3D...")
+    import open3d as o3d
+    all_lidar_pts  = []
+    all_lidar_cols = []
+    scan_dirs_map  = {int(d.name.split('_')[-1]): d
+                      for d in sorted(session_path.glob('fusion_scan_*')) if d.is_dir()}
+    for pi, scan_dir in sorted(scan_dirs_map.items()):
+        ply_dense  = scan_dir / 'sensor_lidar.ply'
+        ply_color  = scan_dir / 'sensor_colored_exact.ply'
+        if not ply_dense.exists():
+            continue
+        traj_f = scan_dir / 'trajectory.json'
+        if not traj_f.exists():
+            continue
+        with open(traj_f) as _f:
+            _traj = json.load(_f)
+        _lp  = _traj['current_pose']['lidar_pose']
+        _pos = np.array([_lp['position']['x'], _lp['position']['y'], _lp['position']['z']])
+        _q   = np.array([_lp['orientation']['x'], _lp['orientation']['y'],
+                         _lp['orientation']['z'], _lp['orientation']['w']])
+        _Rl  = R.from_quat(_q).as_matrix()
 
-    if lidar_ply and ply_out.exists():
+        pcd_dense = o3d.io.read_point_cloud(str(ply_dense))
+        if lidar_voxel_size > 0:
+            pcd_dense = pcd_dense.voxel_down_sample(lidar_voxel_size)
+        pts_s   = np.asarray(pcd_dense.points)
+        pts_ros = (_Rl @ pts_s.T).T + _pos
+        pts_col = (R_ROS2COLMAP @ pts_ros.T).T
+
+        # Transfer colors from sensor_colored_exact.ply using nearest-neighbour
+        if ply_color.exists():
+            pcd_c = o3d.io.read_point_cloud(str(ply_color))
+            if pcd_c.has_colors() and len(pcd_c.points) > 0:
+                from scipy.spatial import cKDTree as _KDT
+                _tree = _KDT(np.asarray(pcd_c.points))
+                _, _idx = _tree.query(pts_s, k=1, workers=-1)
+                cols = (np.asarray(pcd_c.colors)[_idx] * 255).astype(int)
+            else:
+                cols = np.zeros((len(pts_s), 3), int)
+        else:
+            cols = np.zeros((len(pts_s), 3), int)
+
+        all_lidar_pts.append(pts_col)
+        all_lidar_cols.append(cols)
+
+    if all_lidar_pts and ply_out.exists():
+        merged_lidar_pts  = np.vstack(all_lidar_pts)
+        merged_lidar_cols = np.vstack(all_lidar_cols)
+        # Also merge in the SfM points
+        colmap_pcd  = o3d.io.read_point_cloud(str(ply_out))
+        colmap_pts  = np.asarray(colmap_pcd.points)
+        colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) \
+                      if colmap_pcd.has_colors() else np.zeros((len(colmap_pts), 3), int)
+        all_pts  = np.vstack([merged_lidar_pts,  colmap_pts])
+        all_cols = np.vstack([merged_lidar_cols, colmap_cols])
         merged_ply = colmap_dir / 'sparse' / 'merged.ply'
-        _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
-                            lidar_voxel_size=lidar_voxel_size)
+        with open(merged_ply, 'w') as _mf:
+            _mf.write('ply\nformat ascii 1.0\n')
+            _mf.write(f'element vertex {len(all_pts)}\n')
+            _mf.write('property float x\nproperty float y\nproperty float z\n')
+            _mf.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
+            for _p, _c in zip(all_pts, all_cols):
+                _mf.write(f'{_p[0]:.6f} {_p[1]:.6f} {_p[2]:.6f} {int(_c[0])} {int(_c[1])} {int(_c[2])}\n')
+        print(f'  LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts)} -> {merged_ply}')
         _write_merged_to_points3d(output_dir, merged_ply)
+    elif ply_out.exists():
+        # Fallback: use session merged cloud if no per-scan PLYs available
+        session_aligned = session_path / 'merged_aligned_colored.ply'
+        session_merged  = session_path / 'merged_pointcloud.ply'
+        lidar_ply = session_aligned if session_aligned.exists() else \
+                    session_merged  if session_merged.exists()  else None
+        if lidar_ply:
+            merged_ply = colmap_dir / 'sparse' / 'merged.ply'
+            _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
+                                lidar_voxel_size=lidar_voxel_size)
+            _write_merged_to_points3d(output_dir, merged_ply)
+
+    # Generate depth images using non-downsampled per-scan point clouds
+    print("\n10. Generating depth images...")
+    import importlib.util as _ilu
+    _dep_spec = _ilu.spec_from_file_location(
+        'generate_colmap_depth',
+        str(Path(__file__).resolve().parent / 'generate_colmap_depth.py')
+    )
+    _dep_mod = _ilu.module_from_spec(_dep_spec)
+    _dep_spec.loader.exec_module(_dep_mod)
+    _dep_mod.generate_depth_images(str(session_path))
 
     return True
 

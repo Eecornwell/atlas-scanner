@@ -18,10 +18,11 @@ CAMERA_MODE="dual_fisheye"      # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
+USE_SDK_STITCH=true               # dual_fisheye only: use SDK-stitched ERP images instead of ROS topic
 
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
-COLMAP_LIDAR_VOXEL_SIZE=0.20      # LiDAR downsample before COLMAP merge in metres (0 = skip)
+COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
@@ -38,6 +39,8 @@ while [[ $# -gt 0 ]]; do
         --colmap) EXPORT_COLMAP=true; shift ;;
         --no-colmap) EXPORT_COLMAP=false; shift ;;
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
+        --sdk-stitch) USE_SDK_STITCH=true; shift ;;
+        --no-sdk-stitch) USE_SDK_STITCH=false; shift ;;
         *) shift ;;
     esac
 done

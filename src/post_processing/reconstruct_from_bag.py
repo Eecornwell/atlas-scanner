@@ -714,14 +714,77 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # sensor-frame LiDAR points and ERP image share the same scanner pose.
         centres = []
         if sdk_stitch and camera_mode == 'dual_fisheye':
-            # Primary: read /camera/shutter_time messages recorded in the bag.
-            # msg.data is the host clock time of count-increment detection,
-            # which is ~0-0.5s from the actual shutter time.
-            if shutter_msgs:
+            # Build shutter times from .insp filenames (camera RTC synced to host
+            # clock via reset_clock).  RTC encodes the actual shutter moment to ±1s
+            # with no SD-write jitter, making it more accurate than the count-
+            # increment detection used in /camera/shutter_time messages.
+            # Format: IMG_YYYYMMDD_HHMMSS_00_NNN.insp
+            import calendar as _cal, datetime as _dt_mod, re as _re
+            _rtc_centres = []
+            for _insp in sorted(session_path.glob('fusion_scan_*/*.insp')):
+                if _insp.stat().st_size < 100000:
+                    continue
+                _m = _re.match(r'IMG_(\d{8})_(\d{6})_', _insp.stem)
+                if _m:
+                    try:
+                        _rtc_dt = _dt_mod.datetime.strptime(_m.group(1) + _m.group(2), '%Y%m%d%H%M%S')
+                        _rtc_t = float(_cal.timegm(_rtc_dt.timetuple()))
+                        # Prefer .capture_time (host clock) when it is within 2s of
+                        # the RTC time — it has sub-second resolution the RTC lacks.
+                        # capture_time is now the raw count-increment time; the
+                        # difference (capture_time - rtc_time) is the SD write latency.
+                        _ct_f = Path(str(_insp) + '.capture_time')
+                        if _ct_f.exists():
+                            try:
+                                _host_t = float(_ct_f.read_text().strip())
+                                _sd_latency = _host_t - _rtc_t
+                                if 0.0 <= _sd_latency < 3.0:
+                                    # Apply measured SD latency: shutter = host_t - sd_latency
+                                    _rtc_t = _host_t - _sd_latency
+                                elif abs(_host_t - _rtc_t) < 2.0:
+                                    # Fallback: host_t close to RTC, use directly
+                                    _rtc_t = _host_t
+                            except Exception:
+                                pass
+                        if t_start <= _rtc_t <= t_end:
+                            _rtc_centres.append((_rtc_t, None))
+                    except Exception:
+                        pass
+            if _rtc_centres:
+                _rtc_centres.sort(key=lambda x: x[0])
+                # Deduplicate shots within 2s of each other (same physical shot)
+                _deduped = [_rtc_centres[0]]
+                for _c in _rtc_centres[1:]:
+                    if abs(_c[0] - _deduped[-1][0]) >= 2.0:
+                        _deduped.append(_c)
+                centres = _deduped
+                # Log measured SD write latencies for diagnostics
+                _latencies = []
+                for _insp in sorted(session_path.glob('fusion_scan_*/*.insp')):
+                    _ct_f = Path(str(_insp) + '.capture_time')
+                    _m2 = _re.match(r'IMG_(\d{8})_(\d{6})_', _insp.stem)
+                    if _ct_f.exists() and _m2:
+                        try:
+                            _host_t2 = float(_ct_f.read_text().strip())
+                            _rtc_dt2 = _dt_mod.datetime.strptime(_m2.group(1)+_m2.group(2), '%Y%m%d%H%M%S')
+                            _rtc_t2 = float(_cal.timegm(_rtc_dt2.timetuple()))
+                            _lat = _host_t2 - _rtc_t2
+                            if 0.0 <= _lat < 3.0:
+                                _latencies.append(_lat)
+                        except Exception:
+                            pass
+                if _latencies:
+                    _lat_arr = np.array(_latencies)
+                    print(f"  SD write latency: mean={_lat_arr.mean()*1000:.0f}ms  "
+                          f"std={_lat_arr.std()*1000:.0f}ms  "
+                          f"range=[{_lat_arr.min()*1000:.0f},{_lat_arr.max()*1000:.0f}]ms")
+                print(f"  SDK stitch: {len(centres)} shutter times from .insp RTC + capture_time")
+
+            # Fallback 1: /camera/shutter_time bag messages
+            if not centres and shutter_msgs:
                 seen_times = set()
                 for _bag_ts, msg in shutter_msgs:
                     shutter_t = round(_bag_ts, 3)
-                    # Skip if very close to an already-seen time (duplicate)
                     if any(abs(shutter_t - s) < 1.0 for s in seen_times):
                         continue
                     seen_times.add(shutter_t)
@@ -729,8 +792,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         centres.append((shutter_t, None))
                 if centres:
                     centres.sort(key=lambda x: x[0])
-                    print(f"  SDK stitch: {len(centres)} shutter times from bag (precise)")
-            # Fallback: use .capture_time sidecars
+                    print(f"  SDK stitch: {len(centres)} shutter times from bag (fallback)")
+            # Fallback 2: .capture_time sidecars only
             if not centres:
                 for _ts_f in sorted(session_path.glob('fusion_scan_*/*.insp.capture_time')):
                     try:
@@ -742,7 +805,6 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 if centres:
                     centres.sort(key=lambda x: x[0])
                     print(f"  SDK stitch: {len(centres)} .insp capture times as scan centres (fallback)")
-                # so old reconstructions don't pollute the new one.
                 existing = sorted(session_path.glob('fusion_scan_*'))
                 keep_count = len(centres)
                 for stale in existing[keep_count:]:

@@ -377,12 +377,16 @@ int main(int argc, char* argv[]) {
                     if (new_count <= last_count) continue;
 
                     double t_count = now_sec();
-                    double host_t  = t_count - 0.20;
+                    // Use the firmware's nominal shutter time rather than the
+                    // SD-write-detection time. The firmware fires on a precise
+                    // internal timer at t_start + (shot+1)*interval_s; the SD
+                    // write latency (1-4s on a full card) is not the shutter.
+                    double t_expected = t_start + (shot + 1) * (double)interval_s;
+                    double host_t  = t_expected;
 
                     // Ignore increments before expected shutter time —
                     // background camera writes (video, housekeeping) not shots.
-                    double t_expected = t_start + (shot + 1) * (double)interval_s;
-                    if (host_t < t_expected - 0.5) {
+                    if (t_count < t_expected - 0.5) {
                         LOG_OUT("[timer] ignoring early count increment at t=" << std::fixed
                             << std::setprecision(3) << host_t << " (expected shot " << shot
                             << " at " << t_expected << ")");

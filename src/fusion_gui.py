@@ -184,7 +184,12 @@ class FusionCaptureGUI:
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
                         variable=self.colmap_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.sdk_stitch_var = tk.BooleanVar(value=False)
+        self.sdk_stitch_cb = ttk.Checkbutton(mode_frame, text="SDK-stitch ERP images (dual fisheye only)",
+                        variable=self.sdk_stitch_var)
+        self.sdk_stitch_cb.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
+        self.camera_mode_var.trace_add('write', self._on_camera_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
                                       command=self.start_fusion, style="Accent.TButton")
@@ -260,14 +265,30 @@ class FusionCaptureGUI:
             ttk.Button(btn_frame, text=label, command=cmd).grid(
                 row=row, column=col, sticky=(tk.W, tk.E), padx=3, pady=3)
 
-        _pp_btn(0, 0, "Run Post-Processing",          self._pp_run_reconstruct)
-        _pp_btn(0, 1, "Recolor with New Calibration",  self._pp_reprocess)
-        _pp_btn(1, 0, "ICP Alignment",                  self._pp_icp)
-        _pp_btn(1, 1, "Merge (Trajectory Only)",        self._pp_merge_traj)
-        _pp_btn(2, 0, "Export COLMAP Model",            self._pp_colmap)
-        _pp_btn(2, 1, "View Point Cloud (Web)",         self._pp_web_viewer)
-        _pp_btn(3, 0, "Per-Scan Alignment Viewer",      self._pp_toggle_viewer)
-        _pp_btn(3, 1, "Run Sync Benchmark",             self._pp_sync_benchmark)
+        def _pp_sep(row, text):
+            ttk.Separator(btn_frame, orient='horizontal').grid(
+                row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(6, 0))
+            ttk.Label(btn_frame, text=text, foreground='#888',
+                      font=('Arial', 8)).grid(
+                row=row+1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
+
+        # ── Processing ────────────────────────────────────────────────────
+        _pp_btn(0, 0, "Run Post-Processing",         self._pp_run_reconstruct)
+        _pp_btn(0, 1, "Recolor with New Calibration", self._pp_reprocess)
+        _pp_btn(1, 0, "ICP Alignment",                self._pp_icp)
+        _pp_btn(1, 1, "Merge (Trajectory Only)",      self._pp_merge_traj)
+        _pp_btn(2, 0, "Run Sync Benchmark",           self._pp_sync_benchmark)
+        # ── COLMAP ────────────────────────────────────────────────────────
+        _pp_sep(3, "COLMAP")
+        _pp_btn(5, 0, "Export COLMAP Model",          self._pp_colmap)
+        _pp_btn(5, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
+        _pp_btn(6, 0, "Generate Depth Images",        self._pp_colmap_depth)
+        # ── Viewers ───────────────────────────────────────────────────────
+        _pp_sep(7, "Viewers")
+        _pp_btn(9, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(9, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(10, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(10, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -474,6 +495,7 @@ class FusionCaptureGUI:
                 cmd.append('--stationary-wait')
             cmd.append('--icp' if self.icp_var.get() else '--no-icp')
             cmd.append('--colmap' if self.colmap_var.get() else '--no-colmap')
+            cmd.append('--sdk-stitch' if self.sdk_stitch_var.get() else '--no-sdk-stitch')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -627,6 +649,14 @@ class FusionCaptureGUI:
             self.stationary_wait_cb.config(state='normal')
         else:
             self.stationary_wait_cb.config(state='disabled')
+
+    def _on_camera_mode_changed(self, *_):
+        """Enable/disable SDK-stitch option when camera mode changes."""
+        if self.camera_mode_var.get() == 'dual_fisheye':
+            self.sdk_stitch_cb.config(state='normal')
+        else:
+            self.sdk_stitch_cb.config(state='disabled')
+            self.sdk_stitch_var.set(False)
 
     def _is_continuous_mode(self):
         return self.capture_mode_var.get() == 'continuous'
@@ -1103,11 +1133,21 @@ sys.exit(0 if ok[0] else 4)
                     ) if k in os.environ
                 }
                 _safe_env['PYTHONUNBUFFERED'] = '1'
+                _safe_env['ATLAS_GUI_MODE'] = '1'
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, bufsize=1,
                                   env=_safe_env)
                 for line in proc.stdout:
                     safe_line = line.replace('\r', '').rstrip('\n') + '\n'
                     self.root.after(0, self._pp_log_write, safe_line)
+                    if '3D viewer ready:' in line:
+                        import re as _re, os as _os
+                        m = _re.search(r'(/[^\s]+\.html)', line)
+                        if m:
+                            _candidate = _os.path.realpath(m.group(1))
+                            _allowed = _os.path.realpath(_os.path.expanduser('~/atlas_ws/data'))
+                            if _candidate.startswith(_allowed + _os.sep):
+                                self.root.after(0, self._pp_log_write, '  Launching browser...\n')
+                                self.root.after(200, lambda p=_candidate: self._open_colmap_viewer_in_browser(p))
                 proc.wait()
                 self.root.after(0, self._pp_log_write,
                                 f"{'Done' if proc.returncode == 0 else 'FAILED'} (exit {proc.returncode})\n")
@@ -1173,6 +1213,70 @@ sys.exit(0 if ok[0] else 4)
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         self._pp_run("Sync Benchmark", [sys.executable, str(self.script_dir / 'post_processing/sync_benchmark.py'),
                                         sess, '--out', str(pathlib.Path(sess) / 'sync_benchmark.json')])
+
+    def _pp_colmap_quality(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        colmap_sparse = pathlib.Path(sess) / 'colmap' / 'sparse' / '0'
+        if not colmap_sparse.exists():
+            self._pp_log_write("\n[!] No COLMAP sparse model found \u2014 run Export COLMAP Model first.\n")
+            return
+        self._pp_run("COLMAP Pose Quality", [sys.executable,
+                                             str(self.script_dir / 'post_processing/colmap_pose_quality.py'),
+                                             sess])
+
+    def _pp_colmap_depth(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        if not (pathlib.Path(sess) / 'colmap' / 'sparse' / '0').exists():
+            self._pp_log_write("\n[!] No COLMAP sparse model found \u2014 run Export COLMAP Model first.\n")
+            return
+        self._pp_run("Generate Depth Images", [sys.executable,
+                                               str(self.script_dir / 'post_processing/generate_colmap_depth.py'),
+                                               sess])
+
+    def _pp_depth_overlay(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        if not (pathlib.Path(sess) / 'colmap' / 'depth_images').exists():
+            self._pp_log_write("\n[!] No depth images found \u2014 run Generate Depth Images first.\n")
+            return
+        self._pp_run("Depth-RGB Overlay", [sys.executable,
+                                           str(self.script_dir / 'post_processing/colmap_depth_overlay.py'),
+                                           sess])
+
+    def _pp_colmap_viewer(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        if not (pathlib.Path(sess) / 'colmap' / 'sparse' / '0').exists():
+            self._pp_log_write("\n[!] No COLMAP sparse model found \u2014 run Export COLMAP Model first.\n")
+            return
+        self._pp_run("COLMAP Viewer", [sys.executable,
+                                       str(self.script_dir / 'post_processing/colmap_viewer.py'),
+                                       sess])
+
+    def _open_colmap_viewer_in_browser(self, html_path):
+        import subprocess as _sp
+        url = f'file://{html_path}'
+        env = os.environ.copy()
+        env.setdefault('DISPLAY', ':0')
+        wayland = os.environ.get('_ATLAS_WAYLAND_DISPLAY') or os.environ.get('WAYLAND_DISPLAY', '')
+        if wayland:
+            env['WAYLAND_DISPLAY'] = wayland
+        for cmd in [
+            ['firefox', '--new-window', url],
+            ['chromium-browser', '--new-window', url],
+            ['chromium', '--new-window', url],
+            ['xdg-open', url],
+        ]:
+            try:
+                _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                          env=env, preexec_fn=os.setpgrp)
+                self._pp_log_write(f'  Opened in browser: {html_path}\n')
+                return
+            except FileNotFoundError:
+                continue
+        self._pp_log_write(f'  Could not open browser. Open manually:\n  {html_path}\n')
 
     # ───────────────────────────────────────────────────────────────
 
@@ -1273,7 +1377,7 @@ def main():
     # Read defaults from atlas_fusion_capture.sh if no CLI args given
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
-    default_icp, default_colmap, default_colmap_lidar_voxel = False, False, 0.0
+    default_icp, default_colmap, default_sdk_stitch, default_colmap_lidar_voxel = False, False, False, 0.0
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -1287,6 +1391,8 @@ def main():
                 default_icp = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('EXPORT_COLMAP=') and '#' not in line.split('EXPORT_COLMAP=')[0]:
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('USE_SDK_STITCH=') and '#' not in line.split('USE_SDK_STITCH=')[0]:
+                default_sdk_stitch = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
                 try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
                 except ValueError: pass
@@ -1314,8 +1420,10 @@ def main():
     app.stationary_wait_var.set(default_stationary_wait)
     app.icp_var.set(default_icp)
     app.colmap_var.set(default_colmap)
+    app.sdk_stitch_var.set(default_sdk_stitch)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app._on_capture_mode_changed()
+    app._on_camera_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     try:
