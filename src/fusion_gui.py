@@ -165,29 +165,34 @@ class FusionCaptureGUI:
         ttk.Combobox(mode_frame, textvariable=self.camera_mode_var,
                      values=["dual_fisheye", "single_fisheye"],
                      state="readonly", width=14).grid(row=0, column=1, sticky=(tk.W, tk.E))
-        ttk.Label(mode_frame, text="Capture:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        ttk.Label(mode_frame, text="Camera HW:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        self.camera_hw_var = tk.StringVar(value="onex2")
+        ttk.Combobox(mode_frame, textvariable=self.camera_hw_var,
+                     values=["onex2", "x5"],
+                     state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+        ttk.Label(mode_frame, text="Capture:").grid(row=2, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.capture_mode_var = tk.StringVar(value="continuous")
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
-                     state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+                     state="readonly", width=14).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
         self.stationary_wait_var = tk.BooleanVar(value=False)
         self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
                         variable=self.stationary_wait_var)
-        self.stationary_wait_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.stationary_wait_cb.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
-                        variable=self.bag_only_var).grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.bag_only_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.icp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
-                        variable=self.icp_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.icp_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.colmap_var = tk.BooleanVar(value=False)
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
-                        variable=self.colmap_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.colmap_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.sdk_stitch_var = tk.BooleanVar(value=False)
         self.sdk_stitch_cb = ttk.Checkbutton(mode_frame, text="SDK-stitch ERP images (dual fisheye only)",
                         variable=self.sdk_stitch_var)
-        self.sdk_stitch_cb.grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.sdk_stitch_cb.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
         self.camera_mode_var.trace_add('write', self._on_camera_mode_changed)
 
@@ -488,7 +493,8 @@ class FusionCaptureGUI:
             # Start the fusion script
             cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
                    '--camera', camera_val,
-                   '--capture', capture_val]
+                   '--capture', capture_val,
+                   '--camera-hw', self.camera_hw_var.get()]
             if self.bag_only_var.get():
                 cmd.append('--bag-only')
             if self.capture_mode_var.get() == 'stationary' and self.stationary_wait_var.get():
@@ -1378,6 +1384,7 @@ def main():
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
     default_icp, default_colmap, default_sdk_stitch, default_colmap_lidar_voxel = False, False, False, 0.0
+    default_camera_hw = 'onex2'
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -1393,6 +1400,8 @@ def main():
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('USE_SDK_STITCH=') and '#' not in line.split('USE_SDK_STITCH=')[0]:
                 default_sdk_stitch = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('CAMERA_HW=') and '#' not in line.split('CAMERA_HW=')[0]:
+                default_camera_hw = line.split('=', 1)[1].split('#')[0].strip('"\' ')
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
                 try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
                 except ValueError: pass
@@ -1421,6 +1430,7 @@ def main():
     app.icp_var.set(default_icp)
     app.colmap_var.set(default_colmap)
     app.sdk_stitch_var.set(default_sdk_stitch)
+    app.camera_hw_var.set(default_camera_hw)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app._on_capture_mode_changed()
     app._on_camera_mode_changed()

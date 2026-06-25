@@ -620,6 +620,41 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     t_end = lidar_msgs[-1][0]
     duration = t_end - t_start
 
+    # -----------------------------------------------------------------------
+    # Compute host→Livox clock offset.
+    # LiDAR/odometry timestamps are in Livox hardware clock; shutter times
+    # from t_expected are in host system clock.  The offset is stable over a
+    # session (Livox PTP keeps it within ±5ms).  We estimate it from the
+    # LiDAR header stamps vs their bag_ts (host clock at receipt time),
+    # correcting for the ~100ms network/USB delivery latency by using the
+    # median rather than the mean to reject outliers from scheduling jitter.
+    # -----------------------------------------------------------------------
+    _host_to_livox_offset = 0.0
+    try:
+        _con_off = open_db3(bag_dir)
+        _tmap_off = topic_map(_con_off)
+        _lid_tid = next((tid for tid, (n, _) in _tmap_off.items() if n == '/livox/lidar'), None)
+        if _lid_tid:
+            _rows = _con_off.execute(
+                'SELECT data, timestamp FROM messages WHERE topic_id=? ORDER BY timestamp LIMIT 200',
+                (_lid_tid,)
+            ).fetchall()
+            _diffs = []
+            _LidarType = get_message(_tmap_off[_lid_tid][1])
+            for _data, _bag_ns in _rows:
+                _msg = deserialize_message(bytes(_data), _LidarType)
+                _hdr_t = _msg.header.stamp.sec + _msg.header.stamp.nanosec * 1e-9
+                _bag_t = _bag_ns / 1e9
+                _diffs.append(_bag_t - _hdr_t)
+            if _diffs:
+                # delivery_latency ≈ median diff; true clock offset = delivery_latency
+                _host_to_livox_offset = float(np.median(_diffs))
+                print(f'  Host→Livox clock offset: {_host_to_livox_offset*1000:+.1f}ms '
+                      f'(from {len(_diffs)} LiDAR frames)')
+        _con_off.close()
+    except Exception as _e:
+        print(f'  ⚠ Could not estimate host→Livox offset: {_e}')
+
     if image_msgs_raw and odom_msgs:
         # Select scan centres at low-motion moments using IMU gyroscope magnitude.
         # Falls back to odom-based motion detection if IMU is unavailable.
@@ -739,13 +774,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 _host_t = float(_ct_f.read_text().strip())
                                 _sd_latency = _host_t - _rtc_t
                                 if 0.0 <= _sd_latency < 3.0:
-                                    # Apply measured SD latency: shutter = host_t - sd_latency
-                                    _rtc_t = _host_t - _sd_latency
+                                    # shutter = host_t - sd_latency, then convert to Livox clock
+                                    _rtc_t = (_host_t - _sd_latency) - _host_to_livox_offset
                                 elif abs(_host_t - _rtc_t) < 2.0:
-                                    # Fallback: host_t close to RTC, use directly
-                                    _rtc_t = _host_t
+                                    # host_t close to RTC — apply offset directly
+                                    _rtc_t = _host_t - _host_to_livox_offset
                             except Exception:
                                 pass
+                        else:
+                            # No capture_time sidecar: RTC is host clock, convert to Livox clock
+                            _rtc_t = _rtc_t - _host_to_livox_offset
                         if t_start <= _rtc_t <= t_end:
                             _rtc_centres.append((_rtc_t, None))
                     except Exception:
@@ -778,13 +816,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     print(f"  SD write latency: mean={_lat_arr.mean()*1000:.0f}ms  "
                           f"std={_lat_arr.std()*1000:.0f}ms  "
                           f"range=[{_lat_arr.min()*1000:.0f},{_lat_arr.max()*1000:.0f}]ms")
-                print(f"  SDK stitch: {len(centres)} shutter times from .insp RTC + capture_time")
+                print(f"  SDK stitch: {len(centres)} shutter times from .insp RTC + capture_time "
+                      f"(host\u2192Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
 
             # Fallback 1: /camera/shutter_time bag messages
+            # msg.data = t_expected (host clock); subtract host→Livox offset
+            # to align with LiDAR/odometry which are in Livox hardware clock.
             if not centres and shutter_msgs:
                 seen_times = set()
                 for _bag_ts, msg in shutter_msgs:
-                    shutter_t = round(_bag_ts, 3)
+                    shutter_t = round(msg.data - _host_to_livox_offset, 4)
                     if any(abs(shutter_t - s) < 1.0 for s in seen_times):
                         continue
                     seen_times.add(shutter_t)
@@ -792,19 +833,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         centres.append((shutter_t, None))
                 if centres:
                     centres.sort(key=lambda x: x[0])
-                    print(f"  SDK stitch: {len(centres)} shutter times from bag (fallback)")
-            # Fallback 2: .capture_time sidecars only
+                    print(f"  SDK stitch: {len(centres)} shutter times from bag "
+                          f"(host→Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
+            # Fallback 2: .capture_time sidecars only (also host clock — apply offset)
             if not centres:
                 for _ts_f in sorted(session_path.glob('fusion_scan_*/*.insp.capture_time')):
                     try:
-                        _ct = float(_ts_f.read_text().strip())
+                        _ct = float(_ts_f.read_text().strip()) - _host_to_livox_offset
                         if t_start <= _ct <= t_end:
                             centres.append((_ct, None))
                     except Exception:
                         pass
                 if centres:
                     centres.sort(key=lambda x: x[0])
-                    print(f"  SDK stitch: {len(centres)} .insp capture times as scan centres (fallback)")
+                    print(f"  SDK stitch: {len(centres)} .insp capture times as scan centres "
+                          f"(host→Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
                 existing = sorted(session_path.glob('fusion_scan_*'))
                 keep_count = len(centres)
                 for stale in existing[keep_count:]:
@@ -988,8 +1031,25 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
 
         scan_count += 1
+        # In SDK stitch mode, warn if the scanner was moving at shutter time.
+        # The SDK ERP is gravity-aligned by the camera's own IMU (FlowState/EIS),
+        # which applies a rotation correction that does NOT match the LiDAR motion
+        # compensation. At high angular velocity the EIS correction diverges from
+        # the LiDAR sensor frame, causing colour-to-geometry misalignment.
+        motion_warn = ''
+        if sdk_stitch and imu_msgs:
+            _gyro_samples = [np.linalg.norm([m.angular_velocity.x,
+                                             m.angular_velocity.y,
+                                             m.angular_velocity.z])
+                             for ts, m in imu_msgs if abs(ts - centre) <= 0.3]
+            if _gyro_samples:
+                _gyro_mean = float(np.mean(_gyro_samples))
+                if _gyro_mean > 0.3:
+                    motion_warn = f'  ⚠ HIGH MOTION at shutter ({_gyro_mean:.2f} rad/s) — ERP/LiDAR misalignment likely'
+                elif _gyro_mean > 0.1:
+                    motion_warn = f'  ⚠ motion at shutter ({_gyro_mean:.2f} rad/s)'
         print(f"  ✓ {scan_name}: {len(all_points)} pts  "
-              f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s")
+              f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s{motion_warn}")
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 

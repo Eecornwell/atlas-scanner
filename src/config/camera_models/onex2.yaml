@@ -1,0 +1,9 @@
+# Camera model profile: Insta360 One X2
+# ERP output resolution for SDK stitching
+erp_width: 5760
+erp_height: 2880
+# Lidar mask filename (relative to src/)
+lidar_mask_dual: lidar_mask_dual_sdk.png
+lidar_mask_single: lidar_mask_single.png
+# Display name
+display_name: "Insta360 One X2"

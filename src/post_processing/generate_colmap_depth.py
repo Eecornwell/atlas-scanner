@@ -173,10 +173,13 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=2):
 # Calibration
 # ---------------------------------------------------------------------------
 
-def _load_T_camera_lidar():
-    calib_path = _safe_src(
-        Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml')
-    with open(calib_path) as f:
+def _load_T_camera_lidar(session_path=None):
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from camera_hw import camera_hw_for_session, calibration_path
+    hw         = camera_hw_for_session(session_path) if session_path else 'onex2'
+    calib_file = calibration_path(hw)
+    with open(calib_file) as f:
         calib = yaml.safe_load(f)
     T = np.eye(4)
     T[:3, :3] = Rotation.from_euler(
@@ -219,7 +222,7 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=2
     cameras = _read_cameras(sparse_dir / 'cameras.bin')
     images  = _read_images(sparse_dir  / 'images.bin')
 
-    T_camera_lidar = _load_T_camera_lidar()
+    T_camera_lidar = _load_T_camera_lidar(session)
     T_lidar_camera = np.linalg.inv(T_camera_lidar)
 
     # Output directory mirrors the images/ layout

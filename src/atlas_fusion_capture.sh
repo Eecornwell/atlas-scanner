@@ -19,6 +19,7 @@ CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 USE_SDK_STITCH=true               # dual_fisheye only: use SDK-stitched ERP images instead of ROS topic
+CAMERA_HW="onex2"                 # Camera hardware model: onex2 | x5
 
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
@@ -41,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
         --sdk-stitch) USE_SDK_STITCH=true; shift ;;
         --no-sdk-stitch) USE_SDK_STITCH=false; shift ;;
+        --camera-hw) CAMERA_HW="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -50,7 +52,43 @@ ENABLE_POST_PROCESSING_BAGS=false
 SKIP_LIVE_FUSION=true
 AUTO_CREATE_COLORED=true
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─── Camera hardware model config ─────────────────────────────────────────────
+_CAM_MODEL_DIR="$SCRIPT_DIR/config/camera_models"
+_CAM_CALIB_DIR="$SCRIPT_DIR/config/calibrations"
+_VALID_HW="onex2 x5"
+if ! echo "$_VALID_HW" | grep -qw "$CAMERA_HW"; then
+    echo "⚠ Unknown CAMERA_HW='$CAMERA_HW', defaulting to onex2"
+    CAMERA_HW="onex2"
+fi
+
+# Load ERP resolution and mask filenames from camera model YAML
+_hw_yaml="$_CAM_MODEL_DIR/${CAMERA_HW}.yaml"
+if [ -f "$_hw_yaml" ]; then
+    INSTA360_ERP_WIDTH=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_width',5760))")
+    INSTA360_ERP_HEIGHT=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_height',2880))")
+    _LIDAR_MASK_DUAL=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_dual','lidar_mask_dual_sdk.png'))")
+    _LIDAR_MASK_SINGLE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_single','lidar_mask_single.png'))")
+    _HW_DISPLAY=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('display_name',sys.argv[1]))" "$CAMERA_HW")
+else
+    echo "⚠ No camera model config at $_hw_yaml — using defaults"
+    INSTA360_ERP_WIDTH=5760
+    INSTA360_ERP_HEIGHT=2880
+    _LIDAR_MASK_DUAL="lidar_mask_dual_sdk.png"
+    _LIDAR_MASK_SINGLE="lidar_mask_single.png"
+    _HW_DISPLAY="$CAMERA_HW"
+fi
+export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
+
+# Point all tools at the per-model calibration file.
+# Falls back to the shared config/fusion_calibration.yaml if not present.
+_hw_calib="$_CAM_CALIB_DIR/${CAMERA_HW}/fusion_calibration.yaml"
+if [ -f "$_hw_calib" ]; then
+    cp "$_hw_calib" "$SCRIPT_DIR/config/fusion_calibration.yaml"
+    echo "Loaded calibration: $_hw_calib"
+else
+    echo "⚠ No per-model calibration at $_hw_calib — using existing fusion_calibration.yaml"
+fi
+──────────────────
 
 cd "$ROS_WS_DIR"
 export PATH=/home/orion/cmake-3.25/bin:$PATH
@@ -82,6 +120,13 @@ mkdir -p "$SCAN_DIR"
 LOG_FILE="$SCAN_DIR/session.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== Session log started: $(date) ==="
+echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE hw=$CAMERA_HW ==="
+# Write session metadata so post-processing tools know the camera hardware
+cat > "$SCAN_DIR/session_config.json" << _EOF
+{"camera_mode": "$CAMERA_MODE", "capture_mode": "$CAPTURE_MODE", "camera_hw": "$CAMERA_HW",
+ "use_sdk_stitch": $([ "$USE_SDK_STITCH" = "true" ] && echo true || echo false),
+ "erp_width": $INSTA360_ERP_WIDTH, "erp_height": $INSTA360_ERP_HEIGHT}
+_EOF
 
 PIDS=()
 FUSION_READY="false"
@@ -194,16 +239,16 @@ cleanup() {
                 _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
             fi
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 1.0 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.6 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
             # SDK stitch: re-run coloring after reconstruction so sensor_colored_exact.ply
             # is built from the freshly reconstructed sensor_lidar.ply, not stale data.
             if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
                 echo "Generating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             else
                 echo "Generating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
             fi
         fi
     fi
@@ -259,6 +304,7 @@ cleanup() {
                     INSP_FILE=$(find "$scan_dir" -maxdepth 1 -name "*.insp" | head -1)
                     if [ -n "$INSP_FILE" ]; then
                         ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
+                            --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
                             || echo "  Warning: SDK stitch failed for $(basename $scan_dir), skipping"
                     else
                         echo "  Warning: No .insp file for $(basename $scan_dir), skipping"
@@ -266,7 +312,7 @@ cleanup() {
                 done
                 # SDK stitcher handles seam blending internally, no need for blend_erp_seams
                 echo "Creating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             elif [ "$CAMERA_MODE" = "dual_fisheye" ]; then
@@ -283,7 +329,7 @@ cleanup() {
                     python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/blend_erp_seams_simple.py" "$SCAN_DIR"
                 fi
                 echo "Creating masked images from blended ERPs..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             else
@@ -296,7 +342,7 @@ cleanup() {
                         "$BAG_DIR" "$scan_dir" || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
                 done
                 echo "Creating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
             fi
@@ -425,9 +471,9 @@ if [ "$SKIP_SUDO_CHECK" != "1" ]; then
 fi
 
 if [ "$USE_EXISTING_CALIBRATION" = "true" ]; then
-    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --use-existing
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --use-existing --camera-hw "$CAMERA_HW"
 else
-    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src"
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --camera-hw "$CAMERA_HW"
 fi
 
 # Kill stale processes (use pgrep+kill to avoid pkill matching its own cmdline args)

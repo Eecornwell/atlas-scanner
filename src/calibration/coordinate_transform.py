@@ -27,8 +27,6 @@ _ALLOWED_SRC = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
 
 
 def _safe_src(root_path: str, *parts) -> Path:
-    """Join parts onto root_path, resolve, and confirm the result stays within
-    the allowed source tree before returning the Path."""
     resolved = Path(root_path).joinpath(*parts).resolve()
     if _ALLOWED_SRC not in [resolved, *resolved.parents]:
         raise ValueError(
@@ -37,12 +35,27 @@ def _safe_src(root_path: str, *parts) -> Path:
     return resolved
 
 
-def calibration_transform(root_path, use_existing=False):
-    config_path = _safe_src(root_path, 'config', 'fusion_calibration.yaml')
+def _camera_hw_erp_dims(root_path, camera_hw):
+    """Return (erp_width, erp_height) from the camera model YAML."""
+    hw_yaml = Path(root_path) / 'config' / 'camera_models' / f'{camera_hw}.yaml'
+    if hw_yaml.exists():
+        try:
+            cfg = yaml.safe_load(hw_yaml.read_text()) or {}
+            return cfg.get('erp_width', 5760), cfg.get('erp_height', 2880)
+        except Exception:
+            pass
+    defaults = {'onex2': (5760, 2880), 'x5': (7680, 3840)}
+    return defaults.get(camera_hw, (5760, 2880))
+
+
+def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
+    # Write to both the shared config and the per-model calibration file
+    config_path     = _safe_src(root_path, 'config', 'fusion_calibration.yaml')
+    hw_config_path  = _safe_src(root_path, 'config', 'calibrations', camera_hw, 'fusion_calibration.yaml')
     
     if use_existing:
         if config_path.exists():
-            print("Using existing fusion_calibration.yaml")
+            print(f"Using existing calibration for camera_hw={camera_hw}")
             print_calibration_comparison(root_path)
             return
         else:
@@ -132,11 +145,11 @@ def calibration_transform(root_path, use_existing=False):
         except Exception:
             pass
     
-    # SDK stitch always outputs 5760x2880 (full sensor resolution).
+    # SDK stitch always outputs at the camera model's native ERP resolution.
     # Stream mode uses the ROS equirectangular node config.
     # Since exact_match_fusion.py reads dimensions from the actual image,
     # this value is informational only.
-    erp_width, erp_height = 5760, 2880
+    erp_width, erp_height = _camera_hw_erp_dims(root_path, camera_hw)
 
     # Create config with DIRECT values (no complex transformations)
     config = {
@@ -159,11 +172,14 @@ def calibration_transform(root_path, use_existing=False):
         'skip_rate': existing_config.get('skip_rate', 5)
     }
     
-    # Save
+    # Save to shared config (active calibration) and per-model calibration file
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
-    
-    print(f"\n✓ Saved corrected calibration to: {config_path}")
+    hw_config_path.parent.mkdir(parents=True, exist_ok=True)
+    hw_config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+    print(f"\n✓ Saved calibration for {camera_hw} to: {hw_config_path}")
+    print(f"✓ Active calibration updated: {config_path}")
 
 def print_calibration_comparison(root_path):
     """Compare old vs new transformation approach"""
@@ -184,12 +200,17 @@ def print_calibration_comparison(root_path):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python coordinate_transform.py <root_path> [--use-existing]")
-        print("Example: python coordinate_transform.py /home/orion/atlas_ws/src/atlas-scanner/src")
+        print("Usage: python coordinate_transform.py <root_path> [--use-existing] [--camera-hw onex2|x5]")
+        print("Example: python coordinate_transform.py /home/orion/atlas_ws/src/atlas-scanner/src --camera-hw x5")
         sys.exit(1)
-    
-    root_path = sys.argv[1]
-    use_existing = len(sys.argv) > 2 and sys.argv[2] == "--use-existing"
+
+    root_path    = sys.argv[1]
+    use_existing = '--use-existing' in sys.argv
+    camera_hw    = 'onex2'
+    if '--camera-hw' in sys.argv:
+        idx = sys.argv.index('--camera-hw')
+        if idx + 1 < len(sys.argv):
+            camera_hw = sys.argv[idx + 1]
 
     try:
         _safe_src(root_path)
@@ -197,4 +218,4 @@ if __name__ == "__main__":
         print(f"Error: {e}")
         sys.exit(1)
 
-    calibration_transform(root_path, use_existing)
+    calibration_transform(root_path, use_existing, camera_hw)

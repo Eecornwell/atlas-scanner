@@ -70,8 +70,12 @@ FOV_DEG = 90.0
 MIN_BASELINE_M = 0.10
 
 
-def _load_calibration():
-    calib_path = _safe_src(Path.home() / "atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml")
+def _load_calibration(session_path=None):
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from camera_hw import camera_hw_for_session, calibration_path
+    hw = camera_hw_for_session(session_path) if session_path else 'onex2'
+    calib_path = calibration_path(hw)
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
     T_camera_lidar = np.eye(4)
@@ -585,8 +589,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
     colmap_dir = session_path / 'colmap'
     colmap_dir.mkdir(exist_ok=True)
 
-    T_camera_lidar = _load_calibration()
-
+    T_camera_lidar = _load_calibration(session_path)
     print("1. Preparing perspective tiles from ERP images...")
     panoramas = prepare_images(session_path, colmap_dir, T_camera_lidar)
     if not panoramas:

@@ -1,0 +1,9 @@
+# Camera model profile: Insta360 X5
+# ERP output resolution for SDK stitching (8K)
+erp_width: 7680
+erp_height: 3840
+# Lidar mask filename (relative to src/)
+lidar_mask_dual: lidar_mask_dual_x5.png
+lidar_mask_single: lidar_mask_single_x5.png
+# Display name
+display_name: "Insta360 X5"

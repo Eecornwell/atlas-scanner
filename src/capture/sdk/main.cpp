@@ -367,6 +367,12 @@ int main(int argc, char* argv[]) {
                 int shot = 0;
                 int last_count = base_count;
                 std::set<std::string> seen_paths = pre_session_paths;
+                // Rolling estimate of SD-write latency: t_count - true_shutter.
+                // Bootstrapped from early shots where t_expected is close to truth
+                // (firmware clock and host clock agree well at t=0), then used to
+                // back-calculate true shutter time from t_count for later shots.
+                double sd_latency_estimate = 2.0;  // conservative initial guess
+                int    sd_latency_samples  = 0;
 
                 while (!timer_stop.load()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -377,21 +383,51 @@ int main(int argc, char* argv[]) {
                     if (new_count <= last_count) continue;
 
                     double t_count = now_sec();
-                    // Use the firmware's nominal shutter time rather than the
-                    // SD-write-detection time. The firmware fires on a precise
-                    // internal timer at t_start + (shot+1)*interval_s; the SD
-                    // write latency (1-4s on a full card) is not the shutter.
+                    // Estimate the true shutter time from the SD-write detection
+                    // time minus a rolling estimate of SD-write latency.
+                    // This anchors each shot to a real measurement rather than
+                    // the purely mathematical t_expected = t_start + N*interval,
+                    // which drifts from the firmware's actual firing cadence
+                    // (firmware uses its own oscillator, not the host clock) and
+                    // accumulates error linearly across shots.
                     double t_expected = t_start + (shot + 1) * (double)interval_s;
-                    double host_t  = t_expected;
 
                     // Ignore increments before expected shutter time —
                     // background camera writes (video, housekeeping) not shots.
                     if (t_count < t_expected - 0.5) {
                         LOG_OUT("[timer] ignoring early count increment at t=" << std::fixed
-                            << std::setprecision(3) << host_t << " (expected shot " << shot
+                            << std::setprecision(3) << t_count << " (expected shot " << shot
                             << " at " << t_expected << ")");
                         continue;
                     }
+
+                    // Back-calculate true shutter from t_count using the rolling
+                    // SD-write latency estimate. For the first two shots, bootstrap
+                    // from t_expected (clocks agree within ~10ms at session start).
+                    double host_t;
+                    if (sd_latency_samples < 2) {
+                        // Use t_expected to seed the latency estimate.
+                        double measured_latency = t_count - t_expected;
+                        if (measured_latency >= 0.0 && measured_latency < 30.0) {
+                            sd_latency_estimate = (sd_latency_estimate * sd_latency_samples
+                                                   + measured_latency) / (sd_latency_samples + 1);
+                            ++sd_latency_samples;
+                        }
+                        host_t = t_expected;
+                    } else {
+                        // Use t_count - sd_latency_estimate as the shutter time.
+                        // This tracks the firmware's actual firing cadence rather
+                        // than the drifting mathematical prediction.
+                        host_t = t_count - sd_latency_estimate;
+                        // Update latency estimate: assume host_t is correct,
+                        // so latency = t_count - host_t.
+                        double measured_latency = t_count - host_t;
+                        if (measured_latency >= 0.0 && measured_latency < 30.0)
+                            sd_latency_estimate = sd_latency_estimate * 0.8 + measured_latency * 0.2;
+                    }
+                    LOG_OUT("[timer] shot " << shot << " t_count=" << std::fixed << std::setprecision(3)
+                            << t_count << " sd_lat=" << std::setprecision(3) << sd_latency_estimate
+                            << "s host_t=" << std::setprecision(3) << host_t);
 
                     // Find the one new .insp file not present before this shot.
                     // Poll briefly to allow SD write to complete.
@@ -416,13 +452,10 @@ int main(int argc, char* argv[]) {
                     write_shutter_event(session_dir, shot, host_t);
 
                     if (!new_remote.empty()) {
-                        // Download synchronously so the file is fetched while it is
-                        // still the current HTTP-accessible shot (within this interval).
                         std::string shot_dir   = session_dir + "/.sdk_shot_" + std::to_string(shot);
                         fs::create_directories(shot_dir);
                         std::string local_path = shot_dir + "/" + fs::path(new_remote).filename().string();
-                        LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
-                                  << host_t << " url=" << sanitise(fs::path(new_remote).filename().string()));
+                        LOG_OUT("[timer] downloading shot " << shot << " <- " << sanitise(fs::path(new_remote).filename().string()));
                         bool ok;
                         {
                             std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
@@ -437,8 +470,7 @@ int main(int argc, char* argv[]) {
                             LOG_ERR("[timer] download failed: " << sanitise(new_remote));
                         }
                     } else {
-                        LOG_OUT("[timer] shot " << shot << " t=" << std::fixed << std::setprecision(3)
-                                  << host_t << " (no new file found — deferred to recovery)");
+                        LOG_OUT("[timer] shot " << shot << " no new file found — deferred to recovery");
                     }
                     last_count = new_count;
                     ++shot;
