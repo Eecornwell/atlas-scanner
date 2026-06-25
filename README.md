@@ -25,6 +25,8 @@
 - Spherical (360 degree) Camera
     - [Insta360 One X2](https://www.insta360.com/product/insta360-onex2)
         - 4K max resolution at 30fps
+    - [Insta360 X5](https://www.insta360.com/product/insta360-x5)
+        - 8K max resolution at 24fps 
 - Compute
     - 3.4GHz Quad Core, x64 architecture
     - 16GB DDR4 RAM
@@ -103,9 +105,9 @@
 ![Software Screenshot](assets/media/atlas-software-screenshot.png)
 | **Feature**                         | Supported | Notes                                                                                                            |
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
-| Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
+| Intrinsic calibration               | Future    | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
-| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (SDK stitch, `dual_fisheye`) or 3840×1920 (ROS driver)                          |
+| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (SDK stitch, `dual_fisheye`) or 3840×1920 (ROS driver)                           |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
 | Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
 | Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |
