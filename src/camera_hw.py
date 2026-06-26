@@ -19,6 +19,7 @@ _DEFAULTS = {
         'erp_width':         5760,
         'erp_height':        2880,
         'lidar_mask_dual':   'lidar_mask_dual_sdk.png',
+        'lidar_mask_dual_ros': 'lidar_mask_dual.png',
         'lidar_mask_single': 'lidar_mask_single.png',
         'display_name':      'Insta360 One X2',
     },
@@ -26,6 +27,7 @@ _DEFAULTS = {
         'erp_width':         7680,
         'erp_height':        3840,
         'lidar_mask_dual':   'lidar_mask_dual_x5.png',
+        'lidar_mask_dual_ros': 'lidar_mask_dual_x5.png',
         'lidar_mask_single': 'lidar_mask_single_x5.png',
         'display_name':      'Insta360 X5',
     },
@@ -60,7 +62,10 @@ def camera_hw_for_session(session_dir) -> str:
 def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = False) -> Path:
     """Return the absolute lidar mask path for the given mode."""
     if camera_mode == 'dual_fisheye':
-        name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
+        if sdk_stitch:
+            name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
+        else:
+            name = profile.get('lidar_mask_dual_ros', 'lidar_mask_dual.png')
     else:
         name = profile.get('lidar_mask_single', 'lidar_mask_single.png')
     return _SRC / name

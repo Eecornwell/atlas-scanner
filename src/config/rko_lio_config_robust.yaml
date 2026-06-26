@@ -23,7 +23,7 @@ extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 # Conservative processing parameters
 voxel_size: 0.2              # 0.2m: denser map than 0.3m, better ICP correspondences
 max_points_per_voxel: 10
-max_range: 10.0
+max_range: 20.0              # 20m gives SLAM more structure for ICP between scan positions
 min_range: 0.3
 max_correspondance_distance: 1.0  # 5x voxel_size; large enough to survive IMU prediction error
 convergence_criterion: 0.001

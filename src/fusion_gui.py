@@ -1192,7 +1192,8 @@ sys.exit(0 if ok[0] else 4)
     def _pp_colmap(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        cmd = [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess]
+        cmd = [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess,
+               '--no-bundle-adjustment']
         voxel = getattr(self, 'colmap_lidar_voxel_size', 0.0)
         if voxel > 0:
             cmd += ['--lidar-voxel-size', str(voxel)]

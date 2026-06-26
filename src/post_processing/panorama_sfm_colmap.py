@@ -491,8 +491,40 @@ def write_rig_bin(output_dir, db_path, panoramas):
     print(f"  Wrote rigs.bin ({1} rig, {len(frames_with_pose)} frames)")
 
 
+def _filter_sfm_to_lidar_extents(sfm_pts, lidar_pts, padding=0.5):
+    """Remove SfM points outside the LiDAR AABB expanded by padding metres."""
+    mn = lidar_pts.min(axis=0) - padding
+    mx = lidar_pts.max(axis=0) + padding
+    mask = np.all((sfm_pts >= mn) & (sfm_pts <= mx), axis=1)
+    return mask
+
+
+def _filter_sfm_isolated(sfm_pts, radius=1.5, min_neighbors=20):
+    """Remove SfM points with fewer than min_neighbors within radius metres."""
+    if len(sfm_pts) == 0:
+        return np.ones(len(sfm_pts), dtype=bool)
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(sfm_pts)
+    _, ind = pcd.remove_radius_outlier(nb_points=min_neighbors, radius=radius)
+    mask = np.zeros(len(sfm_pts), dtype=bool)
+    mask[ind] = True
+    return mask
+
+
+def _filter_sfm_by_lidar_proximity(sfm_pts, lidar_pts, max_dist=0.35):
+    """Remove SfM points that have no LiDAR point within max_dist metres.
+    Ensures SfM points land on real surfaces rather than floating in space."""
+    if len(sfm_pts) == 0 or len(lidar_pts) == 0:
+        return np.ones(len(sfm_pts), dtype=bool)
+    from scipy.spatial import cKDTree
+    tree = cKDTree(lidar_pts)
+    dists, _ = tree.query(sfm_pts, k=1, workers=-1)
+    return dists <= max_dist
+
+
 def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
-                        lidar_voxel_size=0.0):
+                        lidar_voxel_size=0.0, filter_sfm=False):
     """Merge LiDAR (ROS world frame) and COLMAP point clouds into COLMAP frame."""
     import open3d as o3d
 
@@ -513,6 +545,12 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
     colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) if colmap_pcd.has_colors() \
                   else np.zeros((len(colmap_pts), 3), int)
 
+    if filter_sfm and len(lidar_pts) > 0 and len(colmap_pts) > 0:
+        sfm_mask = _filter_sfm_to_lidar_extents(colmap_pts, lidar_pts)
+        colmap_pts  = colmap_pts[sfm_mask]
+        colmap_cols = colmap_cols[sfm_mask]
+        print(f'  SfM outlier filter: {sfm_mask.sum()}/{len(sfm_mask)} points kept')
+
     all_pts  = np.vstack([lidar_pts,  colmap_pts])
     all_cols = np.vstack([lidar_cols, colmap_cols])
 
@@ -528,7 +566,7 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
     return all_pts, all_cols
 
 
-def _write_merged_to_points3d(output_dir, merged_ply):
+def _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=None):
     """Append LiDAR PLY points into points3D.bin, preserving existing triangulated points."""
     import open3d as o3d
     pcd = o3d.io.read_point_cloud(str(merged_ply))
@@ -552,6 +590,28 @@ def _write_merged_to_points3d(output_dir, merged_ply):
                 if tl > 0:  # keep only real SfM points
                     existing.append((raw_id, raw_xyz, raw_rgb, raw_err,
                                      struct.pack('Q', tl), raw_trk))
+
+    # Filter SfM points to LiDAR extents so outliers don't appear in the viewer
+    if lidar_pts is not None and len(lidar_pts) > 0 and existing:
+        mn = lidar_pts.min(axis=0) - 0.5
+        mx = lidar_pts.max(axis=0) + 0.5
+        filtered = []
+        for rec in existing:
+            x, y, z = struct.unpack('ddd', rec[1])
+            if mn[0] <= x <= mx[0] and mn[1] <= y <= mx[1] and mn[2] <= z <= mx[2]:
+                filtered.append(rec)
+        removed = len(existing) - len(filtered)
+        if removed:
+            print(f'  SfM outlier filter (points3D): removed {removed}/{len(existing)} points')
+        existing = filtered
+        # Remove points with no LiDAR neighbour within 0.5m
+        if existing:
+            raw_pts = np.array([struct.unpack('ddd', r[1]) for r in existing])
+            iso_mask = _filter_sfm_by_lidar_proximity(raw_pts, lidar_pts)
+            existing = [r for r, keep in zip(existing, iso_mask) if keep]
+            iso_removed = int((~iso_mask).sum())
+            if iso_removed:
+                print(f'  SfM proximity filter (points3D): removed {iso_removed}/{len(iso_mask)} points')
 
     n_sfm   = len(existing)
     n_lidar = len(pts)
@@ -579,7 +639,7 @@ def _strip_rig_from_db(db_path):
     conn.close()
 
 
-def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
+def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
                  lidar_voxel_size=0.0):
     try:
         session_path = _safe_data(Path(session_dir).expanduser())
@@ -739,8 +799,17 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
             if pcd_c.has_colors() and len(pcd_c.points) > 0:
                 from scipy.spatial import cKDTree as _KDT
                 _tree = _KDT(np.asarray(pcd_c.points))
-                _, _idx = _tree.query(pts_s, k=1, workers=-1)
-                cols = (np.asarray(pcd_c.colors)[_idx] * 255).astype(int)
+                _dists, _idx = _tree.query(pts_s, k=1, workers=-1)
+                # Only transfer color when the nearest colored point is close enough.
+                # sensor_colored_exact.ply is a filtered subset of sensor_lidar.ply
+                # (distance-clipped, masked), so uncolored points have no valid match.
+                # A threshold of 0.05m (~2x voxel size) rejects spurious far matches.
+                _valid = _dists < 0.05
+                cols = np.zeros((len(pts_s), 3), int)
+                cols[_valid] = (np.asarray(pcd_c.colors)[_idx[_valid]] * 255).astype(int)
+                # Drop points with no valid color transfer
+                pts_col = pts_col[_valid]
+                cols    = cols[_valid]
             else:
                 cols = np.zeros((len(pts_s), 3), int)
         else:
@@ -757,6 +826,18 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
         colmap_pts  = np.asarray(colmap_pcd.points)
         colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) \
                       if colmap_pcd.has_colors() else np.zeros((len(colmap_pts), 3), int)
+        sfm_mask = _filter_sfm_to_lidar_extents(colmap_pts, merged_lidar_pts)
+        colmap_pts  = colmap_pts[sfm_mask]
+        colmap_cols = colmap_cols[sfm_mask]
+        print(f'  SfM outlier filter: {sfm_mask.sum()}/{len(sfm_mask)} points kept')
+        iso_mask = _filter_sfm_by_lidar_proximity(colmap_pts, merged_lidar_pts)
+        colmap_pts  = colmap_pts[iso_mask]
+        colmap_cols = colmap_cols[iso_mask]
+        print(f'  SfM proximity filter: {iso_mask.sum()}/{len(iso_mask)} points kept')
+        lidar_iso_mask = _filter_sfm_isolated(merged_lidar_pts, radius=0.3, min_neighbors=5)
+        merged_lidar_pts  = merged_lidar_pts[lidar_iso_mask]
+        merged_lidar_cols = merged_lidar_cols[lidar_iso_mask]
+        print(f'  LiDAR isolated filter: {lidar_iso_mask.sum()}/{len(lidar_iso_mask)} points kept')
         all_pts  = np.vstack([merged_lidar_pts,  colmap_pts])
         all_cols = np.vstack([merged_lidar_cols, colmap_cols])
         merged_ply = colmap_dir / 'sparse' / 'merged.ply'
@@ -768,7 +849,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
             for _p, _c in zip(all_pts, all_cols):
                 _mf.write(f'{_p[0]:.6f} {_p[1]:.6f} {_p[2]:.6f} {int(_c[0])} {int(_c[1])} {int(_c[2])}\n')
         print(f'  LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts)} -> {merged_ply}')
-        _write_merged_to_points3d(output_dir, merged_ply)
+        _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=merged_lidar_pts)
     elif ply_out.exists():
         # Fallback: use session merged cloud if no per-scan PLYs available
         session_aligned = session_path / 'merged_aligned_colored.ply'
@@ -776,10 +857,13 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=True,
         lidar_ply = session_aligned if session_aligned.exists() else \
                     session_merged  if session_merged.exists()  else None
         if lidar_ply:
+            import open3d as _o3d
             merged_ply = colmap_dir / 'sparse' / 'merged.ply'
+            _fb_lidar_pcd = _o3d.io.read_point_cloud(str(lidar_ply))
+            _fb_lidar_pts = (R_ROS2COLMAP @ np.asarray(_fb_lidar_pcd.points).T).T
             _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
-                                lidar_voxel_size=lidar_voxel_size)
-            _write_merged_to_points3d(output_dir, merged_ply)
+                                lidar_voxel_size=lidar_voxel_size, filter_sfm=True)
+            _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=_fb_lidar_pts)
 
     # Generate depth images using non-downsampled per-scan point clouds
     print("\n10. Generating depth images...")
@@ -810,7 +894,7 @@ if __name__ == '__main__':
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
                         help='Skip rig-aware bundle adjustment')
-    parser.set_defaults(bundle_adjustment=True)
+    parser.set_defaults(bundle_adjustment=False)
     args = parser.parse_args()
 
     try:

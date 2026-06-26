@@ -14,10 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
-CAMERA_MODE="dual_fisheye"      # dual_fisheye | single_fisheye
+CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
-STATIONARY_WAIT=false              # stationary only: wait 3s before starting rosbag (allows scanner to settle)
+STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 USE_SDK_STITCH=true               # dual_fisheye only: use SDK-stitched ERP images instead of ROS topic
 CAMERA_HW="onex2"                 # Camera hardware model: onex2 | x5
 
@@ -421,7 +421,7 @@ cleanup() {
             echo "Exporting session to COLMAP format (panorama SfM)..."
             _colmap_args=""
             [ "${COLMAP_LIDAR_VOXEL_SIZE:-0}" != "0" ] && _colmap_args="--lidar-voxel-size ${COLMAP_LIDAR_VOXEL_SIZE}"
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" $_colmap_args
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" --no-bundle-adjustment $_colmap_args
         fi
 
         echo "Complete. Scans saved in: $SCAN_DIR"

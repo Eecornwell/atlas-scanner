@@ -97,10 +97,12 @@ def create_scan_toggle_viewer(session_dir, use_icp=False):
         except ValueError:
             continue
 
-        # Find colored PLY - prefer world_colored (already in world frame)
+        # All colored PLYs are sensor-frame regardless of filename —
+        # world_colored_exact.ply is misnamed but contains identical sensor-frame
+        # data (exact_match_fusion saves the same coords under both names).
         colored = next((scan_dir / n for n in [
+            'sensor_colored_exact.ply', 'sensor_colored.ply',
             'world_colored_exact.ply', 'world_colored.ply',
-            'sensor_colored_exact.ply', 'sensor_colored.ply'
         ] if (scan_dir / n).exists()), None)
         if colored is not None:
             try:
@@ -122,8 +124,6 @@ def create_scan_toggle_viewer(session_dir, use_icp=False):
         if pts is None or len(pts) == 0:
             continue
 
-        # world_colored_exact.ply and sensor_colored_exact.ply both contain
-        # sensor-frame XYZ — the world transform is applied here via T_rel.
         pts_h = np.hstack([pts, np.ones((len(pts), 1))])
         pts_world = (T_rel @ pts_h.T).T[:, :3]
 
@@ -390,5 +390,3 @@ if __name__ == '__main__':
         print(f'Error: {e}')
         sys.exit(1)
     result = create_scan_toggle_viewer(sys.argv[1])
-    if result and os.environ.get('ATLAS_GUI_MODE'):
-        print(f'✓ 3D viewer ready: {result}')
