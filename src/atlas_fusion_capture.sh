@@ -88,7 +88,6 @@ if [ -f "$_hw_calib" ]; then
 else
     echo "⚠ No per-model calibration at $_hw_calib — using existing fusion_calibration.yaml"
 fi
-──────────────────
 
 cd "$ROS_WS_DIR"
 export PATH=/home/orion/cmake-3.25/bin:$PATH

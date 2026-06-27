@@ -185,9 +185,21 @@ def exact_match_calibration_tool(scan_dir):
 
     print(f"Valid projections: {len(valid_points)} points")
 
-    u_int = np.clip(np.round(valid_u).astype(int), 0, img_width - 1)
-    v_int = np.clip(np.round(valid_v).astype(int), 0, img_height - 1)
-    colors = image[v_int, u_int][:, [2, 1, 0]]  # BGR to RGB
+    # Bilinear interpolation — blends 4 surrounding pixels for each projected
+    # point instead of snapping to nearest pixel, giving sharper color edges.
+    u0 = np.clip(np.floor(valid_u).astype(int), 0, img_width - 1)
+    v0 = np.clip(np.floor(valid_v).astype(int), 0, img_height - 1)
+    u1 = np.clip(u0 + 1, 0, img_width - 1)
+    v1 = np.clip(v0 + 1, 0, img_height - 1)
+    fu = (valid_u - np.floor(valid_u))[:, np.newaxis]
+    fv = (valid_v - np.floor(valid_v))[:, np.newaxis]
+    c00 = image[v0, u0].astype(np.float32)
+    c10 = image[v0, u1].astype(np.float32)
+    c01 = image[v1, u0].astype(np.float32)
+    c11 = image[v1, u1].astype(np.float32)
+    colors_bgr = (c00 * (1 - fu) * (1 - fv) + c10 * fu * (1 - fv) +
+                  c01 * (1 - fu) * fv       + c11 * fu * fv)
+    colors = np.clip(colors_bgr, 0, 255).astype(np.uint8)[:, [2, 1, 0]]  # BGR to RGB
 
     def write_ply(path, pts, cols):
         try:

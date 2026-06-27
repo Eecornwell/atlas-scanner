@@ -56,7 +56,8 @@ static std::string             g_http_base;
 // Serialises all log writes so multi-statement << chains from different
 // threads never interleave on stdout/stderr (CWE-362).
 static std::mutex              g_log_mutex;
-static std::mutex              g_usb_mutex;
+static std::mutex              g_usb_mutex;     // serialises USB commands
+static std::mutex              g_dl_mutex;      // serialises curl downloads (HTTP tunnel, not USB)
 
 // Thread-safe log helpers.
 #define LOG_OUT(msg) do { std::unique_lock<std::mutex> _lk(g_log_mutex); std::cout << msg << std::endl; } while(0)
@@ -211,6 +212,13 @@ int main(int argc, char* argv[]) {
     std::mutex          timer_mutex;
     std::vector<double> timer_timestamps;
     std::thread         timer_thread;
+    // Limit concurrent in-session downloads to prevent USB saturation.
+    // With unlimited detached threads, 10+ concurrent GetCameraFilesCount
+    // polls starve off the USB bus causing 20s command timeouts on the camera.
+    std::mutex              dl_sem_mutex;
+    std::condition_variable dl_sem_cv;
+    int                     dl_active{0};
+    constexpr int           DL_MAX{2};
 
     while (true) {
         { std::ofstream pf(pending_path); pf << 0; }
@@ -367,11 +375,7 @@ int main(int argc, char* argv[]) {
                 int shot = 0;
                 int last_count = base_count;
                 std::set<std::string> seen_paths = pre_session_paths;
-                // Rolling estimate of SD-write latency: t_count - true_shutter.
-                // Bootstrapped from early shots where t_expected is close to truth
-                // (firmware clock and host clock agree well at t=0), then used to
-                // back-calculate true shutter time from t_count for later shots.
-                double sd_latency_estimate = 2.0;  // conservative initial guess
+                double sd_latency_estimate = 2.0;
                 int    sd_latency_samples  = 0;
 
                 while (!timer_stop.load()) {
@@ -429,8 +433,9 @@ int main(int argc, char* argv[]) {
                             << t_count << " sd_lat=" << std::setprecision(3) << sd_latency_estimate
                             << "s host_t=" << std::setprecision(3) << host_t);
 
-                    // Find the one new .insp file not present before this shot.
-                    // Poll briefly to allow SD write to complete.
+                    // Find the new .insp file for this shot via file list.
+                    // Uses g_usb_mutex (USB commands) separately from g_dl_mutex
+                    // (curl downloads) so file discovery never blocks on downloads.
                     std::string new_remote;
                     for (int attempt = 0; attempt < 10 && new_remote.empty(); ++attempt) {
                         if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -452,23 +457,39 @@ int main(int argc, char* argv[]) {
                     write_shutter_event(session_dir, shot, host_t);
 
                     if (!new_remote.empty()) {
+                        // Download in a detached thread so the detection loop is never
+                        // blocked by curl — subsequent shots' GetCameraFilesCount polls
+                        // would deadlock on g_usb_mutex if download held it synchronously.
                         std::string shot_dir   = session_dir + "/.sdk_shot_" + std::to_string(shot);
                         fs::create_directories(shot_dir);
                         std::string local_path = shot_dir + "/" + fs::path(new_remote).filename().string();
-                        LOG_OUT("[timer] downloading shot " << shot << " <- " << sanitise(fs::path(new_remote).filename().string()));
-                        bool ok;
-                        {
-                            std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
-                            ok = http_download(new_remote, local_path);
-                        }
-                        if (ok) {
-                            std::ofstream ct(local_path + ".capture_time");
-                            ct << std::fixed << std::setprecision(6) << host_t;
-                            write_shutter_event(session_dir, shot, host_t);
-                            LOG_OUT("[timer] saved: " << sanitise(local_path));
-                        } else {
-                            LOG_ERR("[timer] download failed: " << sanitise(new_remote));
-                        }
+                        LOG_OUT("[timer] queuing download shot " << shot << " <- " << sanitise(fs::path(new_remote).filename().string()));
+                        std::thread([new_remote, local_path, host_t, shot, &session_dir,
+                                     &dl_sem_mutex, &dl_sem_cv, &dl_active]() {
+                            {
+                                std::unique_lock<std::mutex> lk(dl_sem_mutex);
+                                dl_sem_cv.wait(lk, [&]{ return dl_active < DL_MAX; });
+                                ++dl_active;
+                            }
+                            bool ok;
+                            {
+                                std::unique_lock<std::mutex> dl_lk(g_dl_mutex);
+                                ok = http_download(new_remote, local_path);
+                            }
+                            {
+                                std::unique_lock<std::mutex> lk(dl_sem_mutex);
+                                --dl_active;
+                                dl_sem_cv.notify_all();
+                            }
+                            if (ok) {
+                                std::ofstream ct(local_path + ".capture_time");
+                                ct << std::fixed << std::setprecision(6) << host_t;
+                                write_shutter_event(session_dir, shot, host_t);
+                                LOG_OUT("[timer] saved: " << sanitise(local_path));
+                            } else {
+                                LOG_ERR("[timer] download failed: " << sanitise(new_remote));
+                            }
+                        }).detach();
                     } else {
                         LOG_OUT("[timer] shot " << shot << " no new file found — deferred to recovery");
                     }
