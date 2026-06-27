@@ -20,10 +20,11 @@ set_target_properties(insta360_capture PROPERTIES
 )
 
 # Stitch-only binary (no camera needed, for post-processing .insp files)
+find_package(OpenCV QUIET)
 add_executable(insta360_stitch stitch.cpp)
-target_include_directories(insta360_stitch PRIVATE /usr/include)
+target_include_directories(insta360_stitch PRIVATE /usr/include ${OpenCV_INCLUDE_DIRS})
 target_link_directories(insta360_stitch PRIVATE /usr/lib)
-target_link_libraries(insta360_stitch PRIVATE MediaSDK)
+target_link_libraries(insta360_stitch PRIVATE MediaSDK ${OpenCV_LIBS})
 set_target_properties(insta360_stitch PROPERTIES
     BUILD_RPATH "/usr/lib"
     INSTALL_RPATH "/usr/lib"

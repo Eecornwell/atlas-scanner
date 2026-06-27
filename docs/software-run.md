@@ -5,58 +5,38 @@
 Edit the settings at the top of `~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh` before running:
 
 ```bash
-CAMERA_MODE="single_fisheye"   # dual_fisheye | single_fisheye
+CAMERA_MODE="dual_fisheye"     # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"      # stationary | continuous
-CONTINUOUS_INTERVAL=5          # nominal seconds between captures (continuous mode only;
-                               # SDK stitch dual_fisheye: firmware enforces ~8s minimum
-                               # due to SD write time; downloads run concurrently via HTTP)
+CONTINUOUS_INTERVAL=5          # seconds between captures (continuous mode only;
+                               # firmware enforces ~8s minimum due to SD write time;
+                               # downloads run concurrently via HTTP)
+CAMERA_HW="onex2"              # onex2 | x5
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
 ENABLE_ICP_ALIGNMENT=true      # ICP pose graph refinement on merged cloud
-BLEND_ERP_SEAMS=true           # dual_fisheye only: blend fisheye seams before coloring
 EXPORT_COLMAP=false            # run panorama SfM (COLMAP) after session
 CLEAN_POINTCLOUD=true          # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
-RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session (outputs to screen + sync_benchmark.json)
+RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session
 ```
 
 | `CAMERA_MODE` | `CAPTURE_MODE` | Use case |
 |---|---|---|
 | `dual_fisheye` | `stationary` | Tripod scanning, full 360° ERP images |
-| `single_fisheye` | `stationary` | Tripod scanning, single fisheye |
-| `single_fisheye` | `continuous` | Walking capture, auto-captures every N seconds |
-| `dual_fisheye` | `continuous` | Walking capture with full 360° images |
+| `single_fisheye` | `stationary` | Tripod scanning, LiDAR-facing fisheye only |
+| `dual_fisheye` | `continuous` | Walking capture, full 360° images |
+| `single_fisheye` | `continuous` | Walking capture, LiDAR-facing fisheye only |
 
-### SDK Stitch Mode (`USE_SDK_STITCH`)
+All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera driver is not used. The `insta360_capture` daemon takes ownership of the USB device for the whole session, captures `.insp` files via `TIMELAPSE_INTERVAL_SHOOTING` (continuous) or `TakePhoto` (stationary), and `insta360_stitch` produces the ERP during post-processing. For `single_fisheye`, `insta360_stitch --single` crops the back hemisphere from the full ERP.
 
-When `CAMERA_MODE=dual_fisheye`, an additional option enables high-quality ERP stitching via the Insta360 MediaSDK:
+**How continuous mode works:**
 
-```bash
-USE_SDK_STITCH=true   # use Insta360 MediaSDK stitcher instead of ROS driver (dual_fisheye only)
-```
-
-| Mode | ERP source | Quality | Notes |
-|---|---|---|---|
-| `USE_SDK_STITCH=false` | ROS driver (real-time) | Good | Standard path, camera IMU available |
-| `USE_SDK_STITCH=true` | Insta360 MediaSDK (post-session) | Best | Higher quality stitching, no camera IMU in bag |
-
-**How it works (continuous mode):**
-
-- The ROS camera driver is not started. Instead, `insta360_capture` (a small C++ daemon built from `src/capture/sdk/`) takes ownership of the USB device.
-- In continuous mode, the daemon uses `TIMELAPSE_INTERVAL_SHOOTING` — the firmware manages the shutter clock autonomously at ~8s effective intervals (firmware minimum regardless of `CONTINUOUS_INTERVAL`). Each new shot is detected by polling `GetCameraFilesCount` every 200ms; when the count increments the shutter timestamp is recorded immediately (before the subsequent `GetCameraFilesList` call which takes ~4s), then the `.insp` file is downloaded via HTTP GET to the camera's built-in file server while the session is still active.
-- Shutter time = `t_count_increment - SD_write_latency (0.20s)`. The count increments when the SD write completes (~200ms after the shutter fires), giving ~100ms timing accuracy on the ROS system clock.
-- Each `.insp` file is stitched to a full 5760×2880 ERP JPEG using `TEMPLATE` stitch mode (fixed factory calibration, identical geometry to single-shot mode) by `insta360_stitch` during reconstruction.
-- The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes them on `/camera/shutter_time`, which is recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
-- The effective capture rate is ~8s per shot (firmware SD write minimum). Camera IMU is not available in this mode.
-
-**ERP orientation (continuous mode):**
-
-Each `.insp` file is stitched independently using `TEMPLATE` mode (fixed factory calibration seam lines). `TEMPLATE` stitch geometry is identical between timelapse and single-shot firmware modes — the seam placement does not depend on the capture mode. No post-processing EIS correction is needed or applied.
+- The daemon uses `TIMELAPSE_INTERVAL_SHOOTING` — the firmware manages the shutter clock autonomously. Each new shot is detected by polling `GetCameraFilesCount` every 200ms; when the count increments the shutter timestamp is recorded (~100ms accuracy on the host clock), then the `.insp` file is downloaded via HTTP GET to the camera's built-in file server while the session is still active.
+- The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes on `/camera/shutter_time`, recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
+- Effective capture rate is ~8s per shot (firmware SD write minimum).
 
 **Building the SDK daemon:**
-
-The source lives in `src/capture/sdk/`. Copy to `~/insta360-dev/` and build:
 
 ```bash
 cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
@@ -65,15 +45,21 @@ cd ~/insta360-dev && bash build.sh
 # Produces: build/insta360_capture  build/insta360_stitch
 ```
 
-Re-run these commands after any update to `src/capture/sdk/main.cpp` or `stitch.cpp`.
+Re-run after any update to `main.cpp` or `stitch.cpp`.
 
-**Manually reconstruct an SDK-stitch session:**
+**Manually reconstruct a session:**
 
 ```bash
 cd ~/atlas_ws && source install/setup.bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
     --camera-mode dual_fisheye --sdk-stitch \
+    --interval 5.0 --lidar-window 0.3
+
+# For single_fisheye:
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    --camera-mode single_fisheye --sdk-stitch \
     --interval 5.0 --lidar-window 0.3
 ```
 
@@ -82,9 +68,7 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py
 ```bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
-    --max-gyro 0.5 --iterations 1
-# Writes trajectory_icp_refined.json for each scan
-# Then regenerate merged cloud:
+    --iterations 1
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
 ```
@@ -104,9 +88,10 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
     ```bash
     cd ~/atlas_ws && source install/setup.bash
     sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
-    ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+    ~/insta360-dev/build/insta360_capture
+    # Should print: Found camera: <serial> ... Camera session open
+    # Ctrl+C to exit
     ```
-    `Ctrl+C`
 
 - Run the software
 
@@ -128,6 +113,7 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera dual_fisheye --capture continuous
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera single_fisheye --capture stationary
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --capture continuous --interval 5
+    ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera-hw x5
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --bag-only           # record bag, skip post-processing
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --no-sync-benchmark  # skip sync benchmark
     ```
@@ -148,18 +134,22 @@ sync_fusion_{TIMESTAMP}/
 └── rosbag_{TIMESTAMP}/        # must be named rosbag_*
     └── *.db3  (or *.db3.zstd) # bag must contain:
                                #   /livox/lidar
-                               #   /dual_fisheye/image/compressed  (or any topic with "fisheye")
-                               #   /rko_lio/odometry               (optional, for trajectory poses)
+                               #   /camera/shutter_time  (SDK shutter events)
+                               #   /rko_lio/odometry     (optional, for trajectory poses)
 ```
 
 ```bash
 cd ~/atlas_ws && source install/setup.bash
 python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
     ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
-    --camera-mode single_fisheye \
-    --interval 3.0 --lidar-window 0.5
+    --camera-mode dual_fisheye --sdk-stitch \
+    --interval 5.0 --lidar-window 0.5
 
-# Use --camera-mode dual_fisheye if the session was captured with dual_fisheye mode
+# For single_fisheye mode:
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} \
+    --camera-mode single_fisheye --sdk-stitch \
+    --interval 5.0 --lidar-window 0.5
 ```
 
 ### Reprocess an existing session with a new calibration

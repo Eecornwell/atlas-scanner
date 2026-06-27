@@ -93,7 +93,7 @@ equirectangular_node:
 
 ### Procedure
 
-1. **Capture a scan** to generate a sample ERP image for mask creation:
+1. **Capture calibration scans** (5–10 from different positions) to generate sample ERP images for mask creation:
     ```bash
     cd ~/atlas_ws/src/atlas-scanner/src
     ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw onex2
@@ -102,13 +102,7 @@ equirectangular_node:
 
 2. **Create a lidar mask** for your camera/mount (see [Lidar Masks](#lidar-masks) above).
 
-3. **Capture calibration scans** (5–10 from different positions):
-    ```bash
-    cd ~/atlas_ws/src/atlas-scanner/src
-    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw onex2
-    ```
-
-4. **Combine scans** into the calibration dataset:
+3. **Combine scans** into the calibration dataset:
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
         ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
@@ -210,23 +204,20 @@ equirectangular_node:
 
 ---
 
-## SDK Stitch Calibration
+## ERP–LiDAR Calibration (SDK Stitch)
 
-> *Applies when `USE_SDK_STITCH=true` with `--camera dual_fisheye`. The SDK-stitched ERP is gravity-aligned and has a different camera frame orientation, requiring its own calibration.*
-
-The scanner mounts **upside-down** — lidar faces up, camera faces down, sharing the forward axis. The SDK ERP is a full 360° gravity-aligned equirectangular image.
+The scanner mounts **upside-down** — lidar faces up, camera faces down, sharing the forward axis. The SDK-stitched ERP is gravity-aligned with a different camera frame orientation from a standard equirectangular, requiring its own calibration procedure. This is the only calibration path — the ROS camera driver is not used.
 
 ### Prerequisites
 - Insta360 SDK stitcher binary built at `~/insta360-dev/build/insta360_stitch`
-- At least **2** SDK stitch scans from different positions
+- At least **2** scans from different positions
 
 ### Procedure
 
 1. **Capture scans**:
     ```bash
     cd ~/atlas_ws/src/atlas-scanner/src
-    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye \
-        --sdk-stitch --camera-hw onex2
+    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw onex2
     ```
 
 2. **Combine scans**:

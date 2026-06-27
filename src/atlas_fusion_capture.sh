@@ -18,7 +18,6 @@ CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
-USE_SDK_STITCH=true               # dual_fisheye only: use SDK-stitched ERP images instead of ROS topic
 CAMERA_HW="onex2"                 # Camera hardware model: onex2 | x5
 
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
@@ -40,8 +39,6 @@ while [[ $# -gt 0 ]]; do
         --colmap) EXPORT_COLMAP=true; shift ;;
         --no-colmap) EXPORT_COLMAP=false; shift ;;
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
-        --sdk-stitch) USE_SDK_STITCH=true; shift ;;
-        --no-sdk-stitch) USE_SDK_STITCH=false; shift ;;
         --camera-hw) CAMERA_HW="$2"; shift 2 ;;
         *) shift ;;
     esac
@@ -123,7 +120,6 @@ echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE hw=$C
 # Write session metadata so post-processing tools know the camera hardware
 cat > "$SCAN_DIR/session_config.json" << _EOF
 {"camera_mode": "$CAMERA_MODE", "capture_mode": "$CAPTURE_MODE", "camera_hw": "$CAMERA_HW",
- "use_sdk_stitch": $([ "$USE_SDK_STITCH" = "true" ] && echo true || echo false),
  "erp_width": $INSTA360_ERP_WIDTH, "erp_height": $INSTA360_ERP_HEIGHT}
 _EOF
 
@@ -147,18 +143,17 @@ cleanup() {
     # Send SIGINT (not SIGTERM) to the ros2 launch process — ros2 launch handles
     # SIGINT gracefully by forwarding it to children, whereas SIGTERM causes it
     # to SIGKILL children immediately without giving the SDK time to shut down.
-    for _cam_pid in $(pgrep -f "insta360_ros_driver" 2>/dev/null); do
+    for _cam_pid in $(pgrep -f "insta360_capture" 2>/dev/null); do
         kill -INT "$_cam_pid" 2>/dev/null
     done
     for _w in $(seq 1 150); do
-        pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
+        pgrep -f "insta360_capture" > /dev/null 2>&1 || break
         sleep 0.1
     done
-    pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+    pgrep -f "insta360_capture" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
 
-    # Kill all other tracked processes (excluding camera driver already handled above)
+    # Kill all other tracked processes
     for pid in "${PIDS[@]}"; do
-        pgrep -f "insta360_ros_driver" 2>/dev/null | grep -qw "$pid" && continue
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null
             for _w in $(seq 1 20); do
@@ -187,20 +182,13 @@ cleanup() {
     _pkill "enhanced_trajectory_recorder"
     _pkill "buffered_odom_bridge"
     _pkill "rviz2"
-    _pkill "insta360_ros_driver"
-    _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-    _pkill "image_decoder"
-    _pkill "equirectangular"
-    _pkill "dual_fisheye"
-    _pkill "bringup.launch"
+    _pkill "insta360_capture"
     _pkill "livox_ros_driver2"
     _pkill "rko_lio"
     _pkill "static_transform_publisher"
     _pkill "ros2 bag record"
     _pkill "topic_tools"
     _pkill "continuous_trajectory_recorder"
-    _pkill "ros2 launch.*insta360"
-    _pkill "python.*equirectangular"
 
     # Wait for the SDK capture daemon to call StopTimeLapse and exit cleanly.
     # It was deliberately excluded from PIDS so the loop above didn't kill it.
@@ -231,24 +219,41 @@ cleanup() {
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/imu_sync.py" \
                 "$SCAN_DIR" --window 20.0 || echo "  ⚠ IMU sync failed — continuing without offset"
             echo "Reconstructing scans from bag using header timestamps..."
-            _SDK_STITCH_ARG=""
-            _TRIM_ENDS="3"
-            if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                _SDK_STITCH_ARG="--sdk-stitch"
-                _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
-            fi
+            _SDK_STITCH_ARG="--sdk-stitch"
+            _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
                 "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.6 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+            # Promote .insp files from .sdk_shot_N/ into fusion_scan_NNN/ by shot order,
+            # then stitch each one to equirect_dual_fisheye.jpg
+            _scan_idx=0
+            for _shot_dir in $(ls -d "$SCAN_DIR"/.sdk_shot_* 2>/dev/null | sort -t_ -k3 -n); do
+                _scan_idx=$((_scan_idx + 1))
+                _target_scan="$SCAN_DIR/fusion_scan_$(printf '%03d' $_scan_idx)"
+                [ -d "$_target_scan" ] || continue
+                for _insp in "$_shot_dir"/*.insp; do
+                    [ -f "$_insp" ] || continue
+                    [ "$(stat -c%s "$_insp" 2>/dev/null)" -lt 100000 ] && continue
+                    mv "$_insp" "$_target_scan/" 2>/dev/null
+                    [ -f "${_insp}.capture_time" ] && mv "${_insp}.capture_time" "$_target_scan/" 2>/dev/null
+                done
+            done
+            echo "Converting fisheye images to ERP (SDK stitcher)..."
+            for _scan_dir in "$SCAN_DIR"/fusion_scan_*; do
+                [ -d "$_scan_dir" ] || continue
+                INSP_FILE=$(find "$_scan_dir" -maxdepth 1 -name "*.insp" | head -1)
+                [ -z "$INSP_FILE" ] && continue
+                _stitch_args=""
+                [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
+                ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$_scan_dir/equirect_dual_fisheye.jpg" \
+                    --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
+                    $_stitch_args \
+                    || echo "  Warning: SDK stitch failed for $(basename $_scan_dir), skipping"
+            done
             # SDK stitch: re-run coloring after reconstruction so sensor_colored_exact.ply
             # is built from the freshly reconstructed sensor_lidar.ply, not stale data.
-            if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                echo "Generating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
-            else
-                echo "Generating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
-            fi
+            echo "Generating masked images..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
         fi
     fi
 
@@ -265,8 +270,7 @@ cleanup() {
 
         # Coloring
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
-            if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                # Promote .insp files into fusion_scan_NNN/ by capture order.
+            # Promote .insp files into fusion_scan_NNN/ by capture order.
                 # Source 1: .sdk_shot_N/ subdirectories (older capture method)
                 _scan_idx=0
                 for _shot_dir in $(ls -d "$SCAN_DIR"/.sdk_shot_* 2>/dev/null | sort -t_ -k2 -n); do
@@ -302,8 +306,11 @@ cleanup() {
                     # If we have a raw .insp file, stitch it directly
                     INSP_FILE=$(find "$scan_dir" -maxdepth 1 -name "*.insp" | head -1)
                     if [ -n "$INSP_FILE" ]; then
+                        _stitch_args=""
+                        [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
                         ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
                             --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
+                            $_stitch_args \
                             || echo "  Warning: SDK stitch failed for $(basename $scan_dir), skipping"
                     else
                         echo "  Warning: No .insp file for $(basename $scan_dir), skipping"
@@ -314,37 +321,6 @@ cleanup() {
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
                 echo "Creating colored point clouds..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
-            elif [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-                echo "Converting fisheye images to ERP..."
-                for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
-                    [ -d "$scan_dir" ] || continue
-                    BAG_DIR=$(find "$scan_dir" -maxdepth 1 -name "rosbag_*" -type d 2>/dev/null | grep -v '_imu$' | head -1)
-                    [ -z "$BAG_DIR" ] && continue
-                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
-                        "$BAG_DIR" "$scan_dir" --dual || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
-                done
-                if [ "$BLEND_ERP_SEAMS" = "true" ]; then
-                    echo "Blending ERP image seams..."
-                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/blend_erp_seams_simple.py" "$SCAN_DIR"
-                fi
-                echo "Creating masked images from blended ERPs..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
-                echo "Creating colored point clouds..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
-            else
-                echo "Converting fisheye images to ERP (single fisheye)..."
-                for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
-                    [ -d "$scan_dir" ] || continue
-                    BAG_DIR=$(find "$scan_dir" -maxdepth 1 -name "rosbag_*" -type d 2>/dev/null | grep -v '_imu$' | head -1)
-                    [ -z "$BAG_DIR" ] && continue
-                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/extract_fisheye_from_bag.py" \
-                        "$BAG_DIR" "$scan_dir" || echo "  Warning: ERP extraction failed for $(basename $scan_dir), skipping"
-                done
-                echo "Creating masked images..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --camera-hw "$CAMERA_HW"
-                echo "Creating colored point clouds..."
-                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
-            fi
             echo "✓ Colored point clouds created"
         fi
         # continuous mode coloring is handled inside reconstruct_from_bag.py
@@ -379,10 +355,7 @@ cleanup() {
             echo "Applying ICP alignment..."
         # Continuous mode: scan centres already gyro-filtered by reconstruct_from_bag,
         # so use a higher threshold here to avoid over-filtering.
-        # For SDK stitch mode, scan centres are at shutter times (not gyro-gated),
-        # so disable gyro filter entirely.
-        _POSEGRAPH_GYRO="0.5"
-        [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ] && _POSEGRAPH_GYRO="99.0"
+        _POSEGRAPH_GYRO="99.0"  # scan centres are at shutter times, no gyro filter needed
         python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/align_scan_session_posegraph.py" "$SCAN_DIR" --max-gyro "$_POSEGRAPH_GYRO" --iterations 1
             if [ $? -eq 0 ] && [ -f "$SCAN_DIR/merged_aligned_colored.ply" ]; then
                 MERGED_FILE="$SCAN_DIR/merged_aligned_colored.ply"
@@ -502,10 +475,10 @@ _pkill() {
     wait "${_wait_pids[@]}" 2>/dev/null || true
 }
 
-# Block until all insta360_ros_driver processes have fully exited.
+# Block until all insta360_capture processes have fully exited.
 _wait_camera_dead() {
     # Skip entirely if no camera processes are running
-    if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
+    if ! pgrep -f "insta360_capture" > /dev/null 2>&1; then
         return 0
     fi
     local _usb_dev
@@ -528,10 +501,10 @@ _wait_camera_dead() {
     else
         # No /dev/insta — fall back to pgrep
         for _i in $(seq 1 20); do
-            pgrep -f "insta360_ros_driver" > /dev/null 2>&1 || break
+            pgrep -f "insta360_capture" > /dev/null 2>&1 || break
             sleep 1
         done
-        pgrep -f "insta360_ros_driver" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
+        pgrep -f "insta360_capture" 2>/dev/null | xargs -r kill -KILL 2>/dev/null || true
     fi
     sleep 1
 }
@@ -623,28 +596,16 @@ except Exception as e:
     sleep 3
     echo "✓ Camera USB reset complete"
 }
-
-
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
 _pkill "livox_ros_driver2" & _kpids=($!)
 _pkill "rko_lio" & _kpids+=($!)
-_pkill "insta360_ros_driver" & _kpids+=($!)
-_pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder" & _kpids+=($!)
-_pkill "image_decoder" & _kpids+=($!)
-_pkill "equirectangular" & _kpids+=($!)
-_pkill "dual_fisheye" & _kpids+=($!)
-_pkill "bringup.launch" & _kpids+=($!)
+_pkill "insta360_capture" & _kpids+=($!)
 _pkill "static_transform_publisher" & _kpids+=($!)
 _pkill "ros2 bag record" & _kpids+=($!)
 _pkill "continuous_trajectory_recorder" & _kpids+=($!)
-_pkill "ros2 launch.*insta360" & _kpids+=($!)
-_pkill "python.*equirectangular" & _kpids+=($!)
 _pkill "imu_frame" & _kpids+=($!)
 _pkill "imu_stabilized" & _kpids+=($!)
-_pkill "insta360_capture" & _kpids+=($!)
 wait "${_kpids[@]}"
-# Block until the camera driver process is fully gone so StopLiveStreaming()/Close()
-# completes before we attempt to open a new session.
 _wait_camera_dead
 _wait_firmware_ready
 # Wipe all FastDDS SHM files now that every process is confirmed dead.
@@ -823,7 +784,7 @@ fi
 # ─── Camera driver ────────────────────────────────────────────────────────────
 # In SDK stitch mode the CameraSDK owns the USB device for the whole session
 # — no ROS driver needed. The driver is only required for stream-based capture.
-if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
+# SDK capture daemon
     echo "SDK stitch mode: skipping camera driver (SDK owns USB device)"
     CAMERA_STATUS="SDK (insta360_capture)"
     touch /tmp/.insta360_session_ran
@@ -868,81 +829,6 @@ if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
         fi
     fi
     echo "✓ SDK camera session ready"
-else
-echo "Starting camera driver (mode: $CAMERA_MODE)..."
-_pkill "insta360_ros_driver"
-sleep 1
-
-CAMERA_STARTED=false
-for _cam_attempt in 1 2 3; do
-    _IMU_FILTER="false"
-    [ "$CAPTURE_MODE" = "continuous" ] && _IMU_FILTER="true"
-    > /tmp/camera.log  # clear log for this attempt
-    env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
-        equirectangular:=false \
-        imu_filter:=${_IMU_FILTER} > /tmp/camera.log 2>&1 &
-    CAMERA_PID=$!
-    PIDS+=($CAMERA_PID)
-    { sleep 2 && renice -n 5 -p $CAMERA_PID 2>/dev/null 1>/dev/null; } &
-
-    # Wait up to 70s for "Live streaming started" in /tmp/camera.log.
-    _stream_ready=false
-    for _sw in $(seq 1 70); do
-        if grep -q "Live streaming started" /tmp/camera.log 2>/dev/null; then
-            _stream_ready=true
-            break
-        fi
-        if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
-            break
-        fi
-        sleep 1
-    done
-    if [ "$_stream_ready" = "true" ]; then
-        echo "✓ Camera driver ready"
-        CAMERA_STATUS="/dual_fisheye/image/compressed"
-        _iframe_topic="/dual_fisheye/image/compressed"
-        [ "$CAMERA_MODE" = "single_fisheye" ] && _iframe_topic="/dual_fisheye/image"
-        _cam_data_ok=false
-        for _cw in $(seq 1 20); do
-            _pub=$(ros2 topic info "$_iframe_topic" 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
-            [ "${_pub:-0}" -gt 0 ] && { _cam_data_ok=true; break; }
-            sleep 0.5
-        done
-        if [ "$_cam_data_ok" = "false" ]; then
-            echo "⚠ Camera attempt $_cam_attempt: no data on $_iframe_topic within 10s"
-            _stream_ready=false
-            _pkill "insta360_ros_driver"
-            _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-            _wait_camera_dead
-            _wait_firmware_ready
-            _usb_reset_camera
-            for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
-            [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-            continue
-        fi
-        CAMERA_STARTED=true
-        break
-    else
-        echo "⚠ Camera attempt $_cam_attempt failed (driver exited), retrying..."
-        _pkill "insta360_ros_driver"
-        _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-        _wait_camera_dead
-        _wait_firmware_ready
-        _usb_reset_camera
-        for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
-        [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-    fi
-done
-
-if [ "$CAMERA_STARTED" = "false" ]; then
-    echo "✗ Camera failed to start after 3 attempts"; exit 1
-fi
-echo "✓ Camera data confirmed"
-touch /tmp/.insta360_session_ran  # sentinel: firmware needs settle time before next session
-fi  # end non-SDK-stitch camera driver block
-# Truncate camera log now so pre-ready decoder errors don't pollute per-scan health checks
-> /tmp/camera.log
-
 FUSION_READY="true"
 
 echo ""
@@ -965,15 +851,9 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
 
     ROSBAG_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     ROSBAG_DIR="$SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
-    # SDK stitch mode: record LiDAR+odometry only (no camera stream).
-    # Stream mode: record LiDAR + camera stream + odometry.
-    if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-        CONTINUOUS_TOPICS="/livox/lidar /camera/shutter_time"
-    else
-        CONTINUOUS_TOPICS="/livox/lidar /dual_fisheye/image/compressed"
-    fi
-    [ "$LIO_ENABLED" = "true" ] && CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
     # Main bag: LiDAR + camera + odometry on cores 2-3
+    CONTINUOUS_TOPICS="/livox/lidar /camera/shutter_time"
+    [ "$LIO_ENABLED" = "true" ] && CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
     # shellcheck disable=SC2086
     taskset -c 2,3 nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 100000000 \
         $CONTINUOUS_TOPICS > "$SCAN_DIR/rosbag_main.log" 2>&1 &
@@ -994,50 +874,20 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     echo "✓ Rosbag recording started: $ROSBAG_DIR"
     echo "  Press 'q' + ENTER when scanning is complete."
 
-    if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-        # Continuous SDK mode: send session_dir as trigger — daemon starts timelapse
-        # at INSTA360_INTERVAL_MS. Firmware manages the shutter clock autonomously
-        # at the same PHOTO_SINGLE quality; StopTimeLapse at session end returns
-        # all shot URLs for background download.
-        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-        echo "$SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
-        for _i in $(seq 1 100); do
-            [ -f "$SCAN_DIR/.sdk_capture_done" ] && break
-            [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { echo "✗ SDK timelapse failed to start"; exit 1; }
-            sleep 0.1
-        done
-        rm -f "$SCAN_DIR/.sdk_capture_done"
-        echo "✓ SDK continuous capture started (interval=${CONTINUOUS_INTERVAL}s)"
-        # Start shutter event publisher — watches for capture_N.shutter_event files
-        python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/shutter_event_publisher.py" \
-            "$SCAN_DIR" > "$SCAN_DIR/shutter_publisher.log" 2>&1 &
-        PIDS+=($!)
-        echo "✓ Shutter event publisher started"
-    else
-        # Stream mode: watchdog to restart ROS camera driver if it dies
-        (
-            while true; do
-                sleep 2
-                [ -f "$SCAN_DIR/.session_done" ] && exit 0
-                if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
-                    echo "⚠ Camera driver died, restarting..."
-                    _pkill "insta360_ros_driver"
-                    _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-                    _wait_camera_dead
-                    _usb_reset_camera
-                    for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
-                    [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-                    env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
-                        equirectangular:=false imu_filter:=true > /tmp/camera.log 2>&1 &
-                    CAMERA_PID=$!
-                    echo "✓ Camera driver restarted (pid $CAMERA_PID)"
-                    sleep 10
-                fi
-            done
-        ) &
-        WATCHDOG_PID=$!
-        PIDS+=("$WATCHDOG_PID")
-    fi
+    rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+    echo "$SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
+    for _i in $(seq 1 100); do
+        [ -f "$SCAN_DIR/.sdk_capture_done" ] && break
+        [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { echo "✗ SDK timelapse failed to start"; exit 1; }
+        sleep 0.1
+    done
+    rm -f "$SCAN_DIR/.sdk_capture_done"
+    echo "✓ SDK continuous capture started (interval=${CONTINUOUS_INTERVAL}s)"
+    # Start shutter event publisher — watches for capture_N.shutter_event files
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/shutter_event_publisher.py" \
+        "$SCAN_DIR" > "$SCAN_DIR/shutter_publisher.log" 2>&1 &
+    PIDS+=($!)
+    echo "✓ Shutter event publisher started"
 
     while true; do
         if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
@@ -1059,7 +909,7 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     # For SDK stitch mode: wait for all background downloads to finish
     # before stopping the bag recorder. The daemon writes .sdk_downloads_pending
     # with the outstanding count; poll until it reaches 0.
-    if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ] && [ -n "${SDK_CAPTURE_PID:-}" ]; then
+    if [ -n "${SDK_CAPTURE_PID:-}" ]; then
         echo "Waiting for SDK to stop timelapse and complete downloads..."
         _sdk_wait=0
         while [ $_sdk_wait -lt 300 ]; do
@@ -1075,57 +925,6 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
 
 else
     # ── Stationary mode ──────────────────────────────────────────────────────
-    if [ "$USE_SDK_STITCH" != "true" ] || [ "$CAMERA_MODE" != "dual_fisheye" ]; then
-        # Keep the camera stream alive between scans - the Insta360 SDK closes the
-        # connection if no subscriber consumes frames for ~40s.
-        env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/camera_keepalive.py" "$CAMERA_MODE" &
-        KEEPALIVE_PID=$!
-        PIDS+=($KEEPALIVE_PID)
-
-        # Camera watchdog: restart driver if it dies between scans
-        (
-            while true; do
-                sleep 5
-                [ -f "$SCAN_DIR/.session_done" ] && exit 0
-                if ! pgrep -f "insta360_ros_driver" > /dev/null 2>&1; then
-                    echo "⚠ Camera driver died, restarting..."
-                    _pkill "insta360_ros_driver"
-                    _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-                    _wait_camera_dead
-                    _usb_reset_camera
-                    for _ci in $(seq 1 10); do [ -e /dev/insta ] && break; sleep 1; done
-                    [ "$SKIP_SUDO_CHECK" != "1" ] && sudo chmod 777 /dev/insta 2>/dev/null || true
-                    env -u FASTRTPS_DEFAULT_PROFILES_FILE FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_camera.xml" ROS_DISABLE_LOANED_MESSAGES=1 ros2 launch insta360_ros_driver bringup.launch.xml \
-                        equirectangular:=false imu_filter:=false > /tmp/camera.log 2>&1 &
-                    CAMERA_PID=$!
-                    for _sw in $(seq 1 70); do
-                        grep -q "Live streaming started" /tmp/camera.log 2>/dev/null && break
-                        sleep 1
-                    done
-                    _iframe_topic="/dual_fisheye/image/compressed"
-                    [ "$CAMERA_MODE" = "single_fisheye" ] && _iframe_topic="/dual_fisheye/image"
-                    _cam_data_ok=false
-                    for _cw in $(seq 1 20); do
-                        _pub=$(ros2 topic info "$_iframe_topic" 2>/dev/null | grep -m1 'Publisher count' | grep -o '[0-9]*')
-                        [ "${_pub:-0}" -gt 0 ] && { _cam_data_ok=true; break; }
-                        sleep 0.5
-                    done
-                    if [ "$_cam_data_ok" = "false" ]; then
-                        echo "⚠ Camera watchdog: no data on $_iframe_topic within 10s, will retry next cycle"
-                        _pkill "insta360_ros_driver"
-                        _pkill "insta360_ros_driver/lib/insta360_ros_driver/decoder"
-                        _wait_camera_dead
-                        _usb_reset_camera
-                    else
-                        echo "✓ Camera driver restarted (pid $CAMERA_PID)"
-                    fi
-                fi
-            done
-        ) &
-        STATIONARY_WATCHDOG_PID=$!
-        PIDS+=("$STATIONARY_WATCHDOG_PID")
-    fi
-
     # Use /dev/tty if available (interactive terminal), otherwise use GUI trigger file mode
     _GUI_MODE=false
     if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
@@ -1218,34 +1017,6 @@ else
             sleep 3
         fi
 
-        # Check decoder health for single_fisheye — if it's stuck on corrupt
-        # H.264 frames since the last scan, restart it. The log is truncated at
-        # session ready so only post-ready errors are counted.
-        if [ "$CAMERA_MODE" = "single_fisheye" ]; then
-            _decoder_pid=$(pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" | head -1)
-            if [ -n "$_decoder_pid" ]; then
-                _recent_errors=$(grep -c "non-existing PPS\|decode_slice_header error\|no frame" /tmp/camera.log 2>/dev/null)
-                _recent_errors=${_recent_errors:-0}
-                if [ "$_recent_errors" -gt 10 ]; then
-                    echo "⚠ Decoder stuck on corrupt H.264 stream ($_recent_errors errors), restarting..."
-                    kill -TERM "$_decoder_pid" 2>/dev/null
-                    for _dw in $(seq 1 20); do
-                        kill -0 "$_decoder_pid" 2>/dev/null || break
-                        sleep 0.1
-                    done
-                    kill -0 "$_decoder_pid" 2>/dev/null && kill -KILL "$_decoder_pid" 2>/dev/null || true
-                    for _dw in $(seq 1 20); do
-                        pgrep -f "insta360_ros_driver/lib/insta360_ros_driver/decoder" > /dev/null 2>&1 && break
-                        sleep 0.5
-                    done
-                    sleep 5
-                    # Truncate log again so errors from this restart don't carry forward
-                    > /tmp/camera.log
-                    echo "✓ Decoder restarted"
-                fi
-            fi
-        fi
-
         # Optional settle wait before starting the rosbag — gives the scanner
         # time to stop moving after the trigger before recording begins.
         if [ "$STATIONARY_WAIT" = "true" ]; then
@@ -1262,7 +1033,6 @@ else
         TOPICS_TO_RECORD="/livox/lidar /livox/imu"
         # Only record camera stream if not using SDK stitch — with SDK stitch
         # the .insp file is the authoritative image and the stream is never used
-        if [ "$USE_SDK_STITCH" != "true" ] || [ "$CAMERA_MODE" != "dual_fisheye" ]; then TOPICS_TO_RECORD="$TOPICS_TO_RECORD /dual_fisheye/image/compressed"; fi
         [ "$LIO_ENABLED" = "true" ] && TOPICS_TO_RECORD="$TOPICS_TO_RECORD /rko_lio/odometry"
         setsid env FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_rosbag.xml" \
             ros2 bag record -o "$ROSBAG_DIR" \
@@ -1284,74 +1054,27 @@ else
         echo "Capturing scan $SCAN_COUNT..."
         sleep 2
 
-        if [ "$USE_SDK_STITCH" = "true" ] && [ "$CAMERA_MODE" = "dual_fisheye" ]; then
-            # Signal the persistent SDK daemon to capture via a dedicated trigger file.
-            # .sdk_capture_done now fires when the shutter clicks, not when the download
-            # finishes, so the next scan can start immediately after ~1-2s.
-            rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-            echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
-            # Wait for shutter-fired signal (max 30s — just the shutter, not the download)
-            for _i in $(seq 1 300); do
-                [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
-                [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
-                kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
-                sleep 0.1
-            done
-            [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
-            rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-
-            if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-                _insp=$(ls "$INDIVIDUAL_SCAN_DIR"/*.insp 2>/dev/null | head -1)
-                [ -n "$_insp" ] && echo "  ✓ SDK raw file: $(basename "$_insp") (stitch in post-processing)"
-            else
-                echo "  SDK capture failed, falling back to stream capture..."
-            fi
-        fi
-
-        if [ "${CAPTURE_EXIT_CODE:-1}" -ne 0 ] || [ "$USE_SDK_STITCH" != "true" ] || [ "$CAMERA_MODE" != "dual_fisheye" ]; then
-            # SDK capture failed or not in use — capture image + LiDAR from stream
-            if [ "$CAMERA_MODE" = "single_fisheye" ]; then
-                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
-                timeout 70 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/single_fisheye_capture_decoded.py" \
-                    "$INDIVIDUAL_SCAN_DIR" 30 4.0
-                CAPTURE_EXIT_CODE=$?
-                if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
-                    echo "  Primary capture failed, trying buffered camera capture..."
-                    FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
-                    timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
-                        "$INDIVIDUAL_SCAN_DIR" 15 2.0
-                    CAPTURE_EXIT_CODE=$?
-                fi
-            else
-                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
-                timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
-                    "$INDIVIDUAL_SCAN_DIR" 15 2.0
-                CAPTURE_EXIT_CODE=$?
-            fi
-
-            # Fallback: LiDAR-driven capture
-            if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
-                echo "  Trying LiDAR-driven capture..."
-                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
-                timeout 15 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/lidar_driven_capture.py" \
-                    "$INDIVIDUAL_SCAN_DIR" 8
-                CAPTURE_EXIT_CODE=$?
-            fi
-        else
-            # SDK photo succeeded — still need the LiDAR point cloud from the rosbag.
-            # buffered_camera_capture with --lidar-only skips image capture (we have .insp).
-            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
+        # Signal the SDK daemon to capture — .sdk_capture_done fires at shutter click
+        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+        echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
+        for _i in $(seq 1 300); do
+            [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
+            [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
+            kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
+            sleep 0.1
+        done
+        [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
+        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+        if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
+            _insp=$(ls "$INDIVIDUAL_SCAN_DIR"/*.insp 2>/dev/null | head -1)
+            [ -n "$_insp" ] && echo "  ✓ SDK raw file: $(basename "$_insp") (stitch in post-processing)"
+            # Collect LiDAR point cloud from live topics into sensor_lidar_*.ply / world_lidar_*.ply
+            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+            ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
-                "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only
-            if [ $? -ne 0 ]; then
-                echo "  LiDAR-only capture failed, trying lidar_driven_capture..."
-                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" ROS_DISABLE_LOANED_MESSAGES=1 \
-                timeout 15 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/lidar_driven_capture.py" \
-                    "$INDIVIDUAL_SCAN_DIR" 8
-            fi
-            # SDK .insp is the authoritative image — scan succeeds regardless of LiDAR capture
-            CAPTURE_EXIT_CODE=0
+                "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
         fi
+
 
         # Stop rosbag — send SIGINT to the setsid process group so zstd compressor flushes cleanly
         if kill -0 $ROSBAG_PID 2>/dev/null; then
@@ -1409,11 +1132,8 @@ else
         # Rename PLY to canonical names
         WORLD_PLY=$(ls -t "$INDIVIDUAL_SCAN_DIR"/world_lidar_*.ply 2>/dev/null | head -1)
         SENSOR_PLY=$(ls -t "$INDIVIDUAL_SCAN_DIR"/sensor_lidar_*.ply 2>/dev/null | head -1)
-        if [ -n "$WORLD_PLY" ]; then
-            mv "$WORLD_PLY" "$INDIVIDUAL_SCAN_DIR/world_lidar.ply"
-        elif [ -n "$SENSOR_PLY" ]; then
-            mv "$SENSOR_PLY" "$INDIVIDUAL_SCAN_DIR/sensor_lidar.ply"
-        fi
+        [ -n "$WORLD_PLY" ]  && mv "$WORLD_PLY"  "$INDIVIDUAL_SCAN_DIR/world_lidar.ply"
+        [ -n "$SENSOR_PLY" ] && mv "$SENSOR_PLY" "$INDIVIDUAL_SCAN_DIR/sensor_lidar.ply"
 
         echo "✓ Scan $SCAN_COUNT completed: $SCAN_NAME/"
         echo ""

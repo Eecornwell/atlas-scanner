@@ -189,12 +189,7 @@ class FusionCaptureGUI:
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
                         variable=self.colmap_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
-        self.sdk_stitch_var = tk.BooleanVar(value=False)
-        self.sdk_stitch_cb = ttk.Checkbutton(mode_frame, text="SDK-stitch ERP images (dual fisheye only)",
-                        variable=self.sdk_stitch_var)
-        self.sdk_stitch_cb.grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
-        self.camera_mode_var.trace_add('write', self._on_camera_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
                                       command=self.start_fusion, style="Accent.TButton")
@@ -501,7 +496,6 @@ class FusionCaptureGUI:
                 cmd.append('--stationary-wait')
             cmd.append('--icp' if self.icp_var.get() else '--no-icp')
             cmd.append('--colmap' if self.colmap_var.get() else '--no-colmap')
-            cmd.append('--sdk-stitch' if self.sdk_stitch_var.get() else '--no-sdk-stitch')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -655,14 +649,6 @@ class FusionCaptureGUI:
             self.stationary_wait_cb.config(state='normal')
         else:
             self.stationary_wait_cb.config(state='disabled')
-
-    def _on_camera_mode_changed(self, *_):
-        """Enable/disable SDK-stitch option when camera mode changes."""
-        if self.camera_mode_var.get() == 'dual_fisheye':
-            self.sdk_stitch_cb.config(state='normal')
-        else:
-            self.sdk_stitch_cb.config(state='disabled')
-            self.sdk_stitch_var.set(False)
 
     def _is_continuous_mode(self):
         return self.capture_mode_var.get() == 'continuous'
@@ -1039,23 +1025,16 @@ sys.exit(0 if ok[0] else 4)
         threading.Thread(target=_wait_for_finish, daemon=True).start()
         
     def _cleanup_ros_processes(self):
-        """Clean up any remaining ROS processes"""
+        """Clean up any remaining scanner processes"""
         try:
-            # Kill specific ROS processes
-            processes_to_kill = [
-                "insta360_ros_driver", "equirectangular", "dual_fisheye", "bringup.launch",
+            for process in [
+                "insta360_capture", "insta360_stitch",
                 "livox_ros_driver2", "rko_lio", "static_transform_publisher",
-                "trajectory_recorder", "insta360_ros_driver/lib", "livox_ros_driver2/lib"
-            ]
-
-            import re as _re
-            for process in processes_to_kill:
-                # Escape the pattern so regex metacharacters (., /) in process
-                # names are treated as literals rather than regex operators.
-                pattern = _re.escape(process)
-                subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True)
-                
-            self.log_message("✓ ROS processes cleaned up")
+                "trajectory_recorder", "livox_ros_driver2/lib"
+            ]:
+                import re as _re
+                subprocess.run(["pkill", "-9", "-f", _re.escape(process)], capture_output=True)
+            self.log_message("✓ Processes cleaned up")
         except Exception as e:
             self.log_message(f"Warning: Could not clean up all processes: {e}")
     
@@ -1384,7 +1363,7 @@ def main():
     # Read defaults from atlas_fusion_capture.sh if no CLI args given
     script = pathlib.Path(__file__).parent / 'atlas_fusion_capture.sh'
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
-    default_icp, default_colmap, default_sdk_stitch, default_colmap_lidar_voxel = False, False, False, 0.0
+    default_icp, default_colmap, default_colmap_lidar_voxel = False, False, 0.0
     default_camera_hw = 'onex2'
     try:
         for line in script.read_text().splitlines():
@@ -1399,8 +1378,6 @@ def main():
                 default_icp = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('EXPORT_COLMAP=') and '#' not in line.split('EXPORT_COLMAP=')[0]:
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
-            elif line.startswith('USE_SDK_STITCH=') and '#' not in line.split('USE_SDK_STITCH=')[0]:
-                default_sdk_stitch = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('CAMERA_HW=') and '#' not in line.split('CAMERA_HW=')[0]:
                 default_camera_hw = line.split('=', 1)[1].split('#')[0].strip('"\' ')
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
@@ -1430,11 +1407,9 @@ def main():
     app.stationary_wait_var.set(default_stationary_wait)
     app.icp_var.set(default_icp)
     app.colmap_var.set(default_colmap)
-    app.sdk_stitch_var.set(default_sdk_stitch)
     app.camera_hw_var.set(default_camera_hw)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app._on_capture_mode_changed()
-    app._on_camera_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     
     try:

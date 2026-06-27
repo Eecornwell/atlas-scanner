@@ -12,12 +12,15 @@ static std::string sanitise(std::string s) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: insta360_stitch <input.insp> <output.jpg>" << std::endl;
+        std::cerr << "Usage: insta360_stitch <input.insp> <output.jpg> [--single]" << std::endl;
         return 1;
     }
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
+    bool single_fisheye = false;
+    for (int i = 3; i < argc; ++i)
+        if (std::string(argv[i]) == "--single") single_fisheye = true;
 
     int erp_w = 5760, erp_h = 2880;
     if (auto* v = std::getenv("INSTA360_ERP_WIDTH")) {
@@ -55,6 +58,23 @@ int main(int argc, char* argv[]) {
         std::cerr << "Stitching failed" << std::endl;
         return 1;
     }
+
+    if (single_fisheye) {
+        // Crop the back-hemisphere half (right side of ERP = 180°–360° longitude).
+        // This is the LiDAR-facing lens used in single_fisheye mode.
+        // Uses OpenCV via libjpeg round-trip since MediaSDK writes the full ERP to disk.
+#if __has_include(<opencv2/opencv.hpp>)
+        cv::Mat erp = cv::imread(output_path);
+        if (erp.empty()) { std::cerr << "Crop: failed to read stitched ERP" << std::endl; return 1; }
+        cv::Mat crop = erp(cv::Rect(erp.cols / 2, 0, erp.cols / 2, erp.rows));
+        cv::imwrite(output_path, crop, {cv::IMWRITE_JPEG_QUALITY, 95});
+        std::cout << "Cropped to single fisheye (" << crop.cols << "x" << crop.rows << ")" << std::endl;
+#else
+        std::cerr << "--single requires OpenCV (not available at build time)" << std::endl;
+        return 1;
+#endif
+    }
+
     std::cout << "Done" << std::endl;
     return 0;
 }

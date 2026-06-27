@@ -92,7 +92,7 @@ If the image is **vertically flipped**, change `0.5 - lat/π` to `0.5 + lat/π`.
 
 ### Step 3: Edit the Code
 
-In `generate_intensity_images.py`, find the `if is_sdk_stitch:` block. Replace the axis remap lines:
+In `generate_intensity_images.py`, find the axis remap in the `generate_intensity_image()` function (approximately line 150–170). Replace the axis remap lines:
 
 ```python
 # Current Insta360 mapping:
@@ -128,4 +128,4 @@ The SDK stitch projection is in:
 src/atlas-scanner/src/calibration/generate_intensity_images.py
 ```
 
-In the `generate_intensity_image()` function, under the `if is_sdk_stitch:` branch (approximately line 150–170).
+In the `generate_intensity_image()` function, in the axis remap block (approximately line 150–170).
