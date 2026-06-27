@@ -356,7 +356,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     # Use world_lidar.ply for ICP (already motion-compensated world frame).
     # Transform to relative-to-first for ICP, then apply the same correction
     # to the colored clouds (also transformed to relative-to-first via trajectory_poses).
-    voxel_size = 0.05  # 5cm voxels for ICP reference matching
+    voxel_size = 0.03  # 3cm voxels — denser correspondences for ICP without excessive compute
     pcds = []
     pcds_colored = []
     for i, f in enumerate(lidar_files):
@@ -472,53 +472,60 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
             icp_corrections = list(trajectory_poses)
         else:
             print(f"Refining poses: leave-one-out ICP against merged reference...")
-            # Each scan is refined against the merged geometry of ALL OTHER scans.
-            # The cloud is pre-transformed by the trajectory pose, so ICP from
-            # identity finds ONLY the small residual correction needed.
-            # Corrected pose = T_icp_residual @ trajectory_pose[i]
             icp_corrections = [trajectory_poses[0]]  # scan_001 is reference
-            for i in range(1, n_scans):
-                # Build reference from all scans except current
-                ref = o3d.geometry.PointCloud()
-                for j, p in enumerate(pcds):
-                    if j != i:
-                        ref = ref + p
-                ref = ref.voxel_down_sample(voxel_size)
-                ref.estimate_normals(
-                    o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+            LOO_ROUNDS = 3
+            for _round in range(LOO_ROUNDS):
+                if _round > 0:
+                    print(f"  Round {_round + 1}/{LOO_ROUNDS}...")
+                    # Rebuild pcds from previous round's corrections
+                    for i, f in enumerate(lidar_files):
+                        pcd = o3d.io.read_point_cloud(str(f))
+                        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                        pcd = pcd.voxel_down_sample(voxel_size)
+                        pcd.transform(T_first_inv)
+                        T_delta = icp_corrections[i] @ np.linalg.inv(trajectory_poses[i])
+                        pcd.transform(T_delta)
+                        pcd.estimate_normals(
+                            o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+                        pcd.orient_normals_consistent_tangent_plane(30)
+                        pcds[i] = pcd
+                    icp_corrections = [icp_corrections[0]]
+                for i in range(1, n_scans):
+                    # Build reference from all scans except current
+                    ref = o3d.geometry.PointCloud()
+                    for j, p in enumerate(pcds):
+                        if j != i:
+                            ref = ref + p
+                    ref = ref.voxel_down_sample(voxel_size)
+                    ref.estimate_normals(
+                        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
 
-                # Two-stage ICP from identity — cloud already in trajectory frame.
-                # Stage 1: coarse pass with a wide search radius to handle trajectory
-                # drift up to ~50 cm (common in continuous handheld mode).
-                # Stage 2: fine pass at voxel_size to lock in sub-voxel accuracy.
-                coarse_dist = voxel_size * 8  # ~40 cm for voxel_size=0.05
-                result = o3d.pipelines.registration.registration_icp(
-                    pcds[i], ref, coarse_dist, np.eye(4),
-                    o3d.pipelines.registration.TransformationEstimationPointToPoint(),
-                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
-                if result.fitness >= 0.15:
-                    loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 1.0)
+                    coarse_dist = voxel_size * 8
                     result = o3d.pipelines.registration.registration_icp(
-                        pcds[i], ref, voxel_size * 2, result.transformation,
-                        o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
-                        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
+                        pcds[i], ref, coarse_dist, np.eye(4),
+                        o3d.pipelines.registration.TransformationEstimationPointToPoint(),
+                        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100))
+                    if result.fitness >= 0.15:
+                        loss = o3d.pipelines.registration.TukeyLoss(k=voxel_size * 1.0)
+                        result = o3d.pipelines.registration.registration_icp(
+                            pcds[i], ref, voxel_size * 2, result.transformation,
+                            o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
+                            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=100))
 
-                T_icp = result.transformation
-                rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
-                trans_m = np.linalg.norm(T_icp[:3, 3])
-                euler = np.degrees(Rotation.from_matrix(T_icp[:3,:3]).as_euler('xyz'))
+                    T_icp = result.transformation
+                    rot_deg = np.degrees(np.arccos(np.clip((np.trace(T_icp[:3,:3]) - 1) / 2, -1, 1)))
+                    trans_m = np.linalg.norm(T_icp[:3, 3])
+                    euler = np.degrees(Rotation.from_matrix(T_icp[:3,:3]).as_euler('xyz'))
 
-                if result.fitness < 0.15 or rot_deg > 20.0 or trans_m > 1.0:
-                    print(f"  ⚠ {scan_dirs[i].name}: rejected fitness={result.fitness:.3f} rot={rot_deg:.1f}deg trans={trans_m*100:.0f}cm")
-                    icp_corrections.append(trajectory_poses[i])
-                else:
-                    # T_icp is the residual correction in the already-trajectory-aligned frame.
-                    # Apply it on top of the trajectory pose.
-                    T_corr = T_icp @ trajectory_poses[i]
-                    print(f"  ✓ {scan_dirs[i].name}: fitness={result.fitness:.3f}  "
-                          f"t=({T_icp[0,3]*100:+.1f},{T_icp[1,3]*100:+.1f},{T_icp[2,3]*100:+.1f})cm  "
-                          f"euler=({euler[0]:+.1f},{euler[1]:+.1f},{euler[2]:+.1f})deg")
-                    icp_corrections.append(T_corr)
+                    if result.fitness < 0.15 or rot_deg > 20.0 or trans_m > 1.0:
+                        print(f"  ⚠ {scan_dirs[i].name}: rejected fitness={result.fitness:.3f} rot={rot_deg:.1f}deg trans={trans_m*100:.0f}cm")
+                        icp_corrections.append(trajectory_poses[i])
+                    else:
+                        T_corr = T_icp @ trajectory_poses[i]
+                        print(f"  ✓ {scan_dirs[i].name}: fitness={result.fitness:.3f}  "
+                              f"t=({T_icp[0,3]*100:+.1f},{T_icp[1,3]*100:+.1f},{T_icp[2,3]*100:+.1f})cm  "
+                              f"euler=({euler[0]:+.1f},{euler[1]:+.1f},{euler[2]:+.1f})deg")
+                        icp_corrections.append(T_corr)
             print("Refinement complete!")
 
     # icp_corrections[i] holds the final absolute pose in relative-to-first frame

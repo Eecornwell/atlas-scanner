@@ -775,7 +775,9 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         ply_color  = scan_dir / 'sensor_colored_exact.ply'
         if not ply_dense.exists():
             continue
-        traj_f = scan_dir / 'trajectory.json'
+        traj_f = scan_dir / 'trajectory_icp_refined.json'
+        if not traj_f.exists():
+            traj_f = scan_dir / 'trajectory.json'
         if not traj_f.exists():
             continue
         with open(traj_f) as _f:
@@ -875,6 +877,15 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     _dep_mod = _ilu.module_from_spec(_dep_spec)
     _dep_spec.loader.exec_module(_dep_mod)
     _dep_mod.generate_depth_images(str(session_path))
+
+    print("\nCreating colmap.zip...")
+    import zipfile
+    zip_path = session_path / 'colmap.zip'
+    with zipfile.ZipFile(str(zip_path), 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in sorted(colmap_dir.rglob('*')):
+            if f.is_file():
+                zf.write(f, f.relative_to(session_path))
+    print(f"✓ colmap.zip: {zip_path}")
 
     return True
 
