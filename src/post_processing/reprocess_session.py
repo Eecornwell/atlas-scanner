@@ -15,7 +15,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from exact_match_fusion import exact_match_calibration_tool
-from export_to_colmap import export_to_colmap
 
 _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 _STITCH_BIN = Path(os.path.expanduser('~/insta360-dev/build/insta360_stitch'))
@@ -138,7 +137,14 @@ def reprocess_session(session_dir, skip_coloring=False, skip_colmap=False):
 
     if not skip_colmap:
         print("\n--- Re-exporting to COLMAP ---")
-        export_to_colmap(str(session_path))
+        import importlib.util as _ilu
+        _sfm_spec = _ilu.spec_from_file_location(
+            'panorama_sfm_colmap',
+            Path(__file__).parent / 'panorama_sfm_colmap.py'
+        )
+        _sfm = _ilu.module_from_spec(_sfm_spec)
+        _sfm_spec.loader.exec_module(_sfm)
+        _sfm.run_pipeline(str(session_path), exhaustive=True, bundle_adjustment=False)
 
     print("\n✓ Reprocessing complete.")
     return True

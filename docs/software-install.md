@@ -43,17 +43,17 @@ ros2 launch livox_ros_driver2 rviz_MID360_launch.py
 
 Test Camera (in a new terminal):
 ```bash
-cd ~/atlas_ws
-source ~/atlas_ws/install/setup.bash
-ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+~/insta360-dev/build/insta360_capture
+# Should print: Found camera: <serial>  ...  Camera session open
+# Ctrl+C to exit
 ```
 
-Verify topics (in another terminal):
+Verify LiDAR topics (in another terminal):
 ```bash
 cd ~/atlas_ws
 source ~/atlas_ws/install/setup.bash
 ros2 topic list
-# Should see: /dual_fisheye/image, /equirectangular/image, /imu/data, etc.
+# Should see: /livox/lidar, /livox/imu, /rko_lio/odometry, etc.
 ```
 
 ### 2. Auxiliary Dependencies Installation
@@ -285,30 +285,15 @@ ros2 launch livox_ros_driver2 rviz_MID360_launch.py
 lsusb
 
 # Enable Camera Access
-bash ~/atlas_ws/src/insta360_ros_driver/setup.sh
+bash ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
 ls -l /dev/insta
 
-# Bring up camera to test driver
-cd ~/atlas_ws &&
-source ~/atlas_ws/install/setup.bash &&
-ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
+# Verify camera connection (SDK daemon)
+~/insta360-dev/build/insta360_capture
+# Should print: Found camera: <serial>  ...  Camera session open
+# Ctrl+C to exit
 
-# While the above is running in terminal, open another terminal and run
-cd ~/atlas_ws &&
-source ~/atlas_ws/install/setup.bash &&
-ros2 topic list
-
-# You should see the topics below
-# /dual_fisheye/image
-# /dual_fisheye/image/compressed
-# /equirectangular/image
-# /imu/data
-# /imu/data_raw
-# /parameter_events
-# /rosout
-# /tf
-
-### !!! At this point you should be able to get both camera and lidar streams running successfully inside your ROS workspace
+### !!! At this point you should be able to get both camera and lidar running successfully
 
 # Build Sophus for calibration visualization
 cd ~/atlas_ws &&
@@ -504,29 +489,61 @@ export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibrat
 
 ---
 
-## SDK Stitch Setup
+## SDK Setup
 
-The SDK stitch capture mode (`USE_SDK_STITCH=true`, `dual_fisheye`) uses two binaries built from `src/capture/sdk/`: `insta360_capture` (per-shot TakePhoto daemon) and `insta360_stitch` (offline `.insp` → ERP stitcher). Both require the Insta360 CameraSDK and MediaSDK.
+The ATLAS pipeline uses two Insta360 SDK packages:
 
-### 1. Install MediaSDK
+| Package | Version | Supports |
+|---------|---------|----------|
+| CameraSDK | 2.1.1 (Aug 2025) | One X, One R, One RS, One X2, X3, X4, **X5**, X4 Air |
+| MediaSDK | 3.1.1 (Sep 2025) | `.insp` → ERP stitching for all above models |
 
-The MediaSDK `.deb` is bundled in the same zip as the CameraSDK:
+Download `Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip` from the Insta360 developer portal and place it in `~/Downloads/`.
+
+### 1. Install CameraSDK 2.1.1
 
 ```bash
-# Unzip the SDK bundle (already done if you followed the CameraSDK steps above)
-unzip ~/Downloads/LinuxSDK20241128.zip -d ~/LinuxSDK20241128
+# Extract the zip (macOS metadata entries are harmless)
+cd ~/Downloads
+unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip -d Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/
 
-# Install the MediaSDK dev package
-sudo dpkg -i ~/LinuxSDK20241128/libMediaSDK-dev_2.0-6_amd64_ubuntu18.04.deb
+# Extract the CameraSDK tarball
+mkdir -p ~/LinuxSDK
+tar -xzf ~/Downloads/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/CameraSDK-20250812_192742-2.1.1-Linux.tar_1754998644023.gz \
+    -C ~/LinuxSDK/
+
+# Verify
+ls ~/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux/
+# Should show: bin/  example/  include/  lib/
+```
+
+### 2. Install MediaSDK 3.1.1
+
+The MediaSDK ships as a `.deb` inside a `.tar.xz` inside the zip:
+
+```bash
+# Extract the tar.xz from the zip
+unzip -j ~/Downloads/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip \
+  "Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/libMediaSDK-dev-3.1.1.0-20250922_191110-amd64.tar_1758540334111.xz" \
+  -d /tmp/mediasdk/
+
+# Extract the .deb from the tar.xz
+tar -xJf /tmp/mediasdk/libMediaSDK-dev-3.1.1.0-20250922_191110-amd64.tar_1758540334111.xz \
+    libMediaSDK-dev-3.1.1.0-20250922_191110-amd64/libMediaSDK-dev-3.1.1.0-20250922_191110-amd64.deb \
+    -C /tmp/mediasdk/
+
+# Install
+sudo dpkg -i /tmp/mediasdk/libMediaSDK-dev-3.1.1.0-20250922_191110-amd64/libMediaSDK-dev-3.1.1.0-20250922_191110-amd64.deb
 sudo ldconfig
 
 # Verify
 ldconfig -p | grep MediaSDK   # should show libMediaSDK.so
+ls /usr/include/ins_stitcher.h  # MediaSDK 3.x header (was stitcher/stitcher.h in 2.x)
 ```
 
-### 2. Build insta360_capture and insta360_stitch
+> The MediaSDK 3.x `.deb` also installs `libMNN.so`, `libtscsdk_center.so` and several CUDA stubs into `/usr/lib`. These are required at runtime by `libMediaSDK.so` and are included in the package.
 
-This step is automated by `install_aux_deps.sh` when MediaSDK is installed. To build manually or rebuild after updates:
+### 3. Build insta360_capture and insta360_stitch
 
 ```bash
 mkdir -p ~/insta360-dev
@@ -542,7 +559,14 @@ ls ~/insta360-dev/build/insta360_stitch
 ls ~/insta360-dev/build/insta360_reset_clock
 ```
 
-To rebuild after pulling updates from the repo:
+The `CMakeLists.txt` defaults to `~/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux`. If you extracted elsewhere:
+
+```bash
+# Edit the CAMERA_SDK_DIR line in CMakeLists.txt before building
+set(CAMERA_SDK_DIR "/path/to/CameraSDK-20250812_192742-2.1.1-Linux")
+```
+
+To rebuild after pulling repo updates:
 
 ```bash
 cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
@@ -550,24 +574,42 @@ cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
 cd ~/insta360-dev && bash build.sh
 ```
 
-The `CMakeLists.txt` hardcodes the CameraSDK path to `~/LinuxSDK20241128/CameraSDK-20241120_183228--1.1.0-Linux`. If your SDK is extracted elsewhere, edit that path in `CMakeLists.txt` before building:
+### 4. Camera USB connection (One X2 and X5)
+
+The X5 does **not** have a USB Mode setting in its menus — it uses a direct USB connection protocol that the CameraSDK 2.1.1 handles automatically. Simply:
+
+1. Power on the camera
+2. Connect via USB-C
+3. Run `lsusb | grep -i insta` — should show Vendor ID `2e1a`
+4. Run `sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh`
+5. Verify `/dev/insta` exists
+
+For the One X2, the USB Mode → Android setting is still required as before.
+
+### 5. Verify SDK daemon connects
 
 ```bash
-# Edit line 5 of CMakeLists.txt:
-set(CAMERA_SDK_DIR "/path/to/your/CameraSDK")
+cd ~/atlas_ws && source install/setup.bash
+sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
+~/insta360-dev/build/insta360_capture
+# Should print: Found camera: <serial>  ...  Camera session open
+# Ctrl+C to exit
 ```
 
-The MediaSDK headers and library are expected at system paths installed by the `.deb` above (`/usr/include`, `/usr/lib`).
+### 6. LiDAR mask
 
-### 3. SDK stitch mask
-
-The SDK stitcher places ERP content in different pixel regions than the manual fisheye-to-ERP pipeline, so a dedicated LiDAR exclusion mask is required. It is already included in the repo:
+The SDK stitcher places ERP content in different pixel regions than a manual fisheye-to-ERP pipeline. Dedicated masks are included in the repo for each supported camera:
 
 ```
-~/atlas_ws/src/atlas-scanner/src/lidar_mask_dual_sdk.png
+~/atlas_ws/src/atlas-scanner/src/lidar_mask_dual_sdk.png    # One X2, dual fisheye
+~/atlas_ws/src/atlas-scanner/src/lidar_mask_single.png      # One X2, single fisheye
+~/atlas_ws/src/atlas-scanner/src/lidar_mask_dual_x5.png     # X5, dual fisheye (replace placeholder)
+~/atlas_ws/src/atlas-scanner/src/lidar_mask_single_x5.png   # X5, single fisheye (replace placeholder)
 ```
 
-No additional steps are needed — `atlas_fusion_capture.sh` selects this mask automatically when `USE_SDK_STITCH=true` and `CAMERA_MODE=dual_fisheye`.
+The capture script selects the correct mask automatically based on `CAMERA_HW` and `CAMERA_MODE`.
+
+> The X5 placeholder masks need to be replaced with real masks once you have a sample X5 scan. See [calibration.md](calibration.md) — Lidar Masks section.
 
 ---
 
@@ -637,17 +679,9 @@ Options:
 - `--sequential` — use sequential matcher instead of exhaustive (faster, for large sessions)
 - `--no-bundle-adjustment` — skip rig-aware bundle adjustment
 
-### Legacy pipeline
+### Legacy pipeline (deprecated)
 
-Converts ERP to 6 perspective cubemap faces before running COLMAP:
-
-```bash
-SESSION=~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
-rm -rf $SESSION/colmap
-cd ~/atlas_ws/src/atlas-scanner/src/post_processing
-python3 export_to_colmap.py $SESSION
-python3 erp_to_perspective_colmap.py $SESSION
-```
+The old `export_to_colmap.py` and `erp_to_perspective_colmap.py` scripts have been retired. Use `panorama_sfm_colmap.py` for all COLMAP exports.
 
 ---
 

@@ -124,7 +124,7 @@ def coarse_icp(source, target, voxel_size, init_transform=None):
         init_transform = np.eye(4)
     # Use point-to-point for coarse stage (more robust when normals are noisy)
     result = o3d.pipelines.registration.registration_icp(
-        source, target, voxel_size * 4, init_transform,
+        source, target, voxel_size * 6, init_transform,
         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
     # Refine with point-to-plane
@@ -162,7 +162,7 @@ def pairwise_icp(source, target, voxel_size, init_transform,
     """
     coarse = coarse_icp(source, target, voxel_size, init_transform)
 
-    MIN_FITNESS_FOR_FINE = 0.15
+    MIN_FITNESS_FOR_FINE = 0.05
     if coarse.fitness < MIN_FITNESS_FOR_FINE:
         # Re-evaluate fitness at 2x voxel_size for consistent comparison
         eval_result = o3d.pipelines.registration.evaluate_registration(
@@ -246,14 +246,39 @@ def _load_imu_from_bag(session_path):
     return result
 
 
+def _blur_score(erp_path) -> float:
+    """Laplacian variance blur score on a downsampled ERP.
+    Higher = sharper. Returns 0.0 if image cannot be read."""
+    try:
+        import cv2 as _cv2
+        img = _cv2.imread(str(erp_path), _cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return 0.0
+        small = _cv2.resize(img, (960, 480))
+        return float(_cv2.Laplacian(small, _cv2.CV_64F).var())
+    except Exception:
+        return 0.0
+
+
 def _gyro_at(imu_data, t, window=0.2):
     """75th-percentile gyro magnitude over a window centred on t."""
     samples = [g for ts, g in imu_data if abs(ts - t) <= window / 2.0]
     return float(np.percentile(samples, 75)) if samples else None
 
 
-def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
-    """Pose graph optimization with trajectory initialization."""
+def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1):
+    """Pose graph optimization with trajectory initialization.
+
+    Scan quality filtering (applied in order):
+      1. Blur filter (primary): scans whose ERP Laplacian-variance score is below
+         min_blur are excluded. If min_blur is None the threshold is auto-set to
+         the 25th-percentile of all scans in the session so the worst quarter are
+         dropped regardless of gyro.
+      2. Gyro filter (secondary, optional): if max_gyro > 0 any scan whose IMU
+         gyro magnitude at shutter time exceeds max_gyro rad/s is also excluded.
+         Set max_gyro=0 to disable. Default is very permissive (99 rad/s) so
+         blur is the primary gate.
+    """
 
     def pose_to_T_from_file(traj_file):
         return load_trajectory_pose(Path(traj_file).parent)
@@ -291,12 +316,19 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     lidar_files = []
     ply_files = []  # colored, for output
     valid_scan_dirs = []
+    scan_gyros = []  # gyro magnitude at shutter time per scan
+    scan_blurs = []  # Laplacian variance blur score (higher = sharper)
+    ERP_CANDIDATES = ['equirect_dual_fisheye_masked.png', 'equirect_dual_fisheye.jpg']
     for scan_dir in scan_dirs:
         lidar = next((scan_dir / n for n in LIDAR_CANDIDATES if (scan_dir / n).exists()), None)
         colored = next((scan_dir / n for n in COLORED_CANDIDATES if (scan_dir / n).exists()), None)
         if lidar and colored:
-            # Gyro filter
-            if imu_data:
+            # Measure blur from ERP image
+            erp = next((scan_dir / n for n in ERP_CANDIDATES if (scan_dir / n).exists()), None)
+            blur = _blur_score(erp) if erp else 0.0
+            # Gyro (secondary filter only — primary is blur)
+            gyro_val = 0.0
+            if imu_data and max_gyro > 0:
                 traj_file = scan_dir / "trajectory.json"
                 if traj_file.exists():
                     try:
@@ -309,14 +341,36 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
                                    traj.get('current_pose', {}).get('timestamp')
                     if capture_time is not None:
                         gyro = _gyro_at(imu_data, float(capture_time))
-                        if gyro is not None and gyro > max_gyro:
-                            print(f"  Skipping {scan_dir.name}: gyro={gyro:.3f} rad/s > {max_gyro:.2f}")
-                            continue
+                        if gyro is not None:
+                            gyro_val = gyro
+                            if gyro > max_gyro:
+                                print(f"  Note {scan_dir.name}: gyro={gyro:.3f} rad/s  blur={blur:.0f}")
             lidar_files.append(lidar)
             ply_files.append(colored)
             valid_scan_dirs.append(scan_dir)
+            scan_gyros.append(gyro_val)
+            scan_blurs.append(blur)
 
     scan_dirs = valid_scan_dirs
+
+    # Blur filter: exclude the bottom percentile of scans by sharpness.
+    # This is the primary quality gate — gyro is only informational now.
+    if len(scan_blurs) >= 4:
+        blur_threshold = float(np.percentile(scan_blurs, 20))  # drop bottom 20%
+        if min_blur is None:
+            min_blur = blur_threshold
+        blur_kept = []
+        for i, (sd, blur) in enumerate(zip(scan_dirs, scan_blurs)):
+            if blur >= min_blur:
+                blur_kept.append(i)
+            else:
+                print(f"  Skipping {sd.name}: blur_score={blur:.0f} < threshold {min_blur:.0f} (blurry)")
+        scan_dirs   = [scan_dirs[i]   for i in blur_kept]
+        lidar_files = [lidar_files[i] for i in blur_kept]
+        ply_files   = [ply_files[i]   for i in blur_kept]
+        scan_gyros  = [scan_gyros[i]  for i in blur_kept]
+        scan_blurs  = [scan_blurs[i]  for i in blur_kept]
+        print(f"  Blur filter: kept {len(scan_dirs)}/{len(blur_kept) + (len(valid_scan_dirs) - len(blur_kept))} scans (threshold={min_blur:.0f})")
 
     # Drop scans whose trajectory position is too close to an already-kept scan.
     # Near-duplicate poses add no new geometry and produce degenerate baselines for
@@ -334,6 +388,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     scan_dirs   = [scan_dirs[i]   for i in kept_indices]
     lidar_files = [lidar_files[i] for i in kept_indices]
     ply_files   = [ply_files[i]   for i in kept_indices]
+    scan_gyros  = [scan_gyros[i]  for i in kept_indices]
 
     if len(lidar_files) < 2:
         print(f"Need at least 2 point clouds, found {len(lidar_files)}")
@@ -347,6 +402,18 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
         print(f"Trajectory {scan_dir.name}: t=[{pose[0,3]:.3f}, {pose[1,3]:.3f}, {pose[2,3]:.3f}]")
 
 
+    # Anchor from the lowest-gyro scan (best trajectory quality).
+    # Re-order all arrays so the best scan is index 0 (the reference).
+    ref_idx = int(np.argmin(scan_gyros))
+    if ref_idx != 0:
+        print(f"  Anchoring from {scan_dirs[ref_idx].name} (lowest gyro={scan_gyros[ref_idx]:.3f} rad/s)")
+        # Rotate lists so ref_idx is first
+        scan_dirs   = scan_dirs[ref_idx:]   + scan_dirs[:ref_idx]
+        lidar_files = lidar_files[ref_idx:] + lidar_files[:ref_idx]
+        ply_files   = ply_files[ref_idx:]   + ply_files[:ref_idx]
+        scan_gyros  = scan_gyros[ref_idx:]  + scan_gyros[:ref_idx]
+        traj_poses_abs = traj_poses_abs[ref_idx:] + traj_poses_abs[:ref_idx]
+
     T_first_inv = np.linalg.inv(traj_poses_abs[0])
     trajectory_poses = [T_first_inv @ T for T in traj_poses_abs]
 
@@ -356,7 +423,9 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
     # Use world_lidar.ply for ICP (already motion-compensated world frame).
     # Transform to relative-to-first for ICP, then apply the same correction
     # to the colored clouds (also transformed to relative-to-first via trajectory_poses).
-    voxel_size = 0.03  # 3cm voxels — denser correspondences for ICP without excessive compute
+    voxel_size = 0.05  # 5cm voxels — better overlap at larger correspondence radius
+                        # 3cm was too tight: fitness evaluation at 6cm penalised valid
+                        # correspondences in regions with viewpoint-dependent gaps
     pcds = []
     pcds_colored = []
     for i, f in enumerate(lidar_files):
@@ -427,14 +496,17 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
             result = pairwise_icp(pcds[i], pcds[i+1], voxel_size, T_traj_rel)
             print(f"  Fitness: {result.fitness:.3f}, RMSE: {result.inlier_rmse:.4f}")
             T_icp = result.transformation
-            if result.fitness < 0.25:
+            if result.fitness < 0.10:
                 print(f"  ⚠ Low fitness ({result.fitness:.3f}) — using identity")
                 T_icp = np.eye(4)
             else:
                 seq_edge_fitnesses.append(result.fitness)
             information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
                 pcds[i], pcds[i+1], voxel_size * 2, T_icp)
-            information *= 10.0
+            # Scale by fitness so high-confidence edges dominate the graph optimisation.
+            # Also down-weight edges involving high-gyro scans (worse trajectory init).
+            gyro_weight = 1.0 / (1.0 + 0.5 * (scan_gyros[i] + scan_gyros[i+1]))
+            information *= 10.0 * max(result.fitness, 0.01) * gyro_weight
             pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                 i, i+1, T_icp, information, uncertain=False))
 
@@ -460,6 +532,8 @@ def register_pose_graph(session_dir, max_gyro=0.25, iterations=1):
                     T_icp = result.transformation
                     information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
                         pcds[src], pcds[tgt], voxel_size * 2, T_icp)
+                    gyro_weight = 1.0 / (1.0 + 0.5 * (scan_gyros[src] + scan_gyros[tgt]))
+                    information *= result.fitness * gyro_weight
                     pose_graph.edges.append(o3d.pipelines.registration.PoseGraphEdge(
                         src, tgt, T_icp, information, uncertain=True))
 
@@ -641,7 +715,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("session_dir")
-    parser.add_argument("--max-gyro", type=float, default=0.15)
+    parser.add_argument("--max-gyro", type=float, default=99.0,
+                        help="Max gyro rad/s (informational only; blur filter is primary). Default 99 = disabled.")
+    parser.add_argument("--min-blur", type=float, default=None,
+                        help="Min Laplacian blur score to keep a scan. Default: auto (20th percentile).")
     parser.add_argument("--iterations", type=int, default=1)
     args = parser.parse_args()
     try:
@@ -649,7 +726,8 @@ def main():
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    register_pose_graph(args.session_dir, max_gyro=args.max_gyro, iterations=args.iterations)
+    register_pose_graph(args.session_dir, max_gyro=args.max_gyro,
+                        min_blur=args.min_blur, iterations=args.iterations)
 
 if __name__ == "__main__":
     main()

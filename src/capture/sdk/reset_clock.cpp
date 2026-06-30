@@ -22,7 +22,7 @@ int main() {
     std::cout << "Current time (ms): " << now_ms << "\n";
 
     // Try with seconds
-    bool ok_s = cam->SyncLocalTimeToCamera((uint64_t)now_s);
+    bool ok_s = cam->SyncLocalTimeToCamera((uint64_t)now_s, 0);
     std::cout << "SyncLocalTimeToCamera(seconds): " << (ok_s ? "OK" : "FAILED") << "\n";
 
     cam->Close();

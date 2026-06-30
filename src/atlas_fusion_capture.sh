@@ -16,13 +16,15 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
-CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
+CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
-CAMERA_HW="onex2"                 # Camera hardware model: onex2 | x5
+CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
 
 CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
 COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
+FILTER_BLURRY_FRAMES=true         # remove bottom 20% of scans by sharpness before merge/ICP/COLMAP
+USE_AI_STITCH=false                # use AIFLOW stitching (better seam quality); false = DYNAMICSTITCH (optical flow, no model needed)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
@@ -66,6 +68,9 @@ if [ -f "$_hw_yaml" ]; then
     _LIDAR_MASK_DUAL=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_dual','lidar_mask_dual_sdk.png'))")
     _LIDAR_MASK_SINGLE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_single','lidar_mask_single.png'))")
     _HW_DISPLAY=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('display_name',sys.argv[1]))" "$CAMERA_HW")
+    INSTA360_PHOTO_SIZE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('photo_size_enum'); print(v if v is not None else '')")
+    INSTA360_WB=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('white_balance'); print(v if v is not None else '')")
+    INSTA360_EXPOSURE_MODE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('exposure_mode'); print(v if v is not None else '')")
 else
     echo "⚠ No camera model config at $_hw_yaml — using defaults"
     INSTA360_ERP_WIDTH=5760
@@ -75,6 +80,10 @@ else
     _HW_DISPLAY="$CAMERA_HW"
 fi
 export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
+[ -n "$INSTA360_PHOTO_SIZE" ] && export INSTA360_PHOTO_SIZE_DEFAULT="$INSTA360_PHOTO_SIZE"
+[ -n "$INSTA360_WB" ] && export INSTA360_WB
+[ -n "$INSTA360_EXPOSURE_MODE" ] && export INSTA360_EXPOSURE="$INSTA360_EXPOSURE_MODE"
+[ "$USE_AI_STITCH" = "true" ] && export INSTA360_AI_STITCH=1 INSTA360_MODEL_DIR="$HOME/insta360-dev/models"
 
 # Point all tools at the per-model calibration file.
 # Falls back to the shared config/fusion_calibration.yaml if not present.
@@ -201,6 +210,10 @@ cleanup() {
         kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
         wait "$SDK_CAPTURE_PID" 2>/dev/null || true
     fi
+    # Clear the sentinel if the daemon exited cleanly — the firmware called
+    # StopTimeLapse()+Close() and is no longer in a stuck state, so the next
+    # session does not need a force USB reset.
+    rm -f /tmp/.insta360_session_ran 2>/dev/null || true
 
     if [ "$BAG_ONLY" = "true" ]; then
         echo "Bag-only mode: skipping post-processing. Bag saved in: $SCAN_DIR"
@@ -222,38 +235,10 @@ cleanup() {
             _SDK_STITCH_ARG="--sdk-stitch"
             _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.6 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
-            # Promote .insp files from .sdk_shot_N/ into fusion_scan_NNN/ by shot order,
-            # then stitch each one to equirect_dual_fisheye.jpg
-            _scan_idx=0
-            for _shot_dir in $(ls -d "$SCAN_DIR"/.sdk_shot_* 2>/dev/null | sort -t_ -k3 -n); do
-                _scan_idx=$((_scan_idx + 1))
-                _target_scan="$SCAN_DIR/fusion_scan_$(printf '%03d' $_scan_idx)"
-                [ -d "$_target_scan" ] || continue
-                for _insp in "$_shot_dir"/*.insp; do
-                    [ -f "$_insp" ] || continue
-                    [ "$(stat -c%s "$_insp" 2>/dev/null)" -lt 100000 ] && continue
-                    mv "$_insp" "$_target_scan/" 2>/dev/null
-                    [ -f "${_insp}.capture_time" ] && mv "${_insp}.capture_time" "$_target_scan/" 2>/dev/null
-                done
-            done
-            echo "Converting fisheye images to ERP (SDK stitcher)..."
-            for _scan_dir in "$SCAN_DIR"/fusion_scan_*; do
-                [ -d "$_scan_dir" ] || continue
-                INSP_FILE=$(find "$_scan_dir" -maxdepth 1 -name "*.insp" | head -1)
-                [ -z "$INSP_FILE" ] && continue
-                _stitch_args=""
-                [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
-                ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$_scan_dir/equirect_dual_fisheye.jpg" \
-                    --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
-                    $_stitch_args \
-                    || echo "  Warning: SDK stitch failed for $(basename $_scan_dir), skipping"
-            done
-            # SDK stitch: re-run coloring after reconstruction so sensor_colored_exact.ply
-            # is built from the freshly reconstructed sensor_lidar.ply, not stale data.
-            echo "Generating masked images..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" "$SCAN_DIR" --use-exact
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+            # reconstruct_from_bag.py handles .insp promotion, stitching, masked image
+            # generation, and coloring internally when called with --sdk-stitch.
+            # Nothing further needed here for continuous mode.
         fi
     fi
 
@@ -270,6 +255,16 @@ cleanup() {
 
         # Coloring
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
+            # Stationary mode: reconstruct each per-scan bag centred on the
+            # .insp.capture_time sidecar (exact shutter time) with per-frame
+            # motion compensation.  This overwrites the sensor_lidar.ply that
+            # buffered_camera_capture.py built from a post-shutter window.
+            if ls "$SCAN_DIR"/fusion_scan_*/rosbag_* > /dev/null 2>&1; then
+                echo "Reconstructing stationary scans from per-scan bags..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
+                    "$SCAN_DIR" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" \
+                    || echo "  ⚠ reconstruct_from_bag failed — falling back to live-capture PLYs"
+            fi
             # Promote .insp files into fusion_scan_NNN/ by capture order.
                 # Source 1: .sdk_shot_N/ subdirectories (older capture method)
                 _scan_idx=0
@@ -308,6 +303,9 @@ cleanup() {
                     if [ -n "$INSP_FILE" ]; then
                         _stitch_args=""
                         [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
+                        if [ "$USE_AI_STITCH" = "true" ]; then
+                            _stitch_args="$_stitch_args --ai --model-dir $HOME/insta360-dev/models"
+                        fi
                         ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
                             --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
                             $_stitch_args \
@@ -324,6 +322,13 @@ cleanup() {
             echo "✓ Colored point clouds created"
         fi
         # continuous mode coloring is handled inside reconstruct_from_bag.py
+
+        # Blur filter — mark bottom 20% of scans as blurry before any merge/ICP/COLMAP.
+        # All downstream tools respect the .blur_skip sentinel and skip marked scans.
+        if [ "$FILTER_BLURRY_FRAMES" = "true" ] && [ "$SCAN_COUNT" -ge 4 ]; then
+            echo "Filtering blurry frames..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/filter_blurry_scans.py" "$SCAN_DIR"
+        fi
 
         MERGED_FILE=""
 
@@ -403,6 +408,14 @@ cleanup() {
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/sync_benchmark.py" \
                 "$SCAN_DIR" --out "$SCAN_DIR/sync_benchmark.json"
         fi
+
+        # SDK stitch continuous mode: validate LiDAR-camera timing
+        if [ "$CAPTURE_MODE" = "continuous" ] && [ -f "$SCAN_DIR/.sdk_stitch_continuous" ]; then
+            echo "Validating SDK shutter sync..."
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/sdk_sync_validator.py" \
+                "$SCAN_DIR" --lidar-window 0.6 --walk-speed 0.5 \
+                2>&1 || echo "  ⚠ SDK sync validation failed (non-fatal)"
+        fi
     else
         if [ "$FUSION_READY" = "true" ]; then
             echo "Session ended with no scans captured (stopped before any scan was triggered)."
@@ -435,7 +448,7 @@ wait_for_topic_data() {
 }
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
-echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE ==="
+#echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE ==="
 echo "Scans will be saved to: $SCAN_DIR"
 
 if [ "$SKIP_SUDO_CHECK" != "1" ]; then
@@ -594,8 +607,14 @@ except Exception as e:
         sleep 1
     done
     sleep 3
+    # X5 firmware needs extra settle time after USB reset before
+    # the command server is ready to accept SDK connections.
+    _usb_settle=3
+    if [ "${CAMERA_HW:-onex2}" = "x5" ]; then _usb_settle=8; fi
+    sleep $_usb_settle
     echo "✓ Camera USB reset complete"
 }
+
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
 _pkill "livox_ros_driver2" & _kpids=($!)
 _pkill "rko_lio" & _kpids+=($!)
@@ -607,7 +626,8 @@ _pkill "imu_frame" & _kpids+=($!)
 _pkill "imu_stabilized" & _kpids+=($!)
 wait "${_kpids[@]}"
 _wait_camera_dead
-_wait_firmware_ready
+# _wait_firmware_ready removed: X5 always force-resets at startup below,
+# making the sentinel check redundant for back-to-back sessions.
 # Wipe all FastDDS SHM files now that every process is confirmed dead.
 # This must happen after _wait_camera_dead, not before — the decoder holds
 # _el lock files open until it exits, so an earlier rm just gets recreated.
@@ -624,7 +644,16 @@ fi
 # Always reset the USB device at startup — clears firmware streaming state from
 # a previous unclean session and ensures bConfigurationValue is set before the
 # driver attempts to claim the interface.
-_usb_reset_camera
+# For the X5, always use force reset (clears endpoint buffers regardless of
+# bConfigurationValue) since the X5 firmware leaves stale data in its USB
+# command channel after cam->Close(), causing parse_packet errors on the next
+# Open() attempt.  The X5 re-enumerates cleanly after reset; only the OneX2
+# shuts down on reset when configured.
+if [ "${CAMERA_HW:-onex2}" = "x5" ]; then
+    _usb_force_reset_camera
+else
+    _usb_reset_camera
+fi
 
 # Wait for /dev/insta — may still be re-enumerating after USB reset
 for _i in $(seq 1 15); do

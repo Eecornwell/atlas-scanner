@@ -1,7 +1,15 @@
 # Camera model profile: Insta360 X5
-# ERP output resolution for SDK stitching (8K)
+# ERP output resolution for SDK stitching
 erp_width: 7680
 erp_height: 3840
+# Capture resolution: Size_7680_3840 (enum 21, 8K — matches ERP output resolution)
+# Override at runtime: export INSTA360_PHOTO_SIZE=21
+photo_size_enum: 21
+# White balance: 0=AUTO 1=2700K 2=4000K 3=5000K 4=6500K 5=7500K
+# AUTO lets the camera choose per-shot — best for mixed lighting environments
+white_balance: 0
+# Exposure mode: 0=AUTO 2=SHUTTER_PRIORITY 4=ADAPTIVE
+exposure_mode: 0
 # Lidar mask filename (relative to src/)
 lidar_mask_dual: lidar_mask_dual_x5.png
 lidar_mask_single: lidar_mask_single_x5.png

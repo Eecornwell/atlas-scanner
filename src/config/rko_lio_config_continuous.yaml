@@ -18,14 +18,14 @@ initialization_phase: true
 extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
-voxel_size: 0.2              # matches robust config: 5x ratio with max_correspondance_distance prevents spurious ICP matches
+voxel_size: 0.15             # reduced from 0.2: 20Hz frames have half the points so smaller voxels maintain ICP density
 max_points_per_voxel: 10
 max_range: 20.0
 min_range: 0.3
-max_correspondance_distance: 1.0  # 5x voxel_size; large enough to survive fast handheld rotation
+max_correspondance_distance: 0.75  # 5x voxel_size
 convergence_criterion: 0.001
 max_num_threads: 0
 max_expected_jerk: 1.0
 min_beta: 50.0               # strong enough to prevent pitch/roll drift while allowing LiDAR to correct translation/yaw
 double_downsample: false     # use full voxel_size keypoints for ICP
-max_lidar_buffer_size: 5     # drop stale frames quickly during fast motion to prevent replay misalignment
+max_lidar_buffer_size: 10    # doubled from 5: 20Hz means twice as many frames in flight

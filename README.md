@@ -23,7 +23,11 @@
             - < 0.15º
         - ICM40609 IMU
 - Spherical (360 degree) Camera
-    - [Insta360 One X2](https://www.insta360.com/product/insta360-onex2)
+    - [Insta360 X5](https://www.insta360.com/product/insta360-x5)
+        - 8K max resolution (72MP .insp raw stills)
+        - Dual fisheye lenses, SDK-stitched to ERP in post-processing
+        - USB-C tethered control via CameraSDK
+    - [Insta360 One X2](https://www.insta360.com/product/insta360-onex2) (legacy)
         - 4K max resolution at 30fps
 - Compute
     - 3.4GHz Quad Core, x64 architecture
@@ -57,8 +61,8 @@
     - [ROS2 Humble](https://docs.ros.org/en/humble/Releases/Release-Humble-Hawksbill.html) - ([Apache 2.0/BSD-3-clause](https://docs.ros.org/en/diamondback/api/licenses.html))
 - Drivers
     - [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) - ([MIT](https://github.com/Livox-SDK/livox_ros_driver2?tab=License-1-ov-file#readme))
-    - [insta360_ros_driver](https://github.com/ai4ce/insta360_ros_driver) - ([Apache 2.0](https://github.com/ai4ce/insta360_ros_driver?tab=Apache-2.0-1-ov-file#readme))
-    - [Insta360 SDK](https://www.insta360.com/developer/home)
+    - [Insta360 CameraSDK](https://www.insta360.com/developer/home) - (proprietary, USB device control + capture)
+    - [Insta360 MediaSDK](https://www.insta360.com/developer/home) - (proprietary, .insp → ERP stitching)
 - Tools
     - Calibration
         - [koide3/direct_visual_lidar_calibration](https://github.com/koide3/direct_visual_lidar_calibration) - ([MIT](https://github.com/koide3/direct_visual_lidar_calibration/blob/main/README.md))
@@ -75,16 +79,12 @@
         - /livox/imu
             - ~200Hz
     - Camera
-        - /dual_fisheye/image/compressed
-            - ~30Hz (throttled to 15fps in continuous mode before recording)
-        - /dual_fisheye/image/compressed_15fps
-            - ~15Hz (continuous mode only — throttled topic used for bag recording)
         - /camera/shutter_time
-            - per-shot (SDK stitch mode only — published when a confirmed .insp file is downloaded)
+            - per-shot (published when TakePhoto() returns in SDK capture daemon)
         - /imu/data_raw
-            - ~60Hz (camera IMU, raw — recorded to dedicated IMU bag in continuous mode; not available in SDK stitch mode)
+            - ~60Hz (camera IMU, raw — NOT available in SDK stitch mode)
         - /imu/data
-            - ~60Hz (camera IMU, Madgwick-filtered — continuous mode only; not available in SDK stitch mode)
+            - ~60Hz (camera IMU, Madgwick-filtered — NOT available in SDK stitch mode)
     - Mapping
         - /rko_lio/odometry
             - ~10Hz
@@ -105,7 +105,7 @@
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
 | Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
-| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (SDK stitch, `dual_fisheye`) or 3840×1920 (ROS driver)                          |
+| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (`dual_fisheye`) or full ERP with rear hemisphere blanked + masked (`single_fisheye`)        |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
 | Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
 | Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |
@@ -116,7 +116,7 @@
 | Terrestrial mode (interval scans)   | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
 | Scan progress gui                   | Yes       | Local map is updated in RVIZ and shown during scanning                                                           |
 | Slam mode (continuous scanning)     | Yes       | Automate terrestrial mode by automatically building and saving point cloud, trajectory, and images               |
-| SDK stitch mode (high-quality ERP)  | Yes       | Insta360 MediaSDK stitcher produces full 5760×2880 ERPs; requires `USE_SDK_STITCH=true` and `dual_fisheye` mode  |
+| SDK stitch mode (high-quality ERP)  | Yes       | Insta360 MediaSDK stitcher produces full ERPs from .insp raw files; works in both `dual_fisheye` and `single_fisheye` modes  |
 | Sample gallery                      | Future    | Providing outputs to view various datasets taken with the scanner                                                |
 | Remote capture capability           | Future    | Enable ability to remotely trigger a scan on the device                                                          |
 
@@ -138,23 +138,17 @@ Please review [Running the Software documentation](docs/software-run.md)
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
 
-- An optional SDK stitch mode (`USE_SDK_STITCH=true`, `dual_fisheye` only) replaces the ROS camera driver with the Insta360 MediaSDK daemon (`insta360_capture`). In continuous mode the daemon uses `TIMELAPSE_INTERVAL_SHOOTING` — the firmware manages the shutter clock autonomously, achieving reliable ~8s effective intervals (firmware minimum regardless of `lapseTime` setting). Each shot is detected by polling `GetCameraFilesCount` and downloaded via HTTP GET to the camera's built-in file server while the session is still active. Shutter times are derived from the moment `GetCameraFilesCount` increments minus the SD write latency (~200ms), giving ~100ms timing accuracy on the ROS system clock. Camera IMU is not available in this mode. See [Running the Software](docs/software-run.md) for details.
+- The system uses the Insta360 CameraSDK exclusively — no ROS camera driver. The `insta360_capture` daemon owns the USB device for the entire session. In continuous mode it calls `TakePhoto()` on a host-controlled timer at `CONTINUOUS_INTERVAL` (default 3s). Each `.insp` raw file is downloaded concurrently via HTTP and a shutter event is published for bag recording. In `single_fisheye` mode the same `.insp` is stitched to a full 360° ERP with the rear hemisphere blank; a per-hardware mask (`lidar_mask_single_x5.png`) is applied before coloring to exclude the blank region and scanner body
 
-- Acquisition is camera-triggered — the system waits for a valid camera frame before proceeding, making image availability the primary bottleneck
+- Acquisition is camera-triggered — the system waits for `TakePhoto()` to return before recording the shutter event, making the SDK response time the primary timing factor
 
-- In single fisheye mode, the camera driver is reniced to priority 15 to reduce CPU competition; the LIO estimator is given priority -15 (highest) to keep odometry stable
-
-- In continuous mode, the camera is throttled from 30fps to 15fps before recording to reduce bag write load
-
-- A rosbag is recorded for every scan (stationary) or the entire session (continuous) as a redundancy capture mechanism — raw data can be replayed or reprocessed independently of the live pipeline
-
-- In continuous mode, IMU topics are recorded to a dedicated separate bag (`rosbag_*_imu`) on its own CPU core to prevent IMU starvation from LiDAR/image write bursts
+- In continuous mode, IMU topics are recorded to a dedicated separate bag (`rosbag_*_imu`) on its own CPU core to prevent IMU starvation from LiDAR write bursts
 
 - Color projection onto the point cloud is done entirely in post-processing, not during live capture
 
-- If the primary camera capture fails, the system automatically falls back to a buffered camera capture, then a LiDAR-driven capture as a last resort
+- If the SDK capture daemon crashes during a session, the continuous mode loop detects it and stops the session gracefully
 
-- RKO-LIO odometry requires an IMU — the system prefers the Livox Mid360's built-in IMU, falling back to the camera IMU if unavailable; if neither is found, odometry is disabled
+- RKO-LIO odometry requires an IMU — the system uses the Livox Mid360's built-in IMU (~200Hz); camera IMU is not available in SDK stitch mode
 
 - Calibration is reloaded from calib.json at startup by default; set USE_EXISTING_CALIBRATION=true to skip this step
 
@@ -176,25 +170,17 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 ##### IMU Soft-Sync (Continuous Mode)
 
-- The `insta360_ros_driver` stamps camera frames using `rclpy.clock()` — the same ROS system clock the Livox driver uses. Both sensors therefore share a common time base and the raw camera-to-odometry timestamp gap is typically <5 ms with no correction. There is no persistent hardware clock offset to remove
+- Camera IMU is not available in SDK stitch mode (the CameraSDK owns the USB device exclusively). Clock synchronization between LiDAR and camera shutter times relies on the host→Livox clock offset estimated from bag metadata (typically stable to ±5ms within a session)
 
-- `imu_sync.py` cross-correlates the two IMU gyroscope streams to detect any residual per-session offset and writes the result to `sync_offset.json`. It runs automatically before `reconstruct_from_bag.py` in continuous mode. In practice the measured offset is 0 ms when the correlation is reliable
-
-- The estimated offset is only applied when cross-correlation confidence ≥ 0.7. Below that threshold `delta_t_s` is written as `0.0` and `reconstruct_from_bag.py` skips the correction entirely. A low-confidence result means the scanner was not moving enough during the session, or the wrong axis pair was selected — applying a spurious offset in that case shifts camera timestamps hundreds of milliseconds away from their true position and produces a misaligned merged cloud
-
-- Axis selection is automatic: all 9 axis-pair combinations (Livox x/y/z vs Camera x/y/z) are evaluated by Pearson correlation and the highest-magnitude pair is used. This is necessary because the physical mounting means Livox_z and Camera_z are uncorrelated (r ≈ −0.016), while Livox_x vs Camera_x is typically the best pair (r ≈ 0.978). Using the wrong axis (e.g. the former default `--axis z`) produces confidence values of 0.06–0.09 and offsets of 90–500 ms that are pure noise
-
-- The Insta360 SDK delivers IMU samples in batches with up to 93% duplicate timestamps. `imu_sync.py` reconstructs monotonic per-sample timestamps from batch metadata before correlation to avoid aliasing
-
-- Target synchronization accuracy is ≤10 ms. The benchmark section 5 reports the applied offset, confidence, and residual after correction against the 10 ms threshold. A confidence below 0.7 is flagged and the offset is reported as not applied
+- `imu_sync.py` can cross-correlate the Livox IMU gyroscope with a camera IMU if one is available (e.g. via a separate IMU sensor), but for the standard SDK-only configuration it exits gracefully with a message indicating camera IMU was not found
 
 #### Post-Processing Pipeline
 
 - `imu_sync.py` — reads both IMU gyroscope streams from the dedicated IMU bag (falling back to the main bag), reconstructs monotonic camera IMU timestamps, auto-selects the best-correlated axis pair, and estimates any residual clock offset via FFT cross-correlation. If confidence ≥ 0.7 the offset is written to `sync_offset.json`; otherwise `delta_t_s` is written as `0.0` so the file is a safe no-op. Run automatically before reconstruction in continuous mode
 
-- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. Extracts camera frames as scan centres, filters centres outside the odometry window, applies per-frame motion compensation, and writes a sensor-frame `sensor_lidar.ply` and `trajectory.json` per scan. In SDK stitch mode (`--sdk-stitch`), scan centres come from `/camera/shutter_time` bag messages written by `shutter_event_publisher.py`, which publishes `capture_N.shutter_event` files as they are created by the `insta360_capture` daemon. Each shutter timestamp is derived from `GetCameraFilesCount` increment time minus SD write latency (~200ms), giving ~100ms accuracy relative to the true shutter.
+- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. In SDK stitch mode (`--sdk-stitch`), scan centres come from `.insp` capture_time sidecars (preferred), `/camera/shutter_time` bag messages, or .insp filename RTC timestamps (fallback). The host→Livox clock offset is estimated from bag metadata and applied to convert host-clock shutter times to Livox hardware time for correct LiDAR window alignment. For `single_fisheye` mode, `.insp` files are promoted from `.sdk_shot_N/` directories, stitched to full 360° ERPs (with blank rear hemisphere), masked using the per-hardware mask (`lidar_mask_single_x5.png`), and then colorized. For `dual_fisheye`, the same pipeline applies with the dual mask.
 
-- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama, and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded. No EIS correction is applied — each scan uses its own ERP which is already in the correct camera-frame orientation (TEMPLATE stitch, per-shot IMU).
+- `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama (RGBA with alpha channel), and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded — this excludes the scanner body, nadir, and (in single_fisheye mode) the blank rear hemisphere. No EIS correction is applied — each scan uses its own ERP which is already in the correct camera-frame orientation (DYNAMICSTITCH, per-shot IMU).
 
 - `align_scan_session_posegraph.py` — loads `world_lidar.ply` for each scan at 5 cm voxel resolution, transforms all clouds to relative-to-first frame using trajectory poses, then runs leave-one-out ICP (each scan vs merged reference of all others) over 1 pass by default to find small residual drift corrections. Corrected absolute poses are written to `trajectory_icp_refined.json`. Typical improvement: ~20–25% reduction in inter-scan median NN distance.
 

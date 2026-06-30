@@ -2,6 +2,12 @@
 # ERP output resolution for SDK stitching
 erp_width: 5760
 erp_height: 2880
+# Capture resolution: Size_5952_2976 (enum 12, One X2 native 18MP)
+photo_size_enum: 12
+# White balance: 2=4000K (original default, works well for One X2 indoors)
+white_balance: 2
+# Exposure mode: 2=SHUTTER_PRIORITY at 1/100s (original default)
+exposure_mode: 2
 # Lidar mask filename (relative to src/)
 lidar_mask_dual: lidar_mask_dual_sdk.png
 lidar_mask_single: lidar_mask_single.png

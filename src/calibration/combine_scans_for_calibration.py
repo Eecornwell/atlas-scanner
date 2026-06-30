@@ -94,7 +94,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
 
         if equirect_files and ply_files:
             # Copy and convert image to PNG (handle alpha channel if present)
-                src_img = _safe_resolve(equirect_files[0])
+            src_img = _safe_resolve(equirect_files[0])
             dst_img = str(_safe_output(output_dir, "images", f"{total_count:06d}.png"))
             
             import cv2

@@ -16,6 +16,26 @@ from scipy.spatial.transform import Rotation as R
 YAML_PATH  = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
 CALIB_PATH = Path.home() / 'atlas_ws/output/calib.json'
 
+# Detect which camera hw was used for the output dataset via session_config.json files
+import glob as _glob
+_hw = 'onex2'
+_source_jsons = sorted(_glob.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
+if _source_jsons:
+    try:
+        import json as _json
+        _src = _json.loads(Path(_source_jsons[0]).read_text())
+        _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / '..' / 'session_config.json'
+        if _scan_cfg.exists():
+            _hw = _json.loads(_scan_cfg.read_text()).get('camera_hw', 'onex2')
+    except Exception:
+        pass
+
+# Prefer the per-hw calibration file; fall back to shared
+_hw_yaml = Path.home() / f'atlas_ws/src/atlas-scanner/src/config/calibrations/{_hw}/fusion_calibration.yaml'
+if _hw_yaml.exists():
+    YAML_PATH = _hw_yaml
+    print(f'Using {_hw} calibration: {_hw_yaml}')
+
 with open(YAML_PATH) as f:
     cfg = yaml.safe_load(f)
 
@@ -40,3 +60,5 @@ with open(CALIB_PATH, 'w') as f:
 
 print(f'✓ Seeded {CALIB_PATH}')
 print(f'  T_lidar_camera: {[round(v,4) for v in vec]}')
+if all(abs(v) < 1e-3 for v in vec[:3]) and abs(vec[3] - 1.0) < 0.01:
+    print('  ⚠ WARNING: seeded value looks like identity — calibration yaml may be corrupt')

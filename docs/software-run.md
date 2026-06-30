@@ -7,10 +7,10 @@ Edit the settings at the top of `~/atlas_ws/src/atlas-scanner/src/atlas_fusion_c
 ```bash
 CAMERA_MODE="dual_fisheye"     # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"      # stationary | continuous
-CONTINUOUS_INTERVAL=5          # seconds between captures (continuous mode only;
-                               # firmware enforces ~8s minimum due to SD write time;
-                               # downloads run concurrently via HTTP)
-CAMERA_HW="onex2"              # onex2 | x5
+CONTINUOUS_INTERVAL=3          # seconds between captures (continuous mode only;
+                               # host-controlled TakePhoto() loop; minimum ~3s
+                               # limited by X5 shutter + SD write time)
+CAMERA_HW="x5"                 # onex2 | x5
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
@@ -28,24 +28,31 @@ RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session
 | `dual_fisheye` | `continuous` | Walking capture, full 360° images |
 | `single_fisheye` | `continuous` | Walking capture, LiDAR-facing fisheye only |
 
-All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera driver is not used. The `insta360_capture` daemon takes ownership of the USB device for the whole session, captures `.insp` files via `TIMELAPSE_INTERVAL_SHOOTING` (continuous) or `TakePhoto` (stationary), and `insta360_stitch` produces the ERP during post-processing. For `single_fisheye`, `insta360_stitch --single` crops the back hemisphere from the full ERP.
+All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera driver is not used. The `insta360_capture` daemon takes ownership of the USB device for the whole session, captures `.insp` files via a host-controlled `TakePhoto()` loop (continuous) or single `TakePhoto` calls (stationary), and `insta360_stitch` produces the ERP during post-processing. For `single_fisheye`, the full 360° ERP is output with the rear hemisphere blank; a per-hardware LiDAR mask is then applied to exclude the blank region and scanner body before coloring.
 
 **How continuous mode works:**
 
-- The daemon uses `TIMELAPSE_INTERVAL_SHOOTING` — the firmware manages the shutter clock autonomously. Each new shot is detected by polling `GetCameraFilesCount` every 200ms; when the count increments the shutter timestamp is recorded (~100ms accuracy on the host clock), then the `.insp` file is downloaded via HTTP GET to the camera's built-in file server while the session is still active.
-- The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes on `/camera/shutter_time`, recorded into the bag. `reconstruct_from_bag.py` uses these timestamps as scan centres.
-- Effective capture rate is ~8s per shot (firmware SD write minimum).
+- The daemon drives the shutter from a host timer thread calling `TakePhoto()` at the configured `CONTINUOUS_INTERVAL` (default 3s). The X5 firmware minimum is ~3s per shot (shutter + SD write). Each shot's shutter time is recorded at `TakePhoto()` return (~50ms accuracy on host clock), then the `.insp` file is downloaded via HTTP GET from the camera's built-in file server while the session is still active.
+- The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes on `/camera/shutter_time`, recorded into the bag. `reconstruct_from_bag.py` uses these timestamps (or `.insp.capture_time` sidecars) as scan centres.
+- Camera IMU is not available in SDK stitch mode.
 
-**Building the SDK daemon:**
+**USB session management:**
+
+- After a successful session, the X5 firmware leaves residual protocol data in its USB bulk endpoint. The `insta360_capture` daemon flushes stale bytes from endpoint 0x81 using `libusb` before SDK device discovery, eliminating the need to physically unplug the camera between sessions.
+- The shell script performs a `USBDEVFS_RESET` at startup to force the firmware to restart its command server, followed by an 8s settle time for the X5.
+
+**Building the SDK tools:**
 
 ```bash
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
-cd ~/insta360-dev && bash build.sh
-# Produces: build/insta360_capture  build/insta360_stitch
+cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk
+bash build.sh
+# Produces: ~/insta360-dev/build/insta360_capture
+#           ~/insta360-dev/build/insta360_stitch
+#           ~/insta360-dev/build/insta360_reset_clock
 ```
 
-Re-run after any update to `main.cpp` or `stitch.cpp`.
+Dependencies: `libusb-1.0-dev`, Insta360 CameraSDK, Insta360 MediaSDK, OpenCV.
+Re-run after any update to `main.cpp`, `stitch.cpp`, or `reset_clock.cpp`.
 
 **Manually reconstruct a session:**
 

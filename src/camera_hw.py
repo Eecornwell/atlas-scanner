@@ -19,7 +19,6 @@ _DEFAULTS = {
         'erp_width':         5760,
         'erp_height':        2880,
         'lidar_mask_dual':   'lidar_mask_dual_sdk.png',
-        'lidar_mask_dual_ros': 'lidar_mask_dual.png',
         'lidar_mask_single': 'lidar_mask_single.png',
         'display_name':      'Insta360 One X2',
     },
@@ -27,7 +26,6 @@ _DEFAULTS = {
         'erp_width':         7680,
         'erp_height':        3840,
         'lidar_mask_dual':   'lidar_mask_dual_x5.png',
-        'lidar_mask_dual_ros': 'lidar_mask_dual_x5.png',
         'lidar_mask_single': 'lidar_mask_single_x5.png',
         'display_name':      'Insta360 X5',
     },
@@ -59,13 +57,27 @@ def camera_hw_for_session(session_dir) -> str:
     return 'onex2'
 
 
-def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = False) -> Path:
-    """Return the absolute lidar mask path for the given mode."""
+def is_blur_skipped(scan_dir) -> bool:
+    """Return True if this scan has been marked blurry by filter_blurry_scans.py."""
+    return (Path(scan_dir) / '.blur_skip').exists()
+
+
+def iter_scan_dirs(session_path) -> list:
+    """Return sorted fusion_scan_* dirs that have not been blur-filtered."""
+    return sorted(
+        d for d in Path(session_path).iterdir()
+        if d.is_dir() and d.name.startswith('fusion_scan_')
+        and not (d / '.blur_skip').exists()
+    )
+
+
+def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = True) -> Path:
+    """Return the absolute lidar mask path for the given mode.
+    sdk_stitch parameter kept for API compatibility but ignored — SDK stitch
+    is always used so the SDK mask is always selected.
+    """
     if camera_mode == 'dual_fisheye':
-        if sdk_stitch:
-            name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
-        else:
-            name = profile.get('lidar_mask_dual_ros', 'lidar_mask_dual.png')
+        name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
     else:
         name = profile.get('lidar_mask_single', 'lidar_mask_single.png')
     return _SRC / name

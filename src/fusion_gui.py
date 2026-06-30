@@ -276,8 +276,10 @@ class FusionCaptureGUI:
         _pp_btn(0, 0, "Run Post-Processing",         self._pp_run_reconstruct)
         _pp_btn(0, 1, "Recolor with New Calibration", self._pp_reprocess)
         _pp_btn(1, 0, "ICP Alignment",                self._pp_icp)
+        _pp_btn(1, 1, "Filter Blurry Frames",         self._pp_filter_blurry)
         _pp_btn(1, 1, "Merge (Trajectory Only)",      self._pp_merge_traj)
         _pp_btn(2, 0, "Run Sync Benchmark",           self._pp_sync_benchmark)
+        _pp_btn(2, 1, "SDK Sync Validator",             self._pp_sdk_sync_validator)
         # ── COLMAP ────────────────────────────────────────────────────────
         _pp_sep(3, "COLMAP")
         _pp_btn(5, 0, "Export COLMAP Model",          self._pp_colmap)
@@ -301,6 +303,101 @@ class FusionCaptureGUI:
                                                                     self._pp_log.config(state='disabled')))
         self._pp_log.bind('<Button-3>', lambda e: (_pp_menu.tk_popup(e.x_root, e.y_root),
                                                    _pp_menu.grab_release()))
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ── Calibration tab ──────────────────────────────────────────────────
+        cal_tab = ttk.Frame(notebook, padding="8")
+        notebook.add(cal_tab, text="Calibration")
+
+        # Session picker (reuses same var as post-processing)
+        cal_sess_frame = ttk.LabelFrame(cal_tab, text="Session", padding="5")
+        cal_sess_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Entry(cal_sess_frame, textvariable=self._pp_session_var, width=52).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(cal_sess_frame, text="Browse…", command=self._pp_browse).pack(side=tk.LEFT, padx=(4, 0))
+
+        # Live indicator mirroring the Camera HW dropdown
+        cal_hw_frame = ttk.Frame(cal_tab)
+        cal_hw_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(cal_hw_frame, text="Calibrating camera:",
+                  font=('Arial', 9)).pack(side=tk.LEFT, padx=(0, 6))
+        self._cal_hw_label = ttk.Label(cal_hw_frame,
+            text=self.camera_hw_var.get().upper(),
+            font=('Arial', 10, 'bold'), foreground='#1a6fb5')
+        self._cal_hw_label.pack(side=tk.LEFT)
+        # Keep the indicator in sync with the Camera HW dropdown
+        def _on_hw_change(*_):
+            hw = self.camera_hw_var.get()
+            self._cal_hw_label.config(text=hw.upper())
+        self.camera_hw_var.trace_add('write', _on_hw_change)
+
+        # ── Options row ────────────────────────────────────────────
+        opt_frame = ttk.Frame(cal_tab)
+        opt_frame.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(opt_frame, text="Scene:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cal_scene_var = tk.StringVar(value="indoor")
+        ttk.Combobox(opt_frame, textvariable=self._cal_scene_var,
+                     values=["indoor", "outdoor"], state="readonly", width=9
+                     ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(opt_frame, text="Initial guess:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cal_guess_var = tk.StringVar(value="auto")
+        ttk.Combobox(opt_frame, textvariable=self._cal_guess_var,
+                     values=["auto", "manual"], state="readonly", width=8
+                     ).pack(side=tk.LEFT)
+
+        # ── Action buttons ──────────────────────────────────────────
+        cal_btn_frame = ttk.Frame(cal_tab)
+        cal_btn_frame.pack(fill=tk.BOTH, expand=False)
+        cal_btn_frame.columnconfigure(0, weight=1)
+        cal_btn_frame.columnconfigure(1, weight=1)
+
+        def _cal_btn(row, col, label, cmd):
+            ttk.Button(cal_btn_frame, text=label, command=cmd).grid(
+                row=row, column=col, sticky=(tk.W, tk.E), padx=3, pady=3)
+
+        def _cal_sep(row, text):
+            ttk.Separator(cal_btn_frame, orient='horizontal').grid(
+                row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(6, 0))
+            ttk.Label(cal_btn_frame, text=text, foreground='#888',
+                      font=('Arial', 8)).grid(
+                row=row+1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
+
+        # ── Full pipeline (one click) ──────────────────────────────
+        ttk.Button(cal_btn_frame, text="▶  Run Full Calibration Pipeline",
+                   command=self._cal_run_full_pipeline,
+                   style="Accent.TButton").grid(
+            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(3, 6))
+
+        # ── Individual steps ───────────────────────────────────────
+        _cal_sep(1, "Individual Steps")
+        _cal_btn(3, 0, "1. Combine Scans",                self._cal_combine_scans)
+        _cal_btn(3, 1, "2. Generate Intensity Images",    self._cal_gen_intensity)
+        _cal_btn(4, 0, "3. Match Features (SuperGlue)",   lambda: self._cal_superglue(self._cal_scene_var.get()))
+        _cal_btn(4, 1, "4. Initial Guess",                self._cal_initial_guess)
+        _cal_btn(5, 0, "5. Seed from Current Calib",      self._cal_seed)
+        _cal_btn(5, 1, "6. Run Calibration",              self._cal_run_calibration)
+        _cal_btn(6, 0, "7. Apply Calibration",            self._cal_apply)
+        _cal_btn(6, 1, "8. Verify Calibration",           self._cal_verify)
+        # ── Fine-tune ─────────────────────────────────────────────
+        _cal_sep(7, "Fine-tune")
+        _cal_btn(9,  0, "Tune — Sweep Pitch",             self._cal_tune_pitch)
+        _cal_btn(9,  1, "Tune — Sweep Roll",              self._cal_tune_roll)
+        _cal_btn(10, 0, "Tune — Sweep Yaw",              self._cal_tune_yaw)
+        _cal_btn(10, 1, "Tune — Sweep TX/TY/TZ",         self._cal_tune_t)
+
+        # Output log shared with post-processing tab
+        ttk.Label(cal_tab, text="Output:", foreground='#888', font=('Arial', 8)).pack(anchor=tk.W, pady=(6,0))
+        self._cal_log = scrolledtext.ScrolledText(cal_tab, font=('Consolas', 8), height=12, state='disabled')
+        self._cal_log.pack(fill=tk.BOTH, expand=True)
+        _cal_menu = tk.Menu(self.root, tearoff=0)
+        _cal_menu.add_command(label="Copy",      command=lambda: self._cal_log.event_generate('<<Copy>>'))
+        _cal_menu.add_command(label="Select All", command=lambda: self._cal_log.tag_add(tk.SEL, '1.0', tk.END))
+        _cal_menu.add_command(label="Clear Log",  command=lambda: (self._cal_log.config(state='normal'),
+                                                                    self._cal_log.delete('1.0', tk.END),
+                                                                    self._cal_log.config(state='disabled')))
+        self._cal_log.bind('<Button-3>', lambda e: (_cal_menu.tk_popup(e.x_root, e.y_root),
+                                                    _cal_menu.grab_release()))
         # ─────────────────────────────────────────────────────────────────────
 
         notebook.select(1)
@@ -405,11 +502,23 @@ class FusionCaptureGUI:
         self.start_button.config(state="disabled")
         self.stop_button.config(state="normal")
         
+        # Snapshot all Tkinter StringVar/BooleanVar values on the main thread
+        # before spawning — StringVar.get() is not thread-safe and can return
+        # stale values (e.g. 'stationary') when called from a background thread.
+        _launch_params = {
+            'camera_val':        self.camera_mode_var.get(),
+            'capture_val':       self.capture_mode_var.get(),
+            'camera_hw_val':     self.camera_hw_var.get(),
+            'bag_only':          self.bag_only_var.get(),
+            'stationary_wait':   self.stationary_wait_var.get(),
+            'icp':               self.icp_var.get(),
+            'colmap':            self.colmap_var.get(),
+        }
         # Start fusion process in separate thread
-        threading.Thread(target=self._run_fusion_process, daemon=True).start()
+        threading.Thread(target=self._run_fusion_process, args=(_launch_params,), daemon=True).start()
         
-    def _run_fusion_process(self):
-        """Run the fusion process"""
+    def _run_fusion_process(self, params):
+        """Run the fusion process (called in background thread; use `params` dict, not StringVars)"""
         try:
             # Prepare environment — ensure display vars are forwarded so
             # web_3d_viewer.py can open a browser window from within the script
@@ -473,11 +582,13 @@ class FusionCaptureGUI:
 
                 threading.Thread(target=_run_perms, daemon=True).start()
 
-            # Validate GUI-supplied values before building the command
+            # Validate GUI-supplied values before building the command.
+            # Use pre-snapshotted params (captured on main thread) — StringVar.get()
+            # is not thread-safe and can return stale values from a background thread.
             _VALID_CAMERA  = {'dual_fisheye', 'single_fisheye'}
             _VALID_CAPTURE = {'stationary', 'continuous'}
-            camera_val  = self.camera_mode_var.get()
-            capture_val = self.capture_mode_var.get()
+            camera_val  = params['camera_val']
+            capture_val = params['capture_val']
             if camera_val not in _VALID_CAMERA:
                 self.log_message(f'Invalid camera mode: {camera_val!r}')
                 return
@@ -489,13 +600,13 @@ class FusionCaptureGUI:
             cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
                    '--camera', camera_val,
                    '--capture', capture_val,
-                   '--camera-hw', self.camera_hw_var.get()]
-            if self.bag_only_var.get():
+                   '--camera-hw', params['camera_hw_val']]
+            if params['bag_only']:
                 cmd.append('--bag-only')
-            if self.capture_mode_var.get() == 'stationary' and self.stationary_wait_var.get():
+            if capture_val == 'stationary' and params['stationary_wait']:
                 cmd.append('--stationary-wait')
-            cmd.append('--icp' if self.icp_var.get() else '--no-icp')
-            cmd.append('--colmap' if self.colmap_var.get() else '--no-colmap')
+            cmd.append('--icp' if params['icp'] else '--no-icp')
+            cmd.append('--colmap' if params['colmap'] else '--no-colmap')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -1163,6 +1274,12 @@ sys.exit(0 if ok[0] else 4)
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         self._pp_run("ICP Alignment", [sys.executable, str(self.script_dir / 'post_processing/align_scan_session_posegraph.py'), sess, '--iterations', '1'])
 
+    def _pp_filter_blurry(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        self._pp_run("Filter Blurry Frames", [sys.executable,
+            str(self.script_dir / 'post_processing/filter_blurry_scans.py'), sess])
+
     def _pp_merge_traj(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
@@ -1199,6 +1316,20 @@ sys.exit(0 if ok[0] else 4)
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         self._pp_run("Sync Benchmark", [sys.executable, str(self.script_dir / 'post_processing/sync_benchmark.py'),
                                         sess, '--out', str(pathlib.Path(sess) / 'sync_benchmark.json')])
+
+    def _pp_sdk_sync_validator(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        # Check this is an SDK stitch continuous session
+        if not (pathlib.Path(sess) / '.sdk_stitch_continuous').exists():
+            self._pp_log_write(
+                "\n[!] SDK Sync Validator requires a continuous SDK-stitch session\n"
+                "    (.sdk_stitch_continuous sentinel not found).\n")
+            return
+        self._pp_run("SDK Sync Validator",
+                     [sys.executable,
+                      str(self.script_dir / 'post_processing/sdk_sync_validator.py'),
+                      sess, '--lidar-window', '0.6', '--walk-speed', '0.5'])
 
     def _pp_colmap_quality(self):
         sess = self._pp_session()
@@ -1265,6 +1396,344 @@ sys.exit(0 if ok[0] else 4)
         self._pp_log_write(f'  Could not open browser. Open manually:\n  {html_path}\n')
 
     # ───────────────────────────────────────────────────────────────
+
+    # ── Calibration tab helpers ────────────────────────────────────────────
+
+    def _cal_log_write(self, text):
+        self._cal_log.config(state='normal')
+        self._cal_log.insert(tk.END, text)
+        self._cal_log.see(tk.END)
+        self._cal_log.config(state='disabled')
+
+    def _cal_run(self, label, cmd):
+        """Run a calibration command in a background thread, streaming output to _cal_log."""
+        import os as _os
+        _atlas_ws = str(pathlib.Path.home() / 'atlas_ws')
+        _safe_interp = _os.path.realpath(sys.executable)
+        _actual_cmd0 = _os.path.realpath(cmd[0]) if cmd else ''
+        _is_python = _actual_cmd0 == _safe_interp
+        _is_dvl_bin = _actual_cmd0.startswith(_atlas_ws) and _os.path.isfile(_actual_cmd0)
+        if not _is_python and not _is_dvl_bin:
+            self._cal_log_write(f"Error: rejected unsafe command: {cmd[0]!r}\n")
+            return
+        safe_cmd = ' '.join(str(a) for a in cmd)
+        self._cal_log_write(f"\n>> {label}\n   {safe_cmd}\n")
+        def _run():
+            import subprocess as _sp
+            _safe_env = {
+                k: os.environ[k] for k in (
+                    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                    'ROS_DISTRO', 'ROS_VERSION', 'AMENT_PREFIX_PATH',
+                    'COLCON_PREFIX_PATH', 'CMAKE_PREFIX_PATH',
+                    'LD_LIBRARY_PATH', 'PYTHONPATH',
+                    'DISPLAY', 'XAUTHORITY', 'XDG_RUNTIME_DIR',
+                    'DBUS_SESSION_BUS_ADDRESS',
+                ) if k in os.environ
+            }
+            _safe_env['PYTHONUNBUFFERED'] = '1'
+            try:
+                proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
+                                 bufsize=1, env=_safe_env)
+                for line in proc.stdout:
+                    self.root.after(0, self._cal_log_write, line.replace('\r', ''))
+                proc.wait()
+                self.root.after(0, self._cal_log_write,
+                                f"{'Done' if proc.returncode == 0 else 'FAILED'} (exit {proc.returncode})\n")
+            except FileNotFoundError as e:
+                self.root.after(0, self._cal_log_write, f"Error: {e}\n")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _cal_src(self):
+        """Return atlas-scanner/src directory."""
+        return str(self.script_dir)
+
+    def _cal_hw(self):
+        """Return current camera hardware selection."""
+        return self.camera_hw_var.get()
+
+    def _cal_combine_scans(self):
+        sess = self._pp_session()
+        if not sess: self._cal_log_write("\n[!] No session selected.\n"); return
+        self._cal_run("Combine Scans for Calibration", [
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'combine_scans_for_calibration.py'),
+            sess
+        ])
+
+    def _cal_gen_intensity(self):
+        import os as _os
+        output = str(pathlib.Path.home() / 'atlas_ws' / 'output')
+        self._cal_run("Generate Intensity Images", [
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'generate_intensity_images.py'),
+            output
+        ])
+
+    def _cal_superglue_indoor(self):
+        self._cal_superglue('indoor')
+
+    def _cal_superglue_outdoor(self):
+        self._cal_superglue('outdoor')
+
+    def _cal_initial_guess(self):
+        """Dispatch to auto or manual based on the dropdown."""
+        if self._cal_guess_var.get() == 'manual':
+            self._cal_initial_guess_manual()
+        else:
+            self._cal_initial_guess_auto()
+
+    def _cal_run_full_pipeline(self):
+        """Run all calibration steps in sequence using the current dropdown settings."""
+        scene = self._cal_scene_var.get()
+        guess = self._cal_guess_var.get()
+        dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
+        output = str(pathlib.Path.home() / 'atlas_ws/output')
+        erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
+        import threading as _th
+        import subprocess as _sp
+
+        def _run():
+            import os as _os
+            _safe_env = {
+                k: os.environ[k] for k in (
+                    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                    'PYTHONPATH', 'LD_LIBRARY_PATH', 'DISPLAY',
+                    'ROS_DISTRO', 'AMENT_PREFIX_PATH', 'COLCON_PREFIX_PATH',
+                ) if k in os.environ
+            }
+            _safe_env['PYTHONUNBUFFERED'] = '1'
+            _superglue_dir = str(pathlib.Path.home() / 'atlas_ws/SuperGluePretrainedNetwork')
+            _existing_pp = _safe_env.get('PYTHONPATH', '')
+            _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
+
+            steps = [
+                ("1. Combine Scans", [sys.executable,
+                    str(self.script_dir / 'calibration' / 'combine_scans_for_calibration.py'),
+                    self._pp_session() or output]),
+                ("2. Generate Intensity Images", [sys.executable,
+                    str(self.script_dir / 'calibration' / 'generate_intensity_images.py'), output]),
+                (f"3. Match Features (SuperGlue {scene})", [sys.executable, str(erp_matcher),
+                    output, '--superglue', scene, '--max_keypoints', '2048', '--match_threshold', '0.2']),
+                ("4. Seed from Current Calibration", [sys.executable,
+                    str(self.script_dir / 'calibration' / 'seed_calib.py')]),
+            ]
+            # Step 4b: initial guess
+            if guess == 'auto':
+                steps.append(("5. Initial Guess (Auto)", [
+                    str(dvl / 'initial_guess_auto'), '--data_path', output]))
+            else:
+                steps.append(("5. Initial Guess (Manual — open interactive window)", [
+                    str(dvl / 'initial_guess_manual'), '--data_path', output]))
+            steps += [
+                ("6. Run Calibration", [str(dvl / 'calibrate'), '--data_path', output,
+                    '--nid_bins', '32', '--nelder_mead_convergence_criteria', '1e-10']),
+                ("7. Apply Calibration", [sys.executable,
+                    str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
+                    self._cal_src(), '--camera-hw', self._cal_hw()]),
+            ]
+
+            for label, cmd in steps:
+                safe_cmd = ' '.join(str(a) for a in cmd)
+                self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
+                # Skip session arg if no session selected
+                if not self._pp_session() and 'combine_scans' in safe_cmd:
+                    self.root.after(0, self._cal_log_write, '  Skipped (no session selected)\n')
+                    continue
+                proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                                 text=True, bufsize=1, env=_safe_env, cwd=str(dvl))
+                for line in proc.stdout:
+                    self.root.after(0, self._cal_log_write, line.replace('\r', ''))
+                proc.wait()
+                status = 'Done' if proc.returncode == 0 else f'FAILED (exit {proc.returncode})'
+                self.root.after(0, self._cal_log_write, f'{status}\n')
+                if proc.returncode not in (0, None) and 'Manual' not in label:
+                    self.root.after(0, self._cal_log_write,
+                                    f'Pipeline stopped at: {label}\n')
+                    return
+            self.root.after(0, self._cal_log_write,
+                            '\n✓ Full calibration pipeline complete. Run Verify Calibration to inspect.\n')
+
+        _th.Thread(target=_run, daemon=True).start()
+
+    def _cal_superglue(self, weights):
+        dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
+        output = str(pathlib.Path.home() / 'atlas_ws/output')
+        import threading as _th
+        def _run_sequence():
+            import subprocess as _sp
+            _safe_env = {
+                k: os.environ[k] for k in (
+                    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                    'PYTHONPATH', 'LD_LIBRARY_PATH', 'DISPLAY',
+                    'ROS_DISTRO', 'AMENT_PREFIX_PATH', 'COLCON_PREFIX_PATH',
+                ) if k in os.environ
+            }
+            _safe_env['PYTHONUNBUFFERED'] = '1'
+            _superglue_dir = str(pathlib.Path.home() / 'atlas_ws/SuperGluePretrainedNetwork')
+            _existing_pp = _safe_env.get('PYTHONPATH', '')
+            _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
+            # Use ERP-aware matcher (perspective crops from ERP, better for wide-angle images)
+            erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
+            match_cmd = [sys.executable, str(erp_matcher),
+                         output, '--superglue', weights,
+                         '--max_keypoints', '2048',
+                         '--match_threshold', '0.2']
+            self.root.after(0, self._cal_log_write,
+                            f'>> Match Features ERP (SuperGlue {weights})\n   {" ".join(match_cmd)}\n')
+            proc = _sp.Popen(match_cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                             text=True, bufsize=1, env=_safe_env,
+                             cwd=str(dvl))
+            for line in proc.stdout:
+                self.root.after(0, self._cal_log_write, line.replace('\r', ''))
+            proc.wait()
+            if proc.returncode != 0:
+                self.root.after(0, self._cal_log_write,
+                                f'FAILED (exit {proc.returncode})\n')
+                return
+            # fix_matches.py not needed for ERP matcher (already in ERP coords)
+            self.root.after(0, self._cal_log_write, 'Done\n')
+        _th.Thread(target=_run_sequence, daemon=True).start()
+
+    def _cal_initial_guess_manual(self):
+        dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
+        output = str(pathlib.Path.home() / 'atlas_ws/output')
+        self._cal_run("Initial Guess (Manual)", [
+            str(dvl / 'initial_guess_manual'),
+            '--data_path', output
+        ])
+
+    def _cal_initial_guess_auto(self):
+        dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
+        output = str(pathlib.Path.home() / 'atlas_ws/output')
+        self._cal_run("Initial Guess (Auto)", [
+            str(dvl / 'initial_guess_auto'),
+            '--data_path', output
+        ])
+
+    def _cal_run_calibration(self):
+        dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
+        output = str(pathlib.Path.home() / 'atlas_ws/output')
+        self._cal_run("Run Calibration", [
+            str(dvl / 'calibrate'),
+            '--data_path', output,
+            '--nid_bins', '32',
+            '--nelder_mead_convergence_criteria', '1e-10'
+        ])
+
+    def _cal_seed(self):
+        self._cal_run("Seed from Current Calibration", [
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'seed_calib.py')
+        ])
+
+    def _cal_apply(self):
+        self._cal_run("Apply Calibration", [
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
+            self._cal_src(),
+            '--camera-hw', self._cal_hw()
+        ])
+
+    def _cal_verify(self):
+        sess = self._pp_session()
+        scan_dir = None
+        if sess:
+            scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
+            if scans:
+                scan_dir = str(scans[-1])
+        cmd = [sys.executable,
+               str(self.script_dir / 'calibration' / 'tune_calibration.py'),
+               '--verify']
+        if scan_dir:
+            cmd.insert(2, scan_dir)
+        # After verify completes, open the output image automatically
+        def _after():
+            import subprocess as _sp, os as _os
+            candidates = []
+            if scan_dir:
+                candidates.append(pathlib.Path(scan_dir) / 'calib_sweep' / 'current.jpg')
+            candidates.append(pathlib.Path.home() / 'atlas_ws/output/calib_sweep/current.jpg')
+            for p in candidates:
+                if p.exists():
+                    env = _os.environ.copy()
+                    env.setdefault('DISPLAY', ':0')
+                    for viewer in ['eog', 'eom', 'xdg-open', 'feh']:
+                        try:
+                            _sp.Popen([viewer, str(p)], env=env,
+                                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                            self.root.after(0, self._cal_log_write,
+                                            f'  Opened: {p}\n')
+                            return
+                        except FileNotFoundError:
+                            continue
+                    self.root.after(0, self._cal_log_write,
+                                    f'  Saved: {p} (open manually)\n')
+                    return
+        # Run command then open image
+        import threading as _th
+        import subprocess as _sp
+        def _run_then_open():
+            import os as _os
+            _safe_env = {
+                k: os.environ[k] for k in (
+                    'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                    'PYTHONPATH', 'LD_LIBRARY_PATH', 'DISPLAY',
+                    'ROS_DISTRO', 'AMENT_PREFIX_PATH', 'COLCON_PREFIX_PATH',
+                ) if k in os.environ
+            }
+            _safe_env['PYTHONUNBUFFERED'] = '1'
+            label = 'Verify Calibration'
+            safe_cmd = ' '.join(str(a) for a in cmd)
+            self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
+                             text=True, bufsize=1, env=_safe_env)
+            for line in proc.stdout:
+                self.root.after(0, self._cal_log_write, line.replace('\r', ''))
+            proc.wait()
+            self.root.after(0, self._cal_log_write,
+                            f'{"Done" if proc.returncode == 0 else "FAILED"} (exit {proc.returncode})\n')
+            if proc.returncode == 0:
+                _after()
+        _th.Thread(target=_run_then_open, daemon=True).start()
+
+    def _cal_tune_pitch(self):
+        self._cal_tune_axis('pitch')
+
+    def _cal_tune_roll(self):
+        self._cal_tune_axis('roll')
+
+    def _cal_tune_yaw(self):
+        self._cal_tune_axis('yaw')
+
+    def _cal_tune_t(self):
+        import tkinter.simpledialog as _sd
+        axis = _sd.askstring(
+            'Tune Translation', 'Axis to sweep (tx / ty / tz):',
+            initialvalue='ty', parent=self.root)
+        if axis and axis.strip() in ('tx', 'ty', 'tz'):
+            self._cal_tune_axis(axis.strip())
+
+    def _cal_tune_axis(self, axis):
+        import tkinter.simpledialog as _sd
+        rng = _sd.askfloat(
+            f'Tune {axis}', f'Sweep range ± (degrees or metres):',
+            initialvalue=2.0, parent=self.root)
+        if rng is None:
+            return
+        sess = self._pp_session()
+        scan_dir = None
+        if sess:
+            scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
+            if scans:
+                scan_dir = str(scans[-1])
+        cmd = [sys.executable,
+               str(self.script_dir / 'calibration' / 'tune_calibration.py'),
+               '--axis', axis, '--range', str(rng), '--steps', '5']
+        if scan_dir:
+            cmd.insert(2, scan_dir)
+        self._cal_run(f'Tune {axis} sweep ±{rng}', cmd)
+
+    # ───────────────────────────────────────────────────────────────────
 
     def _system_stopped(self):
         """Called when system is stopped"""

@@ -68,6 +68,13 @@ FACES_360 = list(range(NUM_FACES))
 FACES_180 = [i for i in range(NUM_FACES) if FACES[i]['name'] != 'back']
 FOV_DEG = 90.0
 MIN_BASELINE_M = 0.10
+# Minimum fraction of unmasked pixels for a tile to be included in the COLMAP model.
+# Tiles below this threshold are entirely (or near-entirely) covered by the scanner
+# body mask and contribute no useful features.
+MIN_TILE_VISIBLE = 0.20  # 20% of tile pixels must be unmasked
+# Minimum fraction of unmasked pixels across the whole ERP for a panorama to be
+# included at all. An ERP below this is fully occluded (e.g. cap/floor shot).
+MIN_ERP_VISIBLE  = 0.10  # 10% of ERP pixels must be unmasked
 
 
 def _load_calibration(session_path=None):
@@ -191,7 +198,8 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         shutil.rmtree(mask_dir)
 
     scan_dirs = sorted(d for d in session_path.iterdir()
-                       if d.is_dir() and d.name.startswith('fusion_scan_'))
+                       if d.is_dir() and d.name.startswith('fusion_scan_')
+                       and not (d / '.blur_skip').exists())
 
     panoramas = []
     session_is_360 = None
@@ -199,6 +207,13 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         erp_src, is_360 = _find_erp_image(scan_dir)
         if erp_src is None:
             continue
+        # Skip panoramas where the ERP is almost entirely masked
+        _probe = cv2.imread(str(erp_src), cv2.IMREAD_UNCHANGED)
+        if _probe is not None and _probe.ndim == 3 and _probe.shape[2] == 4:
+            _erp_visible = np.count_nonzero(_probe[:, :, 3]) / _probe[:, :, 3].size
+            if _erp_visible < MIN_ERP_VISIBLE:
+                print(f"  Skipping {scan_dir.name}: ERP only {_erp_visible*100:.1f}% visible (fully masked)")
+                continue
         if session_is_360 is None:
             session_is_360 = is_360
         pose = _load_pose(scan_dir, T_camera_lidar)
@@ -251,7 +266,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             if erp_mask is not None:
                 tile_mask = _erp_to_perspective(erp_mask, cam_from_pano_r, tile_size,
                                                 interpolation=cv2.INTER_NEAREST)
-                if np.count_nonzero(tile_mask) / tile_mask.size < 0.05:
+                if np.count_nonzero(tile_mask) / tile_mask.size < MIN_TILE_VISIBLE:
                     continue
 
             fname = f"pano_{pano_idx:03d}.png"
@@ -512,9 +527,11 @@ def _filter_sfm_isolated(sfm_pts, radius=1.5, min_neighbors=20):
     return mask
 
 
-def _filter_sfm_by_lidar_proximity(sfm_pts, lidar_pts, max_dist=0.35):
+def _filter_sfm_by_lidar_proximity(sfm_pts, lidar_pts, max_dist=0.50):
     """Remove SfM points that have no LiDAR point within max_dist metres.
-    Ensures SfM points land on real surfaces rather than floating in space."""
+    Ensures SfM points land on real surfaces rather than floating in space.
+    Threshold is 0.5m (relaxed from 0.35m) to avoid over-filtering when
+    ICP corrections shift the LiDAR cloud relative to triangulated SfM points."""
     if len(sfm_pts) == 0 or len(lidar_pts) == 0:
         return np.ones(len(sfm_pts), dtype=bool)
     from scipy.spatial import cKDTree
@@ -769,7 +786,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     all_lidar_pts  = []
     all_lidar_cols = []
     scan_dirs_map  = {int(d.name.split('_')[-1]): d
-                      for d in sorted(session_path.glob('fusion_scan_*')) if d.is_dir()}
+                      for d in sorted(session_path.glob('fusion_scan_*'))
+                      if d.is_dir() and not (d / '.blur_skip').exists()}
     for pi, scan_dir in sorted(scan_dirs_map.items()):
         ply_dense  = scan_dir / 'sensor_lidar.ply'
         ply_color  = scan_dir / 'sensor_colored_exact.ply'

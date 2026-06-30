@@ -322,10 +322,16 @@ def extract_back_fisheye(dual_img):
 # Stationary mode: one bag per scan already in fusion_scan_* dirs
 # ---------------------------------------------------------------------------
 
-def _reconstruct_stationary(session_path, per_scan_bags, camera_mode):
+def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_window=0.3):
     """Re-process per-scan bags that were recorded in stationary mode.
     Each bag already corresponds to one scan; we just extract the image,
-    LiDAR, and odometry and run colorization."""
+    LiDAR, and odometry and run colorization.
+
+    Scan centre = .insp.capture_time sidecar (exact TakePhoto() return time,
+    host clock).  Falls back to mid-bag LiDAR timestamp only if no sidecar
+    exists.  The host→Livox clock offset is estimated from the bag so the
+    LiDAR window is correctly centred on the shutter in Livox hardware time.
+    """
     pp = Path(__file__).resolve().parent
     scan_count = 0
 
@@ -346,31 +352,118 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode):
         lidar_msgs, _ = read_topic(con, topics, "/livox/lidar")
         image_msgs_raw, _ = read_topic(con, topics, "fisheye")
         odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
+
+        # Estimate host→Livox clock offset from this bag so the capture_time
+        # sidecar (host clock) can be converted to Livox hardware time.
+        _host_to_livox_offset = 0.0
+        try:
+            _lid_tid = next((tid for tid, (n, _) in topics.items() if n == '/livox/lidar'), None)
+            if _lid_tid:
+                _rows = con.execute(
+                    'SELECT data, timestamp FROM messages WHERE topic_id=? ORDER BY timestamp LIMIT 100',
+                    (_lid_tid,)
+                ).fetchall()
+                _LidarType = get_message(topics[_lid_tid][1])
+                _diffs = []
+                for _data, _bag_ns in _rows:
+                    _msg = deserialize_message(bytes(_data), _LidarType)
+                    _hdr_t = _msg.header.stamp.sec + _msg.header.stamp.nanosec * 1e-9
+                    _diffs.append(_bag_ns / 1e9 - _hdr_t)
+                if _diffs:
+                    _host_to_livox_offset = float(np.median(_diffs))
+                    print(f"  Host→Livox offset: {_host_to_livox_offset*1000:+.1f}ms")
+        except Exception as _e:
+            print(f"  ⚠ Could not estimate host→Livox offset: {_e}")
+
         con.close()
 
         if not lidar_msgs:
             print(f"  ✗ No LiDAR messages, skipping")
             continue
 
-        # --- LiDAR: accumulate all points from the bag ---
+        # --- Scan centre: prefer .insp.capture_time sidecar over mid-bag ---
+        # The capture_time sidecar contains the TakePhoto() return time in host
+        # clock — the most accurate timestamp of the actual shutter moment.
+        # Convert to Livox hardware clock for correct LiDAR window alignment.
+        centre_host = None
+        for _ct_f in sorted(scan_dir.glob("*.insp.capture_time")):
+            try:
+                centre_host = float(_ct_f.read_text().strip())
+                break
+            except Exception:
+                pass
+
+        if centre_host is not None:
+            centre = centre_host - _host_to_livox_offset
+            print(f"  Scan centre: capture_time sidecar "
+                  f"({centre_host:.3f}s host, offset {_host_to_livox_offset*1000:+.1f}ms applied)")
+        else:
+            centre = lidar_msgs[len(lidar_msgs) // 2][0]  # fallback: mid-bag
+            print(f"  Scan centre: mid-bag fallback (no .capture_time sidecar found)")
+
+        ts_str = datetime.fromtimestamp(centre).strftime("%Y%m%d_%H%M%S")
+
+        # --- LiDAR: accumulate frames within ±lidar_window/2 of shutter time
+        # with per-frame motion compensation, same as continuous mode.
+        # Always recompute — discard any PLY from buffered_camera_capture.py
+        # which collected frames from a post-shutter window (wrong centre).
+        half = lidar_window / 2.0
+        window_lidar = [(ts, msg) for ts, msg in lidar_msgs if abs(ts - centre) <= half]
+        if not window_lidar:
+            # Fallback: use all frames if window is empty (e.g. bag covers shutter poorly)
+            print(f"  ⚠ No LiDAR frames within ±{half:.2f}s of shutter — using all bag frames")
+            window_lidar = lidar_msgs
+
         all_points = []
-        for _, msg in lidar_msgs:
-            all_points.extend(unpack_lidar(msg))
+        world_points = []
+        T_capture_inv = None
+        if odom_msgs:
+            try:
+                t_cap, q_cap = interp_pose(odom_msgs, centre)
+                R_cap = Rotation.from_quat(q_cap).as_matrix()
+                T_cap = np.eye(4)
+                T_cap[:3, :3] = R_cap
+                T_cap[:3, 3] = t_cap
+                T_capture_inv = np.linalg.inv(T_cap)
+            except Exception:
+                pass
+
+        seen = set()
+        for frame_ts, msg in window_lidar:
+            mid = id(msg)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            pts = unpack_lidar(msg)
+            if T_capture_inv is not None and odom_msgs:
+                t_f, q_f = interp_pose(odom_msgs, frame_ts)
+                R_f = Rotation.from_quat(q_f).as_matrix()
+                T_f = np.eye(4)
+                T_f[:3, :3] = R_f
+                T_f[:3, 3] = t_f
+                T_rel = T_capture_inv @ T_f
+                for p in pts:
+                    p3 = T_rel[:3, :3] @ np.array(p[:3]) + T_rel[:3, 3]
+                    all_points.append(p3.tolist() + [p[3]])
+                    world_points.append((R_f @ np.array(p[:3]) + t_f).tolist() + [p[3]])
+            else:
+                all_points.extend(pts)
 
         if not all_points:
             print(f"  ✗ Zero valid points, skipping")
             continue
 
-        # Only write PLY if not already present from live capture
+        # Always overwrite PLYs — buffered_camera_capture.py built them from
+        # a post-shutter window; these are centred on the actual shutter time.
         sensor_ply = scan_dir / "sensor_lidar.ply"
-        if not sensor_ply.exists():
-            save_ply(str(sensor_ply), all_points)
-            print(f"  Saved sensor_lidar.ply ({len(all_points)} pts)")
-        else:
-            print(f"  sensor_lidar.ply already exists, skipping")
+        save_ply(str(sensor_ply), all_points)
+        print(f"  Saved sensor_lidar.ply ({len(all_points)} pts, "
+              f"{len(window_lidar)} frames in ±{half:.2f}s window)")
 
-        centre = lidar_msgs[len(lidar_msgs) // 2][0]  # mid-bag timestamp
-        ts_str = datetime.fromtimestamp(centre).strftime("%Y%m%d_%H%M%S")
+        if world_points:
+            world_ply = scan_dir / "world_lidar.ply"
+            save_ply(str(world_ply), world_points)
+            print(f"  Saved world_lidar.ply")
 
         # --- Camera: decode middle frame ---
         if image_msgs_raw:
@@ -392,25 +485,10 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode):
             else:
                 print(f"  fisheye image already exists, skipping")
 
-        # --- Odometry: write trajectory.json if not present ---
+        # --- Odometry: write trajectory.json centred on shutter time ---
         if odom_msgs and not (scan_dir / "trajectory.json").exists():
             write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
-            print(f"  Saved trajectory.json")
-
-            import json as _json
-            with open(str(scan_dir / "trajectory.json")) as _f:
-                _traj = _json.load(_f)
-            _lp = _traj["current_pose"]["lidar_pose"]
-            q = np.array([_lp["orientation"][k] for k in ("x", "y", "z", "w")])
-            q /= np.linalg.norm(q)
-            R_mat = Rotation.from_quat(q).as_matrix()
-            t_vec = np.array([_lp["position"][k] for k in ("x", "y", "z")])
-            world_ply = scan_dir / "world_lidar.ply"
-            if not world_ply.exists():
-                world_pts = [(R_mat @ np.array(p[:3]) + t_vec).tolist() + [p[3]]
-                             for p in all_points]
-                save_ply(str(world_ply), world_pts)
-                print(f"  Saved world_lidar.ply")
+            print(f"  Saved trajectory.json (centred on shutter time)")
 
         scan_count += 1
         print(f"  ✓ {scan_name} ready")
@@ -466,7 +544,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     if not bag_dirs:
         per_scan_bags = sorted(session_path.glob("fusion_scan_*/rosbag_*"))
         if per_scan_bags:
-            return _reconstruct_stationary(session_path, per_scan_bags, camera_mode)
+            return _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_window)
         print("✗ No rosbag_* directory found in session")
         sys.exit(1)
 
@@ -476,7 +554,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     # so the coloring pipeline always uses freshly reconstructed sensor_lidar.ply.
     # Preserve .insp files and .capture_time sidecars across the clear so the
     # ERP stitching step can still find them after reconstruction.
-    if sdk_stitch and camera_mode == 'dual_fisheye':
+    if sdk_stitch:
         import shutil as _shutil
         # Save .insp files keyed by shot index before clearing
         _saved_insp = {}  # idx -> list of (filename, bytes, capture_time_bytes_or_None)
@@ -748,7 +826,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # the LiDAR window is centred on the camera capture time, ensuring the
         # sensor-frame LiDAR points and ERP image share the same scanner pose.
         centres = []
-        if sdk_stitch and camera_mode == 'dual_fisheye':
+        if sdk_stitch:
             # Build shutter times from .insp filenames (camera RTC synced to host
             # clock via reset_clock).  RTC encodes the actual shutter moment to ±1s
             # with no SD-write jitter, making it more accurate than the count-
@@ -909,7 +987,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # SDK stitch mode: accumulate all LiDAR frames in the window and
         # motion-compensate them to the shutter time (centre), exactly like
         # the non-SDK path.
-        if sdk_stitch and camera_mode == 'dual_fisheye':
+        if sdk_stitch:
             T_capture_inv = None
             if odom_msgs:
                 try:
@@ -1054,7 +1132,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 
     # Write sentinel so downstream tools know this was an SDK stitch session
-    if sdk_stitch and camera_mode == 'dual_fisheye':
+    if sdk_stitch:
         (session_path / '.sdk_stitch_continuous').touch()
     # --- ERP conversion + colorization ---
     pp = Path(__file__).resolve().parent
@@ -1088,7 +1166,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         cv2.imwrite(str(img_path), img_f.astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 95])
         print(f"    WB corrected: B/R {b_mean/r_mean:.2f}\u2192{scale_b/scale_r:.2f}  ({img_path.name})")
 
-    if camera_mode == "dual_fisheye":
+    if camera_mode == "dual_fisheye" or (sdk_stitch and sdk_stitch_bin.exists()):
         for scan_dir in sorted(session_path.glob("fusion_scan_*")):
             if not scan_dir.is_dir():
                 continue
@@ -1140,8 +1218,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 elif best_dt > (interval / 2.0 if interval else 1.5):
                     best_insp = None
                 if best_insp is not None and best_insp.exists():
+                    _stitch_cmd = [str(sdk_stitch_bin), str(best_insp), str(erp_path)]
+                    if camera_mode == 'single_fisheye':
+                        _stitch_cmd.append('--single')
+                    _ai = os.environ.get('INSTA360_AI_STITCH', '0') == '1'
+                    _model_dir = os.environ.get('INSTA360_MODEL_DIR', '')
+                    if _ai and _model_dir:
+                        _stitch_cmd += ['--ai', '--model-dir', _model_dir]
                     result = subprocess.run(
-                        [str(sdk_stitch_bin), str(best_insp), str(erp_path)],
+                        _stitch_cmd,
                         capture_output=True,
                     )
                     if result.returncode == 0 and erp_path.exists():
@@ -1160,6 +1245,25 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     [sys.executable, str(pp / "fisheye_to_erp.py"), str(fisheye_jpg), str(erp_path), "--dual"],
                     check=False,
                 )
+        # Apply LiDAR mask to create _masked.png (removes scanner body + blank regions)
+        # Read camera_hw from session_config.json if CAMERA_HW env var is not set
+        _camera_hw = os.environ.get("CAMERA_HW", "")
+        if not _camera_hw:
+            _sess_cfg = session_path / "session_config.json"
+            if _sess_cfg.exists():
+                try:
+                    import json as _j2
+                    _camera_hw = _j2.loads(_sess_cfg.read_text()).get("camera_hw", "x5")
+                except Exception:
+                    _camera_hw = "x5"
+            else:
+                _camera_hw = "x5"
+        subprocess.run(
+            [sys.executable, str(pp / "regenerate_masked_images.py"), str(session_path),
+             "--camera-mode", camera_mode, "--sdk-stitch",
+             "--camera-hw", _camera_hw],
+            check=False,
+        )
         subprocess.run(
             [sys.executable, str(pp / "post_process_coloring.py"), str(session_path), "--use-exact"],
             check=False,

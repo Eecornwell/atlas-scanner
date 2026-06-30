@@ -26,6 +26,10 @@ def apply_mask(image_path, mask_path, output_path):
     if mask.shape != img.shape[:2]:
         mask = cv2.resize(mask, (img.shape[1], img.shape[0]))
     
+    # Threshold to binary (0 or 255) so partial mask values don't cause
+    # semi-transparency in the output RGBA image.
+    _, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+    
     # Create RGBA image
     b, g, r = cv2.split(img)
     rgba = cv2.merge([b, g, r, mask])

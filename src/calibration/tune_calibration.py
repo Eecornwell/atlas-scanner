@@ -27,7 +27,9 @@ _ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
 
 def _safe_output(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+    # Allow writes to ~/atlas_ws/output/ and ~/atlas_ws/data/ (scan dirs)
+    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents] and \
+       _ALLOWED_DATA not in [resolved, *resolved.parents]:
         raise ValueError(f"Path '{resolved}' is outside allowed output root '{_ALLOWED_OUTPUT}'")
     return resolved
 

@@ -44,9 +44,10 @@ def regenerate_masked_images(session_dir, camera_mode="dual_fisheye", sdk_stitch
     
     count = 0
     for scan_dir in sorted(session_path.glob("fusion_scan_*")):
-        if scan_dir.is_dir():
-            # Find blended ERP images
-            for img_file in scan_dir.glob("equirect_*.jpg"):
+        if not scan_dir.is_dir() or (scan_dir / '.blur_skip').exists():
+            continue
+        # Find blended ERP images
+        for img_file in scan_dir.glob("equirect_*.jpg"):
                 if '_bak' not in img_file.name:
                     try:
                         safe_img = _safe_data(img_file)
