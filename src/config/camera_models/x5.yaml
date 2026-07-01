@@ -1,11 +1,9 @@
 # Camera model profile: Insta360 X5
 # ERP output resolution for SDK stitching
 # Native sensor: 10792x5396 per lens. Max theoretical ERP: ~21584x10792.
-# 5760x2880 matches the resolution used during extrinsic calibration.
-# Higher resolutions require re-calibration as the stitcher's optical center
-# mapping shifts slightly at different output sizes.
-erp_width: 5760
-erp_height: 2880
+# 11520x5760 retains most of the sensor detail for high-quality coloring and COLMAP.
+erp_width: 11520
+erp_height: 5760
 # Capture resolution: Size_7680_3840 (enum 21, 8K)
 # The .insp raw file always captures at full sensor resolution regardless of
 # this setting. This enum only controls the in-camera preview/thumbnail.

@@ -388,12 +388,17 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
         centre_host = None
         for _ct_f in sorted(scan_dir.glob("*.insp.capture_time")):
             try:
-                centre_host = float(_ct_f.read_text().strip())
+                # Format: "t_before" (old) or "t_before t_after" (new).
+                # t_before = TakePhoto() call entry = shutter fires.
+                centre_host = float(_ct_f.read_text().strip().split()[0])
                 break
             except Exception:
                 pass
 
         if centre_host is not None:
+            # .capture_time may contain "t_before t_after" (new format) or just
+            # "t_before" (old format).  t_before is the shutter time (TakePhoto
+            # call entry); t_after is after SD write and is NOT used for alignment.
             centre = centre_host - _host_to_livox_offset
             print(f"  Scan centre: capture_time sidecar "
                   f"({centre_host:.3f}s host, offset {_host_to_livox_offset*1000:+.1f}ms applied)")
@@ -849,13 +854,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _ct_f = Path(str(_insp) + '.capture_time')
                         if _ct_f.exists():
                             try:
-                                _host_t = float(_ct_f.read_text().strip())
-                                _sd_latency = _host_t - _rtc_t
+                                # Format: "t_before" (old) or "t_before t_after" (new).
+                                # t_before is TakePhoto() call entry (shutter fires).
+                                # t_after is post-SD-write; used only for latency diagnostics.
+                                _parts = _ct_f.read_text().strip().split()
+                                _host_t = float(_parts[0])  # t_before = shutter time
+                                _sd_latency = float(_parts[1]) - _host_t if len(_parts) > 1 else (_host_t - _rtc_t)
                                 if 0.0 <= _sd_latency < 3.0:
-                                    # shutter = host_t - sd_latency, then convert to Livox clock
-                                    _rtc_t = (_host_t - _sd_latency) - _host_to_livox_offset
+                                    # t_before is already the shutter time; just apply clock offset
+                                    _rtc_t = _host_t - _host_to_livox_offset
                                 elif abs(_host_t - _rtc_t) < 2.0:
-                                    # host_t close to RTC — apply offset directly
                                     _rtc_t = _host_t - _host_to_livox_offset
                             except Exception:
                                 pass
@@ -917,7 +925,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             if not centres:
                 for _ts_f in sorted(session_path.glob('fusion_scan_*/*.insp.capture_time')):
                     try:
-                        _ct = float(_ts_f.read_text().strip()) - _host_to_livox_offset
+                        _parts = _ts_f.read_text().strip().split()
+                        _ct = float(_parts[0]) - _host_to_livox_offset  # t_before = shutter
                         if t_start <= _ct <= t_end:
                             centres.append((_ct, None))
                     except Exception:

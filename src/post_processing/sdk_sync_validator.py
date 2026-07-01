@@ -156,7 +156,9 @@ def read_shutter_events(session: Path) -> list[dict]:
     for ct_path in sorted(session.glob("fusion_scan_*/*.insp.capture_time")):
         try:
             _safe_data(ct_path)
-            capture_time = float(ct_path.read_text().strip())
+            # Format: "t_before" (old) or "t_before t_after" (new).
+            # t_before = TakePhoto() call entry = shutter fires.
+            capture_time = float(ct_path.read_text().strip().split()[0])
         except Exception:
             continue
 
@@ -204,7 +206,7 @@ def read_shutter_events(session: Path) -> list[dict]:
             ct_p = Path(str(insp_files[0]) + ".capture_time")
             if ct_p.exists():
                 try:
-                    capture_time = float(ct_p.read_text().strip())
+                    capture_time = float(ct_p.read_text().strip().split()[0])
                 except Exception:
                     pass
 

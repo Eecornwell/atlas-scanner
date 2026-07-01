@@ -1,5 +1,7 @@
 # Camera model profile: Insta360 One X2
 # ERP output resolution for SDK stitching
+# Native sensor: 2976x2976 per lens (5952x2976 dual). Max ERP: 5952x2976.
+# 5760x2880 is the highest practical ERP for the One X2 sensor.
 erp_width: 5760
 erp_height: 2880
 # Capture resolution: Size_5952_2976 (enum 12, One X2 native 18MP)

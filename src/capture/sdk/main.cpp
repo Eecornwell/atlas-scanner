@@ -385,17 +385,20 @@ int main(int argc, char* argv[]) {
                             << std::fixed << std::setprecision(1)
                             << (host_t - t_start) << "s");
 
-                    // Record time BEFORE TakePhoto() — the actual exposure happens
-                    // at the start of the TakePhoto() call, not at return. The
-                    // firmware blocks for sensor readout + SD write (0-900ms jitter)
-                    // before returning, but the shutter fires immediately.
-                    double t_shutter = now_sec();
+                    // Record t_before and t_after around TakePhoto() so the
+                    // SD write latency can be subtracted to recover the true
+                    // shutter moment.  The firmware fires the shutter at the
+                    // start of the call; the remainder is sensor readout + SD
+                    // write (0–900ms jitter on the X5).
+                    double t_before = now_sec();
 
                     // TakePhoto blocks until shutter fires + SD write (~3-9s on X5)
                     auto url = [&]() {
                         std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
                         return cam->TakePhoto();
                     }();
+
+                    double t_after = now_sec();
 
                     if (url.Empty() || !url.IsSingleOrigin()) {
                         LOG_ERR("[continuous] shot " << shot << " TakePhoto failed");
@@ -404,6 +407,15 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
+                    // Best estimate of true shutter time: t_before (shutter fires
+                    // at call entry).  t_after is written to the .capture_time
+                    // sidecar so reconstruct_from_bag can compute SD write latency
+                    // (t_after - RTC) and subtract it for sub-100ms accuracy.
+                    double t_shutter = t_before;
+                    LOG_OUT("[continuous] shot " << shot
+                            << " TakePhoto latency: "
+                            << std::fixed << std::setprecision(3)
+                            << (t_after - t_before) << "s");
                     write_shutter_event(session_dir, shot, t_shutter);
                     { std::unique_lock<std::mutex> lk(timer_mutex); timer_timestamps.push_back(t_shutter); }
 
@@ -418,8 +430,12 @@ int main(int argc, char* argv[]) {
                     // TakePhoto() to avoid timing interference on the USB bus.
                     bool ok = http_download(remote_path, local_path);
                     if (ok) {
+                        // Write "t_before t_after" so reconstruct_from_bag can
+                        // compute SD write latency = t_after - RTC and use
+                        // t_before as the authoritative shutter time.
                         std::ofstream ct(local_path + ".capture_time");
-                        ct << std::fixed << std::setprecision(6) << t_shutter;
+                        ct << std::fixed << std::setprecision(6)
+                           << t_shutter << " " << t_after;
                         write_shutter_event(session_dir, shot, t_shutter);
                         LOG_OUT("[continuous] saved shot " << shot << ": "
                                 << sanitise(fs::path(local_path).filename().string()));
@@ -429,7 +445,13 @@ int main(int argc, char* argv[]) {
 
                     // Advance next_shot_time from the original schedule, not from
                     // now, so interval drift doesn't accumulate over many shots.
+                    // But if TakePhoto() overran the interval (slow SD card),
+                    // skip forward to the next future slot to avoid back-to-back
+                    // shots with overlapping LiDAR windows.
                     next_shot_time += std::chrono::seconds(interval_s);
+                    auto now_tp = std::chrono::steady_clock::now();
+                    while (next_shot_time <= now_tp + std::chrono::milliseconds(500))
+                        next_shot_time += std::chrono::seconds(interval_s);
                     ++shot;
                 }
                 LOG_OUT("[continuous] timer thread exiting after " << shot << " shots");
