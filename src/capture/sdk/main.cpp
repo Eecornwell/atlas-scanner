@@ -345,7 +345,7 @@ int main(int argc, char* argv[]) {
             // interval instead.
             interval_s = 5;
             if (auto* v = std::getenv("INSTA360_INTERVAL_MS"))
-                interval_s = std::max(3, std::atoi(v) / 1000);
+                interval_s = std::max(1, std::atoi(v) / 1000);
 
             if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
                 LOG_ERR("SetPhotoSubMode failed (continuing)");
@@ -385,16 +385,20 @@ int main(int argc, char* argv[]) {
                             << std::fixed << std::setprecision(1)
                             << (host_t - t_start) << "s");
 
-                    // TakePhoto blocks until shutter fires (~1-3s on X5)
+                    // Record time BEFORE TakePhoto() — the actual exposure happens
+                    // at the start of the TakePhoto() call, not at return. The
+                    // firmware blocks for sensor readout + SD write (0-900ms jitter)
+                    // before returning, but the shutter fires immediately.
+                    double t_shutter = now_sec();
+
+                    // TakePhoto blocks until shutter fires + SD write (~3-9s on X5)
                     auto url = [&]() {
                         std::unique_lock<std::mutex> usb_lk(g_usb_mutex);
                         return cam->TakePhoto();
                     }();
-                    double t_shutter = now_sec();
 
                     if (url.Empty() || !url.IsSingleOrigin()) {
                         LOG_ERR("[continuous] shot " << shot << " TakePhoto failed");
-                        // Schedule next shot from original expected time to avoid drift
                         next_shot_time += std::chrono::seconds(interval_s);
                         ++shot;
                         continue;
@@ -410,7 +414,8 @@ int main(int argc, char* argv[]) {
                     LOG_OUT("[continuous] downloading shot " << shot << " <- "
                             << sanitise(fs::path(remote_path).filename().string()));
 
-                    // Download does not need g_usb_mutex — HTTP/TCP, not USB
+                    // Download is HTTP over USB tunnel — must complete before next
+                    // TakePhoto() to avoid timing interference on the USB bus.
                     bool ok = http_download(remote_path, local_path);
                     if (ok) {
                         std::ofstream ct(local_path + ".capture_time");
@@ -455,6 +460,9 @@ int main(int argc, char* argv[]) {
                 ct << std::fixed << std::setprecision(6) << host_t;
                 write_shutter_event(session_dir, capture_index, host_t);
                 LOG_OUT("Shot " << capture_index << " saved");
+                // Delete from camera storage to prevent filling up Quick Reader/SD
+                if (!cam->DeleteCameraFile(remote_path))
+                    LOG_ERR("Failed to delete " << sanitise(fs::path(remote_path).filename().string()) << " from camera");
             } else {
                 LOG_ERR("Shot " << capture_index << " download failed: " << sanitise(remote_path));
             }

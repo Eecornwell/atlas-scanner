@@ -11,7 +11,7 @@ y_offset: 0.15426126450100044
 z_offset: -0.04834721067040187
 flip_x: false
 flip_y: false
-image_width: 7680
-image_height: 3840
+image_width: 5760
+image_height: 2880
 use_fisheye: false
 skip_rate: 5

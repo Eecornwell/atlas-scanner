@@ -44,29 +44,50 @@ def _safe_src(p) -> Path:
 R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 
 # cam_from_pano rotations matching panorama_sfm.py get_virtual_rotations().
-# 4 yaw steps at 0/90/180/270 deg = cubemap sides, plus ceiling and floor.
-# Rotation.from_euler("XY", [-pitch, -yaw]) matches the example convention.
+# 8 yaw steps at 45° intervals on the equatorial band for maximum feature quality.
+# Polar faces (ceiling/floor) are excluded — ERP pixel density is too low at the
+# poles for reliable SIFT feature extraction, and they suffer from heavy
+# interpolation blur when reprojected to perspective.
+# The stitch seam runs vertically at yaw=0°/360° (left/right ERP edges) in
+# dual_fisheye mode. Faces at yaw=0° and yaw=180° have the seam at their
+# horizontal edges (within the 90° FOV overlap), but the seam artifacts are
+# concentrated in a narrow band and empirically still yield better features
+# than the polar tiles. A dedicated seam mask is applied below to exclude the
+# affected pixel strip.
 FACES = [
-    {'name': 'ceiling', 'pitch':  90, 'yaw':   0},
-    {'name': 'floor',   'pitch': -90, 'yaw':   0},
-    {'name': 'front',   'pitch':   0, 'yaw':   0},
-    {'name': 'back',    'pitch':   0, 'yaw': 180},
-    {'name': 'left',    'pitch':   0, 'yaw':  90},
-    {'name': 'right',   'pitch':   0, 'yaw': 270},
+    {'name': 'front',       'pitch':   0, 'yaw':   0},
+    {'name': 'front_left',  'pitch':   0, 'yaw':  45},
+    {'name': 'left',        'pitch':   0, 'yaw':  90},
+    {'name': 'back_left',   'pitch':   0, 'yaw': 135},
+    {'name': 'back',        'pitch':   0, 'yaw': 180},
+    {'name': 'back_right',  'pitch':   0, 'yaw': 225},
+    {'name': 'right',       'pitch':   0, 'yaw': 270},
+    {'name': 'front_right', 'pitch':   0, 'yaw': 315},
 ]
 FACES_CAM_FROM_PANO = [
     R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
     for f in FACES
 ]
+# The Insta360 SDK ERP has forward (+X) at the top (v=0) and floor (-Z) at
+# the center (v=H/2), equivalent to a standard ERP with the pole rotated by
+# R_y(-90°). To sample equatorial faces correctly we pre-compose R_y(+90°)
+# into each face rotation so the camera rays land on the actual horizon band
+# of the Insta360 ERP rather than the polar region.
+_R_INSTA_CORRECTION = R.from_euler('Y', 90, degrees=True).as_matrix()
+FACES_CAM_FROM_PANO = [
+    (R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
+     @ _R_INSTA_CORRECTION)
+    for f in FACES
+]
 NUM_FACES = len(FACES)
-REF_FACE = 0  # ceiling is ref — must be first in cameras array for rig_configurator
+REF_FACE = 0  # front is ref — must be first in cameras array for rig_configurator
 
 # Face indices for each camera mode.
 # For 180° single fisheye, only render faces in the front hemisphere (look dir Z > 0 in pano frame).
 FACES_360 = list(range(NUM_FACES))
-# FACES_180: all faces except 'back' (index 3) which points away from the single fisheye lens
-FACES_180 = [i for i in range(NUM_FACES) if FACES[i]['name'] != 'back']
-FOV_DEG = 90.0
+# FACES_180: front hemisphere only (yaw within ±90° of center)
+FACES_180 = [i for i in range(NUM_FACES) if abs(((FACES[i]['yaw'] + 180) % 360) - 180) <= 90]
+FOV_DEG = 65.0
 MIN_BASELINE_M = 0.10
 # Minimum fraction of unmasked pixels for a tile to be included in the COLMAP model.
 # Tiles below this threshold are entirely (or near-entirely) covered by the scanner
@@ -167,13 +188,20 @@ def _find_erp_image(scan_dir):
 
 
 def _tile_size_for_erp(erp_w):
-    """Nearest power-of-two to erp_w/4, clamped to [512, 2048]."""
-    p = int(2 ** round(np.log2(erp_w / 4)))
+    """Tile size matched to ERP pixel density at the tile edge latitude.
+    At ±FOV/2 latitude, ERP has cos(FOV/2) fewer px/deg than at equator.
+    Tile px/deg = tile_size / FOV_DEG must not exceed ERP px/deg at the edge
+    to avoid upsampling (which causes grain/blur)."""
+    px_per_deg_equator = erp_w / 360.0
+    px_per_deg_edge = px_per_deg_equator * np.cos(np.radians(FOV_DEG / 2))
+    max_tile = int(px_per_deg_edge * FOV_DEG)
+    # Round down to nearest power of 2 for GPU-friendly sizes
+    p = int(2 ** int(np.log2(max_tile)))
     return max(512, min(2048, p))
 
 
-def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LINEAR):
-    """Sample a perspective tile from an ERP image."""
+def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LANCZOS4):
+    """Sample a perspective tile from an ERP image using Lanczos for sharper output."""
     pano_h, pano_w = erp_img.shape[:2]
     f = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
     c = tile_size / 2.0
@@ -255,6 +283,18 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         if erp_img is not None and erp_img.ndim == 3 and erp_img.shape[2] == 4:
             erp_mask = erp_img[:, :, 3]
             erp_img = erp_img[:, :, :3]
+
+        # Apply a seam exclusion strip to the mask. The dual-fisheye stitch seam
+        # runs vertically at the left/right ERP edges (u=0 and u=W, which wrap).
+        # DYNAMICSTITCH blending distorts features in a ~5% horizontal band on
+        # each side. Mask these out so SIFT doesn't match warped features.
+        if erp_img is not None:
+            _erp_w = erp_img.shape[1]
+            _seam_strip = int(_erp_w * 0.04)  # 4% on each side of the wrap seam
+            if erp_mask is None:
+                erp_mask = np.full(erp_img.shape[:2], 255, dtype=np.uint8)
+            erp_mask[:, :_seam_strip] = 0
+            erp_mask[:, _erp_w - _seam_strip:] = 0
 
         R_cam_w2c_col = pano['R_c2w'].T
         tiles = []
@@ -689,6 +729,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--ImageReader.camera_model', 'SIMPLE_PINHOLE',
         '--ImageReader.single_camera_per_folder', '1',
         '--ImageReader.camera_params', f'{f_px:.4f},{c:.1f},{c:.1f}',
+        '--SiftExtraction.max_num_features', '32768',
     ]
     if any(mask_dir.rglob('*.png')):
         cmd += ['--ImageReader.mask_path', str(mask_dir)]
@@ -709,6 +750,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--database_path', str(db_path),
         '--FeatureMatching.rig_verification', '1',
         '--FeatureMatching.skip_image_pairs_in_same_frame', '1',
+        '--FeatureMatching.max_num_matches', '32768',
+        '--FeatureMatching.gpu_index', '-1',
     ], check=True)
 
     print("5. Writing binary init model with known poses...")

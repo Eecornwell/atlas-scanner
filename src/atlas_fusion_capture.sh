@@ -16,7 +16,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
-CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only; camera minimum is 5s)
+CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
 
@@ -649,8 +649,15 @@ fi
 # command channel after cam->Close(), causing parse_packet errors on the next
 # Open() attempt.  The X5 re-enumerates cleanly after reset; only the OneX2
 # shuts down on reset when configured.
+# EXCEPTION: Skip the reset if /dev/insta is already present AND no previous
+# session sentinel exists — this means the camera was just plugged in fresh
+# and resetting would trigger the USB mode selection prompt again.
 if [ "${CAMERA_HW:-onex2}" = "x5" ]; then
-    _usb_force_reset_camera
+    if [ -f /tmp/.insta360_session_ran ]; then
+        _usb_force_reset_camera
+    else
+        echo "✓ Camera already connected, skipping USB reset (no prior session)"
+    fi
 else
     _usb_reset_camera
 fi
@@ -664,6 +671,16 @@ done
 if [ ! -e /dev/insta ]; then
     echo "✗ Camera device not found at /dev/insta"
     exit 1
+fi
+
+# Disable USB autosuspend for the camera — the kernel may suspend the device
+# during the 3s gap between Open() and the first TakePhoto(), causing
+# LIBUSB_ERROR_NO_DEVICE. Setting autosuspend_delay_ms=-1 keeps it always on.
+_cam_busdev=$(udevadm info --query=path --name="$(readlink -f /dev/insta)" 2>/dev/null \
+    | grep -oP '[0-9]+-[0-9.]+$')
+if [ -n "$_cam_busdev" ] && [ -d "/sys/bus/usb/devices/$_cam_busdev/power" ]; then
+    echo -1 | sudo tee "/sys/bus/usb/devices/$_cam_busdev/power/autosuspend_delay_ms" > /dev/null 2>&1
+    echo on | sudo tee "/sys/bus/usb/devices/$_cam_busdev/power/control" > /dev/null 2>&1
 fi
 
 # Verify camera is in Android USB mode by checking for a network interface

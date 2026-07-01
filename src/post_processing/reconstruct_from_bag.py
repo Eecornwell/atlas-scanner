@@ -1186,27 +1186,54 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     except Exception:
                         pass
                 best_insp, best_dt = None, float("inf")
-                # .insp is now co-located in the scan folder
+                # Search ALL .sdk_shot_* dirs and session-level .insp files for
+                # the image whose capture_time is closest to this scan's centre.
+                # Apply host→Livox offset since scan_centre is in Livox clock
+                # but capture_time sidecars are in host clock.
                 import calendar as _cal, datetime as _dt_mod
-                _insp_times = {}
-                for _ts_f in sorted(scan_dir.glob("*.insp.capture_time")):
-                    try:
-                        _insp_path = Path(str(_ts_f).replace(".capture_time", ""))
-                        _insp_times[str(_insp_path)] = float(_ts_f.read_text().strip())
-                    except Exception: pass
-                # Fallback: use .insp filename cam_rtc
-                for _insp in sorted(scan_dir.glob("*.insp")):
-                    if str(_insp) not in _insp_times:
-                        _parts = _insp.stem.split("_")
-                        try:
-                            _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], "%Y%m%d%H%M%S")
-                            _insp_times[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
-                        except Exception: pass
-                for _insp_path_str, _ct in _insp_times.items():
+                _all_insps = {}  # path_str -> host_clock_time
+                # From .sdk_shot_N directories
+                for _shot_dir in sorted(session_path.glob('.sdk_shot_*')):
+                    for _insp in sorted(_shot_dir.glob('*.insp')):
+                        if _insp.stat().st_size < 100000:
+                            continue
+                        _ct_f = _shot_dir / (_insp.name + '.capture_time')
+                        if _ct_f.exists():
+                            try:
+                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip())
+                            except Exception:
+                                pass
+                        else:
+                            _parts = _insp.stem.split('_')
+                            try:
+                                _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
+                                _all_insps[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
+                            except Exception:
+                                pass
+                # From scan dirs (if previously promoted)
+                for _sd in sorted(session_path.glob('fusion_scan_*')):
+                    for _insp in sorted(_sd.glob('*.insp')):
+                        if _insp.stat().st_size < 100000 or str(_insp) in _all_insps:
+                            continue
+                        _ct_f = _sd / (_insp.name + '.capture_time')
+                        if _ct_f.exists():
+                            try:
+                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip())
+                            except Exception:
+                                pass
+                        else:
+                            _parts = _insp.stem.split('_')
+                            try:
+                                _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
+                                _all_insps[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
+                            except Exception:
+                                pass
+                # Match: scan_centre is in Livox clock, capture_time is in host clock
+                # host_time = livox_time + host_to_livox_offset
+                _scan_centre_host = _scan_centre + _host_to_livox_offset if _scan_centre else None
+                for _insp_path_str, _ct_host in _all_insps.items():
                     _insp_p = Path(_insp_path_str)
-                    if not _insp_p.exists() or _insp_p.stat().st_size < 100000:
-                        continue
-                    _dt = abs(_ct - _scan_centre) if _scan_centre else 0.0
+                    _dt = abs(_ct_host - _scan_centre_host) if _scan_centre_host else 0.0
                     if _dt < best_dt:
                         best_dt, best_insp = _dt, _insp_p
                 # If exactly one valid .insp is in this scan dir it was placed here
