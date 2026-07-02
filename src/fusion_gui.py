@@ -30,6 +30,399 @@ import logging
 import traceback
 from datetime import datetime
 import pathlib
+import math
+
+
+# ─── Coverage Panel ───────────────────────────────────────────────────────────
+# Mirrors the logic in capture/coverage_tracker.py but renders into a tk.Canvas
+# so it can be embedded as a notebook tab in the GUI.
+
+_COV_CELL_SIZE        = 0.5
+_COV_HEIGHT_BANDS     = 3
+_COV_BAND_SIZE        = 0.4
+_COV_HEIGHT_ORIGIN    = 0.0
+_COV_MIN_VISITS       = 1
+_COV_BAND_LABELS      = ['Low', 'Mid', 'High']
+# Colour per number of covered bands (0..HEIGHT_BANDS)
+# Cell background darkens as more bands are captured
+# Cell colour keyed by frozenset of covered bands (band indices that have >= MIN_VISITS)
+# Readable at any cell size — no sub-cell drawing needed
+_COV_NONE   = '#f0f0f0'   # nothing shot
+_COV_COLOUR = {
+    frozenset()       : _COV_NONE,
+    frozenset([0])    : '#4575b4',   # Low only      — cool blue
+    frozenset([1])    : '#74add1',   # Mid only      — light blue
+    frozenset([2])    : '#abd9e9',   # High only     — pale cyan
+    frozenset([0,1])  : '#fee090',   # Low+Mid       — yellow
+    frozenset([0,2])  : '#fdae61',   # Low+High      — amber
+    frozenset([1,2])  : '#f46d43',   # Mid+High      — orange
+    frozenset([0,1,2]): '#1a9641',   # All done      — green
+}
+
+def _cov_band(z: float) -> int:
+    return max(0, min(_COV_HEIGHT_BANDS - 1,
+                      int(math.floor((z - _COV_HEIGHT_ORIGIN) / _COV_BAND_SIZE))))
+
+
+class CoveragePanel:
+    """Tkinter canvas widget showing live 2.5D coverage during a scan session."""
+
+    def __init__(self, parent: tk.Frame):
+        # grid[(gx,gy)] = {band: shot_count} — only incremented on confirmed captures
+        self._grid: dict[tuple, dict] = {}
+        self._current = (0.0, 0.0, 0.0)
+        self._last_drawn_current = None
+        self._latest_pose: tuple | None = None
+        self._pose_lock = threading.Lock()
+        self._ros_thread = None
+        self._running = False
+        self._cell_px = 14
+        self._cell_items: dict[tuple, int] = {}    # bg rectangle per cell
+
+        self._player_item: int | None = None
+        self._scan_dir: str | None = None
+        self._seen_shutters: set = set()
+        self._perimeter: list[tuple] = []
+        self._perimeter_item: int | None = None
+        self._perimeter_done = False
+        self._lidar_pts: list[tuple] = []
+
+        # ── Layout ────────────────────────────────────────────────────────────
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        self._stats_var = tk.StringVar(value=f'Starting at mid elevation — waiting for LiDAR perimeter…')
+        ttk.Label(parent, textvariable=self._stats_var,
+                  font=('Consolas', 9)).grid(row=0, column=0, sticky=tk.W, padx=6, pady=(4, 0))
+
+        leg_frame = tk.Frame(parent)
+        leg_frame.grid(row=0, column=1, sticky=tk.E, padx=6, pady=(4, 0))
+        for col, label in [
+            (_COV_NONE,                        'none'),
+            (_COV_COLOUR[frozenset([0])],       'L'),
+            (_COV_COLOUR[frozenset([1])],       'M'),
+            (_COV_COLOUR[frozenset([2])],       'H'),
+            (_COV_COLOUR[frozenset([0,1])],     'L+M'),
+            (_COV_COLOUR[frozenset([0,2])],     'L+H'),
+            (_COV_COLOUR[frozenset([1,2])],     'M+H'),
+            (_COV_COLOUR[frozenset([0,1,2])],   'all ✓'),
+        ]:
+            tk.Label(leg_frame, bg=col, width=2, relief='flat').pack(side=tk.LEFT, padx=(4, 1))
+            tk.Label(leg_frame, text=label, font=('Arial', 8)).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._canvas = tk.Canvas(parent, bg='white', highlightthickness=0)
+        self._canvas.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self._canvas.bind('<Configure>', self._on_resize)
+
+        hb_frame = ttk.LabelFrame(parent, text='Current height band', padding='4')
+        hb_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=6, pady=(4, 4))
+        self._band_labels: list[ttk.Label] = []
+        for i, name in enumerate(_COV_BAND_LABELS):
+            lbl = ttk.Label(hb_frame, text=f'  {name}  ', relief='groove',
+                            font=('Arial', 9, 'bold'), anchor='center')
+            lbl.grid(row=0, column=i, padx=3)
+            self._band_labels.append(lbl)
+
+    # ── ROS thread ────────────────────────────────────────────────────────────
+
+    def start(self, scan_dir: str | None = None):
+        if self._running:
+            return
+        self._running = True
+        self._scan_dir = scan_dir
+        self._grid.clear()
+        self._cell_items.clear()
+        self._seen_shutters.clear()
+        self._player_item = None
+        self._perimeter: list[tuple] = []   # convex hull in grid coords
+        self._perimeter_item: int | None = None
+        self._perimeter_done = False
+        self._lidar_pts: list[tuple] = []   # raw (x,y) accumulator
+        self._current = (0.0, 0.0, 0.0)
+        self._last_drawn_current = None
+        self._latest_pose = None
+        self._canvas.delete('all')
+        self._ros_thread = threading.Thread(target=self._ros_spin, daemon=True)
+        self._ros_thread.start()
+        self._canvas.after(500, self._poll)
+
+    def stop(self):
+        self._running = False
+
+    def _ros_spin(self):
+        try:
+            import rclpy
+            from nav_msgs.msg import Odometry as _Odom
+            from sensor_msgs.msg import PointCloud2 as _PC2
+            import struct
+            if not rclpy.ok():
+                rclpy.init()
+            node = rclpy.create_node('atlas_coverage_gui')
+
+            def _odom_cb(msg):
+                p = msg.pose.pose.position
+                with self._pose_lock:
+                    self._latest_pose = (p.x, p.y, p.z)
+            node.create_subscription(_Odom, '/rko_lio/odometry', _odom_cb, 10)
+
+            def _lidar_cb(msg):
+                if self._perimeter_done:
+                    return
+                # Parse XYZ from PointCloud2 — find field offsets once
+                fields = {f.name: f.offset for f in msg.fields}
+                if 'x' not in fields or 'y' not in fields or 'z' not in fields:
+                    return
+                ox, oy, oz = fields['x'], fields['y'], fields['z']
+                ps = msg.point_step
+                data = bytes(msg.data)
+                pts = []
+                for i in range(msg.width * msg.height):
+                    base = i * ps
+                    x, y, z = (struct.unpack_from('<f', data, base + o)[0]
+                               for o in (ox, oy, oz))
+                    if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                        continue
+                    # Keep points in a plausible wall/furniture height band
+                    if 0.1 <= z <= 2.5:
+                        pts.append((x, y))
+                with self._pose_lock:
+                    self._lidar_pts.extend(pts)
+            node.create_subscription(_PC2, '/livox/lidar', _lidar_cb, 2)
+
+            while self._running and rclpy.ok():
+                rclpy.spin_once(node, timeout_sec=0.1)
+            node.destroy_node()
+        except Exception:
+            pass
+
+    # ── Poll (main thread, 2 Hz) ──────────────────────────────────────────────
+
+    def set_scan_dir(self, scan_dir: str):
+        self._scan_dir = scan_dir
+
+    # ── Perimeter estimate ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _convex_hull(pts: list[tuple]) -> list[tuple]:
+        """Graham scan convex hull. Returns hull vertices in CCW order."""
+        pts = list(set(pts))
+        if len(pts) < 3:
+            return pts
+        pivot = min(pts, key=lambda p: (p[1], p[0]))
+        def _angle(p):
+            dx, dy = p[0] - pivot[0], p[1] - pivot[1]
+            return math.atan2(dy, dx)
+        pts.sort(key=_angle)
+        hull = []
+        for p in pts:
+            while len(hull) >= 2:
+                ox, oy = hull[-2][0] - hull[-1][0], hull[-2][1] - hull[-1][1]
+                nx, ny = p[0]  - hull[-1][0], p[1]  - hull[-1][1]
+                if ox * ny - oy * nx >= 0:   # not a left turn
+                    hull.pop()
+                else:
+                    break
+            hull.append(p)
+        return hull
+
+    def _try_build_perimeter(self):
+        """Called from _poll for the first 8 s. Builds hull once enough points exist."""
+        with self._pose_lock:
+            pts = list(self._lidar_pts)
+        # Downsample to ~0.3 m grid to avoid hull dominated by dense nearby surfaces
+        grid: dict[tuple, tuple] = {}
+        for x, y in pts:
+            k = (int(math.floor(x / 0.3)), int(math.floor(y / 0.3)))
+            grid[k] = (x, y)
+        sampled = list(grid.values())
+        if len(sampled) < 20:
+            return
+        hull_world = self._convex_hull(sampled)
+        # Convert world coords to grid-cell coords
+        self._perimeter = [
+            (x / _COV_CELL_SIZE, y / _COV_CELL_SIZE) for x, y in hull_world
+        ]
+        self._perimeter_done = True
+        # Free the accumulator
+        with self._pose_lock:
+            self._lidar_pts.clear()
+        self._draw_perimeter()
+
+    def _draw_perimeter(self):
+        """Draw (or redraw) the perimeter hull on the canvas."""
+        if not self._perimeter:
+            return
+        if not self._grid:
+            # No cells yet — seed a dummy origin so _layout has keys
+            self._grid[(0, 0)] = {}
+        min_x, max_y, px, off_x, off_y = self._layout()
+        def _to_canvas(gx, gy):
+            return (off_x + (gx - min_x) * px + px // 2,
+                    off_y + (max_y - gy) * px + px // 2)
+        coords = [c for gx, gy in self._perimeter for c in _to_canvas(gx, gy)]
+        if len(coords) < 6:   # need at least 3 points
+            return
+        if self._perimeter_item is not None:
+            try:
+                self._canvas.delete(self._perimeter_item)
+            except Exception:
+                pass
+        self._perimeter_item = self._canvas.create_polygon(
+            coords, outline='#4a9eff', fill='', width=2, dash=(6, 4))
+        # Label the perimeter so the operator knows what it represents
+        cx = sum(c for i, c in enumerate(coords) if i % 2 == 0) // (len(coords) // 2)
+        cy = min(c for i, c in enumerate(coords) if i % 2 == 1) - 10
+        self._canvas.create_text(cx, cy, text='LiDAR perimeter (mid elev.)',
+                                 fill='#4a9eff', font=('Arial', 7), tags='perimeter_label')
+        # Keep perimeter below cell rectangles so it doesn't obscure pips
+        self._canvas.tag_lower(self._perimeter_item)
+
+    def _poll(self):
+        # Update current position
+        with self._pose_lock:
+            pose = self._latest_pose
+            self._latest_pose = None
+        if pose is not None:
+            self._current = pose
+            self._update_player()
+            self._update_stats()
+
+        # Build perimeter from early LiDAR accumulation
+        if not self._perimeter_done:
+            self._try_build_perimeter()
+        elif self._perimeter and self._perimeter_item is None and self._grid:
+            self._draw_perimeter()
+
+        # Check for new shutter events — each one is a confirmed capture
+        if self._scan_dir:
+            try:
+                for se in pathlib.Path(self._scan_dir).glob(
+                        'fusion_scan_*/capture_*.shutter_event'):
+                    if str(se) in self._seen_shutters:
+                        continue
+                    self._seen_shutters.add(str(se))
+                    x, y, z = self._current
+                    key  = (int(math.floor(x / _COV_CELL_SIZE)),
+                            int(math.floor(y / _COV_CELL_SIZE)))
+                    band = _cov_band(z)
+                    cell = self._grid.setdefault(key, {})
+                    cell[band] = cell.get(band, 0) + 1
+                    self._update_cell(key)
+                    self._update_stats()
+            except OSError:
+                pass
+
+        if self._running:
+            self._canvas.after(500, self._poll)
+
+    # ── Drawing ───────────────────────────────────────────────────────────────
+
+    def _on_resize(self, event):
+        self._cell_items.clear()
+        self._player_item = None
+        self._perimeter_item = None
+        self._canvas.delete('perimeter_label')
+        self._last_drawn_current = None  # force player redraw after resize
+        self._canvas.delete('all')
+        for key in self._grid:
+            self._update_cell(key)
+        self._draw_perimeter()
+        self._update_player()
+
+    def _layout(self):
+        """Return (min_x, max_y, px, off_x, off_y) sized to fit the perimeter (or grid)."""
+        keys  = list(self._grid.keys())
+        min_x = min(k[0] for k in keys)
+        max_x = max(k[0] for k in keys)
+        min_y = min(k[1] for k in keys)
+        max_y = max(k[1] for k in keys)
+        # Expand bounds to the perimeter hull so the whole room is visible
+        if self._perimeter:
+            pxs = [gx for gx, gy in self._perimeter]
+            pys = [gy for gx, gy in self._perimeter]
+            min_x = min(min_x, math.floor(min(pxs)))
+            max_x = max(max_x, math.ceil(max(pxs)))
+            min_y = min(min_y, math.floor(min(pys)))
+            max_y = max(max_y, math.ceil(max(pys)))
+        margin = 2   # cells of padding around the perimeter
+        min_x -= margin; max_x += margin
+        min_y -= margin; max_y += margin
+        span_x = max(max_x - min_x + 1, 1)
+        span_y = max(max_y - min_y + 1, 1)
+        c  = self._canvas
+        w  = max(c.winfo_width(),  1)
+        h  = max(c.winfo_height(), 1)
+        px = max(4, min(40, w // span_x, h // span_y))
+        self._cell_px = px
+        off_x = (w - span_x * px) // 2
+        off_y = (h - span_y * px) // 2
+        return min_x, max_y, px, off_x, off_y
+
+    def _update_cell(self, key):
+        """Create or update the background rect and three height-band pips for a cell."""
+        if not self._grid:
+            return
+        bv = self._grid.get(key)
+        if bv is None:
+            return
+        done_bands = frozenset(b for b, v in bv.items() if v >= _COV_MIN_VISITS)
+        bg         = _COV_COLOUR.get(done_bands, _COV_NONE)
+        gx, gy  = key
+        min_x, max_y, px, off_x, off_y = self._layout()
+        sx = off_x + (gx - min_x) * px
+        sy = off_y + (max_y - gy) * px
+
+        # Background rectangle
+        if key in self._cell_items:
+            self._canvas.itemconfig(self._cell_items[key], fill=bg)
+        else:
+            self._cell_items[key] = self._canvas.create_rectangle(
+                sx, sy, sx + px, sy + px, fill=bg, outline='#cccccc', width=1)
+
+        if self._player_item is not None:
+            self._canvas.tag_raise(self._player_item)
+
+    def _update_player(self):
+        """Move or create the current-position oval without touching other items."""
+        if not self._grid:
+            return
+        x, y, z = self._current
+        cx = int(math.floor(x / _COV_CELL_SIZE))
+        cy = int(math.floor(y / _COV_CELL_SIZE))
+        if self._last_drawn_current == (cx, cy) and self._player_item is not None:
+            return
+        self._last_drawn_current = (cx, cy)
+        min_x, max_y, px, off_x, off_y = self._layout()
+        sx = off_x + (cx - min_x) * px
+        sy = off_y + (max_y - cy) * px
+        m  = max(1, px // 5)
+        coords = sx + m, sy + m, sx + px - m, sy + px - m
+        if self._player_item is None:
+            self._player_item = self._canvas.create_oval(*coords, fill='#e74c3c', outline='#c0392b')
+        else:
+            self._canvas.coords(self._player_item, *coords)
+        self._canvas.tag_raise(self._player_item)
+
+    def _update_stats(self):
+        total   = len(self._grid)
+        full    = sum(1 for bv in self._grid.values()
+                      if sum(1 for v in bv.values() if v >= _COV_MIN_VISITS) >= _COV_HEIGHT_BANDS)
+        partial = sum(1 for bv in self._grid.values()
+                      if 0 < sum(1 for v in bv.values() if v >= _COV_MIN_VISITS) < _COV_HEIGHT_BANDS)
+        shots   = len(self._seen_shutters)
+        pct     = (full / total * 100) if total else 0
+        x, y, z = self._current
+        self._stats_var.set(
+            f'Pos ({x:.1f}, {y:.1f}, {z:.1f}) m  |  Shots: {shots}  |  '
+            f'Full: {full}/{total} ({pct:.0f}%)  Partial: {partial}'
+        )
+        current_band = _cov_band(z)
+        for i, lbl in enumerate(self._band_labels):
+            if i == current_band:
+                lbl.config(background='#7ed321', foreground='white')
+            else:
+                lbl.config(background='', foreground='')
+
 
 class FusionCaptureGUI:
     def __init__(self, root):
@@ -400,10 +793,16 @@ class FusionCaptureGUI:
                                                     _cal_menu.grab_release()))
         # ─────────────────────────────────────────────────────────────────────
 
-        notebook.select(1)
+        # ── Coverage tab ───────────────────────────────────────────────────────────
+        cov_tab = ttk.Frame(notebook)
+        notebook.insert(1, cov_tab, text='Coverage')
+        self._coverage_panel = CoveragePanel(cov_tab)
+        # ───────────────────────────────────────────────────────────────────
+
+        notebook.select(1)  # start on Coverage tab
 
         # Switch to log tab on new message if viewer is active, badge the tab
-        self._log_tab_index = 1
+        self._log_tab_index = 2
         self._notebook = notebook
         notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
@@ -624,6 +1023,8 @@ class FusionCaptureGUI:
             )
 
             self.is_running = True
+            self.root.after(0, lambda: self._coverage_panel.start(
+                getattr(self, 'scan_dir', None)))
 
             # Read output in real-time
             while self.fusion_process and self.is_running:
@@ -642,6 +1043,7 @@ class FusionCaptureGUI:
                             session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
                             self.scan_dir = str(session_dir.resolve())
                             self._pp_session_var.set(self.scan_dir)
+                            self._coverage_panel.set_scan_dir(self.scan_dir)
                             try:
                                 _add_session_log_handler(self.scan_dir)
                                 self._session_log_attached = True
@@ -768,7 +1170,7 @@ class FusionCaptureGUI:
         """Watch for the RViz2 window launched by the fusion script and embed it"""
         self.rviz_process = True  # sentinel — set immediately to prevent double-call
         self._rviz_search_start = time.monotonic()
-        self._notebook.select(0)
+        self._notebook.select(1)  # switch to Coverage tab when session starts
 
         def _start_when_ready(attempts=0):
             self.root.update_idletasks()
@@ -1741,6 +2143,7 @@ sys.exit(0 if ok[0] else 4)
             return  # already stopped, ignore duplicate call
         self.is_running = False
         self.fusion_process = None
+        self._coverage_panel.stop()
 
         if self.rviz_process:
             if self.rviz_win_id:

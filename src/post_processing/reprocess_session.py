@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from exact_match_fusion import exact_match_calibration_tool
 
 _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
-_STITCH_BIN = Path(os.path.expanduser('~/insta360-dev/build/insta360_stitch'))
+_STITCH_BIN = Path(__file__).resolve().parents[1] / 'capture' / 'sdk' / 'build' / 'insta360_stitch'
 
 
 def _safe_data(p) -> Path:

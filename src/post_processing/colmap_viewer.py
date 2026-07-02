@@ -170,19 +170,37 @@ def generate_html(sparse_dir, output_path, max_pts=200000):
     sparse_dir = _safe_data(sparse_dir)
     cameras  = _read_cameras(sparse_dir / 'cameras.bin')
     images   = _read_images(sparse_dir  / 'images.bin')
-    pts, cols, is_sfm = _read_points3d(sparse_dir / 'points3D.bin', max_pts)
+    # points3D.bin now contains only LiDAR points (track_len=0).
+    # SfM points come from reconstructed.ply (COLMAP model_converter output).
+    lidar_pts, lidar_cols, _ = _read_points3d(sparse_dir / 'points3D.bin', max_pts)
+
+    sfm_pts  = np.zeros((0, 3), dtype=np.float32)
+    sfm_cols = np.zeros((0, 3), dtype=np.float32)
+    recon_ply = sparse_dir.parent / 'reconstructed.ply'
+    if recon_ply.exists():
+        try:
+            import open3d as _o3d
+            _pcd = _o3d.io.read_point_cloud(str(recon_ply))
+            sfm_pts  = np.asarray(_pcd.points, dtype=np.float32)
+            sfm_cols = np.asarray(_pcd.colors, dtype=np.float32) if _pcd.has_colors() \
+                       else np.zeros((len(sfm_pts), 3), dtype=np.float32)
+            print(f'  SfM PLY: {len(sfm_pts)} points from {recon_ply.name}')
+        except Exception as _e:
+            print(f'  ⚠ Could not load SfM PLY: {_e}')
 
     panoramas = build_panoramas(images, cameras)
-    n_panos   = len(panoramas)
-    n_pts     = len(pts)
-    n_sfm     = int(is_sfm.sum())
-    n_lidar   = n_pts - n_sfm
+    n_panos  = len(panoramas)
+    n_lidar  = len(lidar_pts)
+    n_sfm    = len(sfm_pts)
 
-    # Encode point data as base64 float32
     import base64
-    pts_b64  = _encode_float32(pts.flatten())
-    cols_b64 = _encode_float32(cols.flatten())
-    sfm_b64  = base64.b64encode(is_sfm.astype(np.uint8).tobytes()).decode()
+    # Encode LiDAR and SfM separately — no shared mask needed
+    pts_b64      = _encode_float32(lidar_pts.flatten())
+    cols_b64     = _encode_float32(lidar_cols.flatten())
+    sfm_pts_b64  = _encode_float32(sfm_pts.flatten())
+    sfm_cols_b64 = _encode_float32(sfm_cols.flatten())
+    # Keep sfm_b64 as empty mask for backward compat (unused now)
+    sfm_b64 = base64.b64encode(np.zeros(0, dtype=np.uint8).tobytes()).decode()
 
     # Build panorama JSON (frustum poses)
     pano_json = json.dumps(panoramas)
@@ -230,7 +248,7 @@ input[type=checkbox] {{ cursor: pointer; }}
   <div class="stat">Panoramas <span id="s-panos">{n_panos}</span></div>
   <div class="stat">SfM points <span id="s-sfm">{n_sfm}</span></div>
   <div class="stat">LiDAR points <span id="s-lidar">{n_lidar}</span></div>
-  <div class="stat">Showing <span id="s-showing">{n_pts}</span></div>
+  <div class="stat">Showing <span id="s-showing">{n_lidar + n_sfm}</span></div>
   <hr>
   <div class="row">
     <label><input type="checkbox" id="chk-sfm" checked> SfM points</label>
@@ -245,8 +263,12 @@ input[type=checkbox] {{ cursor: pointer; }}
     <label><input type="checkbox" id="chk-axes"> Frustum axes</label>
   </div>
   <div class="row">
-    <label for="sl-pt-size">Point size</label>
+    <label for="sl-pt-size">LiDAR pt size</label>
     <input type="range" id="sl-pt-size" min="1" max="20" value="3" step="1">
+  </div>
+  <div class="row">
+    <label for="sl-sfm-size">SfM pt size</label>
+    <input type="range" id="sl-sfm-size" min="1" max="40" value="8" step="1">
   </div>
   <div class="row">
     <label for="sl-frustum-scale">Frustum scale</label>
@@ -286,9 +308,10 @@ function b64toU8(b64) {{
   return u8;
 }}
 
-const ptsFlat  = b64toF32('{pts_b64}');
-const colsFlat = b64toF32('{cols_b64}');
-const sfmMask  = b64toU8('{sfm_b64}');
+const ptsFlat      = b64toF32('{pts_b64}');
+const colsFlat     = b64toF32('{cols_b64}');
+const sfmPtsFlat   = b64toF32('{sfm_pts_b64}');
+const sfmColsFlat  = b64toF32('{sfm_cols_b64}');
 const panoramas = {pano_json};
 
 // ── scene setup ────────────────────────────────────────────────────────────
@@ -317,38 +340,26 @@ function paletteColor(i, n) {{
 }}
 
 // ── point cloud ────────────────────────────────────────────────────────────
-const ptGeo = new THREE.BufferGeometry();
-ptGeo.setAttribute('position', new THREE.BufferAttribute(ptsFlat, 3));
-ptGeo.setAttribute('color',    new THREE.BufferAttribute(colsFlat, 3));
-const ptMat = new THREE.PointsMaterial({{ vertexColors: true, size: 0.03, sizeAttenuation: true }});
-const ptCloud = new THREE.Points(ptGeo, ptMat);
-root.add(ptCloud);
-
-// separate index arrays for SfM vs LiDAR for toggling
-const sfmIdx   = [], lidarIdx = [];
-for (let i = 0; i < sfmMask.length; i++) {{
-  (sfmMask[i] ? sfmIdx : lidarIdx).push(i);
+function _makeCloud(posFlat, colFlat, mat) {{
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(posFlat, 3));
+  geo.setAttribute('color',    new THREE.BufferAttribute(colFlat, 3));
+  return new THREE.Points(geo, mat);
 }}
 
+const lidarMat = new THREE.PointsMaterial({{ vertexColors: true, size: 0.03, sizeAttenuation: true }});
+const sfmMat   = new THREE.PointsMaterial({{ vertexColors: true, size: 0.08, sizeAttenuation: true }});
+const lidarCloud = _makeCloud(ptsFlat,    colsFlat,    lidarMat);
+const sfmCloud   = _makeCloud(sfmPtsFlat, sfmColsFlat, sfmMat);
+root.add(lidarCloud);
+root.add(sfmCloud);
+
 function rebuildPointCloud() {{
-  const showSfm   = document.getElementById('chk-sfm').checked;
-  const showLidar = document.getElementById('chk-lidar').checked;
-  const keep = [];
-  if (showSfm)   sfmIdx.forEach(i => keep.push(i));
-  if (showLidar) lidarIdx.forEach(i => keep.push(i));
-  keep.sort((a,b) => a-b);
-  const pos = new Float32Array(keep.length * 3);
-  const col = new Float32Array(keep.length * 3);
-  for (let j = 0; j < keep.length; j++) {{
-    const i = keep[j];
-    pos[j*3]   = ptsFlat[i*3];   pos[j*3+1] = ptsFlat[i*3+1];   pos[j*3+2] = ptsFlat[i*3+2];
-    col[j*3]   = colsFlat[i*3];  col[j*3+1] = colsFlat[i*3+1];  col[j*3+2] = colsFlat[i*3+2];
-  }}
-  ptGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  ptGeo.setAttribute('color',    new THREE.BufferAttribute(col, 3));
-  ptGeo.attributes.position.needsUpdate = true;
-  ptGeo.attributes.color.needsUpdate    = true;
-  document.getElementById('s-showing').textContent = keep.length;
+  lidarCloud.visible = document.getElementById('chk-lidar').checked;
+  sfmCloud.visible   = document.getElementById('chk-sfm').checked;
+  const showing = (lidarCloud.visible ? lidarCloud.geometry.attributes.position.count : 0)
+                + (sfmCloud.visible   ? sfmCloud.geometry.attributes.position.count   : 0);
+  document.getElementById('s-showing').textContent = showing;
 }}
 
 // ── frustum helpers ────────────────────────────────────────────────────────
@@ -456,8 +467,10 @@ panoramas.forEach((pano, pi) => {{
 }});
 
 // ── fit camera to scene ────────────────────────────────────────────────────
-ptGeo.computeBoundingBox();
-const bbox   = ptGeo.boundingBox;
+const _fitGeo = lidarCloud.geometry.attributes.position.count > 0
+  ? lidarCloud.geometry : sfmCloud.geometry;
+_fitGeo.computeBoundingBox();
+const bbox   = _fitGeo.boundingBox;
 const center = new THREE.Vector3();
 bbox.getCenter(center);
 const span   = bbox.getSize(new THREE.Vector3()).length();
@@ -476,7 +489,10 @@ document.getElementById('chk-axes').addEventListener('change', e => {{
   axisGroup.visible = e.target.checked;
 }});
 document.getElementById('sl-pt-size').addEventListener('input', e => {{
-  ptMat.size = parseFloat(e.target.value) * 0.01;
+  lidarMat.size = parseFloat(e.target.value) * 0.01;
+}});
+document.getElementById('sl-sfm-size').addEventListener('input', e => {{
+  sfmMat.size = parseFloat(e.target.value) * 0.01;
 }});
 document.getElementById('sl-frustum-scale').addEventListener('input', e => {{
   frustumScale = parseFloat(e.target.value) * 0.01;
@@ -503,7 +519,7 @@ window.addEventListener('resize', () => {{
 
     output_path = _safe_data(output_path)
     output_path.write_text(html)
-    print(f"✓ COLMAP viewer: {output_path}  ({n_panos} panoramas, {n_pts} points)")
+    print(f"✓ COLMAP viewer: {output_path}  ({n_panos} panoramas, {n_lidar} LiDAR + {n_sfm} SfM points)")
     return output_path
 
 

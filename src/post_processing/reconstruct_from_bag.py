@@ -1145,7 +1145,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         (session_path / '.sdk_stitch_continuous').touch()
     # --- ERP conversion + colorization ---
     pp = Path(__file__).resolve().parent
-    sdk_stitch_bin = Path.home() / "insta360-dev/build/insta360_stitch"
+    sdk_stitch_bin = Path(__file__).resolve().parents[1] / "capture" / "sdk" / "build" / "insta360_stitch"
 
     print("\nConverting fisheye \u2192 ERP and colorizing...")
 

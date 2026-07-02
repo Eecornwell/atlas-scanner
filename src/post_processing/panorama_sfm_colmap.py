@@ -623,66 +623,24 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
     return all_pts, all_cols
 
 
-def _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=None):
-    """Append LiDAR PLY points into points3D.bin, preserving existing triangulated points."""
-    import open3d as o3d
-    pcd = o3d.io.read_point_cloud(str(merged_ply))
-    pts  = np.asarray(pcd.points)
-    cols = (np.asarray(pcd.colors) * 255).astype(int) if pcd.has_colors() \
-           else np.zeros((len(pts), 3), int)
-
-    # Read existing triangulated points so we don't discard them.
-    existing = []
-    p3d_bin = output_dir / 'points3D.bin'
-    if p3d_bin.exists():
-        with open(p3d_bin, 'rb') as f:
-            n_exist = struct.unpack('Q', f.read(8))[0]
-            for _ in range(n_exist):
-                raw_id   = f.read(8)
-                raw_xyz  = f.read(24)
-                raw_rgb  = f.read(3)
-                raw_err  = f.read(8)
-                tl       = struct.unpack('Q', f.read(8))[0]
-                raw_trk  = f.read(tl * 8)
-                if tl > 0:  # keep only real SfM points
-                    existing.append((raw_id, raw_xyz, raw_rgb, raw_err,
-                                     struct.pack('Q', tl), raw_trk))
-
-    # Filter SfM points to LiDAR extents so outliers don't appear in the viewer
-    if lidar_pts is not None and len(lidar_pts) > 0 and existing:
-        mn = lidar_pts.min(axis=0) - 0.5
-        mx = lidar_pts.max(axis=0) + 0.5
-        filtered = []
-        for rec in existing:
-            x, y, z = struct.unpack('ddd', rec[1])
-            if mn[0] <= x <= mx[0] and mn[1] <= y <= mx[1] and mn[2] <= z <= mx[2]:
-                filtered.append(rec)
-        removed = len(existing) - len(filtered)
-        if removed:
-            print(f'  SfM outlier filter (points3D): removed {removed}/{len(existing)} points')
-        existing = filtered
-        # Remove points with no LiDAR neighbour within 0.5m
-        if existing:
-            raw_pts = np.array([struct.unpack('ddd', r[1]) for r in existing])
-            iso_mask = _filter_sfm_by_lidar_proximity(raw_pts, lidar_pts)
-            existing = [r for r, keep in zip(existing, iso_mask) if keep]
-            iso_removed = int((~iso_mask).sum())
-            if iso_removed:
-                print(f'  SfM proximity filter (points3D): removed {iso_removed}/{len(iso_mask)} points')
-
-    n_sfm   = len(existing)
+def _write_merged_to_points3d(output_dir, lidar_pts_world, lidar_cols_world, lidar_pts_for_filter=None):
+    """Write LiDAR points as the sole point cloud in points3D.bin.
+    SfM triangulated points are intentionally discarded — they served their
+    purpose driving pose estimation and are not needed in the final model.
+    lidar_pts_world / lidar_cols_world are already in COLMAP world coordinates."""
+    pts  = lidar_pts_world
+    cols = lidar_cols_world
     n_lidar = len(pts)
+    p3d_bin = output_dir / 'points3D.bin'
     with open(p3d_bin, 'wb') as f:
-        f.write(struct.pack('Q', n_sfm + n_lidar))
-        for raw_id, raw_xyz, raw_rgb, raw_err, raw_tl, raw_trk in existing:
-            f.write(raw_id + raw_xyz + raw_rgb + raw_err + raw_tl + raw_trk)
+        f.write(struct.pack('Q', n_lidar))
         for i in range(n_lidar):
-            f.write(struct.pack('Q', n_sfm + i + 1))
+            f.write(struct.pack('Q', i + 1))
             f.write(struct.pack('ddd', *pts[i]))
             f.write(struct.pack('BBB', *cols[i]))
             f.write(struct.pack('d', 0.0))
-            f.write(struct.pack('Q', 0))  # track_len=0 marks LiDAR-injected
-    print(f'✓ points3D.bin: {n_sfm} SfM + {n_lidar} LiDAR = {n_sfm + n_lidar} total')
+            f.write(struct.pack('Q', 0))  # track_len=0: LiDAR-injected
+    print(f'✓ points3D.bin: {n_lidar} LiDAR points')
 
 
 def _strip_rig_from_db(db_path):
@@ -912,7 +870,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             for _p, _c in zip(all_pts, all_cols):
                 _mf.write(f'{_p[0]:.6f} {_p[1]:.6f} {_p[2]:.6f} {int(_c[0])} {int(_c[1])} {int(_c[2])}\n')
         print(f'  LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts)} -> {merged_ply}')
-        _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=merged_lidar_pts)
+        _write_merged_to_points3d(output_dir, merged_lidar_pts, merged_lidar_cols)
     elif ply_out.exists():
         # Fallback: use session merged cloud if no per-scan PLYs available
         session_aligned = session_path / 'merged_aligned_colored.ply'
@@ -926,7 +884,10 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _fb_lidar_pts = (R_ROS2COLMAP @ np.asarray(_fb_lidar_pcd.points).T).T
             _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
                                 lidar_voxel_size=lidar_voxel_size, filter_sfm=True)
-            _write_merged_to_points3d(output_dir, merged_ply, lidar_pts=_fb_lidar_pts)
+            _write_merged_to_points3d(output_dir, _fb_lidar_pts,
+                                      (np.asarray(_fb_lidar_pcd.colors) * 255).astype(int)
+                                      if _fb_lidar_pcd.has_colors()
+                                      else np.zeros((len(_fb_lidar_pts), 3), int))
 
     # Generate depth images using non-downsampled per-scan point clouds
     print("\n10. Generating depth images...")

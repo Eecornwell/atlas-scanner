@@ -83,7 +83,9 @@ export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
 [ -n "$INSTA360_PHOTO_SIZE" ] && export INSTA360_PHOTO_SIZE_DEFAULT="$INSTA360_PHOTO_SIZE"
 [ -n "$INSTA360_WB" ] && export INSTA360_WB
 [ -n "$INSTA360_EXPOSURE_MODE" ] && export INSTA360_EXPOSURE="$INSTA360_EXPOSURE_MODE"
-[ "$USE_AI_STITCH" = "true" ] && export INSTA360_AI_STITCH=1 INSTA360_MODEL_DIR="$HOME/insta360-dev/models"
+[ "$USE_AI_STITCH" = "true" ] && export INSTA360_AI_STITCH=1 INSTA360_MODEL_DIR="$SCRIPT_DIR/capture/sdk/models"
+
+_SDK_BIN="$SCRIPT_DIR/capture/sdk/build"
 
 # Point all tools at the per-model calibration file.
 # Falls back to the shared config/fusion_calibration.yaml if not present.
@@ -190,6 +192,7 @@ cleanup() {
 
     _pkill "enhanced_trajectory_recorder"
     _pkill "buffered_odom_bridge"
+    _pkill "coverage_tracker"
     _pkill "rviz2"
     _pkill "insta360_capture"
     _pkill "livox_ros_driver2"
@@ -304,9 +307,9 @@ cleanup() {
                         _stitch_args=""
                         [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
                         if [ "$USE_AI_STITCH" = "true" ]; then
-                            _stitch_args="$_stitch_args --ai --model-dir $HOME/insta360-dev/models"
+                            _stitch_args="$_stitch_args --ai --model-dir $SCRIPT_DIR/capture/sdk/models"
                         fi
-                        ~/insta360-dev/build/insta360_stitch "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
+                        "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
                             --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
                             $_stitch_args \
                             || echo "  Warning: SDK stitch failed for $(basename $scan_dir), skipping"
@@ -822,6 +825,12 @@ if [ "$LIO_ENABLED" = "true" ]; then
         > "$SCAN_DIR/odom_buffer.log" 2>&1 &
     PIDS+=($!)
     TRAJECTORY_RECORDING=true
+    if [ "$CAPTURE_MODE" = "continuous" ]; then
+        python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/coverage_tracker.py" \
+            > "$SCAN_DIR/coverage_tracker.log" 2>&1 &
+        PIDS+=($!)
+        echo "✓ Coverage tracker started (live map in coverage_tracker.log)"
+    fi
 fi
 
 # ─── Camera driver ────────────────────────────────────────────────────────────
@@ -839,7 +848,7 @@ fi
     # Start the persistent SDK session daemon
     export INSTA360_INTERVAL_MS=$(( CONTINUOUS_INTERVAL * 1000 ))
     INSTA360_SESSION_DIR="$SCAN_DIR" \
-        ~/insta360-dev/build/insta360_capture > "$SCAN_DIR/sdk_capture.log" 2>&1 &
+        "$_SDK_BIN/insta360_capture" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
     SDK_CAPTURE_PID=$!
     # Not added to PIDS — cleanup must not kill the daemon before StopTimeLapse runs.
     # The shell waits for it to exit naturally after the download drain below.
@@ -861,7 +870,7 @@ fi
         rm -f "$SCAN_DIR/.sdk_ready"
         # One retry after force reset
         INSTA360_SESSION_DIR="$SCAN_DIR" \
-            ~/insta360-dev/build/insta360_capture >> "$SCAN_DIR/sdk_capture.log" 2>&1 &
+            "$_SDK_BIN/insta360_capture" >> "$SCAN_DIR/sdk_capture.log" 2>&1 &
         SDK_CAPTURE_PID=$!
         for _i in $(seq 1 60); do
             [ -f "$SCAN_DIR/.sdk_ready" ] && break
