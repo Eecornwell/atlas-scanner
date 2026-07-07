@@ -32,9 +32,19 @@ All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera d
 
 **How continuous mode works:**
 
-- The daemon drives the shutter from a host timer thread calling `TakePhoto()` at the configured `CONTINUOUS_INTERVAL` (default 3s). The X5 firmware minimum is ~3s per shot (shutter + SD write). Each shot's shutter time is recorded at `TakePhoto()` return (~50ms accuracy on host clock), then the `.insp` file is downloaded via HTTP GET from the camera's built-in file server while the session is still active.
+- The daemon drives the shutter from a host timer thread calling `TakePhoto()` at the configured `CONTINUOUS_INTERVAL` (default 3s). The X5 firmware minimum is ~3s per shot (shutter + SD write). Each shot's shutter time is recorded at `TakePhoto()` return (~10ms accuracy on host clock), then the `.insp` file is downloaded via HTTP GET from the camera's built-in file server while the session is still active.
 - The `shutter_event_publisher.py` node watches for `capture_N.shutter_event` files and publishes on `/camera/shutter_time`, recorded into the bag. `reconstruct_from_bag.py` uses these timestamps (or `.insp.capture_time` sidecars) as scan centres.
 - Camera IMU is not available in SDK stitch mode.
+
+**LiDAR–camera clock synchronization:**
+
+The MID360 hardware clock runs independently from the host system clock, producing a fixed ~65ms offset between LiDAR `header.stamp` values and host-clock shutter timestamps. The system handles this in two steps:
+
+1. **At startup:** `livox_time_sync` runs before the LiDAR driver and calls `SetLivoxLidarRmcSyncTime()` (Livox SDK2) to set the device's internal wall-clock reference to current UTC time. This must complete before `livox_ros_driver2` starts since both cannot share the LiDAR command port simultaneously.
+
+2. **In post-processing:** `reconstruct_from_bag.py` measures `median(bag_receipt_time - lidar_header_stamp)` over 200 LiDAR frames to compute the residual offset (~65ms, stable ±0.3ms session-to-session) and applies it when converting shutter times to the Livox clock domain for LiDAR window selection.
+
+Typical timing results: shutter→nearest LiDAR frame mean ~8–12ms, max ~23ms, positional error ~0.4–0.6cm at 0.5m/s walking speed.
 
 **USB session management:**
 
@@ -46,13 +56,14 @@ All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera d
 ```bash
 cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk
 bash build.sh
-# Produces: ~/insta360-dev/build/insta360_capture
-#           ~/insta360-dev/build/insta360_stitch
-#           ~/insta360-dev/build/insta360_reset_clock
+# Produces: build/insta360_capture    — SDK capture daemon (camera control)
+#           build/insta360_stitch     — .insp → ERP stitcher
+#           build/insta360_reset_clock — camera RTC sync utility
+#           build/livox_time_sync    — MID360 hardware clock sync (run before LiDAR driver)
 ```
 
-Dependencies: `libusb-1.0-dev`, Insta360 CameraSDK, Insta360 MediaSDK, OpenCV.
-Re-run after any update to `main.cpp`, `stitch.cpp`, or `reset_clock.cpp`.
+Dependencies: `libusb-1.0-dev`, Insta360 CameraSDK, Insta360 MediaSDK, OpenCV, Livox SDK2.
+Re-run after any update to `main.cpp`, `stitch.cpp`, `reset_clock.cpp`, or `livox_time_sync.cpp`.
 
 **Manually reconstruct a session:**
 

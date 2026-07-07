@@ -355,6 +355,8 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
 
         # Estimate host→Livox clock offset from this bag so the capture_time
         # sidecar (host clock) can be converted to Livox hardware time.
+        # When livox_time_sync (or PTP) has synced the clocks, the measured
+        # difference is just delivery latency and should NOT be applied.
         _host_to_livox_offset = 0.0
         try:
             _lid_tid = next((tid for tid, (n, _) in topics.items() if n == '/livox/lidar'), None)
@@ -370,8 +372,13 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
                     _hdr_t = _msg.header.stamp.sec + _msg.header.stamp.nanosec * 1e-9
                     _diffs.append(_bag_ns / 1e9 - _hdr_t)
                 if _diffs:
-                    _host_to_livox_offset = float(np.median(_diffs))
-                    print(f"  Host→Livox offset: {_host_to_livox_offset*1000:+.1f}ms")
+                    _measured = float(np.median(_diffs))
+                    if abs(_measured) < 0.1:
+                        print(f"  Host→Livox offset: {_measured*1000:+.1f}ms "
+                              f"(within sync threshold — clocks aligned, not applied)")
+                    else:
+                        _host_to_livox_offset = _measured
+                        print(f"  Host→Livox offset: {_host_to_livox_offset*1000:+.1f}ms")
         except Exception as _e:
             print(f"  ⚠ Could not estimate host→Livox offset: {_e}")
 
@@ -579,20 +586,12 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 _saved_insp[_idx] = _files
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
-        # Promote .insp files from .sdk_shot_N/ subdirs into fusion_scan_NNN/ by index.
-        for _shot_dir in sorted(session_path.glob('.sdk_shot_*'),
-                                key=lambda p: int(p.name.split('_')[-1])):
-            _idx = int(_shot_dir.name.split('_')[-1])
-            _scan_dir = session_path / f'fusion_scan_{_idx + 1:03d}'
-            _scan_dir.mkdir(exist_ok=True)
-            for _insp in sorted(_shot_dir.glob('*.insp')):
-                _dest = _scan_dir / _insp.name
-                if not _dest.exists():
-                    _insp.rename(_dest)
-                _ct_src = _shot_dir / (_insp.name + '.capture_time')
-                _ct_dst = _scan_dir / (_insp.name + '.capture_time')
-                if _ct_src.exists() and not _ct_dst.exists():
-                    _ct_src.rename(_ct_dst)
+        # Do NOT pre-populate fusion_scan_NNN/ with .insp files by shot index.
+        # Shot 0 may fire before the bag starts, making index-based promotion
+        # off by one (shot N's .insp ends up in fusion_scan_{N+1} but the
+        # scan centre for fusion_scan_001 corresponds to shot 1, not shot 0).
+        # The ERP stitching step below matches each .insp to its scan centre
+        # by capture_time proximity, which is correct regardless of index offset.
         # Restore any .insp files that were in fusion_scan_* but not in .sdk_shot_*
         for _idx, _files in _saved_insp.items():
             _scan_dir = session_path / f'fusion_scan_{_idx:03d}'
@@ -706,13 +705,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     # -----------------------------------------------------------------------
     # Compute host→Livox clock offset.
     # LiDAR/odometry timestamps are in Livox hardware clock; shutter times
-    # from t_expected are in host system clock.  The offset is stable over a
-    # session (Livox PTP keeps it within ±5ms).  We estimate it from the
-    # LiDAR header stamps vs their bag_ts (host clock at receipt time),
-    # correcting for the ~100ms network/USB delivery latency by using the
-    # median rather than the mean to reject outliers from scheduling jitter.
+    # from t_before are in host system clock.
+    # When PTP is active (ptp4l-livox.service running as master, phc2sys syncing
+    # system clock to /dev/ptp0), the MID360 slaves its hardware clock to the
+    # host PHC — both clocks are the same and the offset is 0.  We detect this
+    # by checking whether the measured offset is within the PTP convergence
+    # window (<5ms).  If so we zero it out and log the confirmation.
+    # Without PTP the offset is ~50-60ms and must be applied.
     # -----------------------------------------------------------------------
     _host_to_livox_offset = 0.0
+    _ptp_active = False
     try:
         _con_off = open_db3(bag_dir)
         _tmap_off = topic_map(_con_off)
@@ -730,10 +732,23 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 _bag_t = _bag_ns / 1e9
                 _diffs.append(_bag_t - _hdr_t)
             if _diffs:
-                # delivery_latency ≈ median diff; true clock offset = delivery_latency
-                _host_to_livox_offset = float(np.median(_diffs))
-                print(f'  Host→Livox clock offset: {_host_to_livox_offset*1000:+.1f}ms '
-                      f'(from {len(_diffs)} LiDAR frames)')
+                _measured = float(np.median(_diffs))
+                # bag_t - hdr_t = delivery_latency + clock_offset.
+                # When livox_time_sync (or PTP) has synced the MID360 clock to
+                # host system_clock, the measured difference is purely DDS/UDP
+                # delivery latency (~10-70ms), NOT a real clock domain offset.
+                # Applying it would shift scan centres away from the true shutter
+                # time and cause geometric misalignment in the merged cloud.
+                # Only apply when the offset exceeds 100ms — indicating the
+                # clocks are genuinely unsynchronised.
+                if abs(_measured) < 0.1:
+                    _ptp_active = True
+                    print(f'  Host→Livox clock offset: {_measured*1000:+.1f}ms '
+                          f'(within sync threshold — clocks aligned, not applied)')
+                else:
+                    _host_to_livox_offset = _measured
+                    print(f'  Host→Livox clock offset: {_host_to_livox_offset*1000:+.1f}ms '
+                          f'(from {len(_diffs)} LiDAR frames)')
         _con_off.close()
     except Exception as _e:
         print(f'  ⚠ Could not estimate host→Livox offset: {_e}')
@@ -846,7 +861,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 if _m:
                     try:
                         _rtc_dt = _dt_mod.datetime.strptime(_m.group(1) + _m.group(2), '%Y%m%d%H%M%S')
-                        _rtc_t = float(_cal.timegm(_rtc_dt.timetuple()))
+                        # Camera RTC is in local time — use mktime() not timegm()
+                        import time as _time_mod
+                        _tm = _rtc_dt.timetuple()
+                        _rtc_t = float(_time_mod.mktime(_tm))
                         # Prefer .capture_time (host clock) when it is within 2s of
                         # the RTC time — it has sub-second resolution the RTC lacks.
                         # capture_time is now the raw count-increment time; the
@@ -860,8 +878,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 _parts = _ct_f.read_text().strip().split()
                                 _host_t = float(_parts[0])  # t_before = shutter time
                                 _sd_latency = float(_parts[1]) - _host_t if len(_parts) > 1 else (_host_t - _rtc_t)
-                                if 0.0 <= _sd_latency < 3.0:
-                                    # t_before is already the shutter time; just apply clock offset
+                                if _sd_latency >= 0.0:
+                                    # t_before is the shutter time regardless of SD write duration
                                     _rtc_t = _host_t - _host_to_livox_offset
                                 elif abs(_host_t - _rtc_t) < 2.0:
                                     _rtc_t = _host_t - _host_to_livox_offset
@@ -882,6 +900,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     if abs(_c[0] - _deduped[-1][0]) >= 2.0:
                         _deduped.append(_c)
                 centres = _deduped
+                # Apply gyro filter
+                if imu_msgs and centres:
+                    _gyro_filtered = []
+                    for _ct, _ci in centres:
+                        _samples = [np.linalg.norm([m.angular_velocity.x,
+                                                    m.angular_velocity.y,
+                                                    m.angular_velocity.z])
+                                    for _ts, m in imu_msgs if abs(_ts - _ct) <= 0.25]
+                        _gyro = float(np.mean(_samples)) if _samples else 0.0
+                        if _gyro <= max_gyro:
+                            _gyro_filtered.append((_ct, _ci))
+                        else:
+                            print(f"    Dropped shutter at t+{_ct-t_start:.1f}s: gyro={_gyro:.3f} rad/s > {max_gyro}")
+                    if _gyro_filtered:
+                        centres = _gyro_filtered
                 # Log measured SD write latencies for diagnostics
                 _latencies = []
                 for _insp in sorted(session_path.glob('fusion_scan_*/*.insp')):
@@ -891,7 +924,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         try:
                             _host_t2 = float(_ct_f.read_text().strip())
                             _rtc_dt2 = _dt_mod.datetime.strptime(_m2.group(1)+_m2.group(2), '%Y%m%d%H%M%S')
-                            _rtc_t2 = float(_cal.timegm(_rtc_dt2.timetuple()))
+                            _rtc_t2 = float(_time_mod.mktime(_rtc_dt2.timetuple()))
                             _lat = _host_t2 - _rtc_t2
                             if 0.0 <= _lat < 3.0:
                                 _latencies.append(_lat)
@@ -910,6 +943,34 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             # to align with LiDAR/odometry which are in Livox hardware clock.
             if not centres and shutter_msgs:
                 seen_times = set()
+                # Compute per-session SD write latency: bag_ts (file detection time)
+                # minus msg.data (RTC integer second = shutter time).
+                # Read raw bag receipt timestamps directly from the database.
+                _sd_lats = []
+                try:
+                    _con2 = open_db3(bag_dir)
+                    _tmap2 = topic_map(_con2)
+                    _st_tid2 = next((t for t,(n,_) in _tmap2.items() if 'shutter' in n), None)
+                    if _st_tid2:
+                        _st_rows = _con2.execute(
+                            'SELECT data, timestamp FROM messages WHERE topic_id=? ORDER BY timestamp',
+                            (_st_tid2,)).fetchall()
+                        for _d, _bt_ns in _st_rows:
+                            try:
+                                _val = struct.unpack_from('<d', bytes(_d), 4)[0]
+                                if _val > 1e9:
+                                    _sd_lats.append(_bt_ns/1e9 - _val)
+                            except Exception:
+                                pass
+                    _con2.close()
+                except Exception:
+                    pass
+                _sd_latency_s = float(np.median(_sd_lats)) if _sd_lats else 0.0
+                if _sd_lats:
+                    print(f"  SD write latency: {_sd_latency_s*1000:.0f}ms (median of {len(_sd_lats)} shots)")
+
+                # With TakePhoto() mode, msg.data = t_before (exact shutter time,
+                # accurate to ~10ms). Use it directly as the scan centre.
                 for _bag_ts, msg in shutter_msgs:
                     shutter_t = round(msg.data - _host_to_livox_offset, 4)
                     if any(abs(shutter_t - s) < 1.0 for s in seen_times):
@@ -919,6 +980,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         centres.append((shutter_t, None))
                 if centres:
                     centres.sort(key=lambda x: x[0])
+                    # Apply gyro filter to drop scans where rig was moving at shutter time
+                    if imu_msgs:
+                        _filtered = []
+                        for _ct, _ci in centres:
+                            _samples = [np.linalg.norm([m.angular_velocity.x,
+                                                        m.angular_velocity.y,
+                                                        m.angular_velocity.z])
+                                        for _ts, m in imu_msgs if abs(_ts - _ct) <= 0.25]
+                            _gyro = float(np.mean(_samples)) if _samples else 0.0
+                            if _gyro <= max_gyro:
+                                _filtered.append((_ct, _ci))
+                            else:
+                                print(f"    Dropped shutter at t+{_ct-t_start:.1f}s: gyro={_gyro:.3f} rad/s > {max_gyro}")
+                        if _filtered:
+                            centres = _filtered
                     print(f"  SDK stitch: {len(centres)} shutter times from bag "
                           f"(host→Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
             # Fallback 2: .capture_time sidecars only (also host clock — apply offset)
@@ -1117,6 +1193,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             else:
                 print(f"    ⚠ {scan_name}: closest odom is {dt_odom:.2f}s away")
 
+        # Re-write the shutter event so the coverage GUI can find it after
+        # post-processing (reconstruct_from_bag clears fusion_scan_* dirs).
+        # centre is in Livox clock; convert back to host clock for the event file.
+        centre_host = centre + _host_to_livox_offset
+        ev_path = scan_dir / f"capture_{idx}.shutter_event"
+        with open(ev_path, 'w') as _ev:
+            _ev.write(f"{centre_host:.6f}")
+
         scan_count += 1
         # In SDK stitch mode, warn if the scanner was moving at shutter time.
         # The SDK ERP is gravity-aligned by the camera's own IMU (FlowState/EIS),
@@ -1209,14 +1293,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _ct_f = _shot_dir / (_insp.name + '.capture_time')
                         if _ct_f.exists():
                             try:
-                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip())
+                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip().split()[0])
                             except Exception:
                                 pass
                         else:
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
-                                _all_insps[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
+                                _all_insps[str(_insp)] = float(_time_mod.mktime(_cam_dt.timetuple()))
                             except Exception:
                                 pass
                 # From scan dirs (if previously promoted)
@@ -1234,7 +1318,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
-                                _all_insps[str(_insp)] = float(_cal.timegm(_cam_dt.timetuple()))
+                                _all_insps[str(_insp)] = float(_time_mod.mktime(_cam_dt.timetuple()))
                             except Exception:
                                 pass
                 # Match: scan_centre is in Livox clock, capture_time is in host clock
@@ -1268,6 +1352,17 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     if result.returncode == 0 and erp_path.exists():
                         _wb_correct(erp_path)
                         print(f"  \u2713 ERP saved: {erp_path} ({erp_path.stat().st_size // 1024}KB)  insp_dt={best_dt:.3f}s  scan={scan_dir.name}")
+                        # Copy .insp and .capture_time into fusion_scan_NNN/ so the
+                        # sync validator can find them after reconstruction.
+                        _insp_dest = scan_dir / best_insp.name
+                        if not _insp_dest.exists():
+                            import shutil as _shu
+                            _shu.copy2(str(best_insp), str(_insp_dest))
+                        _ct_src = Path(str(best_insp) + '.capture_time')
+                        _ct_dst = scan_dir / (best_insp.name + '.capture_time')
+                        if _ct_src.exists() and not _ct_dst.exists():
+                            import shutil as _shu
+                            _shu.copy2(str(_ct_src), str(_ct_dst))
                     else:
                         print(f"  \u26a0 SDK stitch failed for {scan_dir.name}")
                         if fisheye_jpg:

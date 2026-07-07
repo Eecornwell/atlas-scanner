@@ -138,6 +138,17 @@ def transform_points(points, position, orientation):
     
     return points_world
 
+def yaw_only_matrix(T):
+    """Return a 4x4 matrix with only the yaw component of T's rotation,
+    zeroing roll and pitch. Used for terrestrial merging where the floor
+    is assumed flat and roll/pitch variation between scans causes misalignment."""
+    yaw = R.from_matrix(T[:3, :3]).as_euler('xyz')[2]  # radians
+    T_yaw = np.eye(4)
+    T_yaw[:3, :3] = R.from_euler('z', yaw).as_matrix()
+    T_yaw[:3, 3] = T[:3, 3]
+    return T_yaw
+
+
 def pose_matrix_from_trajectory(traj):
     """Return 4x4 pose matrix from trajectory.json.
     Prefers current_pose.lidar_pose (already interpolated at capture_time)
@@ -205,9 +216,8 @@ def merge_scans_with_trajectory(session_dir):
     print(f"Merging {len(scan_dirs)} scans using trajectory poses...")
 
     if not (scan_dirs[0] / "trajectory.json").exists():
-        print("✗ No trajectory data found - RKO-LIO was not running.")
-        print("  Cannot merge without poses. Re-run with a working LIO or enable ICP alignment.")
-        return False
+        print("⚠ No trajectory data — merging without alignment (scans concatenated at origin).")
+        return merge_scans_simple(session_dir)
 
     # sensor_colored_exact.ply is always sensor-frame (world_colored_exact.ply is identical
     # despite its name — exact_match_fusion saves sensor coords under both filenames).
@@ -241,17 +251,14 @@ def merge_scans_with_trajectory(session_dir):
         print(f"  Using ICP-refined poses for {len(icp_refined)}/{len(scan_dirs)} scans")
 
     if not pose_matrices:
-        print("✗ No trajectory data found in any scan - RKO-LIO was not running.")
-        print("  Cannot merge without poses. Re-run with a working LIO or enable ICP alignment.")
-        return False
+        print("⚠ No trajectory data in any scan — merging without alignment (scans concatenated at origin).")
+        return merge_scans_simple(session_dir)
 
     # The LiDAR has a static mounting tilt so the odom Z-axis is not true vertical.
     # Extract roll/pitch from the first scan's pose and build a gravity-alignment
     # correction that levels the merged cloud (yaw left at 0 to keep X forward).
     first_name = scan_dirs[0].name
     T_first = pose_matrices[first_name]
-    # ICP-refined poses are already in relative-to-first frame (T_first = identity).
-    # Raw trajectory poses are in absolute odom frame and need T_first_inv applied.
     using_icp = bool(icp_refined)
     euler_first = R.from_matrix(T_first[:3, :3]).as_euler('xyz', degrees=True)
     print(f"  Odom tilt: roll={euler_first[0]:.2f} pitch={euler_first[1]:.2f} yaw={euler_first[2]:.2f} deg")

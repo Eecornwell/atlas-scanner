@@ -158,27 +158,30 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - All timestamps are hardware-originated — the Livox driver stamps LiDAR and IMU messages from the sensor's own clock, and RKO-LIO preserves those stamps through to the odometry output. The buffered odometry bridge forwards live messages with their original LIO header timestamp intact; only stale fallback messages (published when odometry has dropped out) use wall clock time
 
-- Scan centers are defined by camera frame timestamps. During reconstruction (post processing), each camera stamp is used to interpolate a pose from the bracketing pair of odometry samples (SLERP for rotation, linear for translation). The interpolation bracket half-width — half the gap between the two surrounding odom samples — bounds the worst-case pose error at each scan centre. At ~10 Hz odometry this is typically ≤50 ms regardless of camera frame rate
+- **Host→Livox clock offset:** The MID360 hardware clock runs in a separate domain from the host system clock, producing a fixed offset of ~65ms between LiDAR `header.stamp` values and host-clock shutter timestamps (`t_before`). This offset is stable to ±0.3ms session-to-session and is measured automatically from bag metadata during reconstruction. It is applied to convert shutter times to the Livox clock domain before LiDAR window selection.
+
+- **MID360 clock sync (RMC):** At startup, `livox_time_sync` (built from `livox_time_sync.cpp` using Livox SDK2) connects to the MID360 before the ROS driver starts and calls `SetLivoxLidarRmcSyncTime()` with a synthesised GPRMC sentence encoding the current UTC time. This sets the device's internal wall-clock reference. The point cloud `header.stamp` domain is unaffected — the ~65ms offset correction in `reconstruct_from_bag.py` remains necessary and is always applied.
+
+- Scan centers are defined by camera frame timestamps. During reconstruction (post processing), each camera stamp is used to interpolate a pose from the bracketing pair of odometry samples (SLERP for rotation, linear for translation). The interpolation bracket half-width — half the gap between the two surrounding odom samples — bounds the worst-case pose error at each scan centre. At ~18 Hz odometry this is typically ≤28ms
 
 - Camera frames whose timestamps fall outside the odometry window (before the first or after the last odom sample) cannot be interpolated and are filtered out during reconstruction to avoid clamped extrapolation errors
 
 - Per-frame motion compensation is applied to each LiDAR scan: individual LiDAR returns within a scan are de-skewed using interpolated poses across the scan duration before the scan is projected into world frame
 
-- The Livox Mid360 IMU publishes at ~200 Hz using best-effort QoS (`SensorDataQoS`), matching RKO-LIO's subscriber. A QoS mismatch (reliable publisher vs best-effort subscriber) will cause IMU starvation and degrade odometry from ~10 Hz to ~6 Hz — the benchmark will report POOR in this case
+- The Livox Mid360 IMU publishes at ~200 Hz using best-effort QoS (`SensorDataQoS`), matching RKO-LIO's subscriber. A QoS mismatch (reliable publisher vs best-effort subscriber) will cause IMU starvation and degrade odometry from ~18 Hz to ~6 Hz — the benchmark will report POOR in this case
 
 - The sync benchmark measures five quantities: raw inter-message gaps per topic, interpolation residual (odom bracket half-width at each scan centre), odom coverage fraction over the session window, per-topic arrival jitter (std of inter-message gaps), and IMU soft-sync confidence and residual. Overall quality is rated GOOD / OK / POOR based on mean bracket half-width against a 33 ms threshold
 
-##### IMU Soft-Sync (Continuous Mode)
-
-- Camera IMU is not available in SDK stitch mode (the CameraSDK owns the USB device exclusively). Clock synchronization between LiDAR and camera shutter times relies on the host→Livox clock offset estimated from bag metadata (typically stable to ±5ms within a session)
-
-- `imu_sync.py` can cross-correlate the Livox IMU gyroscope with a camera IMU if one is available (e.g. via a separate IMU sensor), but for the standard SDK-only configuration it exits gracefully with a message indicating camera IMU was not found
+- **Typical timing results (X5 + MID360, continuous mode):**
+  - Host→Livox clock offset: ~65ms (stable, auto-measured each session)
+  - Shutter → nearest LiDAR frame: mean ~8–12ms, max ~23ms
+  - Positional error at 0.5 m/s: ~0.4–0.6 cm
 
 #### Post-Processing Pipeline
 
 - `imu_sync.py` — reads both IMU gyroscope streams from the dedicated IMU bag (falling back to the main bag), reconstructs monotonic camera IMU timestamps, auto-selects the best-correlated axis pair, and estimates any residual clock offset via FFT cross-correlation. If confidence ≥ 0.7 the offset is written to `sync_offset.json`; otherwise `delta_t_s` is written as `0.0` so the file is a safe no-op. Run automatically before reconstruction in continuous mode
 
-- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. In SDK stitch mode (`--sdk-stitch`), scan centres come from `.insp` capture_time sidecars (preferred), `/camera/shutter_time` bag messages, or .insp filename RTC timestamps (fallback). The host→Livox clock offset is estimated from bag metadata and applied to convert host-clock shutter times to Livox hardware time for correct LiDAR window alignment. For `single_fisheye` mode, `.insp` files are promoted from `.sdk_shot_N/` directories, stitched to full 360° ERPs (with blank rear hemisphere), masked using the per-hardware mask (`lidar_mask_single_x5.png`), and then colorized. For `dual_fisheye`, the same pipeline applies with the dual mask.
+- `reconstruct_from_bag.py` — replays the session bag, loads `sync_offset.json` (continuous mode only) and applies `delta_t_s` to camera timestamps only when confidence ≥ 0.7 — below that threshold the correction is skipped and a warning is printed. In SDK stitch mode (`--sdk-stitch`), scan centres come from `.insp` capture_time sidecars (preferred), `/camera/shutter_time` bag messages, or .insp filename RTC timestamps (fallback). The host→Livox clock offset (~65ms, stable ±0.3ms) is measured from bag metadata by computing `median(bag_receipt_time - lidar_header_stamp)` over 200 LiDAR frames and applied to convert host-clock shutter times to Livox hardware time for correct LiDAR window alignment. For `single_fisheye` mode, `.insp` files are promoted from `.sdk_shot_N/` directories, stitched to full 360° ERPs (with blank rear hemisphere), masked using the per-hardware mask (`lidar_mask_single_x5.png`), and then colorized. For `dual_fisheye`, the same pipeline applies with the dual mask.
 
 - `exact_match_fusion.py` — projects `sensor_lidar.ply` into the equirectangular image using the extrinsic calibration (T_camera_lidar), samples RGB from the masked panorama (RGBA with alpha channel), and writes `sensor_colored_exact.ply`. Points projecting onto masked-out regions (alpha < 128) are discarded — this excludes the scanner body, nadir, and (in single_fisheye mode) the blank rear hemisphere. No EIS correction is applied — each scan uses its own ERP which is already in the correct camera-frame orientation (DYNAMICSTITCH, per-shot IMU).
 

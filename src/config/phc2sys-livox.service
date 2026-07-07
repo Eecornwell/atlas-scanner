@@ -1,0 +1,13 @@
+[Unit]
+Description=PTP Hardware Clock to System Clock sync (Livox MID360)
+After=ptp4l-livox.service
+Requires=ptp4l-livox.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /etc/linuxptp/phc_sync.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

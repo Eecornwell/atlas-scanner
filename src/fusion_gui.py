@@ -39,8 +39,8 @@ import math
 
 _COV_CELL_SIZE        = 0.5
 _COV_HEIGHT_BANDS     = 3
-_COV_BAND_SIZE        = 0.4
-_COV_HEIGHT_ORIGIN    = 0.0
+_COV_BAND_SIZE        = 0.6
+_COV_HEIGHT_ORIGIN    = -0.6  # Low: [-0.6, 0.0)  Mid: [0.0,+0.6)  High: [+0.6,+1.2)
 _COV_MIN_VISITS       = 1
 _COV_BAND_LABELS      = ['Low', 'Mid', 'High']
 # Colour per number of covered bands (0..HEIGHT_BANDS)
@@ -141,9 +141,12 @@ class CoveragePanel:
         self._current = (0.0, 0.0, 0.0)
         self._last_drawn_current = None
         self._latest_pose = None
+        with self._pose_lock:
+            self._pose_history = []
         self._canvas.delete('all')
         self._ros_thread = threading.Thread(target=self._ros_spin, daemon=True)
         self._ros_thread.start()
+        self._update_stats()  # highlight correct band immediately at startup
         self._canvas.after(500, self._poll)
 
     def stop(self):
@@ -161,8 +164,15 @@ class CoveragePanel:
 
             def _odom_cb(msg):
                 p = msg.pose.pose.position
+                t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
                 with self._pose_lock:
                     self._latest_pose = (p.x, p.y, p.z)
+                    # Keep a rolling 60s history for shutter-time pose lookup
+                    if not hasattr(self, '_pose_history'):
+                        self._pose_history = []
+                    self._pose_history.append((t, (p.x, p.y, p.z)))
+                    if len(self._pose_history) > 1200:  # 20Hz * 60s
+                        self._pose_history = self._pose_history[-1200:]
             node.create_subscription(_Odom, '/rko_lio/odometry', _odom_cb, 10)
 
             def _lidar_cb(msg):
@@ -199,6 +209,31 @@ class CoveragePanel:
 
     def set_scan_dir(self, scan_dir: str):
         self._scan_dir = scan_dir
+
+    def _pose_at_shutter(self, shutter_event_path) -> tuple | None:
+        """Return (x, y, z) pose at shutter time by reading trajectory.json."""
+        try:
+            import json
+            scan_dir = shutter_event_path.parent
+            traj_f = scan_dir / 'trajectory.json'
+            if traj_f.exists():
+                t = json.loads(traj_f.read_text())
+                p = t['current_pose']['position']
+                return (p['x'], p['y'], p['z'])
+            # Fallback: read shutter timestamp and find closest stored pose.
+            # shutter_t is host clock; _pose_history uses Livox clock (~54ms offset).
+            # The offset is negligible for 0.5m grid cells.
+            shutter_t = float(shutter_event_path.read_text().strip())
+            with self._pose_lock:
+                hist = list(getattr(self, '_pose_history', []))
+            if hist:
+                closest = min(hist, key=lambda e: abs(e[0] - shutter_t))
+                # Only use if within 5s — guards against empty/stale history
+                if abs(closest[0] - shutter_t) < 5.0:
+                    return closest[1]
+        except Exception:
+            pass
+        return None
 
     # ── Perimeter estimate ────────────────────────────────────────────────────
 
@@ -301,7 +336,11 @@ class CoveragePanel:
                     if str(se) in self._seen_shutters:
                         continue
                     self._seen_shutters.add(str(se))
-                    x, y, z = self._current
+                    # Use the pose at shutter time, not current pose.
+                    # Read the shutter timestamp from the event file and find
+                    # the closest trajectory pose.
+                    shutter_pos = self._pose_at_shutter(se)
+                    x, y, z = shutter_pos if shutter_pos else self._current
                     key  = (int(math.floor(x / _COV_CELL_SIZE)),
                             int(math.floor(y / _COV_CELL_SIZE)))
                     band = _cov_band(z)
@@ -1043,7 +1082,8 @@ class FusionCaptureGUI:
                             session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
                             self.scan_dir = str(session_dir.resolve())
                             self._pp_session_var.set(self.scan_dir)
-                            self._coverage_panel.set_scan_dir(self.scan_dir)
+                            _sd = self.scan_dir
+                            self.root.after(0, lambda d=_sd: self._coverage_panel.set_scan_dir(d))
                             try:
                                 _add_session_log_handler(self.scan_dir)
                                 self._session_log_attached = True

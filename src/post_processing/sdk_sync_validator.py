@@ -127,7 +127,14 @@ def _host_to_livox_offset(con) -> float:
             diffs.append(bag_ns / 1e9 - hdr_t)
         except Exception:
             pass
-    return float(np.median(diffs)) if diffs else 0.0
+    if not diffs:
+        return 0.0
+    measured = float(np.median(diffs))
+    # When livox_time_sync (or PTP) has synced clocks, the measured value is
+    # just DDS delivery latency, not a real clock offset. Zero it.
+    if abs(measured) < 0.1:
+        return 0.0
+    return measured
 
 
 # ---------------------------------------------------------------------------

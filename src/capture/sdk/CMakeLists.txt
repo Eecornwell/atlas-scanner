@@ -14,13 +14,30 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 
+# Livox SDK2 for the one-shot time sync utility
+set(LIVOX_SDK2_DIR "$ENV{HOME}/atlas_ws/install/livox_sdk2")
+
 add_executable(insta360_capture main.cpp)
-target_include_directories(insta360_capture PRIVATE ${CAMERA_SDK_DIR}/include /usr/include ${LIBUSB_INCLUDE_DIRS})
+target_include_directories(insta360_capture PRIVATE
+    ${CAMERA_SDK_DIR}/include /usr/include ${LIBUSB_INCLUDE_DIRS})
 target_link_directories(insta360_capture PRIVATE ${CAMERA_SDK_DIR}/lib /usr/lib)
 target_link_libraries(insta360_capture PRIVATE CameraSDK ${LIBUSB_LIBRARIES})
 set_target_properties(insta360_capture PROPERTIES
     BUILD_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"
     INSTALL_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"
+)
+
+# One-shot LiDAR time sync utility — run once before livox_ros_driver2 starts
+add_executable(livox_time_sync livox_time_sync.cpp)
+target_include_directories(livox_time_sync PRIVATE
+    /usr/include ${LIVOX_SDK2_DIR}/include)
+target_link_directories(livox_time_sync PRIVATE
+    /usr/lib ${LIVOX_SDK2_DIR}/lib)
+target_link_libraries(livox_time_sync PRIVATE
+    livox_lidar_sdk_static pthread)
+set_target_properties(livox_time_sync PROPERTIES
+    BUILD_RPATH "/usr/lib"
+    INSTALL_RPATH "/usr/lib"
 )
 
 # Stitch-only binary (no camera needed, for post-processing .insp files)

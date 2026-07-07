@@ -1,0 +1,13 @@
+[Unit]
+Description=PTP master for Livox MID360 (enp2s0)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ptp4l -f /etc/linuxptp/ptp4l_livox.cfg -m
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

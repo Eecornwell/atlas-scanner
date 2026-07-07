@@ -20,10 +20,12 @@ from nav_msgs.msg import Odometry
 # ─── Config ───────────────────────────────────────────────────────────────────
 CELL_SIZE        = 0.5   # XY metres per floor cell
 HEIGHT_BANDS     = 3     # number of Z bands (low / mid / high)
-HEIGHT_BAND_SIZE = 0.4   # metres per height band
-HEIGHT_ORIGIN    = 0.0   # Z=0 is set by RKO-LIO at startup (scanner resting height)
-                         # Adjust if your scanner starts at a non-zero Z offset.
-                         # Band centres: 0.2m, 0.6m, 1.0m above origin by default.
+HEIGHT_BAND_SIZE = 0.6   # metres per height band
+HEIGHT_ORIGIN    = -0.6  # Low: [-0.6,0.0)  Mid: [0.0,+0.6)  High: [+0.6,+1.2)
+                         # (mid elevation on the pole). With 0.6m bands:
+                         # Low:  z in [-0.9, -0.3) — pole lowered ~0.6m from start
+                         # Mid:  z in [-0.3, +0.3) — centred on starting height
+                         # High: z in [+0.3, +0.9) — pole raised ~0.6m from start
 MIN_VISITS_PER_BAND = 2  # visits in a band before it counts as "covered"
 RENDER_INTERVAL  = 3.0   # seconds between redraws
 MAX_GRID_CELLS   = 50    # max display width/height in cells

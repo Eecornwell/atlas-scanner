@@ -16,11 +16,13 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
-CONTINUOUS_INTERVAL=5             # seconds between captures (continuous mode only; camera minimum is 5s)
+CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
+                                  # X5 minimum is ~8s: TakePhoto() blocks for the full SD write
+                                  # (7-9s measured). Setting lower causes skip-forward jitter.
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
 
-CLEAN_POINTCLOUD=true             # statistical outlier removal on merged cloud
+CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
 COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
 FILTER_BLURRY_FRAMES=true         # remove bottom 20% of scans by sharpness before merge/ICP/COLMAP
@@ -238,7 +240,7 @@ cleanup() {
             _SDK_STITCH_ARG="--sdk-stitch"
             _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.15 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.3 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
             # reconstruct_from_bag.py handles .insp promotion, stitching, masked image
             # generation, and coloring internally when called with --sdk-stitch.
             # Nothing further needed here for continuous mode.
@@ -709,6 +711,16 @@ if [ -n "$_cam_sysfs" ]; then
 fi
 
 echo "Starting LiDAR driver..."
+# Sync MID360 hardware clock to system time before starting the LiDAR driver.
+# This sets the LiDAR's internal clock via SetLivoxLidarRmcSyncTime() so that
+# LiDAR header.stamp matches host system_clock (t_before shutter timestamps).
+# Must run before livox_ros_driver2 — the two cannot share the command port.
+echo "Syncing MID360 clock to system time..."
+if "$_SDK_BIN/livox_time_sync" 2>/dev/null; then
+    echo "✓ MID360 clock synced"
+else
+    echo "⚠ MID360 clock sync failed (non-fatal — offset correction will be applied)"
+fi
 # Pin Livox driver to cores 0-1 so its UDP receive thread is isolated
 # from the bag recorders on cores 2-3, preventing IMU packet drops.
 taskset -c 0,1 setsid ros2 launch livox_ros_driver2 msg_MID360_launch.py > /tmp/lidar.log 2>&1 &
@@ -908,7 +920,20 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     ROSBAG_DIR="$SCAN_DIR/rosbag_$ROSBAG_TIMESTAMP"
     # Main bag: LiDAR + camera + odometry on cores 2-3
     CONTINUOUS_TOPICS="/livox/lidar /camera/shutter_time"
-    [ "$LIO_ENABLED" = "true" ] && CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
+    if [ "$LIO_ENABLED" = "true" ]; then
+        CONTINUOUS_TOPICS="$CONTINUOUS_TOPICS /rko_lio/odometry"
+        # Wait for RKO-LIO to confirm it is publishing odometry before starting the bag.
+        # ros2 topic echo is too slow (DDS discovery ~5s per attempt); instead poll the
+        # log for the "Publishing odometry" line which appears at node startup.
+        _odom_wait=0
+        while [ $_odom_wait -lt 20 ]; do
+            grep -q "Publishing odometry" /tmp/rko_lio.log 2>/dev/null && break
+            sleep 0.5; _odom_wait=$((_odom_wait + 1))
+        done
+        [ $_odom_wait -ge 20 ] && echo "⚠ /rko_lio/odometry not confirmed — bag may lack odom"
+        # Brief settle so the first messages are in-flight before the recorder subscribes
+        sleep 1
+    fi
     # shellcheck disable=SC2086
     taskset -c 2,3 nice -n 10 ros2 bag record -o "$ROSBAG_DIR" --max-cache-size 100000000 \
         $CONTINUOUS_TOPICS > "$SCAN_DIR/rosbag_main.log" 2>&1 &
