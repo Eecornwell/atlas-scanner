@@ -1201,6 +1201,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         with open(ev_path, 'w') as _ev:
             _ev.write(f"{centre_host:.6f}")
 
+        # Propagate cam_index from .capture_time sidecar (format: "t_before t_after cam_idx")
+        # so post-processing uses the correct per-camera calibration.
+        _cam_idx_written = False
+        for _ct in sorted(scan_dir.glob('*.capture_time')):
+            try:
+                _ct_parts = _ct.read_text().strip().split()
+                if len(_ct_parts) >= 3:
+                    (scan_dir / '.cam_index').write_text(_ct_parts[2])
+                    _cam_idx_written = True
+                    break
+            except Exception:
+                pass
+        if not _cam_idx_written and not (scan_dir / '.cam_index').exists():
+            (scan_dir / '.cam_index').write_text('0')
+
         scan_count += 1
         # In SDK stitch mode, warn if the scanner was moving at shutter time.
         # The SDK ERP is gravity-aligned by the camera's own IMU (FlowState/EIS),
@@ -1350,7 +1365,11 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         capture_output=True,
                     )
                     if result.returncode == 0 and erp_path.exists():
-                        _wb_correct(erp_path)
+                        # Skip legacy WB correction in multi-camera sessions —
+                        # color_normalize.py handles cross-camera matching properly.
+                        # _wb_correct applies gray-world which can yellow X5 images.
+                        if not any(session_path.glob('fusion_scan_*/.cam_index')):
+                            _wb_correct(erp_path)
                         print(f"  \u2713 ERP saved: {erp_path} ({erp_path.stat().st_size // 1024}KB)  insp_dt={best_dt:.3f}s  scan={scan_dir.name}")
                         # Copy .insp and .capture_time into fusion_scan_NNN/ so the
                         # sync validator can find them after reconstruction.
@@ -1363,6 +1382,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         if _ct_src.exists() and not _ct_dst.exists():
                             import shutil as _shu
                             _shu.copy2(str(_ct_src), str(_ct_dst))
+                        # Propagate cam_index from capture_time sidecar
+                        _ct_for_cam = _ct_dst if _ct_dst.exists() else _ct_src
+                        if _ct_for_cam.exists():
+                            try:
+                                _ctp = _ct_for_cam.read_text().strip().split()
+                                if len(_ctp) >= 3:
+                                    (scan_dir / '.cam_index').write_text(_ctp[2])
+                            except Exception:
+                                pass
                     else:
                         print(f"  \u26a0 SDK stitch failed for {scan_dir.name}")
                         if fisheye_jpg:
@@ -1389,6 +1417,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _camera_hw = "x5"
             else:
                 _camera_hw = "x5"
+        # Apply per-camera color normalization before masking/coloring.
+        # Only runs if color profiles exist (created by: color_normalize.py calibrate <session>)
+        _color_norm = pp / "color_normalize.py"
+        if _color_norm.exists() and any(session_path.glob('fusion_scan_*/.cam_index')):
+            subprocess.run(
+                [sys.executable, str(_color_norm), "normalize", str(session_path)],
+                check=False,
+            )
         subprocess.run(
             [sys.executable, str(pp / "regenerate_masked_images.py"), str(session_path),
              "--camera-mode", camera_mode, "--sdk-stitch",

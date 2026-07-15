@@ -105,7 +105,7 @@ def extract(camera_hw='onex2'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--camera-hw', default='onex2', choices=['onex2', 'x5'],
+    parser.add_argument('--camera-hw', default='onex2', choices=['onex2', 'x3', 'x5'],
                         help='Camera hardware model (default: onex2)')
     args = parser.parse_args()
     extract(args.camera_hw)

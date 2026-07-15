@@ -29,6 +29,9 @@ HEIGHT_ORIGIN    = -0.6  # Low: [-0.6,0.0)  Mid: [0.0,+0.6)  High: [+0.6,+1.2)
 MIN_VISITS_PER_BAND = 2  # visits in a band before it counts as "covered"
 RENDER_INTERVAL  = 3.0   # seconds between redraws
 MAX_GRID_CELLS   = 50    # max display width/height in cells
+POS_ALPHA        = 0.03  # EMA smoothing factor for position (lower = smoother)
+CELL_MOVE_FRAMES = 30    # consecutive odom frames the EMA must be in a new cell
+                         # before the display marker commits (~3s at 10Hz)
 
 # Coverage quality thresholds (number of height bands covered out of HEIGHT_BANDS)
 _BAND_LABELS = ['L', 'M', 'H', '4', '5']  # label per band index
@@ -66,7 +69,15 @@ class CoverageTracker(Node):
         super().__init__('coverage_tracker')
         # grid[(gx, gy)] = {band_index: visit_count}
         self._grid: dict[tuple, dict] = {}
-        self._current = (0.0, 0.0, 0.0)  # x, y, z
+        self._current = (0.0, 0.0, 0.0)  # x, y, z (raw)
+        self._smooth = (0.0, 0.0, 0.0)   # x, y, z (EMA-filtered)
+        self._smooth_init = False            # first odom seeds the EMA
+        self._display_cell = (0, 0)          # current marker cell (stable)
+        self._display_band = 0               # current height band (stable)
+        self._candidate_cell = (0, 0)        # proposed new cell
+        self._candidate_count = 0            # frames candidate has been consistent
+        self._candidate_band = 0             # proposed new height band
+        self._band_count = 0                 # frames band candidate consistent
         self._total_poses = 0
 
         self.create_subscription(Odometry, '/rko_lio/odometry', self._odom_cb, 10)
@@ -82,6 +93,51 @@ class CoverageTracker(Node):
         self._current = (p.x, p.y, p.z)
         self._total_poses += 1
 
+        # EMA smoothing for display position
+        if not self._smooth_init:
+            self._smooth = (p.x, p.y, p.z)
+            self._display_cell = (int(math.floor(p.x / CELL_SIZE)),
+                                  int(math.floor(p.y / CELL_SIZE)))
+            self._candidate_cell = self._display_cell
+            self._display_band = _height_band(p.z)
+            self._candidate_band = self._display_band
+            self._smooth_init = True
+        else:
+            a = POS_ALPHA
+            sx = self._smooth[0] * (1 - a) + p.x * a
+            sy = self._smooth[1] * (1 - a) + p.y * a
+            sz = self._smooth[2] * (1 - a) + p.z * a
+            self._smooth = (sx, sy, sz)
+
+        # Stable cell update: only commit when the smoothed position has been
+        # in a different cell for CELL_MOVE_FRAMES consecutive callbacks.
+        sx, sy, sz = self._smooth
+        new_cell = (int(math.floor(sx / CELL_SIZE)), int(math.floor(sy / CELL_SIZE)))
+        if new_cell == self._display_cell:
+            self._candidate_count = 0
+        elif new_cell == self._candidate_cell:
+            self._candidate_count += 1
+            if self._candidate_count >= CELL_MOVE_FRAMES:
+                self._display_cell = new_cell
+                self._candidate_count = 0
+        else:
+            self._candidate_cell = new_cell
+            self._candidate_count = 1
+
+        # Stable height band: same consecutive-frame logic for Z
+        new_band = _height_band(sz)
+        if new_band == self._display_band:
+            self._band_count = 0
+        elif new_band == self._candidate_band:
+            self._band_count += 1
+            if self._band_count >= CELL_MOVE_FRAMES:
+                self._display_band = new_band
+                self._band_count = 0
+        else:
+            self._candidate_band = new_band
+            self._band_count = 1
+
+        # Coverage grid uses raw position (accurate for coverage accounting)
         key = (int(math.floor(p.x / CELL_SIZE)), int(math.floor(p.y / CELL_SIZE)))
         band = _height_band(p.z)
 
@@ -100,8 +156,7 @@ class CoverageTracker(Node):
         span_x = min(max_x - min_x + 1, MAX_GRID_CELLS)
         span_y = min(max_y - min_y + 1, MAX_GRID_CELLS)
 
-        cx = int(math.floor(self._current[0] / CELL_SIZE))
-        cy = int(math.floor(self._current[1] / CELL_SIZE))
+        cx, cy = self._display_cell
 
         left_rows, right_rows = [], []
         for gy in range(max_y, max_y - span_y, -1):
@@ -144,8 +199,8 @@ class CoverageTracker(Node):
             f'',
             f'  @ = current pos  |  Cell {CELL_SIZE}m  |  Band height {HEIGHT_BAND_SIZE}m  |  '
             f'Min visits/band: {MIN_VISITS_PER_BAND}',
-            f'  Pos: ({self._current[0]:.1f}, {self._current[1]:.1f}, {self._current[2]:.1f}) m  '
-            f'Height band: {_BAND_LABELS[_height_band(self._current[2])]}  |  Poses: {self._total_poses}',
+            f'  Pos: ({self._smooth[0]:.1f}, {self._smooth[1]:.1f}, {self._smooth[2]:.1f}) m  '
+            f'Height band: {_BAND_LABELS[self._display_band]}  |  Poses: {self._total_poses}',
             f'  Cells: {total_cells}  |  Full ({HEIGHT_BANDS}-band): {full_cells} ({pct:.0f}%)  |  '
             f'Partial: {partial_cells}  |  Unvisited: {total_cells - full_cells - partial_cells}',
         ]

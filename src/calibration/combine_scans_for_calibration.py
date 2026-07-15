@@ -32,8 +32,12 @@ def _safe_output(output_dir: str, *parts) -> Path:
     return resolved
 
 
-def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
-    """Combine multiple scan sessions into one calibration dataset"""
+def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=None):
+    """Combine multiple scan sessions into one calibration dataset.
+    
+    If cam_index is specified, only scans from that camera are included
+    (reads .cam_index file in each fusion_scan directory).
+    """
 
     out = _safe_output(output_dir)  # validates output_dir is within _ALLOWED_OUTPUT
     os.makedirs(out / "images", exist_ok=True)
@@ -43,6 +47,37 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
     
     # Find all fusion_scan directories
     fusion_dirs = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith('fusion_scan')])
+    
+    # Filter by camera index if specified
+    if cam_index is not None:
+        # Check if this is a single-camera session (all scans have same cam_index)
+        unique_indices = set()
+        for d in fusion_dirs:
+            ci_file = d / '.cam_index'
+            if ci_file.exists():
+                try:
+                    unique_indices.add(int(ci_file.read_text().strip()))
+                except (ValueError, OSError):
+                    pass
+        if len(unique_indices) <= 1:
+            # Single-camera session — use all scans regardless of cam_index filter
+            print(f"  Single-camera session detected, using all {len(fusion_dirs)} scans")
+        else:
+            filtered = []
+            for d in fusion_dirs:
+                ci_file = d / '.cam_index'
+                if ci_file.exists():
+                    try:
+                        ci = int(ci_file.read_text().strip())
+                        if ci == cam_index:
+                            filtered.append(d)
+                    except (ValueError, OSError):
+                        pass
+                elif cam_index == 0:
+                    # No .cam_index means single-camera session — treat as cam_0
+                    filtered.append(d)
+            fusion_dirs = filtered
+            print(f"  Filtering for cam_{cam_index}: {len(fusion_dirs)} scans")
     
     timestamps = []
     total_count = 0
@@ -211,14 +246,17 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4):
 
 if __name__ == '__main__':
     import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python3 combine_scans_for_calibration.py <session_directory>")
-        print("Example: python3 combine_scans_for_calibration.py /home/orion/atlas_ws/data/synchronized_scans/sync_fusion_20260121_170652")
-        sys.exit(1)
+    import argparse
 
-    base_dir = sys.argv[1]
-    output_dir = "/home/orion/atlas_ws/output"
+    parser = argparse.ArgumentParser(description='Combine scans into calibration dataset')
+    parser.add_argument('session_directory', help='Path to session directory')
+    parser.add_argument('max_scans', nargs='?', type=int, default=10, help='Max scans to include')
+    parser.add_argument('--cam-index', type=int, default=None,
+                        help='Only include scans from this camera index (reads .cam_index files)')
+    args = parser.parse_args()
+
+    base_dir = args.session_directory
+    output_dir = str(Path(os.path.expanduser("~/atlas_ws/output")).resolve())
 
     if not os.path.exists(base_dir):
         print(f"Error: Input directory {base_dir} does not exist")
@@ -231,29 +269,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     if os.path.exists(output_dir):
-        # Preserve calib.json if it contains valid calibration results
-        _calib_backup = None
-        try:
-            _calib_path = _safe_output(output_dir, 'calib.json')
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        if _calib_path.exists():
-            import json as _json
-            try:
-                _c = _json.loads(_calib_path.read_text())
-                _vec = _c.get('results', {}).get('T_lidar_camera', [])
-                if len(_vec) == 7 and any(abs(v) > 1e-6 for v in _vec[:3] + _vec[4:]):
-                    _calib_backup = _calib_path.read_text()
-            except Exception:
-                pass
         shutil.rmtree(output_dir)
-        if _calib_backup:
-            os.makedirs(output_dir, exist_ok=True)
-            _calib_path.write_text(_calib_backup)
-            print(f"  Preserved existing calib.json")
 
-    count = combine_scans_for_calibration(base_dir, output_dir, int(sys.argv[2]) if len(sys.argv) > 2 else 10)
+    count = combine_scans_for_calibration(base_dir, output_dir, args.max_scans, cam_index=args.cam_index)
     
     if count > 1:
         print(f"\n✓ Ready for calibration with {count} images!")

@@ -24,7 +24,7 @@ if _source_jsons:
     try:
         import json as _json
         _src = _json.loads(Path(_source_jsons[0]).read_text())
-        _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / '..' / 'session_config.json'
+        _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
         if _scan_cfg.exists():
             _hw = _json.loads(_scan_cfg.read_text()).get('camera_hw', 'onex2')
     except Exception:

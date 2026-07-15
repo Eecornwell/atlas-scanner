@@ -3,36 +3,61 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Orion. All rights reserved.
 #
-# Description: Installs a persistent udev rule for the Insta360 camera and sets device permissions. Only requires elevated privileges on first-time setup when the rule is not yet present.
+# Description: Installs persistent udev rules for Insta360 cameras and sets device
+# permissions. Supports multiple cameras: creates /dev/insta (first camera, legacy
+# compat) plus /dev/insta0, /dev/insta1, /dev/insta2 indexed by USB bus path.
 
 echo "Setting up Insta360 camera permissions..."
 
-# Add udev rule for Insta360 camera (only if not already present)
-# If already root (e.g. called via pkexec), run commands directly; otherwise use sudo
 _sudo() { [ "$(id -u)" = "0" ] && "$@" || sudo "$@"; }
 
-RULE='SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", SYMLINK+="insta", MODE="0777"'
-if ! grep -q "$RULE" /etc/udev/rules.d/99-insta.rules 2>/dev/null; then
-    echo "$RULE" | _sudo tee /etc/udev/rules.d/99-insta.rules > /dev/null
+# Multi-camera udev rule: creates /dev/insta symlink for the first camera found
+# and /dev/instaN for each camera indexed by kernel device order.
+RULE_FILE="/etc/udev/rules.d/99-insta.rules"
+RULES='SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", MODE="0777"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", SYMLINK+="insta%n", MODE="0777"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", RUN+="/bin/sh -c '\''test -e /dev/insta || ln -sf /dev/insta%n /dev/insta'\''"'
+
+if ! diff -q <(echo "$RULES") "$RULE_FILE" > /dev/null 2>&1; then
+    echo "$RULES" | _sudo tee "$RULE_FILE" > /dev/null
     _sudo udevadm control --reload-rules
     _sudo udevadm trigger
     sleep 1
 fi
 
-echo "Waiting for camera device..."
+echo "Waiting for camera device(s)..."
+FOUND=0
 for i in {1..15}; do
-    if [ -e /dev/insta ]; then
-        _sudo chmod 777 /dev/insta
-        echo "✓ Camera permissions set successfully"
-        ls -la /dev/insta
-        exit 0
-    else
-        echo "Waiting for /dev/insta... (attempt $i/15)"
-        sleep 1
+    # Count Insta360 USB devices by vendor ID
+    FOUND=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+    if [ "$FOUND" -gt 0 ]; then
+        break
     fi
+    echo "Waiting for Insta360 camera(s)... (attempt $i/15)"
+    sleep 1
 done
 
-echo "✗ Camera device not found. Please check:"
-echo "1. Camera is connected via USB"
-echo "2. Camera is in the correct mode"
-echo "3. Run 'lsusb | grep -i insta' to verify detection"
+if [ "$FOUND" -eq 0 ]; then
+    echo "✗ No Insta360 camera found. Please check:"
+    echo "  1. Camera(s) connected via USB"
+    echo "  2. Camera(s) in Android USB mode"
+    echo "  3. Run 'lsusb -d 2e1a:' to verify detection"
+    exit 1
+fi
+
+# Set permissions on all Insta360 USB device nodes
+for dev in /dev/bus/usb/*/; do
+    for devfile in "$dev"*; do
+        [ -f "$devfile" ] || continue
+        # Check if this is an Insta360 device
+        _vid=$(cat "/sys/bus/usb/devices/$(udevadm info -q name -n "$devfile" 2>/dev/null)/idVendor" 2>/dev/null)
+        if [ "$_vid" = "2e1a" ]; then
+            _sudo chmod 777 "$devfile" 2>/dev/null
+        fi
+    done
+done
+
+echo "✓ Found $FOUND Insta360 camera(s)"
+lsusb -d 2e1a: 2>/dev/null | while read -r line; do
+    echo "  $line"
+done

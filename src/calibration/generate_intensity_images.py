@@ -53,8 +53,24 @@ def remap_lidar_to_strips(image):
     return image
 
 def _load_T_cam_lidar():
-    """Load T_camera_lidar from fusion_calibration.yaml."""
+    """Load T_camera_lidar from the appropriate calibration file.
+    Prefers per-hw calibration detected from output dataset, falls back to active."""
+    import glob as _g
     calib_path = Path(__file__).parent.parent / 'config' / 'fusion_calibration.yaml'
+    # Try to detect camera_hw from the output dataset
+    _source_jsons = sorted(_g.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
+    if _source_jsons:
+        try:
+            import json as _j
+            _src = _j.loads(Path(_source_jsons[0]).read_text())
+            _sess_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
+            if _sess_cfg.exists():
+                _hw = _j.loads(_sess_cfg.read_text()).get('camera_hw', '')
+                _hw_path = Path(__file__).parent.parent / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
+                if _hw_path.exists():
+                    calib_path = _hw_path
+        except Exception:
+            pass
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
     T = np.eye(4)
@@ -183,31 +199,28 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                 except: pass
         origin, R_world_lidar = _load_trajectory_pose(_safe_scan_dir)
         if is_sdk_stitch:
-            # SDK stitch: identity projection (no rotation).
-            # Project raw lidar XYZ directly into ERP using standard spherical:
-            #   lon = atan2(Y, X),  lat = asin(Z / r)
-            #   u = W * (0.5 + lon / (2*pi)),  v = H * (0.5 - lat / pi)
-            # This gives a raw intensity image for visual landmark comparison.
+            # SDK stitch: project lidar into camera ERP frame using the
+            # current seed calibration. This coarsely aligns the intensity
+            # image with the camera ERP so SuperGlue can find matches.
+            # The compose_initial_guess.py step then accounts for the
+            # pre-applied rotation when computing the final T_lidar_camera.
             if origin is not None and R_world_lidar is not None and is_world_frame:
                 pts_lidar = (R_world_lidar.T @ (points - origin).T).T
             else:
                 pts_lidar = points
-            norm_c = np.sqrt((pts_lidar**2).sum(axis=1)).clip(1e-6)
-            X = pts_lidar[:, 0] / norm_c
-            Y = pts_lidar[:, 1] / norm_c
-            Z = pts_lidar[:, 2] / norm_c
-            orig_indices = np.arange(len(pts_lidar))
-            lon = np.arctan2(Y, X)
-            lat = np.arcsin(np.clip(Z, -1, 1))
-            # Insta360 SDK stitch ERP: pitched 90° forward vs standard.
-            # Apply R_y(-90) to coords: X_new = -Z, Y_new = Y, Z_new = X
-            # Then project with lon=atan2(Y_new, X_new), lat=asin(Z_new/r)
-            X_new = -Z
-            Y_new = Y
-            Z_new = X
-            lon2 = np.arctan2(Y_new, X_new)
-            lat2 = np.arcsin(np.clip(Z_new, -1, 1))
-            u = (out_w * (0.5 - lon2 / (2 * np.pi))).astype(int) % out_w
+            # Apply T_camera_lidar from current calibration
+            T_cl = _load_T_cam_lidar()
+            R_cl = T_cl[:3, :3]
+            pts_cam = (R_cl @ pts_lidar.T).T
+            norm_c = np.sqrt((pts_cam**2).sum(axis=1)).clip(1e-6)
+            bearing = pts_cam / norm_c[:, None]
+            orig_indices = np.arange(len(pts_cam))
+            # Equirectangular projection matching equirectangular.hpp:
+            #   lat = -asin(bearing[1]), lon = atan2(bearing[0], bearing[2])
+            #   u = W*(0.5 + lon/(2*pi)), v = H*(0.5 - lat/pi)
+            lat2 = -np.arcsin(np.clip(bearing[:, 1], -1, 1))
+            lon2 = np.arctan2(bearing[:, 0], bearing[:, 2])
+            u = (out_w * (0.5 + lon2 / (2 * np.pi))).astype(int) % out_w
             v = (out_h * (0.5 - lat2 / np.pi)).astype(int)
             v = np.clip(v, 0, out_h - 1)
         else:

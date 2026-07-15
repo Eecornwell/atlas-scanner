@@ -600,27 +600,32 @@ class FusionCaptureGUI:
         ttk.Label(mode_frame, text="Camera HW:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.camera_hw_var = tk.StringVar(value="onex2")
         ttk.Combobox(mode_frame, textvariable=self.camera_hw_var,
-                     values=["onex2", "x5"],
+                     values=["onex2", "x3", "x5"],
                      state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
-        ttk.Label(mode_frame, text="Capture:").grid(row=2, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        ttk.Label(mode_frame, text="Cameras:").grid(row=2, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        self.num_cameras_var = tk.StringVar(value="auto")
+        ttk.Combobox(mode_frame, textvariable=self.num_cameras_var,
+                     values=["auto", "1", "2", "3"],
+                     state="readonly", width=14).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+        ttk.Label(mode_frame, text="Capture:").grid(row=3, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.capture_mode_var = tk.StringVar(value="continuous")
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
-                     state="readonly", width=14).grid(row=2, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+                     state="readonly", width=14).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
         self.stationary_wait_var = tk.BooleanVar(value=False)
         self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
                         variable=self.stationary_wait_var)
-        self.stationary_wait_cb.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.stationary_wait_cb.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
-                        variable=self.bag_only_var).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.bag_only_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.icp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
-                        variable=self.icp_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.icp_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.colmap_var = tk.BooleanVar(value=False)
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
-                        variable=self.colmap_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.colmap_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -709,20 +714,20 @@ class FusionCaptureGUI:
         _pp_btn(0, 1, "Recolor with New Calibration", self._pp_reprocess)
         _pp_btn(1, 0, "ICP Alignment",                self._pp_icp)
         _pp_btn(1, 1, "Filter Blurry Frames",         self._pp_filter_blurry)
-        _pp_btn(1, 1, "Merge (Trajectory Only)",      self._pp_merge_traj)
-        _pp_btn(2, 0, "Run Sync Benchmark",           self._pp_sync_benchmark)
-        _pp_btn(2, 1, "SDK Sync Validator",             self._pp_sdk_sync_validator)
+        _pp_btn(2, 0, "Merge (Trajectory Only)",      self._pp_merge_traj)
+        _pp_btn(2, 1, "Run Sync Benchmark",           self._pp_sync_benchmark)
+        _pp_btn(3, 0, "SDK Sync Validator",            self._pp_sdk_sync_validator)
         # ── COLMAP ────────────────────────────────────────────────────────
-        _pp_sep(3, "COLMAP")
-        _pp_btn(5, 0, "Export COLMAP Model",          self._pp_colmap)
-        _pp_btn(5, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
-        _pp_btn(6, 0, "Generate Depth Images",        self._pp_colmap_depth)
+        _pp_sep(4, "COLMAP")
+        _pp_btn(6, 0, "Export COLMAP Model",          self._pp_colmap)
+        _pp_btn(6, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
+        _pp_btn(7, 0, "Generate Depth Images",        self._pp_colmap_depth)
         # ── Viewers ───────────────────────────────────────────────────────
-        _pp_sep(7, "Viewers")
-        _pp_btn(9, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
-        _pp_btn(9, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
-        _pp_btn(10, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
-        _pp_btn(10, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
+        _pp_sep(8, "Viewers")
+        _pp_btn(10, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(10, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(11, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(11, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -747,20 +752,15 @@ class FusionCaptureGUI:
         ttk.Entry(cal_sess_frame, textvariable=self._pp_session_var, width=52).pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(cal_sess_frame, text="Browse…", command=self._pp_browse).pack(side=tk.LEFT, padx=(4, 0))
 
-        # Live indicator mirroring the Camera HW dropdown
+        # Live indicator showing which camera is being calibrated
         cal_hw_frame = ttk.Frame(cal_tab)
         cal_hw_frame.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(cal_hw_frame, text="Calibrating camera:",
                   font=('Arial', 9)).pack(side=tk.LEFT, padx=(0, 6))
         self._cal_hw_label = ttk.Label(cal_hw_frame,
-            text=self.camera_hw_var.get().upper(),
+            text="cam_0 (X5)",
             font=('Arial', 10, 'bold'), foreground='#1a6fb5')
         self._cal_hw_label.pack(side=tk.LEFT)
-        # Keep the indicator in sync with the Camera HW dropdown
-        def _on_hw_change(*_):
-            hw = self.camera_hw_var.get()
-            self._cal_hw_label.config(text=hw.upper())
-        self.camera_hw_var.trace_add('write', _on_hw_change)
 
         # ── Options row ────────────────────────────────────────────
         opt_frame = ttk.Frame(cal_tab)
@@ -776,7 +776,30 @@ class FusionCaptureGUI:
         self._cal_guess_var = tk.StringVar(value="auto")
         ttk.Combobox(opt_frame, textvariable=self._cal_guess_var,
                      values=["auto", "manual"], state="readonly", width=8
+                     ).pack(side=tk.LEFT, padx=(0, 12))
+
+        ttk.Label(opt_frame, text="Camera:").pack(side=tk.LEFT, padx=(0, 4))
+        self._cal_cam_var = tk.StringVar(value="cam_0")
+        ttk.Combobox(opt_frame, textvariable=self._cal_cam_var,
+                     values=["cam_0", "cam_1", "cam_2"], state="readonly", width=7
                      ).pack(side=tk.LEFT)
+
+        # Keep the calibrating-camera indicator in sync with the Camera dropdown
+        def _on_cal_cam_change(*_):
+            cam = self._cal_cam_var.get()
+            try:
+                import yaml as _y
+                mc = self.script_dir / 'config' / 'multi_camera.yaml'
+                if mc.exists():
+                    cfg = _y.safe_load(open(mc))
+                    hw = cfg.get('cameras', {}).get(cam, {}).get('camera_hw', '?')
+                    self._cal_hw_label.config(text=f"{cam} ({hw.upper()})")
+                    return
+            except Exception:
+                pass
+            self._cal_hw_label.config(text=cam)
+        self._cal_cam_var.trace_add('write', _on_cal_cam_change)
+        _on_cal_cam_change()
 
         # ── Action buttons ──────────────────────────────────────────
         cal_btn_frame = ttk.Frame(cal_tab)
@@ -795,28 +818,59 @@ class FusionCaptureGUI:
                       font=('Arial', 8)).grid(
                 row=row+1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
 
-        # ── Full pipeline (one click) ──────────────────────────────
-        ttk.Button(cal_btn_frame, text="▶  Run Full Calibration Pipeline",
+        # ── Physical Seed (run before calibration) ────────────────
+        seed_frame = ttk.LabelFrame(cal_btn_frame, text="Physical Seed (camera offset from LiDAR)")
+        seed_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(3, 3))
+        seed_frame.columnconfigure(1, weight=1)
+        seed_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(seed_frame, text="Fwd (in):").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self._seed_fwd_var = tk.StringVar(value="3.25")
+        ttk.Entry(seed_frame, textvariable=self._seed_fwd_var, width=6).grid(row=0, column=1, padx=2)
+
+        ttk.Label(seed_frame, text="Left (in):").grid(row=0, column=2, sticky=tk.W, padx=2)
+        self._seed_left_var = tk.StringVar(value="0.0")
+        ttk.Entry(seed_frame, textvariable=self._seed_left_var, width=6).grid(row=0, column=3, padx=2)
+
+        ttk.Label(seed_frame, text="Up (in):").grid(row=1, column=0, sticky=tk.W, padx=2)
+        self._seed_up_var = tk.StringVar(value="0.0")
+        ttk.Entry(seed_frame, textvariable=self._seed_up_var, width=6).grid(row=1, column=1, padx=2)
+
+        ttk.Label(seed_frame, text="Yaw (\u00b0):").grid(row=1, column=2, sticky=tk.W, padx=2)
+        self._seed_yaw_var = tk.StringVar(value="0.0")
+        ttk.Entry(seed_frame, textvariable=self._seed_yaw_var, width=6).grid(row=1, column=3, padx=2)
+
+        ttk.Button(seed_frame, text="Write Physical Seed", command=self._cal_write_physical_seed
+                   ).grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
+        ttk.Button(seed_frame, text="Interactive Viewer", command=self._cal_interactive_seed
+                   ).grid(row=2, column=2, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
+
+        # \u2500\u2500 Full pipeline (one click) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        ttk.Button(cal_btn_frame, text="\u25b6  Run Full Calibration Pipeline",
                    command=self._cal_run_full_pipeline,
                    style="Accent.TButton").grid(
-            row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(3, 6))
+            row=1, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(3, 6))
 
-        # ── Individual steps ───────────────────────────────────────
-        _cal_sep(1, "Individual Steps")
-        _cal_btn(3, 0, "1. Combine Scans",                self._cal_combine_scans)
-        _cal_btn(3, 1, "2. Generate Intensity Images",    self._cal_gen_intensity)
-        _cal_btn(4, 0, "3. Match Features (SuperGlue)",   lambda: self._cal_superglue(self._cal_scene_var.get()))
-        _cal_btn(4, 1, "4. Initial Guess",                self._cal_initial_guess)
-        _cal_btn(5, 0, "5. Seed from Current Calib",      self._cal_seed)
-        _cal_btn(5, 1, "6. Run Calibration",              self._cal_run_calibration)
-        _cal_btn(6, 0, "7. Apply Calibration",            self._cal_apply)
-        _cal_btn(6, 1, "8. Verify Calibration",           self._cal_verify)
-        # ── Fine-tune ─────────────────────────────────────────────
-        _cal_sep(7, "Fine-tune")
-        _cal_btn(9,  0, "Tune — Sweep Pitch",             self._cal_tune_pitch)
-        _cal_btn(9,  1, "Tune — Sweep Roll",              self._cal_tune_roll)
-        _cal_btn(10, 0, "Tune — Sweep Yaw",              self._cal_tune_yaw)
-        _cal_btn(10, 1, "Tune — Sweep TX/TY/TZ",         self._cal_tune_t)
+        # \u2500\u2500 Individual steps \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        _cal_sep(2, "Individual Steps")
+        _cal_btn(4, 0, "1. Combine Scans",                self._cal_combine_scans)
+        _cal_btn(4, 1, "2. Generate Intensity Images",    self._cal_gen_intensity)
+        _cal_btn(5, 0, "3. Match Features (SuperGlue)",   lambda: self._cal_superglue(self._cal_scene_var.get()))
+        _cal_btn(5, 1, "4. Initial Guess",                self._cal_initial_guess)
+        _cal_btn(6, 0, "5. Seed from Current Calib",      self._cal_seed)
+        _cal_btn(6, 1, "6. Run Calibration",              self._cal_run_calibration)
+        _cal_btn(7, 0, "7. Apply Calibration",            self._cal_apply)
+        _cal_btn(7, 1, "8. Verify Calibration",           self._cal_verify)
+        # \u2500\u2500 Fine-tune \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        _cal_sep(8, "Fine-tune")
+        _cal_btn(10, 0, "Tune \u2014 Sweep Pitch",             self._cal_tune_pitch)
+        _cal_btn(10, 1, "Tune \u2014 Sweep Roll",              self._cal_tune_roll)
+        _cal_btn(11, 0, "Tune \u2014 Sweep Yaw",              self._cal_tune_yaw)
+        _cal_btn(11, 1, "Tune \u2014 Sweep TX/TY/TZ",         self._cal_tune_t)
+        # ── Multi-camera color ────────────────────────────────────────
+        _cal_sep(12, "Multi-Camera Color")
+        _cal_btn(14, 0, "Calibrate Color Profiles",       self._cal_color_calibrate)
+        _cal_btn(14, 1, "Apply Color Normalization",      self._cal_color_normalize)
 
         # Output log shared with post-processing tab
         ttk.Label(cal_tab, text="Output:", foreground='#888', font=('Arial', 8)).pack(anchor=tk.W, pady=(6,0))
@@ -947,6 +1001,7 @@ class FusionCaptureGUI:
             'camera_val':        self.camera_mode_var.get(),
             'capture_val':       self.capture_mode_var.get(),
             'camera_hw_val':     self.camera_hw_var.get(),
+            'num_cameras_val':   self.num_cameras_var.get(),
             'bag_only':          self.bag_only_var.get(),
             'stationary_wait':   self.stationary_wait_var.get(),
             'icp':               self.icp_var.get(),
@@ -1039,6 +1094,8 @@ class FusionCaptureGUI:
                    '--camera', camera_val,
                    '--capture', capture_val,
                    '--camera-hw', params['camera_hw_val']]
+            if params['num_cameras_val'] != 'auto':
+                cmd += ['--num-cameras', params['num_cameras_val']]
             if params['bag_only']:
                 cmd.append('--bag-only')
             if capture_val == 'stationary' and params['stationary_wait']:
@@ -1890,17 +1947,32 @@ sys.exit(0 if ok[0] else 4)
         return str(self.script_dir)
 
     def _cal_hw(self):
-        """Return current camera hardware selection."""
+        """Return camera hardware for the selected calibration camera.
+        Reads from multi_camera.yaml if available, falls back to global setting."""
+        cam = self._cal_cam_var.get()  # e.g. "cam_0"
+        try:
+            import yaml
+            mc_path = self.script_dir / 'config' / 'multi_camera.yaml'
+            if mc_path.exists():
+                with open(mc_path) as f:
+                    cfg = yaml.safe_load(f)
+                hw = cfg.get('cameras', {}).get(cam, {}).get('camera_hw', '')
+                if hw:
+                    return hw
+        except Exception:
+            pass
         return self.camera_hw_var.get()
 
     def _cal_combine_scans(self):
         sess = self._pp_session()
         if not sess: self._cal_log_write("\n[!] No session selected.\n"); return
-        self._cal_run("Combine Scans for Calibration", [
+        cmd = [
             sys.executable,
             str(self.script_dir / 'calibration' / 'combine_scans_for_calibration.py'),
-            sess
-        ])
+            sess,
+            '--cam-index', self._cal_cam_var.get().split('_')[1]
+        ]
+        self._cal_run("Combine Scans for Calibration", cmd)
 
     def _cal_gen_intensity(self):
         import os as _os
@@ -1948,10 +2020,12 @@ sys.exit(0 if ok[0] else 4)
             _existing_pp = _safe_env.get('PYTHONPATH', '')
             _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
 
+            _cam_args = ['--cam-index', self._cal_cam_var.get().split('_')[1]]
+
             steps = [
                 ("1. Combine Scans", [sys.executable,
                     str(self.script_dir / 'calibration' / 'combine_scans_for_calibration.py'),
-                    self._pp_session() or output]),
+                    self._pp_session() or output] + _cam_args),
                 ("2. Generate Intensity Images", [sys.executable,
                     str(self.script_dir / 'calibration' / 'generate_intensity_images.py'), output]),
                 (f"3. Match Features (SuperGlue {scene})", [sys.executable, str(erp_matcher),
@@ -2068,6 +2142,64 @@ sys.exit(0 if ok[0] else 4)
             str(self.script_dir / 'calibration' / 'seed_calib.py')
         ])
 
+    def _cal_write_physical_seed(self):
+        """Compute and write calibration seed from physical measurements."""
+        try:
+            fwd_in = float(self._seed_fwd_var.get())
+            left_in = float(self._seed_left_var.get())
+            up_in = float(self._seed_up_var.get())
+            yaw_deg = float(self._seed_yaw_var.get())
+        except ValueError:
+            self._cal_log_write("\n[!] Invalid numeric input in seed fields.\n")
+            return
+        cam = self._cal_cam_var.get()
+        hw = self._cal_hw()
+        self._cal_run("Write Physical Seed", [
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'physical_seed.py'),
+            '--camera-hw', hw,
+            '--forward', str(fwd_in),
+            '--left', str(left_in),
+            '--up', str(up_in),
+            '--yaw', str(yaw_deg),
+        ])
+
+    def _cal_verify_seed(self):
+        """Generate overlay and open it in the system image viewer."""
+        import subprocess, pathlib
+        sess = self._pp_session()
+        if not sess:
+            self._cal_log_write("\n[!] No session selected.\n")
+            return
+        result = subprocess.run(
+            [sys.executable,
+             str(self.script_dir / 'calibration' / 'verify_seed_overlay.py'),
+             sess],
+            capture_output=True, text=True
+        )
+        self._cal_log_write(result.stdout)
+        if result.returncode != 0:
+            self._cal_log_write(result.stderr)
+            return
+        # Open the edge image directly
+        edge_path = pathlib.Path(sess) / 'seed_edges.jpg'
+        if edge_path.exists():
+            subprocess.Popen(['xdg-open', str(edge_path)])
+
+    def _cal_interactive_seed(self):
+        """Launch interactive seed viewer window."""
+        import subprocess
+        sess = self._pp_session()
+        if not sess:
+            self._cal_log_write("\n[!] No session selected.\n")
+            return
+        hw = self._cal_hw()
+        subprocess.Popen([
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'interactive_seed.py'),
+            sess, '--camera-hw', hw,
+        ])
+
     def _cal_apply(self):
         self._cal_run("Apply Calibration", [
             sys.executable,
@@ -2174,6 +2306,30 @@ sys.exit(0 if ok[0] else 4)
         if scan_dir:
             cmd.insert(2, scan_dir)
         self._cal_run(f'Tune {axis} sweep ±{rng}', cmd)
+
+    def _cal_color_calibrate(self):
+        sess = self._pp_session()
+        if not sess: self._cal_log_write("\n[!] No session selected.\n"); return
+        import tkinter.simpledialog as _sd
+        ref = _sd.askinteger(
+            'Reference Camera',
+            'Camera index to use as color reference\n'
+            '(all other cameras will be matched to this one):',
+            initialvalue=0, minvalue=0, maxvalue=2, parent=self.root)
+        if ref is None:
+            return
+        self._cal_run("Calibrate Color Profiles", [
+            sys.executable,
+            str(self.script_dir / 'post_processing' / 'color_normalize.py'),
+            'calibrate', sess, '--reference-cam', str(ref)])
+
+    def _cal_color_normalize(self):
+        sess = self._pp_session()
+        if not sess: self._cal_log_write("\n[!] No session selected.\n"); return
+        self._cal_run("Apply Color Normalization", [
+            sys.executable,
+            str(self.script_dir / 'post_processing' / 'color_normalize.py'),
+            'normalize', sess])
 
     # ───────────────────────────────────────────────────────────────────
 

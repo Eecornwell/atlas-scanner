@@ -19,8 +19,11 @@ CAPTURE_MODE="continuous"         # stationary | continuous
 CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
                                   # X5 minimum is ~8s: TakePhoto() blocks for the full SD write
                                   # (7-9s measured). Setting lower causes skip-forward jitter.
+                                  # With N cameras, effective interval = CONTINUOUS_INTERVAL / N
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
+NUM_CAMERAS=0                     # 0 = auto-detect all connected cameras (up to 3)
+                                  # 1-3 = use exactly N cameras
 
 CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
@@ -44,6 +47,7 @@ while [[ $# -gt 0 ]]; do
         --no-colmap) EXPORT_COLMAP=false; shift ;;
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
         --camera-hw) CAMERA_HW="$2"; shift 2 ;;
+        --num-cameras) NUM_CAMERAS="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
@@ -56,7 +60,7 @@ AUTO_CREATE_COLORED=true
 # ─── Camera hardware model config ─────────────────────────────────────────────
 _CAM_MODEL_DIR="$SCRIPT_DIR/config/camera_models"
 _CAM_CALIB_DIR="$SCRIPT_DIR/config/calibrations"
-_VALID_HW="onex2 x5"
+_VALID_HW="onex2 x3 x5"
 if ! echo "$_VALID_HW" | grep -qw "$CAMERA_HW"; then
     echo "⚠ Unknown CAMERA_HW='$CAMERA_HW', defaulting to onex2"
     CAMERA_HW="onex2"
@@ -86,6 +90,25 @@ export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
 [ -n "$INSTA360_WB" ] && export INSTA360_WB
 [ -n "$INSTA360_EXPOSURE_MODE" ] && export INSTA360_EXPOSURE="$INSTA360_EXPOSURE_MODE"
 [ "$USE_AI_STITCH" = "true" ] && export INSTA360_AI_STITCH=1 INSTA360_MODEL_DIR="$SCRIPT_DIR/capture/sdk/models"
+
+# ─── Multi-camera shared settings override ─────────────────────────────────────
+# When multiple cameras are detected, load shared settings from
+# multi_camera.yaml to ensure all cameras use identical exposure/WB regardless
+# of their individual camera_models/*.yaml defaults (e.g. X5 + X3 mixed).
+_MULTI_CAM_YAML="$SCRIPT_DIR/config/multi_camera.yaml"
+if [ -f "$_MULTI_CAM_YAML" ]; then
+    _mc_exposure=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('exposure_mode'); print(v if v is not None else '')" 2>/dev/null)
+    _mc_wb=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('white_balance'); print(v if v is not None else '')" 2>/dev/null)
+    _mc_ev=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('ev_bias'); print(v if v is not None else '')" 2>/dev/null)
+    _detected_cams=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+    _effective_cams=${NUM_CAMERAS:-$_detected_cams}
+    if [ "${_effective_cams:-1}" -gt 1 ]; then
+        [ -n "$_mc_exposure" ] && export INSTA360_EXPOSURE="$_mc_exposure"
+        [ -n "$_mc_wb" ] && export INSTA360_WB="$_mc_wb"
+        [ -n "$_mc_ev" ] && export INSTA360_EV_BIAS="$_mc_ev"
+        echo "Multi-camera: shared settings applied (exposure=$_mc_exposure wb=$_mc_wb ev=$_mc_ev)"
+    fi
+fi
 
 _SDK_BIN="$SCRIPT_DIR/capture/sdk/build"
 
@@ -133,7 +156,8 @@ echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE hw=$C
 # Write session metadata so post-processing tools know the camera hardware
 cat > "$SCAN_DIR/session_config.json" << _EOF
 {"camera_mode": "$CAMERA_MODE", "capture_mode": "$CAPTURE_MODE", "camera_hw": "$CAMERA_HW",
- "erp_width": $INSTA360_ERP_WIDTH, "erp_height": $INSTA360_ERP_HEIGHT}
+ "erp_width": $INSTA360_ERP_WIDTH, "erp_height": $INSTA360_ERP_HEIGHT,
+ "num_cameras": ${_USE_CAMERAS:-1}}
 _EOF
 
 PIDS=()
@@ -320,6 +344,10 @@ cleanup() {
                     fi
                 done
                 # SDK stitcher handles seam blending internally, no need for blend_erp_seams
+                # Apply per-camera color normalization (if profiles exist)
+                if ls "$SCAN_DIR"/fusion_scan_*/.cam_index > /dev/null 2>&1; then
+                    python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/color_normalize.py" normalize "$SCAN_DIR"
+                fi
                 echo "Creating masked images..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/regenerate_masked_images.py" "$SCAN_DIR" --camera-mode "$CAMERA_MODE" --sdk-stitch --camera-hw "$CAMERA_HW"
                 echo "Creating colored point clouds..."
@@ -657,7 +685,28 @@ fi
 # EXCEPTION: Skip the reset if /dev/insta is already present AND no previous
 # session sentinel exists — this means the camera was just plugged in fresh
 # and resetting would trigger the USB mode selection prompt again.
-if [ "${CAMERA_HW:-onex2}" = "x5" ]; then
+if [ "${_USE_CAMERAS:-1}" -gt 1 ]; then
+    # Multi-camera: force-reset ALL Insta360 USB devices to clear stale state
+    echo "Resetting all Insta360 USB devices for multi-camera mode..."
+    for _usb_dev in $(find /sys/bus/usb/devices/ -name "idVendor" -exec grep -l "2e1a" {} \; 2>/dev/null); do
+        _busdev=$(dirname "$_usb_dev")
+        _busdev_name=$(basename "$_busdev")
+        _devnode=$(find /dev/bus/usb -name "*" -exec udevadm info -q property -n {} \; 2>/dev/null | grep -B20 "ID_VENDOR_ID=2e1a" | grep "DEVNAME=" | head -1 | cut -d= -f2)
+        if [ -n "$_devnode" ]; then
+            sudo python3 -c "
+import fcntl, sys
+USBDEVFS_RESET = 0x5514
+try:
+    with open('$_devnode', 'wb') as f:
+        fcntl.ioctl(f, USBDEVFS_RESET, 0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null && echo "  Reset: $_devnode" || true
+        fi
+    done
+    sleep 5
+    echo "✓ USB reset complete"
+elif [ "${CAMERA_HW:-onex2}" = "x5" ] || [ "$_DETECTED_CAMERAS" -gt 1 ]; then
     if [ -f /tmp/.insta360_session_ran ]; then
         _usb_force_reset_camera
     else
@@ -857,16 +906,70 @@ fi
     touch /tmp/.insta360_session_ran
     # Wait for any previous SDK daemon to fully release the USB device
     _wait_camera_dead
+    # Detect number of cameras and choose single vs multi binary
+    _DETECTED_CAMERAS=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+    if [ "$NUM_CAMERAS" -gt 0 ] 2>/dev/null; then
+        _USE_CAMERAS=$NUM_CAMERAS
+    else
+        _USE_CAMERAS=$_DETECTED_CAMERAS
+    fi
+    [ "$_USE_CAMERAS" -gt 3 ] && _USE_CAMERAS=3
+    [ "$_USE_CAMERAS" -lt 1 ] && _USE_CAMERAS=1
+    if [ "$_USE_CAMERAS" -gt 1 ] && [ -x "$_SDK_BIN/insta360_capture_multi" ]; then
+        _CAPTURE_BIN="$_SDK_BIN/insta360_capture_multi"
+        echo "Multi-camera mode: $_USE_CAMERAS cameras detected (shot every ${CONTINUOUS_INTERVAL}s, per-camera every $((CONTINUOUS_INTERVAL * _USE_CAMERAS))s)"
+    elif [ "$_USE_CAMERAS" -eq 1 ] && [ -x "$_SDK_BIN/insta360_capture_multi" ] && [ "$_DETECTED_CAMERAS" -gt 1 ]; then
+        # Single-camera mode but multiple cameras connected — use multi binary
+        # with serial filter so it opens the correct one.
+        _CAPTURE_BIN="$_SDK_BIN/insta360_capture_multi"
+        echo "Single-camera mode: using $_USE_CAMERAS of $_DETECTED_CAMERAS cameras"
+    else
+        _CAPTURE_BIN="$_SDK_BIN/insta360_capture"
+        _USE_CAMERAS=1
+    fi
     # Start the persistent SDK session daemon
     export INSTA360_INTERVAL_MS=$(( CONTINUOUS_INTERVAL * 1000 ))
+    # Read camera serials from multi_camera.yaml to ensure deterministic index assignment
+    if [ -f "$_MULTI_CAM_YAML" ] && [ "$_CAPTURE_BIN" = "$_SDK_BIN/insta360_capture_multi" ]; then
+        if [ "$_USE_CAMERAS" -gt 1 ]; then
+            # Multi-camera: pass all serials in order
+            _cam_serials=$(python3 -c "
+import yaml, sys
+d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
+cams = d.get('cameras', {})
+serials = []
+for i in range(3):
+    c = cams.get(f'cam_{i}', {})
+    s = c.get('serial', '')
+    if s:
+        serials.append(s)
+print(','.join(serials))
+" 2>/dev/null)
+        else
+            # Single-camera from multi-camera setup: find serial matching CAMERA_HW
+            _cam_serials=$(python3 -c "
+import yaml, sys
+d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
+cams = d.get('cameras', {})
+for i in range(3):
+    c = cams.get(f'cam_{i}', {})
+    if c.get('camera_hw', '') == '$CAMERA_HW' and c.get('serial', ''):
+        print(c['serial'])
+        break
+" 2>/dev/null)
+        fi
+        [ -n "$_cam_serials" ] && export INSTA360_CAMERA_SERIALS="$_cam_serials"
+    fi
     INSTA360_SESSION_DIR="$SCAN_DIR" \
-        "$_SDK_BIN/insta360_capture" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
+        "$_CAPTURE_BIN" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
     SDK_CAPTURE_PID=$!
     # Not added to PIDS — cleanup must not kill the daemon before StopTimeLapse runs.
     # The shell waits for it to exit naturally after the download drain below.
     # Wait for the daemon to signal ready
     echo "Waiting for SDK camera session..."
-    for _i in $(seq 1 120); do
+    _sdk_timeout=120
+    [ "$_USE_CAMERAS" -gt 1 ] && _sdk_timeout=180
+    for _i in $(seq 1 $_sdk_timeout); do
         [ -f "$SCAN_DIR/.sdk_ready" ] && break
         if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
             echo "✗ SDK capture daemon exited — check $SCAN_DIR/sdk_capture.log"
@@ -882,7 +985,7 @@ fi
         rm -f "$SCAN_DIR/.sdk_ready"
         # One retry after force reset
         INSTA360_SESSION_DIR="$SCAN_DIR" \
-            "$_SDK_BIN/insta360_capture" >> "$SCAN_DIR/sdk_capture.log" 2>&1 &
+            "$_CAPTURE_BIN" >> "$SCAN_DIR/sdk_capture.log" 2>&1 &
         SDK_CAPTURE_PID=$!
         for _i in $(seq 1 60); do
             [ -f "$SCAN_DIR/.sdk_ready" ] && break
@@ -896,6 +999,14 @@ fi
         fi
     fi
     echo "✓ SDK camera session ready"
+    # Update _USE_CAMERAS from SDK's actual opened count (may be less than lsusb detected)
+    if [ -f "$SCAN_DIR/.sdk_camera_count" ]; then
+        _sdk_cams=$(cat "$SCAN_DIR/.sdk_camera_count" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$_sdk_cams" ] && [ "$_sdk_cams" -gt 0 ] 2>/dev/null && [ "$_sdk_cams" -lt "$_USE_CAMERAS" ]; then
+            echo "  ⚠ SDK only opened $_sdk_cams of $_USE_CAMERAS cameras (check sdk_capture.log)"
+            _USE_CAMERAS=$_sdk_cams
+        fi
+    fi
 FUSION_READY="true"
 
 echo ""
@@ -1134,25 +1245,61 @@ else
         echo "Capturing scan $SCAN_COUNT..."
         sleep 2
 
-        # Signal the SDK daemon to capture — .sdk_capture_done fires at shutter click
-        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-        echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
-        for _i in $(seq 1 300); do
-            [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
-            [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
-            kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
-            sleep 0.1
+        # In multi-camera stationary mode, each camera gets its own scan folder.
+        # scan N = cam_0, scan N+1 = cam_1, etc.
+        _num_shots=${_USE_CAMERAS:-1}
+        _first_scan=$SCAN_COUNT
+        for _cam_shot in $(seq 1 $_num_shots); do
+            if [ $_cam_shot -gt 1 ]; then
+                SCAN_COUNT=$((SCAN_COUNT + 1))
+                SCAN_NAME="fusion_scan_$(printf "%03d" $SCAN_COUNT)"
+                INDIVIDUAL_SCAN_DIR="$SCAN_DIR/$SCAN_NAME"
+                mkdir -p "$INDIVIDUAL_SCAN_DIR"
+            fi
+            CAPTURE_EXIT_CODE=""
+            rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+            echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
+            for _i in $(seq 1 900); do
+                [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
+                [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
+                kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
+                sleep 0.1
+            done
+            [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
+            if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
+                _insp=$(ls "$INDIVIDUAL_SCAN_DIR"/*.insp 2>/dev/null | head -1)
+                [ -n "$_insp" ] && echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
+            else
+                echo "  ✗ cam_$((_cam_shot-1)) capture failed"
+                break
+            fi
         done
-        [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
-        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+        # Wait for background downloads to complete (SDK signals via .sdk_downloads_pending)
+        if [ $_num_shots -gt 1 ]; then
+            for _dw in $(seq 1 600); do
+                _pending=$(cat "$SCAN_DIR/.sdk_downloads_pending" 2>/dev/null | tr -d '[:space:]')
+                [ "$_pending" = "0" ] && break
+                sleep 0.1
+            done
+        fi
+        # Collect LiDAR for the first scan dir, then copy to all camera scan dirs
+        INDIVIDUAL_SCAN_DIR="$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"
         if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-            _insp=$(ls "$INDIVIDUAL_SCAN_DIR"/*.insp 2>/dev/null | head -1)
-            [ -n "$_insp" ] && echo "  ✓ SDK raw file: $(basename "$_insp") (stitch in post-processing)"
-            # Collect LiDAR point cloud from live topics into sensor_lidar_*.ply / world_lidar_*.ply
+            # Collect LiDAR point cloud from live topics
             FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
             ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
+            # Copy LiDAR PLY to all other camera scan dirs for this position
+            if [ $_num_shots -gt 1 ]; then
+                for _cs in $(seq 2 $_num_shots); do
+                    _other_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cs - 1)))"
+                    for _ply in "$INDIVIDUAL_SCAN_DIR"/sensor_lidar_*.ply "$INDIVIDUAL_SCAN_DIR"/world_lidar_*.ply; do
+                        [ -f "$_ply" ] && cp "$_ply" "$_other_dir/" 2>/dev/null
+                    done
+                done
+                echo "  ✓ LiDAR copied to all $_num_shots scan dirs"
+            fi
         fi
 
 
@@ -1201,19 +1348,26 @@ else
             SCAN_COUNT=$((SCAN_COUNT - 1)); continue
         fi
 
-        # Trajectory trigger
+        # Trajectory trigger — save for all scan dirs at this position
         if [ "$LIO_ENABLED" = "true" ] && [ "$TRAJECTORY_RECORDING" = "true" ]; then
             CAPTURE_TIMESTAMP=$(python3 -c "import time; print(time.time())")
-            echo "{\"scan_name\": \"$SCAN_NAME\", \"scan_dir\": \"$INDIVIDUAL_SCAN_DIR\", \"capture_time\": $CAPTURE_TIMESTAMP}" \
-                > "$SCAN_DIR/.save_trajectory_${SCAN_NAME}"
-            echo "✓ Trajectory trigger saved"
+            for _scan_idx in $(seq $_first_scan $SCAN_COUNT); do
+                _traj_name="fusion_scan_$(printf "%03d" $_scan_idx)"
+                _traj_dir="$SCAN_DIR/$_traj_name"
+                echo "{\"scan_name\": \"$_traj_name\", \"scan_dir\": \"$_traj_dir\", \"capture_time\": $CAPTURE_TIMESTAMP}" \
+                    > "$SCAN_DIR/.save_trajectory_${_traj_name}"
+            done
+            echo "✓ Trajectory trigger saved for $_num_shots scan(s)"
         fi
 
-        # Rename PLY to canonical names
-        WORLD_PLY=$(ls -t "$INDIVIDUAL_SCAN_DIR"/world_lidar_*.ply 2>/dev/null | head -1)
-        SENSOR_PLY=$(ls -t "$INDIVIDUAL_SCAN_DIR"/sensor_lidar_*.ply 2>/dev/null | head -1)
-        [ -n "$WORLD_PLY" ]  && mv "$WORLD_PLY"  "$INDIVIDUAL_SCAN_DIR/world_lidar.ply"
-        [ -n "$SENSOR_PLY" ] && mv "$SENSOR_PLY" "$INDIVIDUAL_SCAN_DIR/sensor_lidar.ply"
+        # Rename PLY to canonical names in all scan dirs for this position
+        for _scan_idx in $(seq $_first_scan $SCAN_COUNT); do
+            _sdir="$SCAN_DIR/fusion_scan_$(printf "%03d" $_scan_idx)"
+            WORLD_PLY=$(ls -t "$_sdir"/world_lidar_*.ply 2>/dev/null | head -1)
+            SENSOR_PLY=$(ls -t "$_sdir"/sensor_lidar_*.ply 2>/dev/null | head -1)
+            [ -n "$WORLD_PLY" ]  && mv "$WORLD_PLY"  "$_sdir/world_lidar.ply"
+            [ -n "$SENSOR_PLY" ] && mv "$SENSOR_PLY" "$_sdir/sensor_lidar.ply"
+        done
 
         echo "✓ Scan $SCAN_COUNT completed: $SCAN_NAME/"
         echo ""

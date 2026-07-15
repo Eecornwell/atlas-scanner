@@ -9,7 +9,7 @@ import sys
 import os
 from pathlib import Path
 
-MASK_BASE = "/home/orion/atlas_ws/src/atlas-scanner/src"
+MASK_BASE = str(Path(os.path.expanduser("~/atlas_ws/src/atlas-scanner/src")).resolve())
 
 def apply_mask(image_path, mask_path, output_path):
     import cv2

@@ -35,11 +35,11 @@ def ray_to_erp(rays, W, H):
 
 def ray_to_erp_sdk(rays, W, H):
     """Convert unit rays to SDK-stitch lidar intensity ERP pixel coords.
-       Matches generate_intensity_images.py SDK stitch formula:
-       lat = arcsin(Y), lon = atan2(Z, X) + pi/2
+       Since the intensity image is projected into camera frame using the seed
+       calibration, this uses the same formula as ray_to_erp (equirectangular.hpp).
     """
     X, Y, Z = rays[..., 0], rays[..., 1], rays[..., 2]
-    lat = np.arcsin(np.clip(-Y, -1, 1))
+    lat = -np.arcsin(np.clip(Y, -1, 1))
     lon = np.arctan2(X, Z)
     u = W * (0.5 + lon / (2 * np.pi))
     v = H * (0.5 - lat / np.pi)

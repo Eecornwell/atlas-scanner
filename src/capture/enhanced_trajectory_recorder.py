@@ -18,13 +18,27 @@ from scipy.spatial.transform import Rotation, Slerp
 
 CALIB_PATH = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
 
-def _load_camera_lidar_transform():
+def _load_camera_lidar_transform(cam_index=None):
     """Load T_camera_lidar from fusion_calibration.yaml and return T_lidar_camera (4x4).
     
     fusion_calibration.yaml stores T_camera_lidar (lidar->camera) as euler XYZ + translation.
     Invert once to get T_lidar_camera (camera->lidar frame, i.e. camera position in lidar frame).
+    If cam_index is provided, tries per-camera calibration first.
     """
-    with open(CALIB_PATH) as f:
+    calib_path = CALIB_PATH
+    if cam_index is not None:
+        # Try per-camera calibration
+        sys_path = Path.home() / 'atlas_ws/src/atlas-scanner/src'
+        sys.path.insert(0, str(sys_path))
+        try:
+            from camera_hw import calibration_path, camera_hw_for_session
+            # Default to x5 if we can't determine hw
+            per_cam = sys_path / 'config' / 'calibrations' / 'x5' / f'cam_{cam_index}' / 'fusion_calibration.yaml'
+            if per_cam.exists():
+                calib_path = per_cam
+        except ImportError:
+            pass
+    with open(calib_path) as f:
         calib = yaml.safe_load(f)
     roll = calib['roll_offset']
     pitch = calib['pitch_offset']

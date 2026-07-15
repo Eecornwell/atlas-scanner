@@ -127,8 +127,13 @@ def exact_match_calibration_tool(scan_dir):
         return False
     img_height, img_width = image.shape[:2]
 
-    # Load calibration
-    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'fusion_calibration.yaml')
+    # Load calibration — use per-camera calibration if .cam_index exists
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from camera_hw import calibration_path, cam_index_for_scan, camera_hw_for_session
+    _session_dir = os.path.dirname(scan_dir)
+    _hw = camera_hw_for_session(_session_dir)
+    _cam_idx = cam_index_for_scan(scan_dir)
+    config_path = str(calibration_path(_hw, _cam_idx))
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 

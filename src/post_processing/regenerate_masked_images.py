@@ -12,11 +12,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from apply_lidar_mask import apply_mask
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from camera_hw import load_camera_profile, camera_hw_for_session, mask_path as _mask_path
+from camera_hw import load_camera_profile, camera_hw_for_session, mask_path as _mask_path, cam_index_for_scan
 
 MASK_BASE = Path(os.path.expanduser('~/atlas_ws/src/atlas-scanner/src'))
 _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 _ALLOWED_SRC  = Path(os.path.expanduser('~/atlas_ws/src')).resolve()
+_MASK_DIR = MASK_BASE / 'config' / 'masks'
+_MULTI_CAM_YAML = MASK_BASE / 'config' / 'multi_camera.yaml'
 
 
 def _safe_data(p) -> Path:
@@ -31,22 +33,70 @@ def _mask_for_hw(camera_mode, sdk_stitch, camera_hw):
     return str(_mask_path(profile, camera_mode, sdk_stitch))
 
 
+def _mask_for_cam(cam_idx: int, camera_mode: str) -> str | None:
+    """Look up per-camera mask from multi_camera.yaml. Returns path or None."""
+    if not _MULTI_CAM_YAML.exists():
+        return None
+    try:
+        import yaml
+        cfg = yaml.safe_load(_MULTI_CAM_YAML.read_text()) or {}
+        cameras = cfg.get('cameras', {})
+        cam_key = f'cam_{cam_idx}'
+        if cam_key not in cameras:
+            return None
+        cam_cfg = cameras[cam_key]
+        mask_key = 'mask_dual' if camera_mode == 'dual_fisheye' else 'mask_single'
+        mask_name = cam_cfg.get(mask_key)
+        if not mask_name:
+            return None
+        mask_file = _MASK_DIR / mask_name
+        if mask_file.exists():
+            return str(mask_file)
+        # Fallback: check src/ root (legacy location)
+        legacy = MASK_BASE / mask_name
+        if legacy.exists():
+            return str(legacy)
+    except Exception:
+        pass
+    return None
+
+
 def regenerate_masked_images(session_dir, camera_mode="dual_fisheye", sdk_stitch=False,
                              camera_hw="onex2"):
-    """Regenerate masked images from blended ERP images"""
+    """Regenerate masked images from blended ERP images.
+    Uses per-camera masks from multi_camera.yaml when available."""
     try:
         session_path = _safe_data(session_dir)
     except ValueError as e:
         print(f"Error: {e}")
         return
-    mask_file = _mask_for_hw(camera_mode, sdk_stitch, camera_hw)
-    print(f"  Using mask: {Path(mask_file).name}  (hw={camera_hw})")
-    
+
+    # Default mask for cameras without a per-camera override
+    default_mask = _mask_for_hw(camera_mode, sdk_stitch, camera_hw)
+    print(f"  Default mask: {Path(default_mask).name}  (hw={camera_hw})")
+
     count = 0
+    # Detect if this is a single-camera session (all same cam_index)
+    all_indices = set()
+    for scan_dir in sorted(session_path.glob("fusion_scan_*")):
+        if scan_dir.is_dir():
+            all_indices.add(cam_index_for_scan(scan_dir))
+    is_single_cam = len(all_indices) <= 1
+
     for scan_dir in sorted(session_path.glob("fusion_scan_*")):
         if not scan_dir.is_dir() or (scan_dir / '.blur_skip').exists():
             continue
-        # Find blended ERP images
+
+        # Determine mask for this scan based on camera index
+        cam_idx = cam_index_for_scan(scan_dir)
+        # In single-camera sessions, cam_index is always 0 regardless of
+        # which physical camera was used. Use the default (from camera_hw).
+        if is_single_cam:
+            per_cam_mask = None
+        else:
+            per_cam_mask = _mask_for_cam(cam_idx, camera_mode)
+        mask_file = per_cam_mask if per_cam_mask else default_mask
+
         for img_file in scan_dir.glob("equirect_*.jpg"):
                 if '_bak' not in img_file.name:
                     try:
@@ -56,7 +106,9 @@ def regenerate_masked_images(session_dir, camera_mode="dual_fisheye", sdk_stitch
                         continue
                     if apply_mask(str(safe_img), mask_file, str(safe_out)):
                         count += 1
-    
+                        if per_cam_mask:
+                            print(f"    {scan_dir.name}: cam_{cam_idx} mask={Path(mask_file).name}")
+
     print(f"✓ Regenerated {count} masked images from blended ERPs")
 
 if __name__ == "__main__":
@@ -66,7 +118,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera-mode", default="dual_fisheye", choices=["dual_fisheye", "single_fisheye"])
     parser.add_argument("--sdk-stitch", action="store_true")
     parser.add_argument("--camera-hw", default="onex2",
-                        choices=["onex2", "x5"])
+                        choices=["onex2", "x3", "x5"])
     args = parser.parse_args()
     try:
         _safe_data(args.session_dir)

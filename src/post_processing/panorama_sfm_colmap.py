@@ -265,7 +265,15 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
     kept, positions = [], []
     for p in panoramas:
-        if not positions or min(np.linalg.norm(p['center'] - q) for q in positions) >= MIN_BASELINE_M:
+        # In multi-camera mode, scans from different cameras at the same position
+        # provide different viewpoints and should NOT be filtered by baseline.
+        cam_idx_file = p['scan_dir'] / '.cam_index'
+        is_multi_cam = cam_idx_file.exists()
+        if is_multi_cam:
+            # Always keep — different cameras provide unique viewpoints
+            kept.append(p)
+            positions.append(p['center'])
+        elif not positions or min(np.linalg.norm(p['center'] - q) for q in positions) >= MIN_BASELINE_M:
             kept.append(p)
             positions.append(p['center'])
     panoramas = kept

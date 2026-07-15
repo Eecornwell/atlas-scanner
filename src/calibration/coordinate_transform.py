@@ -63,7 +63,7 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
             use_existing = False
     
     # Load calib.json from workspace level
-    calib_path = '/home/orion/atlas_ws/output/calib.json'
+    calib_path = str(Path(os.path.expanduser('~/atlas_ws/output/calib.json')).resolve())
     
     if not os.path.exists(calib_path):
         if config_path.exists():

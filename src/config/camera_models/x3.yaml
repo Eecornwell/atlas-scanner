@@ -1,0 +1,17 @@
+# Camera model profile: Insta360 X3
+# ERP output resolution for SDK stitching
+# Native sensor: 3648x3648 per lens. Max theoretical ERP: ~7296x3648.
+# 7680x3840 is a good balance of detail and processing speed.
+erp_width: 7680
+erp_height: 3840
+# Capture resolution: Size_7296_3648 (enum 18, X3 native 72MP)
+photo_size_enum: 18
+# White balance: 0=AUTO (matches X5 for multi-camera consistency)
+white_balance: 0
+# Exposure mode: 0=AUTO (matches X5 for multi-camera consistency)
+exposure_mode: 0
+# Lidar mask filename (relative to config/masks/)
+lidar_mask_dual: lidar_mask_dual_x3_cam_left.png
+lidar_mask_single: lidar_mask_single_x5.png
+# Display name
+display_name: "Insta360 X3"

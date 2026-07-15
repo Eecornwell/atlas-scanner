@@ -39,8 +39,9 @@ class ShutterEventPublisher(Node):
         for f in self.session_dir.glob('fusion_scan_*/capture_*.shutter_event'):
             try:
                 safe_f = _safe_data(f)
-                val = float(safe_f.read_text().strip())
-            except ValueError:
+                parts = safe_f.read_text().strip().split()
+                val = float(parts[0])
+            except (ValueError, IndexError):
                 continue
 
             prev = self.file_state.get(str(f))
@@ -51,8 +52,9 @@ class ShutterEventPublisher(Node):
                 msg = Float64()
                 msg.data = val
                 self.pub.publish(msg)
+                cam_idx = int(parts[1]) if len(parts) > 1 else 0
                 action = 'Published' if prev is None else f'Refined ({prev:.3f}->{val:.3f})'
-                self.get_logger().info(f'{action} shutter_t={val:.6f}  ({f.name})')
+                self.get_logger().info(f'{action} shutter_t={val:.6f} cam={cam_idx}  ({f.name})')
 
 
 def main():

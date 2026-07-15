@@ -61,7 +61,7 @@ def process_scan_coloring(scan_dir, use_exact=False):
         subprocess.run(
             [sys.executable, str(script_path), str(scan_dir)],
             check=False,
-            cwd="/home/orion/atlas_ws",
+            cwd=os.path.expanduser("~/atlas_ws"),
         )
         
         # Check if colored PLY was created
