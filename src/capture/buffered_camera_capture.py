@@ -83,7 +83,10 @@ class BufferedCameraCapture(Node):
         print(f"✓ Buffered capture initialized")
 
     def lidar_cb(self, msg):
-        timestamp = time.time()
+        # Use the LiDAR header stamp (Livox hardware clock) rather than host
+        # time.time() so find_closest_message() comparisons stay in one clock domain.
+        stamp = msg.header.stamp
+        timestamp = stamp.sec + stamp.nanosec * 1e-9
         with self.buffer_lock:
             self.lidar_buffer.append((timestamp, msg))
 

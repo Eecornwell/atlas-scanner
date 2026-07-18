@@ -143,12 +143,76 @@ def main():
     if is_sdk:
         print('Detected SDK stitch mode — using perspective crop matching')
 
-    # Perspective crop directions: sample full 360 at multiple pitches for maximum coverage
+    # Read seed calibration yaw to bias crop directions toward camera FOV.
+    # When the camera has a large yaw offset (e.g. cam_1 faces right at -90°),
+    # the LiDAR intensity image is projected into that rotated frame, so content
+    # appears at a different ERP location than for a forward-facing camera.
+    # We add the seed yaw offset to all crop directions so SuperGlue samples
+    # where camera and LiDAR content actually overlap.
+    #
+    # Priority order for calibration file:
+    #   1. ATLAS_CALIBRATION_FILE env var (set by calibrate_camera.sh to the
+    #      exact per-slot path used by generate_intensity_images.py)
+    #   2. ATLAS_CALIBRATION_CAM_INDEX + multi_camera.yaml slot lookup
+    #   3. hw-level file detected from session_config.json (old fallback)
+    seed_yaw_deg = 0.0
+    try:
+        import yaml as _yaml
+        import glob as _glob
+        import os as _os
+        _src_root = _P.home() / 'atlas_ws/src/atlas-scanner/src'
+        _x5_path = _src_root / 'config' / 'calibrations' / 'x5' / 'fusion_calibration.yaml'
+        _x5_yaw = _yaml.safe_load(_x5_path.read_text())['yaw_offset'] if _x5_path.exists() else 0.0
+
+        _calib_path = None
+
+        # Priority 1: explicit path set by calibrate_camera.sh
+        _env_file = _os.environ.get('ATLAS_CALIBRATION_FILE', '')
+        if _env_file and _P(_env_file).exists():
+            _calib_path = _P(_env_file)
+            print(f'Seed calibration (ATLAS_CALIBRATION_FILE): {_calib_path}')
+
+        # Priority 2: cam index → multi_camera.yaml slot path
+        if _calib_path is None:
+            _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+            if _cam_idx:
+                _mc_path = _src_root / 'config' / 'multi_camera.yaml'
+                if _mc_path.exists():
+                    _mc = _yaml.safe_load(_mc_path.read_text()) or {}
+                    _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+                    if _calib_rel:
+                        _slot_path = _src_root / 'config' / _calib_rel
+                        if _slot_path.exists():
+                            _calib_path = _slot_path
+                            print(f'Seed calibration (cam_{_cam_idx} slot): {_calib_path}')
+
+        # Priority 3: hw-level file from session_config.json
+        if _calib_path is None:
+            _src_jsons = sorted(_glob.glob(f'{data_path}/*_source.json'))
+            _hw = 'x5'
+            if _src_jsons:
+                _src = _json.load(open(_src_jsons[0]))
+                _sc = _P(_src.get('scan_dir', '')) / '..' / 'session_config.json'
+                if _sc.exists():
+                    _hw = _json.loads(_sc.read_text()).get('camera_hw', 'x5')
+            _hw_path = _src_root / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
+            _calib_path = _hw_path if _hw_path.exists() else _src_root / 'config' / 'fusion_calibration.yaml'
+            print(f'Seed calibration (hw fallback, {_hw}): {_calib_path}')
+
+        if _calib_path and _calib_path.exists():
+            _calib = _yaml.safe_load(_calib_path.read_text())
+            seed_yaw_deg = float(np.degrees(_calib['yaw_offset'] - _x5_yaw))
+            print(f'Seed yaw offset: {seed_yaw_deg:.1f}° — biasing crop directions')
+    except Exception as e:
+        print(f'Could not read seed yaw: {e}')
+
+    # Perspective crop directions: sample full 360 at multiple pitches.
+    # Rotated by seed_yaw_deg so crops are centred on the camera's actual FOV.
+    _base_yaws = [0, 90, 180, 270, 45, 135, 225, 315, 0, 90, 180, 270, 0, 90, 180, 270]
+    _pitches   = [0,  0,   0,   0,  0,   0,   0,   0, 25, 25,  25,  25,-25,-25, -25, -25]
     crop_directions = [
-        (0,   0), (90,  0), (180,  0), (270,  0),
-        (45,  0), (135, 0), (225,  0), (315,  0),
-        (0,  25), (90, 25), (180, 25), (270, 25),
-        (0, -25), (90,-25), (180,-25), (270,-25),
+        (int((y + seed_yaw_deg) % 360), p)
+        for y, p in zip(_base_yaws, _pitches)
     ]
 
     for bag_name in calib['meta']['bag_names']:

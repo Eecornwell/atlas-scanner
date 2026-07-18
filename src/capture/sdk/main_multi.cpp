@@ -493,12 +493,38 @@ int main(int argc, char* argv[]) {
         if (trigger_content[0] != '/') trigger_content = fs::current_path().string() + "/" + trigger_content;
 
         if (trigger_content == session_dir) {
-            // --- Continuous mode: alternating TakePhoto() across N cameras ---
+            // --- Continuous mode: evenly-staggered TakePhoto() across N cameras ---
+            //
+            // Goal: produce a shutter event every (interval_s) seconds by cycling
+            // through cameras in round-robin. With 3 cameras at 3s interval, the
+            // timeline should be:
+            //   t=0  cam_0 fires
+            //   t=3  cam_1 fires
+            //   t=6  cam_2 fires
+            //   t=9  cam_0 fires (its TakePhoto from t=0 finished ~t=8)
+            //   ...
+            //
+            // Challenge: TakePhoto() blocks for 7-9s (X5). A fixed-cadence
+            // scheduler fails because the camera is still busy when its next
+            // slot arrives. Instead we use a pipeline approach:
+            //
+            //   - Each camera has a dedicated worker thread that calls
+            //     TakePhoto() as soon as it receives a dispatch signal.
+            //   - A single dispatcher thread maintains a wall-clock schedule
+            //     and dispatches the next camera in round-robin order.
+            //   - The dispatcher does NOT wait for the previous camera to
+            //     finish — it fires the next camera at the scheduled time
+            //     regardless. Since each camera has its own thread, they
+            //     overlap: cam_1 can be mid-TakePhoto while cam_0 is still
+            //     blocking.
+            //   - If a camera is still busy from its previous shot when its
+            //     turn comes again (i.e., TakePhoto took longer than
+            //     interval * N), the dispatcher skips it and moves to the
+            //     next available camera to maintain even spacing.
+
             interval_s = 5;
             if (auto* v = std::getenv("INSTA360_INTERVAL_MS"))
                 interval_s = std::max(1, std::atoi(v) / 1000);
-
-            // Settings already applied at open time — no per-trigger reconfiguration needed.
 
             t_start = now_sec();
             continuous_active = true;
@@ -521,12 +547,12 @@ int main(int argc, char* argv[]) {
                             << " <- " << sanitise(fs::path(job.remote_path).filename().string()));
                     bool ok = http_download(job.http_base, job.remote_path, job.local_path);
                     if (ok) {
-                        // Write .capture_time: "t_shutter t_after cam_idx"
+                        // t_shutter is already the midpoint estimate; write it as the canonical time.
                         std::ofstream ct(job.local_path + ".capture_time");
                         ct << std::fixed << std::setprecision(6)
-                           << job.t_shutter << " " << job.t_after << " " << job.cam_idx;
+                           << job.t_shutter << " " << job.t_after << " " << job.cam_idx
+                           << " " << (job.t_after - job.t_shutter) * 2.0;  // original latency for diagnostics
 
-                        // Also write into fusion_scan_NNN/
                         char idx_buf[8];
                         std::snprintf(idx_buf, sizeof(idx_buf), "%03d", job.global_shot + 1);
                         fs::path scan_dir = fs::path(session_dir) / ("fusion_scan_" + std::string(idx_buf));
@@ -536,14 +562,12 @@ int main(int argc, char* argv[]) {
                         ct2 << std::fixed << std::setprecision(6)
                             << job.t_shutter << " " << job.t_after << " " << job.cam_idx;
 
-                        // Write cam_idx marker so post-processing knows which calibration to use
                         std::ofstream ci(scan_dir / ".cam_index");
                         ci << job.cam_idx;
 
                         LOG_OUT("[dl] saved shot " << job.global_shot << " cam[" << job.cam_idx << "]: "
                                 << sanitise(insp_name.string()));
 
-                        // Delete from camera storage to prevent filling SD card
                         if (!slots[job.cam_idx].cam->DeleteCameraFile(job.remote_path))
                             LOG_ERR("[dl] failed to delete " << sanitise(insp_name.string()) << " from cam[" << job.cam_idx << "]");
                     } else {
@@ -553,53 +577,44 @@ int main(int argc, char* argv[]) {
                 LOG_OUT("[dl] download worker exiting");
             });
 
-            // Single scheduler thread dispatches shots in strict round-robin.
-            // Each camera has its own worker thread that blocks on TakePhoto().
-            // The scheduler waits for the assigned camera to be idle before
-            // dispatching, maintaining consistent stagger regardless of variable
-            // TakePhoto() blocking duration.
+            // Per-camera state
             static std::atomic<bool> cam_busy[MAX_CAMERAS];
             for (int i = 0; i < MAX_CAMERAS; ++i) cam_busy[i].store(false);
-            std::mutex shot_mutex;
-            std::condition_variable shot_cv;
 
-            struct ShotRequest {
-                int cam_idx = 0;
+            // Per-camera dispatch signal: worker waits on this.
+            // Must be static so it outlives the if-block scope (threads
+            // reference it for the entire session lifetime).
+            struct CamDispatch {
+                std::mutex mtx;
+                std::condition_variable cv;
+                bool pending = false;
                 int shot_num = 0;
-                std::chrono::steady_clock::time_point scheduled_time{};
             };
-            static std::queue<ShotRequest> cam_queues[MAX_CAMERAS];
-            for (int i = 0; i < MAX_CAMERAS; ++i)
-                while (!cam_queues[i].empty()) cam_queues[i].pop();  // clear from prior session
+            static CamDispatch cam_dispatches[MAX_CAMERAS];
+            for (int i = 0; i < MAX_CAMERAS; ++i) {
+                cam_dispatches[i].pending = false;
+                cam_dispatches[i].shot_num = 0;
+            }
 
-            // Shared: last time a shutter actually fired (any camera).
-            // Updated by worker threads, read by scheduler to enforce spacing.
-            static std::atomic<double> last_shutter_time{0.0};
-            last_shutter_time.store(0.0);
-
-            // Per-camera worker threads: pull from their queue and call TakePhoto()
+            // Per-camera worker threads: wait for dispatch, then call TakePhoto()
             for (int ci = 0; ci < num_cameras; ++ci) {
                 timer_threads.emplace_back([&, ci]() {
                     while (!timer_stop.load()) {
-                        ShotRequest req;
+                        int shot_num;
                         {
-                            std::unique_lock<std::mutex> lk(shot_mutex);
-                            shot_cv.wait(lk, [&]{ return !cam_queues[ci].empty() || timer_stop.load(); });
+                            std::unique_lock<std::mutex> lk(cam_dispatches[ci].mtx);
+                            cam_dispatches[ci].cv.wait(lk, [&]{
+                                return cam_dispatches[ci].pending || timer_stop.load();
+                            });
                             if (timer_stop.load()) break;
-                            req = cam_queues[ci].front();
-                            cam_queues[ci].pop();
+                            cam_dispatches[ci].pending = false;
+                            shot_num = cam_dispatches[ci].shot_num;
                         }
-
-                        // Wait until scheduled time
-                        while (!timer_stop.load() && std::chrono::steady_clock::now() < req.scheduled_time)
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        if (timer_stop.load()) break;
 
                         cam_busy[ci].store(true);
                         double t_before = now_sec();
-                        last_shutter_time.store(t_before);
 
-                        LOG_OUT("[cam" << ci << "] taking shot " << req.shot_num << " at t+"
+                        LOG_OUT("[cam" << ci << "] taking shot " << shot_num << " at t+"
                                 << std::fixed << std::setprecision(1) << (t_before - t_start) << "s");
 
                         auto url = slots[ci].cam->TakePhoto();
@@ -607,25 +622,28 @@ int main(int argc, char* argv[]) {
                         cam_busy[ci].store(false);
 
                         if (url.Empty() || !url.IsSingleOrigin()) {
-                            LOG_ERR("[cam" << ci << "] shot " << req.shot_num << " TakePhoto failed");
+                            LOG_ERR("[cam" << ci << "] shot " << shot_num << " TakePhoto FAILED");
                             continue;
                         }
 
-                        double t_shutter = t_before;
-                        LOG_OUT("[cam" << ci << "] shot " << req.shot_num
+                        double t_latency = t_after - t_before;
+                        // Best estimate of actual shutter time: midpoint of TakePhoto() call.
+                        // t_before is the call entry; the sensor fires somewhere in the middle.
+                        // Using the midpoint halves the worst-case error vs using t_before alone.
+                        double t_shutter_est = t_before + t_latency * 0.5;
+                        LOG_OUT("[cam" << ci << "] shot " << shot_num
                                 << " latency: " << std::fixed << std::setprecision(3)
-                                << (t_after - t_before) << "s");
-                        write_shutter_event(session_dir, req.shot_num, t_shutter, ci);
+                                << t_latency << "s  shutter_est=" << std::setprecision(6) << t_shutter_est);
+                        write_shutter_event(session_dir, shot_num, t_shutter_est, ci);
 
-                        // Enqueue download
                         std::string remote_path = url.GetSingleOrigin();
-                        std::string shot_dir = session_dir + "/.sdk_shot_" + std::to_string(req.shot_num);
+                        std::string shot_dir = session_dir + "/.sdk_shot_" + std::to_string(shot_num);
                         fs::create_directories(shot_dir);
                         std::string local_path = shot_dir + "/" + fs::path(remote_path).filename().string();
                         {
                             std::unique_lock<std::mutex> lk(dl_mutex);
-                            dl_queue.push({req.shot_num, ci, slots[ci].http_base,
-                                          remote_path, local_path, t_shutter, t_after});
+                            dl_queue.push({shot_num, ci, slots[ci].http_base,
+                                          remote_path, local_path, t_before, t_after});
                         }
                         dl_cv.notify_one();
                     }
@@ -633,86 +651,89 @@ int main(int argc, char* argv[]) {
                 });
             }
 
-            // Each camera gets its own fixed-cadence schedule anchored to t_start.
-            // cam_N fires at: t_start + (N * spacing_ms) + (k * per_camera_interval_ms)
-            // This prevents convergence regardless of variable TakePhoto() latency.
-            // If a camera misses its slot (still processing), it waits for the next one.
-            int spacing_ms = interval_s * 1000;  // gap between any two consecutive shots
-            int per_cam_ms = spacing_ms * num_cameras;  // each camera's own repeat interval
+            // Batch dispatcher: fire ALL cameras simultaneously, wait for all
+            // to finish, then wait interval_s before the next batch.
+            //
+            // This gives a predictable rhythm:
+            //   - All cameras fire at once (~simultaneous shutters)
+            //   - All cameras finish within ~9s (slowest = OneX2 ~8-9s)
+            //   - Clean gap of interval_s seconds where it is safe to move
+            //   - Repeat
+            //
+            // With interval_s=5 and 3 cameras: capture ~9s, move ~5s, repeat.
+            // The "safe to move" window starts when the last camera finishes
+            // and ends when the next batch fires.
+            int spacing_ms = interval_s * 1000;
+            timer_threads.emplace_back([&, spacing_ms]() {
+                // Brief initial delay so the operator is ready
+                std::this_thread::sleep_for(std::chrono::milliseconds(spacing_ms));
 
-            for (int ci = 0; ci < num_cameras; ++ci) {
-                int offset_ms = ci * spacing_ms;  // stagger: cam0 at 0, cam1 at spacing, cam2 at 2*spacing
-                timer_threads.emplace_back([&, ci, offset_ms, per_cam_ms]() {
-                    // This camera's first shot time
-                    auto epoch = std::chrono::steady_clock::now();
-                    auto next_fire = epoch + std::chrono::milliseconds(offset_ms + per_cam_ms);
-
-                    while (!timer_stop.load()) {
-                        // Wait until our scheduled fire time
-                        while (!timer_stop.load() && std::chrono::steady_clock::now() < next_fire)
-                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                        if (timer_stop.load()) break;
-
-                        // If still busy from previous shot, skip to next slot
-                        if (cam_busy[ci].load()) {
-                            LOG_OUT("[cam" << ci << "] still busy, skipping slot");
-                            next_fire += std::chrono::milliseconds(per_cam_ms);
-                            continue;
+                while (!timer_stop.load()) {
+                    // Wait until all cameras are free before firing the batch
+                    bool all_free = false;
+                    while (!timer_stop.load() && !all_free) {
+                        all_free = true;
+                        for (int ci = 0; ci < num_cameras; ++ci) {
+                            if (cam_busy[ci].load()) { all_free = false; break; }
                         }
+                        if (!all_free)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    if (timer_stop.load()) break;
 
+                    // Fire all cameras simultaneously
+                    LOG_OUT("[dispatch] batch firing " << num_cameras << " cameras at t+"
+                            << std::fixed << std::setprecision(1) << (now_sec() - t_start) << "s");
+                    for (int ci = 0; ci < num_cameras; ++ci) {
                         int shot = global_shot_counter.fetch_add(1);
                         {
-                            std::unique_lock<std::mutex> lk(shot_mutex);
-                            cam_queues[ci].push({ci, shot, std::chrono::steady_clock::now()});
+                            std::unique_lock<std::mutex> lk(cam_dispatches[ci].mtx);
+                            cam_dispatches[ci].shot_num = shot;
+                            cam_dispatches[ci].pending = true;
                         }
-                        shot_cv.notify_all();
-
-                        // Advance to next fixed slot for this camera
-                        next_fire += std::chrono::milliseconds(per_cam_ms);
+                        cam_dispatches[ci].cv.notify_one();
                     }
-                    shot_cv.notify_all();
-                    LOG_OUT("[sched-cam" << ci << "] exiting");
-                });
-            }
+
+                    // Wait for all cameras to finish, then wait the move interval
+                    bool all_done = false;
+                    while (!timer_stop.load() && !all_done) {
+                        all_done = true;
+                        for (int ci = 0; ci < num_cameras; ++ci) {
+                            if (cam_busy[ci].load()) { all_done = false; break; }
+                        }
+                        if (!all_done)
+                            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                    if (timer_stop.load()) break;
+
+                    // All cameras done — safe to move window starts now
+                    LOG_OUT("[dispatch] batch complete — move window " << interval_s << "s");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(spacing_ms));
+                }
+
+                // Wake all workers so they can exit
+                for (int ci = 0; ci < num_cameras; ++ci) {
+                    {
+                        std::unique_lock<std::mutex> lk(cam_dispatches[ci].mtx);
+                        cam_dispatches[ci].pending = true;
+                    }
+                    cam_dispatches[ci].cv.notify_one();
+                }
+                LOG_OUT("[dispatch] exiting");
+            });
 
             LOG_OUT("Continuous capture started (" << num_cameras << " cameras, "
-                    << "shot every " << interval_s << "s, "
-                    << "per-camera every " << interval_s * num_cameras << "s)");
+                    << "batch mode: all cameras fire simultaneously, "
+                    << interval_s << "s move window between batches)");
             { std::ofstream df(done_path); df << "ok"; }
 
         } else {
-            // --- Stationary mode: single shot on next camera in round-robin ---
-            static int stat_cam_idx = 0;
-            auto& slot = slots[stat_cam_idx % num_cameras];
+            // --- Stationary mode: parallel batch capture across all cameras ---
+            // Fire TakePhoto() on all cameras concurrently so shutter times are
+            // within ~100ms of each other regardless of per-camera blocking time.
             fs::create_directories(trigger_content);
 
-            int shot = global_shot_counter.fetch_add(1);
-            LOG_OUT("Taking photo " << shot << " on cam[" << slot.index << "]...");
-            auto url = slot.cam->TakePhoto();
-            if (url.Empty() || !url.IsSingleOrigin()) { std::ofstream ff(failed_path); ff << "fail"; stat_cam_idx++; continue; }
-
-            double host_t = now_sec();
-            write_shutter_event(session_dir, shot, host_t, slot.index);
-
-            // Signal done immediately so shell can trigger next camera without
-            // waiting for the (potentially slow) USB download to complete.
-            std::string remote_path = url.GetSingleOrigin();
-            std::string local_path = std::string(trigger_content) + "/" + fs::path(remote_path).filename().string();
-            LOG_OUT("[dl] cam[" << slot.index << "] URL: " << sanitise(slot.http_base) << sanitise(remote_path)
-                    << " -> " << sanitise(fs::path(local_path).filename().string()));
-
-            // Write cam_index marker immediately (doesn't depend on download)
-            { std::ofstream ci(fs::path(trigger_content) / ".cam_index"); ci << slot.index; }
-            // Write capture_time sidecar immediately
-            { std::ofstream ct(local_path + ".capture_time");
-              ct << std::fixed << std::setprecision(6) << host_t << " " << host_t << " " << slot.index; }
-
-            { std::ofstream df(done_path); df << "ok"; df.flush(); }
-            LOG_OUT("[stat] cam[" << slot.index << "] shot " << shot << " done signaled");
-            // Brief pause to ensure shell detects done before next loop iteration
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-            // Download in background — enqueue to shared download worker
+            // Ensure download worker is running
             if (!dl_thread.joinable()) {
                 dl_stop.store(false);
                 dl_thread = std::thread([&]() {
@@ -740,14 +761,111 @@ int main(int argc, char* argv[]) {
                     }
                 });
             }
-            {
-                std::unique_lock<std::mutex> lk(dl_mutex);
-                dl_queue.push({shot, slot.index, slot.http_base, remote_path, local_path, host_t, host_t});
+
+            // Fire all cameras in parallel threads
+            struct ParallelResult {
+                bool ok = false;
+                int cam_idx = 0;
+                int shot_num = 0;
+                double t_shutter = 0.0;
+                std::string remote_path;
+                std::string local_path;
+            };
+            std::vector<ParallelResult> results(num_cameras);
+            std::vector<std::thread> fire_threads;
+
+            // Determine per-camera output directories from trigger_content base
+            // trigger_content = ".../fusion_scan_NNN" (first scan dir)
+            std::string base_scan_dir = trigger_content;
+
+            for (int ci = 0; ci < num_cameras; ++ci) {
+                fire_threads.emplace_back([&, ci]() {
+                    int shot = global_shot_counter.fetch_add(1);
+                    results[ci].cam_idx = ci;
+                    results[ci].shot_num = shot;
+
+                    // Each camera writes to its own scan dir
+                    // cam_0 -> trigger_content (base), cam_1 -> base+1, cam_2 -> base+2
+                    std::string cam_dir = base_scan_dir;
+                    if (ci > 0) {
+                        // Parse scan number from base dir and increment
+                        // e.g. fusion_scan_001 -> fusion_scan_002 for cam_1
+                        fs::path bp(base_scan_dir);
+                        std::string dirname = bp.filename().string();
+                        // Extract NNN from fusion_scan_NNN
+                        size_t upos = dirname.rfind('_');
+                        if (upos != std::string::npos) {
+                            int base_num = std::atoi(dirname.substr(upos + 1).c_str());
+                            char buf[8];
+                            std::snprintf(buf, sizeof(buf), "%03d", base_num + ci);
+                            cam_dir = (bp.parent_path() / (dirname.substr(0, upos + 1) + buf)).string();
+                        }
+                    }
+                    fs::create_directories(cam_dir);
+
+                    LOG_OUT("[stat] cam[" << ci << "] firing shot " << shot << "...");
+                    double t_before = now_sec();
+                    auto url = slots[ci].cam->TakePhoto();
+                    double t_after = now_sec();
+
+                    if (url.Empty() || !url.IsSingleOrigin()) {
+                        LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed");
+                        results[ci].ok = false;
+                        return;
+                    }
+
+                    results[ci].ok = true;
+                    double t_latency_stat = t_after - t_before;
+                    double t_shutter_stat = t_before + t_latency_stat * 0.5;
+                    results[ci].t_shutter = t_shutter_stat;
+                    results[ci].remote_path = url.GetSingleOrigin();
+                    results[ci].local_path = cam_dir + "/" + fs::path(results[ci].remote_path).filename().string();
+
+                    LOG_OUT("[stat] cam[" << ci << "] shot " << shot
+                            << " latency: " << std::fixed << std::setprecision(3)
+                            << t_latency_stat << "s  shutter_est=" << std::setprecision(6) << t_shutter_stat);
+
+                    write_shutter_event(session_dir, shot, t_shutter_stat, ci);
+
+                    // Write cam_index and capture_time immediately
+                    { std::ofstream cif(fs::path(cam_dir) / ".cam_index"); cif << ci; }
+                    { std::ofstream ct(results[ci].local_path + ".capture_time");
+                      ct << std::fixed << std::setprecision(6)
+                         << t_before << " " << t_after << " " << ci; }
+                });
             }
-            stat_dl_pending.fetch_add(1);
+
+            // Wait for all cameras to complete
+            for (auto& t : fire_threads) t.join();
+
+            // Check if any camera succeeded
+            bool any_ok = false;
+            for (auto& r : results) {
+                if (r.ok) { any_ok = true; break; }
+            }
+
+            if (!any_ok) {
+                std::ofstream ff(failed_path); ff << "fail";
+                continue;
+            }
+
+            // Enqueue downloads for all successful shots
+            for (auto& r : results) {
+                if (!r.ok) continue;
+                {
+                    std::unique_lock<std::mutex> lk(dl_mutex);
+                    dl_queue.push({r.shot_num, r.cam_idx, slots[r.cam_idx].http_base,
+                                  r.remote_path, r.local_path, r.t_shutter, r.t_shutter});
+                }
+                stat_dl_pending.fetch_add(1);
+            }
             { std::ofstream pf(pending_path); pf << stat_dl_pending.load(); }
             dl_cv.notify_one();
-            stat_cam_idx++;
+
+            // Signal done
+            { std::ofstream df(done_path); df << "ok"; df.flush(); }
+            LOG_OUT("[stat] batch capture done: " << num_cameras << " cameras fired in parallel");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
     }
 

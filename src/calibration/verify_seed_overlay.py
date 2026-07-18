@@ -70,6 +70,35 @@ def project_ply_to_erp(ply_path, T_cam_lidar, width, height):
     return img
 
 
+def _get_calibration_mask(camera_hw, cam_w, cam_h):
+    """Load the calibration mask for a camera from multi_camera.yaml.
+    Falls back to the camera model's lidar_mask_dual if not set."""
+    mc_path = _SRC / 'config' / 'multi_camera.yaml'
+    mask_name = ''
+    if mc_path.exists():
+        import yaml as _y
+        mc = _y.safe_load(mc_path.read_text()) or {}
+        for cam in mc.get('cameras', {}).values():
+            if cam.get('camera_hw', '') == camera_hw:
+                mask_name = cam.get('mask_calibration', cam.get('mask_dual', ''))
+                break
+    if not mask_name:
+        hw_yaml = _SRC / 'config' / 'camera_models' / f'{camera_hw}.yaml'
+        if hw_yaml.exists():
+            import yaml as _y
+            _cfg = _y.safe_load(hw_yaml.read_text()) or {}
+            mask_name = _cfg.get('lidar_mask_dual', '')
+    if not mask_name:
+        return None
+    mask_path = _SRC / 'config' / 'masks' / mask_name
+    if not mask_path.exists():
+        return None
+    mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+    if mask_img is None:
+        return None
+    return cv2.resize(mask_img, (cam_w, cam_h), interpolation=cv2.INTER_NEAREST)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Verify seed calibration with visual overlay')
     parser.add_argument('session_dir', nargs='?', default=str(Path.home() / 'atlas_ws/output'),
@@ -96,8 +125,54 @@ def main():
 
     print(f"Camera HW: {camera_hw}")
 
-    # Load calibration
-    T_cam_lidar, img_w, img_h = load_calibration(camera_hw)
+    # Load calibration — prefer the per-slot path from multi_camera.yaml
+    # (e.g. calibrations/x3/left/fusion_calibration.yaml for cam_1) so the
+    # overlay reflects the same transform used during calibration, not the
+    # hw-level file which may be stale or belong to a different camera slot.
+    import os as _os
+    _src_root = Path(__file__).resolve().parent.parent
+    _calib_override = _os.environ.get('ATLAS_CALIBRATION_FILE', '')
+    if _calib_override and Path(_calib_override).exists():
+        # Patch load_calibration to use this path
+        _T, _w, _h = load_calibration(camera_hw)  # loads hw-level as base
+        with open(_calib_override) as _f:
+            _cfg_slot = yaml.safe_load(_f)
+        _T = np.eye(4)
+        _T[:3, :3] = R.from_euler('xyz', [
+            _cfg_slot['roll_offset'], _cfg_slot['pitch_offset'], _cfg_slot['yaw_offset']
+        ]).as_matrix()
+        _T[:3, 3] = [_cfg_slot['x_offset'], _cfg_slot['y_offset'], _cfg_slot['z_offset']]
+        T_cam_lidar, img_w, img_h = _T, _cfg_slot.get('image_width', 5760), _cfg_slot.get('image_height', 2880)
+        print(f'Using slot calibration: {_calib_override}')
+    else:
+        # Fallback: check multi_camera.yaml for a slot path matching camera_hw
+        _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+        if _cam_idx:
+            _mc_path = _src_root / 'config' / 'multi_camera.yaml'
+            if _mc_path.exists():
+                _mc = yaml.safe_load(_mc_path.read_text()) or {}
+                _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+                if _calib_rel:
+                    _slot_path = _src_root / 'config' / _calib_rel
+                    if _slot_path.exists():
+                        with open(_slot_path) as _f:
+                            _cfg_slot = yaml.safe_load(_f)
+                        T_cam_lidar = np.eye(4)
+                        T_cam_lidar[:3, :3] = R.from_euler('xyz', [
+                            _cfg_slot['roll_offset'], _cfg_slot['pitch_offset'], _cfg_slot['yaw_offset']
+                        ]).as_matrix()
+                        T_cam_lidar[:3, 3] = [_cfg_slot['x_offset'], _cfg_slot['y_offset'], _cfg_slot['z_offset']]
+                        img_w = _cfg_slot.get('image_width', 5760)
+                        img_h = _cfg_slot.get('image_height', 2880)
+                        print(f'Using slot calibration (cam_{_cam_idx}): {_slot_path}')
+                    else:
+                        T_cam_lidar, img_w, img_h = load_calibration(camera_hw)
+                else:
+                    T_cam_lidar, img_w, img_h = load_calibration(camera_hw)
+            else:
+                T_cam_lidar, img_w, img_h = load_calibration(camera_hw)
+        else:
+            T_cam_lidar, img_w, img_h = load_calibration(camera_hw)
     euler = R.from_matrix(T_cam_lidar[:3, :3]).as_euler('xyz', degrees=True)
     print(f"Seed rotation (deg): roll={euler[0]:.1f} pitch={euler[1]:.1f} yaw={euler[2]:.1f}")
     print(f"Seed translation: [{T_cam_lidar[0,3]:.4f}, {T_cam_lidar[1,3]:.4f}, {T_cam_lidar[2,3]:.4f}]")
@@ -129,20 +204,13 @@ def main():
     cam_img = cv2.imread(str(cam_files[0]))
     cam_h, cam_w = cam_img.shape[:2]
 
-    # Apply LiDAR mask if available (blacks out scanner body/nadir)
-    mask_dir = _SRC / 'config' / 'masks'
-    hw_yaml = _SRC / 'config' / 'camera_models' / f'{camera_hw}.yaml'
-    if hw_yaml.exists():
-        import yaml as _y
-        _hw_cfg = _y.safe_load(hw_yaml.read_text()) or {}
-        mask_name = _hw_cfg.get('lidar_mask_dual', '')
-        mask_path = mask_dir / mask_name if mask_name else None
-        if mask_path and mask_path.exists():
-            mask_img = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            if mask_img is not None:
-                mask_img = cv2.resize(mask_img, (cam_w, cam_h), interpolation=cv2.INTER_NEAREST)
-                cam_img[mask_img < 128] = 0
-                print(f"Applied mask: {mask_name}")
+    # Apply calibration mask (from multi_camera.yaml mask_calibration field)
+    mask_img = _get_calibration_mask(camera_hw, cam_w, cam_h)
+    if mask_img is not None:
+        cam_img[mask_img < 128] = 0
+        print(f"Applied calibration mask for {camera_hw}")
+    else:
+        print(f"No calibration mask found for {camera_hw}")
 
     print(f"Projecting {ply_files[0].name} ({cam_w}x{cam_h})...")
     lid_img = project_ply_to_erp(ply_files[0], T_cam_lidar, cam_w, cam_h)

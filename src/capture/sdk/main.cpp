@@ -330,7 +330,6 @@ int main(int argc, char* argv[]) {
     std::thread              dl_thread;
 
     while (true) {
-        { std::ofstream pf(pending_path); pf << 0; }
 
         if (fs::exists(quit_path)) {
             LOG_OUT("Session done — stopping continuous capture...");
@@ -515,23 +514,30 @@ int main(int argc, char* argv[]) {
             double host_t = now_sec();
             write_shutter_event(session_dir, capture_index, host_t);
             std::string remote_path = url.GetSingleOrigin();
-            std::string shot_dir   = session_dir + "/.sdk_shot_" + std::to_string(capture_index);
-            fs::create_directories(shot_dir);
-            std::string local_path = shot_dir + "/" + fs::path(remote_path).filename().string();
+            // Download directly to the scan dir (trigger_content = fusion_scan_NNN/)
+            std::string local_path = trigger_content + "/" + fs::path(remote_path).filename().string();
             LOG_OUT("Taking photo " << capture_index << " — downloading...");
-            bool ok = http_download(remote_path, local_path);  // HTTP, no USB lock needed
+
+            // Write cam_index and capture_time sidecars immediately
+            { std::ofstream ci(fs::path(trigger_content) / ".cam_index"); ci << 0; }
+            { std::ofstream ct(local_path + ".capture_time");
+              ct << std::fixed << std::setprecision(6) << host_t << " " << host_t << " 0"; }
+
+            // Signal pending=1 BEFORE done so shell waits for download to finish
+            { std::ofstream pf(pending_path); pf << 1; }
+            { std::ofstream df(done_path); df << "ok"; }
+
+            // Download .insp to scan dir (shell polls pending until 0)
+            bool ok = http_download(remote_path, local_path);
             if (ok) {
-                std::ofstream ct(local_path + ".capture_time");
-                ct << std::fixed << std::setprecision(6) << host_t;
-                write_shutter_event(session_dir, capture_index, host_t);
                 LOG_OUT("Shot " << capture_index << " saved");
-                // Delete from camera storage to prevent filling up Quick Reader/SD
                 if (!cam->DeleteCameraFile(remote_path))
                     LOG_ERR("Failed to delete " << sanitise(fs::path(remote_path).filename().string()) << " from camera");
             } else {
                 LOG_ERR("Shot " << capture_index << " download failed: " << sanitise(remote_path));
             }
-            { std::ofstream df(done_path); df << "ok"; }
+            // Signal download complete
+            { std::ofstream pf(pending_path); pf << 0; }
             ++capture_index;
         }
     }

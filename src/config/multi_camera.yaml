@@ -17,7 +17,7 @@
 # Output example:
 #   Found 2 camera(s):
 #     [0] serial=XXXXXXXXXXXXXX  type=4  name=Insta360 X5
-#     [1] serial=XXXXXXXXXXXXXX type=3  name=Insta360 ONE X2
+#     [1] serial=XXXXXXXXXXXXXX  type=3  name=Insta360 ONE X2
 #
 # Copy the serial strings into the cam_0/cam_1 entries below.
 # cam_0 should be your primary/reference camera (best quality).
@@ -46,24 +46,35 @@ settings:
 #                camera_hw default. Use when cameras are at different positions
 #                and see different parts of the scanner body.
 #   mask_single: Same as mask_dual but for single_fisheye mode.
+#   mask_calibration: Mask used during per-camera calibration sessions (in
+#                config/masks/). Typically blocks only the scanner body/LiDAR
+#                as seen from this camera's position — NOT the other cameras,
+#                since they are removed during single-camera calibration capture.
+#                Falls back to mask_dual if not specified.
 #   calibration: Per-camera extrinsic calibration path (relative to config/).
 #                Falls back to calibrations/<camera_hw>/fusion_calibration.yaml.
 #
 # cam_0 = primary/reference camera. Its images are never color-corrected.
 # cam_1+ = secondary cameras. Color profiles are applied to match cam_0.
+# lidar_mask_dual_x5_calib.png
+# lidar_mask_dual_x3_calib.png
+# 
 cameras:
   cam_0:
-    serial: ""
+    serial: "XXXXXXXXXXXXXX"
     camera_hw: x5
     mask_dual: lidar_mask_dual_x5_cam2.png
+    mask_calibration: lidar_mask_dual_x5_calib.png
     calibration: calibrations/x5/center/fusion_calibration.yaml
   cam_1:
-    serial: ""
+    serial: "XXXXXXXXXXXXXX"
     camera_hw: x3
     mask_dual: lidar_mask_dual_x3_cam_left.png
+    mask_calibration: lidar_mask_dual_x3_calib.png
     calibration: calibrations/x3/left/fusion_calibration.yaml
   cam_2:
-    serial: ""
+    serial: "XXXXXXXXXXXXXX"
     camera_hw: onex2
     mask_dual: lidar_mask_dual_onex2_cam_right.png
+    mask_calibration: lidar_mask_dual_onex2_calib.png
     calibration: calibrations/onex2/right/fusion_calibration.yaml

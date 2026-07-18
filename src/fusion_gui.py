@@ -39,8 +39,8 @@ import math
 
 _COV_CELL_SIZE        = 0.5
 _COV_HEIGHT_BANDS     = 3
-_COV_BAND_SIZE        = 0.6
-_COV_HEIGHT_ORIGIN    = -0.6  # Low: [-0.6, 0.0)  Mid: [0.0,+0.6)  High: [+0.6,+1.2)
+_COV_BAND_SIZE        = 0.4064  # 16" per band — fits the ~47" scanner extension range
+_COV_HEIGHT_ORIGIN    = 0.0     # Low: [0, 16")  Mid: [16", 32")  High: [32"+)
 _COV_MIN_VISITS       = 1
 _COV_BAND_LABELS      = ['Low', 'Mid', 'High']
 # Colour per number of covered bands (0..HEIGHT_BANDS)
@@ -59,9 +59,9 @@ _COV_COLOUR = {
     frozenset([0,1,2]): '#1a9641',   # All done      — green
 }
 
-def _cov_band(z: float) -> int:
+def _cov_band(z: float, z_ref: float = 0.0) -> int:
     return max(0, min(_COV_HEIGHT_BANDS - 1,
-                      int(math.floor((z - _COV_HEIGHT_ORIGIN) / _COV_BAND_SIZE))))
+                      int(math.floor((z - z_ref) / _COV_BAND_SIZE))))
 
 
 class CoveragePanel:
@@ -71,8 +71,8 @@ class CoveragePanel:
         # grid[(gx,gy)] = {band: shot_count} — only incremented on confirmed captures
         self._grid: dict[tuple, dict] = {}
         self._current = (0.0, 0.0, 0.0)
-        self._last_drawn_current = None
-        self._latest_pose: tuple | None = None
+        self._current_yaw = 0.0
+        self._z_ref = None  # set on first pose; bands are relative to this
         self._pose_lock = threading.Lock()
         self._ros_thread = None
         self._running = False
@@ -80,6 +80,8 @@ class CoveragePanel:
         self._cell_items: dict[tuple, int] = {}    # bg rectangle per cell
 
         self._player_item: int | None = None
+        self._arrow_item: int | None = None
+        self._current_yaw: float = 0.0
         self._scan_dir: str | None = None
         self._seen_shutters: set = set()
         self._perimeter: list[tuple] = []
@@ -91,7 +93,7 @@ class CoveragePanel:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        self._stats_var = tk.StringVar(value=f'Starting at mid elevation — waiting for LiDAR perimeter…')
+        self._stats_var = tk.StringVar(value=f'Starting at low elevation — waiting for LiDAR perimeter…')
         ttk.Label(parent, textvariable=self._stats_var,
                   font=('Consolas', 9)).grid(row=0, column=0, sticky=tk.W, padx=6, pady=(4, 0))
 
@@ -134,12 +136,17 @@ class CoveragePanel:
         self._cell_items.clear()
         self._seen_shutters.clear()
         self._player_item = None
+        self._arrow_item = None
+        self._current_yaw = 0.0
+        self._z_ref = None
+        self._last_drawn_state = None
         self._perimeter: list[tuple] = []   # convex hull in grid coords
         self._perimeter_item: int | None = None
         self._perimeter_done = False
         self._lidar_pts: list[tuple] = []   # raw (x,y) accumulator
         self._current = (0.0, 0.0, 0.0)
-        self._last_drawn_current = None
+        self._current_yaw = 0.0
+        self._last_drawn_state = None
         self._latest_pose = None
         with self._pose_lock:
             self._pose_history = []
@@ -164,9 +171,15 @@ class CoveragePanel:
 
             def _odom_cb(msg):
                 p = msg.pose.pose.position
+                o = msg.pose.pose.orientation
                 t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                # Extract yaw from quaternion (rotation about Z axis)
+                # yaw = atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+                siny_cosp = 2.0 * (o.w * o.z + o.x * o.y)
+                cosy_cosp = 1.0 - 2.0 * (o.y * o.y + o.z * o.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
                 with self._pose_lock:
-                    self._latest_pose = (p.x, p.y, p.z)
+                    self._latest_pose = (p.x, p.y, p.z, yaw)
                     # Keep a rolling 60s history for shutter-time pose lookup
                     if not hasattr(self, '_pose_history'):
                         self._pose_history = []
@@ -318,7 +331,12 @@ class CoveragePanel:
             pose = self._latest_pose
             self._latest_pose = None
         if pose is not None:
-            self._current = pose
+            self._current = (pose[0], pose[1], pose[2])
+            self._current_yaw = pose[3] if len(pose) > 3 else 0.0
+            # Set Z reference on first pose so bands are relative to start height.
+            # Low = start height ± half-band, Mid = start + 24", High = start + 48"
+            if self._z_ref is None:
+                self._z_ref = self._current[2]
             self._update_player()
             self._update_stats()
 
@@ -343,7 +361,7 @@ class CoveragePanel:
                     x, y, z = shutter_pos if shutter_pos else self._current
                     key  = (int(math.floor(x / _COV_CELL_SIZE)),
                             int(math.floor(y / _COV_CELL_SIZE)))
-                    band = _cov_band(z)
+                    band = _cov_band(z, self._z_ref or 0.0)
                     cell = self._grid.setdefault(key, {})
                     cell[band] = cell.get(band, 0) + 1
                     self._update_cell(key)
@@ -359,9 +377,10 @@ class CoveragePanel:
     def _on_resize(self, event):
         self._cell_items.clear()
         self._player_item = None
+        self._arrow_item = None
         self._perimeter_item = None
         self._canvas.delete('perimeter_label')
-        self._last_drawn_current = None  # force player redraw after resize
+        self._last_drawn_state = None
         self._canvas.delete('all')
         for key in self._grid:
             self._update_cell(key)
@@ -422,25 +441,51 @@ class CoveragePanel:
             self._canvas.tag_raise(self._player_item)
 
     def _update_player(self):
-        """Move or create the current-position oval without touching other items."""
+        """Move or create the current-position indicator with direction arrow."""
         if not self._grid:
             return
         x, y, z = self._current
+        yaw = getattr(self, '_current_yaw', 0.0)
         cx = int(math.floor(x / _COV_CELL_SIZE))
         cy = int(math.floor(y / _COV_CELL_SIZE))
-        if self._last_drawn_current == (cx, cy) and self._player_item is not None:
-            return
-        self._last_drawn_current = (cx, cy)
+        # Redraw if position or yaw changed significantly
+        _prev = getattr(self, '_last_drawn_state', None)
+        if _prev is not None:
+            _pcx, _pcy, _pyaw = _prev
+            if _pcx == cx and _pcy == cy and abs(yaw - _pyaw) < 0.1:
+                return
+        self._last_drawn_state = (cx, cy, yaw)
         min_x, max_y, px, off_x, off_y = self._layout()
-        sx = off_x + (cx - min_x) * px
-        sy = off_y + (max_y - cy) * px
-        m  = max(1, px // 5)
-        coords = sx + m, sy + m, sx + px - m, sy + px - m
-        if self._player_item is None:
-            self._player_item = self._canvas.create_oval(*coords, fill='#e74c3c', outline='#c0392b')
-        else:
-            self._canvas.coords(self._player_item, *coords)
+        # Centre of the cell in canvas coords
+        cell_cx = off_x + (cx - min_x) * px + px / 2
+        cell_cy = off_y + (max_y - cy) * px + px / 2
+        r = max(3, px * 0.35)  # radius of the circle
+
+        # Delete old items
+        if self._player_item is not None:
+            self._canvas.delete(self._player_item)
+        if getattr(self, '_arrow_item', None) is not None:
+            self._canvas.delete(self._arrow_item)
+
+        # Draw filled circle
+        self._player_item = self._canvas.create_oval(
+            cell_cx - r, cell_cy - r, cell_cx + r, cell_cy + r,
+            fill='#e74c3c', outline='#c0392b', width=1)
+
+        # Draw direction arrow from centre outward
+        # In RKO-LIO, +X is forward in the lidar frame. On the canvas,
+        # +X maps to right and +Y maps to down (Y is flipped).
+        arrow_len = r * 1.8
+        # yaw is rotation about Z (up): 0 = +X (right on canvas)
+        ax = cell_cx + arrow_len * math.cos(yaw)
+        ay = cell_cy - arrow_len * math.sin(yaw)  # minus because canvas Y is inverted
+        self._arrow_item = self._canvas.create_line(
+            cell_cx, cell_cy, ax, ay,
+            fill='#00ff00', width=max(2, px // 6),
+            arrow=tk.LAST, arrowshape=(max(4, px // 3), max(5, px // 2.5), max(2, px // 6)))
+
         self._canvas.tag_raise(self._player_item)
+        self._canvas.tag_raise(self._arrow_item)
 
     def _update_stats(self):
         total   = len(self._grid)
@@ -451,11 +496,12 @@ class CoveragePanel:
         shots   = len(self._seen_shutters)
         pct     = (full / total * 100) if total else 0
         x, y, z = self._current
+        z_rel = z - (self._z_ref or 0.0)
         self._stats_var.set(
-            f'Pos ({x:.1f}, {y:.1f}, {z:.1f}) m  |  Shots: {shots}  |  '
+            f'Pos ({x:.1f}, {y:.1f}, {z:.1f}) m  z_rel={z_rel:+.2f}m  |  Shots: {shots}  |  '
             f'Full: {full}/{total} ({pct:.0f}%)  Partial: {partial}'
         )
-        current_band = _cov_band(z)
+        current_band = _cov_band(z, self._z_ref or 0.0)
         for i, lbl in enumerate(self._band_labels):
             if i == current_band:
                 lbl.config(background='#7ed321', foreground='white')
@@ -819,26 +865,30 @@ class FusionCaptureGUI:
                 row=row+1, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
 
         # ── Physical Seed (run before calibration) ────────────────
-        seed_frame = ttk.LabelFrame(cal_btn_frame, text="Physical Seed (camera offset from LiDAR)")
+        seed_frame = ttk.LabelFrame(cal_btn_frame, text="Physical Seed (stand behind scanner, cable facing you)")
         seed_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=(3, 3))
         seed_frame.columnconfigure(1, weight=1)
         seed_frame.columnconfigure(3, weight=1)
 
-        ttk.Label(seed_frame, text="Fwd (in):").grid(row=0, column=0, sticky=tk.W, padx=2)
+        ttk.Label(seed_frame, text="Fwd \":").grid(row=0, column=0, sticky=tk.W, padx=2)
         self._seed_fwd_var = tk.StringVar(value="3.25")
         ttk.Entry(seed_frame, textvariable=self._seed_fwd_var, width=6).grid(row=0, column=1, padx=2)
 
-        ttk.Label(seed_frame, text="Left (in):").grid(row=0, column=2, sticky=tk.W, padx=2)
+        ttk.Label(seed_frame, text="Left \":").grid(row=0, column=2, sticky=tk.W, padx=2)
         self._seed_left_var = tk.StringVar(value="0.0")
         ttk.Entry(seed_frame, textvariable=self._seed_left_var, width=6).grid(row=0, column=3, padx=2)
 
-        ttk.Label(seed_frame, text="Up (in):").grid(row=1, column=0, sticky=tk.W, padx=2)
+        ttk.Label(seed_frame, text="Up \":").grid(row=1, column=0, sticky=tk.W, padx=2)
         self._seed_up_var = tk.StringVar(value="0.0")
         ttk.Entry(seed_frame, textvariable=self._seed_up_var, width=6).grid(row=1, column=1, padx=2)
 
-        ttk.Label(seed_frame, text="Yaw (\u00b0):").grid(row=1, column=2, sticky=tk.W, padx=2)
+        ttk.Label(seed_frame, text="Yaw \u00b0:").grid(row=1, column=2, sticky=tk.W, padx=2)
         self._seed_yaw_var = tk.StringVar(value="0.0")
         ttk.Entry(seed_frame, textvariable=self._seed_yaw_var, width=6).grid(row=1, column=3, padx=2)
+
+        # Help text
+        ttk.Label(seed_frame, text="+Fwd=front  -Fwd=back  |  +Left=left  -Left=right  |  Yaw: 0=fwd  +90=left  -90=right",
+                  font=('Arial', 7), foreground='#666').grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=2, pady=(2, 0))
 
         ttk.Button(seed_frame, text="Write Physical Seed", command=self._cal_write_physical_seed
                    ).grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
@@ -1439,6 +1489,7 @@ sys.exit(0 if ok[0] else 4)
         self._resize_after_id = self.root.after(150, lambda: self._x11_resize(wid_int, w, h))
     def _system_ready(self):
         """Called when system is ready"""
+        self._system_ready_time = time.time()
         self.update_status("System Ready - Ready to capture scans", "green")
         self.log_message("✓ System is ready for scanning!")
         if self.rviz_process is None:
@@ -1583,7 +1634,19 @@ sys.exit(0 if ok[0] else 4)
         """Stop the fusion system"""
         if not self.is_running:
             return
-            
+
+        # Guard against accidental stop within 5s of system becoming ready
+        # (can happen from stray keyboard events during RViz embedding)
+        _ready_time = getattr(self, '_system_ready_time', 0)
+        if time.time() - _ready_time < 5.0:
+            self.log_message("⚠ Ignoring stop request (system just became ready — wait 5s)")
+            return
+
+        # Log the call stack to help diagnose unexpected stops
+        import traceback
+        caller = ''.join(traceback.format_stack()[-3:-1]).strip()
+        logging.info(f"stop_fusion called from:\n{caller}")
+
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
         
@@ -1904,7 +1967,7 @@ sys.exit(0 if ok[0] else 4)
         self._cal_log.see(tk.END)
         self._cal_log.config(state='disabled')
 
-    def _cal_run(self, label, cmd):
+    def _cal_run(self, label, cmd, env_extra=None):
         """Run a calibration command in a background thread, streaming output to _cal_log."""
         import os as _os
         _atlas_ws = str(pathlib.Path.home() / 'atlas_ws')
@@ -1930,6 +1993,8 @@ sys.exit(0 if ok[0] else 4)
                 ) if k in os.environ
             }
             _safe_env['PYTHONUNBUFFERED'] = '1'
+            if env_extra:
+                _safe_env.update(env_extra)
             try:
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True,
                                  bufsize=1, env=_safe_env)
@@ -1977,11 +2042,35 @@ sys.exit(0 if ok[0] else 4)
     def _cal_gen_intensity(self):
         import os as _os
         output = str(pathlib.Path.home() / 'atlas_ws' / 'output')
+        mask_file = self._cal_get_mask()
+        cam_idx = self._cal_cam_var.get().split('_')[1]  # '0', '1', or '2'
+        env_extra = {'ATLAS_CALIBRATION_CAM_INDEX': cam_idx}
+        if mask_file and _os.path.isfile(mask_file):
+            env_extra['ATLAS_CALIBRATION_MASK'] = mask_file
+            self._cal_log_write(f"  Using calibration mask: {_os.path.basename(mask_file)}\n")
         self._cal_run("Generate Intensity Images", [
             sys.executable,
             str(self.script_dir / 'calibration' / 'generate_intensity_images.py'),
             output
-        ])
+        ], env_extra=env_extra)
+
+    def _cal_get_mask(self):
+        """Return the calibration mask path for the currently selected camera."""
+        cam = self._cal_cam_var.get()
+        try:
+            import yaml
+            mc_path = self.script_dir / 'config' / 'multi_camera.yaml'
+            if mc_path.exists():
+                cfg = yaml.safe_load(mc_path.read_text())
+                c = cfg.get('cameras', {}).get(cam, {})
+                # Prefer mask_calibration, fall back to mask_dual
+                mask_name = c.get('mask_calibration', c.get('mask_dual', ''))
+                if mask_name:
+                    mask_path = str(self.script_dir / 'config' / 'masks' / mask_name)
+                    return mask_path
+        except Exception:
+            pass
+        return None
 
     def _cal_superglue_indoor(self):
         self._cal_superglue('indoor')
@@ -2003,6 +2092,7 @@ sys.exit(0 if ok[0] else 4)
         dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
         output = str(pathlib.Path.home() / 'atlas_ws/output')
         erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
+        mask_file = self._cal_get_mask()
         import threading as _th
         import subprocess as _sp
 
@@ -2016,6 +2106,16 @@ sys.exit(0 if ok[0] else 4)
                 ) if k in os.environ
             }
             _safe_env['PYTHONUNBUFFERED'] = '1'
+            # Pass per-camera calibration mask and camera index
+            cam_idx = self._cal_cam_var.get().split('_')[1]
+            _safe_env['ATLAS_CALIBRATION_CAM_INDEX'] = cam_idx
+            if mask_file and _os.path.isfile(mask_file):
+                _safe_env['ATLAS_CALIBRATION_MASK'] = mask_file
+                self.root.after(0, self._cal_log_write,
+                                f'  Calibration mask: {_os.path.basename(mask_file)}\n')
+            else:
+                self.root.after(0, self._cal_log_write,
+                                f'  ⚠ No calibration mask applied (mask_file={mask_file!r})\n')
             _superglue_dir = str(pathlib.Path.home() / 'atlas_ws/SuperGluePretrainedNetwork')
             _existing_pp = _safe_env.get('PYTHONPATH', '')
             _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
@@ -2152,8 +2252,8 @@ sys.exit(0 if ok[0] else 4)
         except ValueError:
             self._cal_log_write("\n[!] Invalid numeric input in seed fields.\n")
             return
-        cam = self._cal_cam_var.get()
         hw = self._cal_hw()
+        cam_idx = self._cal_cam_var.get().split('_')[1]
         self._cal_run("Write Physical Seed", [
             sys.executable,
             str(self.script_dir / 'calibration' / 'physical_seed.py'),
@@ -2162,15 +2262,33 @@ sys.exit(0 if ok[0] else 4)
             '--left', str(left_in),
             '--up', str(up_in),
             '--yaw', str(yaw_deg),
-        ])
+        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
 
     def _cal_verify_seed(self):
-        """Generate overlay and open it in the system image viewer."""
+        """Write current seed values, generate overlay and open it."""
         import subprocess, pathlib
         sess = self._pp_session()
         if not sess:
             self._cal_log_write("\n[!] No session selected.\n")
             return
+        hw = self._cal_hw()
+        # Write current GUI seed values first
+        try:
+            fwd_in  = float(self._seed_fwd_var.get())
+            left_in = float(self._seed_left_var.get())
+            up_in   = float(self._seed_up_var.get())
+            yaw_deg = float(self._seed_yaw_var.get())
+            subprocess.run([
+                sys.executable,
+                str(self.script_dir / 'calibration' / 'physical_seed.py'),
+                '--camera-hw', hw,
+                '--forward', str(fwd_in),
+                '--left', str(left_in),
+                '--up', str(up_in),
+                '--yaw', str(yaw_deg),
+            ], capture_output=True)
+        except ValueError:
+            pass  # use whatever is already saved
         result = subprocess.run(
             [sys.executable,
              str(self.script_dir / 'calibration' / 'verify_seed_overlay.py'),
@@ -2181,19 +2299,37 @@ sys.exit(0 if ok[0] else 4)
         if result.returncode != 0:
             self._cal_log_write(result.stderr)
             return
-        # Open the edge image directly
         edge_path = pathlib.Path(sess) / 'seed_edges.jpg'
         if edge_path.exists():
             subprocess.Popen(['xdg-open', str(edge_path)])
 
     def _cal_interactive_seed(self):
-        """Launch interactive seed viewer window."""
+        """Write current seed values then launch interactive seed viewer window."""
         import subprocess
         sess = self._pp_session()
         if not sess:
             self._cal_log_write("\n[!] No session selected.\n")
             return
         hw = self._cal_hw()
+        # Write the current GUI seed values first so the viewer starts with them
+        try:
+            fwd_in  = float(self._seed_fwd_var.get())
+            left_in = float(self._seed_left_var.get())
+            up_in   = float(self._seed_up_var.get())
+            yaw_deg = float(self._seed_yaw_var.get())
+        except ValueError:
+            self._cal_log_write("\n[!] Invalid seed field values — fix before opening viewer.\n")
+            return
+        import subprocess as _sp, os as _os
+        _sp.run([
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'physical_seed.py'),
+            '--camera-hw', hw,
+            '--forward', str(fwd_in),
+            '--left', str(left_in),
+            '--up', str(up_in),
+            '--yaw', str(yaw_deg),
+        ], capture_output=True)
         subprocess.Popen([
             sys.executable,
             str(self.script_dir / 'calibration' / 'interactive_seed.py'),

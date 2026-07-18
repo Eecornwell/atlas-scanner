@@ -89,17 +89,38 @@ def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = True) -> Path:
 
 
 def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
-    """Return the per-model (and optionally per-camera) calibration YAML.
-    If cam_index is provided, looks for calibrations/<hw>/cam_<N>/fusion_calibration.yaml
-    first, then falls back to calibrations/<hw>/fusion_calibration.yaml.
+    """Return the calibration YAML for a camera.
+
+    Resolution order:
+    1. Per-camera slot path from multi_camera.yaml (cam_index → calibration field)
+       e.g. cam_1 → calibrations/x3/left/fusion_calibration.yaml
+    2. Legacy per-hw/cam_N path: calibrations/<hw>/cam_<N>/fusion_calibration.yaml
+    3. Per-hw path: calibrations/<hw>/fusion_calibration.yaml
+    4. Active shared calibration: config/fusion_calibration.yaml
     """
+    # Priority 1: per-camera slot path from multi_camera.yaml
     if cam_index is not None:
+        mc_path = _SRC / 'config' / 'multi_camera.yaml'
+        if mc_path.exists():
+            try:
+                mc = yaml.safe_load(mc_path.read_text()) or {}
+                cam_cfg = mc.get('cameras', {}).get(f'cam_{cam_index}', {})
+                calib_rel = cam_cfg.get('calibration', '')
+                if calib_rel:
+                    slot_path = _SRC / 'config' / calib_rel
+                    if slot_path.exists():
+                        return slot_path
+            except Exception:
+                pass
+        # Priority 2: legacy per-hw/cam_N path
         p = _CALIB_DIR / camera_hw / f'cam_{cam_index}' / 'fusion_calibration.yaml'
         if p.exists():
             return p
+    # Priority 3: per-hw path
     p = _CALIB_DIR / camera_hw / 'fusion_calibration.yaml'
     if p.exists():
         return p
+    # Priority 4: active shared calibration
     return _SRC / 'config' / 'fusion_calibration.yaml'
 
 

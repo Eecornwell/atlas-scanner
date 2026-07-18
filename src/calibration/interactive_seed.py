@@ -34,6 +34,39 @@ def load_x5_orientation():
     return cfg['roll_offset'], cfg['pitch_offset'], cfg['yaw_offset']
 
 
+def load_seed_values(camera_hw):
+    """Load saved translation and yaw from the camera's calibration file.
+    Returns (fwd_in, left_in, up_in, yaw_deg) in inches/degrees,
+    back-computed from T_camera_lidar."""
+    calib_path = _CALIB_DIR / camera_hw / 'fusion_calibration.yaml'
+    if not calib_path.exists():
+        calib_path = _SRC / 'config' / 'fusion_calibration.yaml'
+    if not calib_path.exists():
+        return 3.0, 0.0, 0.0, 0.0
+    with open(calib_path) as f:
+        cfg = yaml.safe_load(f)
+
+    x5_path = _CALIB_DIR / 'x5' / 'fusion_calibration.yaml'
+    with open(x5_path) as f:
+        x5 = yaml.safe_load(f)
+
+    # Yaw offset relative to X5 reference
+    yaw_deg = float(np.degrees(cfg['yaw_offset'] - x5['yaw_offset']))
+
+    # Back-compute position in LiDAR frame from T_camera_lidar
+    # t_cam = R_cam_lidar @ (-cam_pos_lidar)  =>  cam_pos_lidar = -R_cam_lidar.T @ t_cam
+    R_mat = R.from_euler('xyz', [
+        cfg['roll_offset'], cfg['pitch_offset'], cfg['yaw_offset']
+    ]).as_matrix()
+    t_cam = np.array([cfg['x_offset'], cfg['y_offset'], cfg['z_offset']])
+    cam_pos_lidar = -R_mat.T @ t_cam  # meters
+
+    fwd_in  = cam_pos_lidar[0] / INCHES_TO_METERS
+    left_in = cam_pos_lidar[1] / INCHES_TO_METERS
+    up_in   = cam_pos_lidar[2] / INCHES_TO_METERS
+    return fwd_in, left_in, up_in, yaw_deg
+
+
 def compute_T(roll, pitch, yaw, fwd_m, left_m, up_m):
     """Compute T_camera_lidar from orientation and position."""
     R_mat = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
@@ -115,21 +148,33 @@ def main():
     v = ply['vertex']
     points = np.column_stack([v['x'], v['y'], v['z']]).astype(np.float32)
 
-    # Load mask
-    mask_dir = _SRC / 'config' / 'masks'
-    hw_yaml = _MODELS_DIR / f'{camera_hw}.yaml'
+    # Load calibration mask from multi_camera.yaml
     cam_mask = np.ones((disp_h, disp_w), dtype=bool)
-    if hw_yaml.exists():
-        _cfg = yaml.safe_load(hw_yaml.read_text()) or {}
-        mask_name = _cfg.get('lidar_mask_dual', '')
-        mask_path = mask_dir / mask_name if mask_name else None
-        if mask_path and mask_path.exists():
+    mc_path = _SRC / 'config' / 'multi_camera.yaml'
+    mask_name = ''
+    if mc_path.exists():
+        mc = yaml.safe_load(mc_path.read_text()) or {}
+        for cam in mc.get('cameras', {}).values():
+            if cam.get('camera_hw', '') == camera_hw:
+                mask_name = cam.get('mask_calibration', cam.get('mask_dual', ''))
+                break
+    if not mask_name:
+        hw_yaml = _MODELS_DIR / f'{camera_hw}.yaml'
+        if hw_yaml.exists():
+            _cfg = yaml.safe_load(hw_yaml.read_text()) or {}
+            mask_name = _cfg.get('lidar_mask_dual', '')
+    if mask_name:
+        mask_path = _SRC / 'config' / 'masks' / mask_name
+        if mask_path.exists():
             m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             m = cv2.resize(m, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
             cam_mask = m > 128
+            print(f"Calibration mask: {mask_name}")
 
-    # Load X5 reference orientation
+    # Load X5 reference orientation and current seed values
     x5_roll, x5_pitch, x5_yaw = load_x5_orientation()
+    init_fwd, init_left, init_up, init_yaw = load_seed_values(camera_hw)
+    print(f"Loaded seed: fwd={init_fwd:.2f}\" left={init_left:.2f}\" up={init_up:.2f}\" yaw={init_yaw:.1f}°")
 
     # Slider ranges: generous enough to not max out
     # Translation: -12" to +12" (0.05" per tick, 480 ticks)
@@ -143,12 +188,12 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, disp_w, disp_h + 200)
 
-    cv2.createTrackbar('Fwd (in)',   win, T_RANGE + int(3.0 / T_SCALE), T_RANGE * 2, lambda x: None)
-    cv2.createTrackbar('Left (in)',  win, T_RANGE + int(0.0 / T_SCALE), T_RANGE * 2, lambda x: None)
-    cv2.createTrackbar('Up (in)',    win, T_RANGE + int(0.0 / T_SCALE), T_RANGE * 2, lambda x: None)
-    cv2.createTrackbar('Roll (deg)', win, R_RANGE, R_RANGE * 2, lambda x: None)
+    cv2.createTrackbar('Fwd (in)',    win, T_RANGE + int(round(init_fwd  / T_SCALE)), T_RANGE * 2, lambda x: None)
+    cv2.createTrackbar('Left (in)',   win, T_RANGE + int(round(init_left / T_SCALE)), T_RANGE * 2, lambda x: None)
+    cv2.createTrackbar('Up (in)',     win, T_RANGE + int(round(init_up   / T_SCALE)), T_RANGE * 2, lambda x: None)
+    cv2.createTrackbar('Roll (deg)',  win, R_RANGE, R_RANGE * 2, lambda x: None)
     cv2.createTrackbar('Pitch (deg)', win, R_RANGE, R_RANGE * 2, lambda x: None)
-    cv2.createTrackbar('Yaw (deg)',  win, R_RANGE, R_RANGE * 2, lambda x: None)
+    cv2.createTrackbar('Yaw (deg)',   win, R_RANGE + int(round(init_yaw  / R_SCALE)), R_RANGE * 2, lambda x: None)
 
     print(f"\nInteractive Seed Viewer - {camera_hw}")
     print(f"  Adjust sliders to align LiDAR with camera features")

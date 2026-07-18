@@ -54,10 +54,37 @@ def remap_lidar_to_strips(image):
 
 def _load_T_cam_lidar():
     """Load T_camera_lidar from the appropriate calibration file.
-    Prefers per-hw calibration detected from output dataset, falls back to active."""
-    import glob as _g
-    calib_path = Path(__file__).parent.parent / 'config' / 'fusion_calibration.yaml'
-    # Try to detect camera_hw from the output dataset
+    Checks ATLAS_CALIBRATION_CAM_INDEX env var to find the per-camera-slot
+    path from multi_camera.yaml. Falls back to per-hw then active calibration."""
+    import glob as _g, os as _os
+    src_root = Path(__file__).parent.parent
+
+    # Priority 1: per-camera-slot path from multi_camera.yaml
+    _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+    if _cam_idx:
+        try:
+            import yaml as _y
+            mc_path = src_root / 'config' / 'multi_camera.yaml'
+            if mc_path.exists():
+                mc = _y.safe_load(mc_path.read_text()) or {}
+                cam_cfg = mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
+                calib_rel = cam_cfg.get('calibration', '')
+                if calib_rel:
+                    slot_path = src_root / 'config' / calib_rel
+                    if slot_path.exists():
+                        with open(slot_path) as f:
+                            calib = yaml.safe_load(f)
+                        T = np.eye(4)
+                        T[:3, :3] = Rotation.from_euler('xyz', [
+                            calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
+                        ]).as_matrix()
+                        T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+                        return T
+        except Exception:
+            pass
+
+    # Priority 2: per-hw calibration detected from output dataset
+    calib_path = src_root / 'config' / 'fusion_calibration.yaml'
     _source_jsons = sorted(_g.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
     if _source_jsons:
         try:
@@ -66,7 +93,7 @@ def _load_T_cam_lidar():
             _sess_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
             if _sess_cfg.exists():
                 _hw = _j.loads(_sess_cfg.read_text()).get('camera_hw', '')
-                _hw_path = Path(__file__).parent.parent / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
+                _hw_path = src_root / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
                 if _hw_path.exists():
                     calib_path = _hw_path
         except Exception:
@@ -367,7 +394,23 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         if cam is not None:
             cam_out = cam if is_dual else remap_to_strips(cam)
             cam_gray = cv2.cvtColor(cam_out, cv2.COLOR_BGR2GRAY) if cam_out.ndim == 3 else cam_out
-            if not is_dual:
+            # Per-camera calibration mask override via environment variable
+            # Applied regardless of is_dual when explicitly set for calibration
+            _env_mask = os.environ.get('ATLAS_CALIBRATION_MASK', '')
+            if _env_mask and os.path.isfile(_env_mask):
+                _calib_lidar_mask = cv2.imread(_env_mask, cv2.IMREAD_GRAYSCALE)
+                if _calib_lidar_mask is not None:
+                    _calib_lidar_mask = cv2.resize(_calib_lidar_mask, (cam_gray.shape[1], cam_gray.shape[0]), interpolation=cv2.INTER_NEAREST)
+                    # Erode mask boundary to suppress false keypoints at mask edges.
+                    # Hard mask edges create strong gradients that SuperPoint detects
+                    # as high-confidence keypoints — these are false features.
+                    # Eroding by ~1% of image width removes a border zone wide enough
+                    # to clear the edge artifacts from both camera and LiDAR images.
+                    _erode_px = max(8, cam_gray.shape[1] // 100)
+                    _erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_erode_px * 2 + 1, _erode_px * 2 + 1))
+                    _calib_lidar_mask = cv2.erode(_calib_lidar_mask, _erode_k)
+                    cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=_calib_lidar_mask)
+            elif not is_dual:
                 mask_path_src = 'lidar_mask_dual.png' if (is_sdk_stitch or width > 2560) else 'lidar_mask_single.png'
                 mask_path = Path(__file__).parent.parent / mask_path_src
                 lidar_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -396,8 +439,16 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                 cam_gray_path = None
             if cam_gray_path:
                 cv2.imwrite(cam_gray_path, cam_gray)
-            # Overwrite the root PNG SuperGlue reads with the masked grayscale
-            if feather is not None:
+            # When a calibration mask is active, overwrite the root PNG so the
+            # calibration viewer (initial_guess_manual / calibrate) also shows
+            # the masked image rather than the original unmasked capture.
+            _env_mask_write = os.environ.get('ATLAS_CALIBRATION_MASK', '')
+            if _env_mask_write and os.path.isfile(_env_mask_write):
+                try:
+                    cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
+                except ValueError:
+                    pass
+            elif feather is not None:
                 try:
                     cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
                 except ValueError:
@@ -406,6 +457,21 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # Zero lidar rows outside camera coverage (with same margin)
     intensity_image[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = 0
     indices_image[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = -1
+
+    # Apply per-camera calibration mask to lidar intensity image as well.
+    # This ensures SuperGlue only finds matches in the region where both
+    # the camera and lidar have valid data for this specific camera position.
+    _env_mask = os.environ.get('ATLAS_CALIBRATION_MASK', '')
+    if _env_mask and os.path.isfile(_env_mask):
+        _calib_mask = cv2.imread(_env_mask, cv2.IMREAD_GRAYSCALE)
+        if _calib_mask is not None:
+            _calib_mask = cv2.resize(_calib_mask, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+            # Same erosion as applied to camera image — keeps boundary zones consistent
+            _erode_px = max(8, out_w // 100)
+            _erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_erode_px * 2 + 1, _erode_px * 2 + 1))
+            _calib_mask = cv2.erode(_calib_mask, _erode_k)
+            intensity_image[_calib_mask < 128] = 0
+            indices_image[_calib_mask < 128] = -1
 
     cv2.imwrite(str(_safe_output(output_image)), intensity_image)
 
@@ -434,6 +500,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"\nGenerating intensity images for {len(ply_files)} PLY files...")
+    _mask_env = os.environ.get('ATLAS_CALIBRATION_MASK', '')
+    if _mask_env:
+        print(f"  Calibration mask: {_mask_env} (exists={os.path.isfile(_mask_env)})")
+    else:
+        print(f"  No ATLAS_CALIBRATION_MASK set — using default mask")
 
     for ply_file in ply_files:
         base_name = ply_file.stem

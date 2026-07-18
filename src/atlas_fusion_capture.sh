@@ -16,10 +16,11 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="continuous"         # stationary | continuous
-CONTINUOUS_INTERVAL=3             # seconds between captures (continuous mode only)
-                                  # X5 minimum is ~8s: TakePhoto() blocks for the full SD write
-                                  # (7-9s measured). Setting lower causes skip-forward jitter.
-                                  # With N cameras, effective interval = CONTINUOUS_INTERVAL / N
+CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (continuous mode)
+                                  # All cameras fire simultaneously, then you have this many
+                                  # seconds to move before the next batch fires.
+                                  # Capture time per batch: ~9s (slowest camera = OneX2 ~8-9s)
+                                  # Total cycle: ~9s capture + CONTINUOUS_INTERVAL move window
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
 NUM_CAMERAS=0                     # 0 = auto-detect all connected cameras (up to 3)
@@ -1245,43 +1246,49 @@ else
         echo "Capturing scan $SCAN_COUNT..."
         sleep 2
 
-        # In multi-camera stationary mode, each camera gets its own scan folder.
-        # scan N = cam_0, scan N+1 = cam_1, etc.
+        # In multi-camera stationary mode, all cameras fire in parallel via a
+        # single batch trigger. The SDK daemon creates per-camera scan dirs.
         _num_shots=${_USE_CAMERAS:-1}
         _first_scan=$SCAN_COUNT
-        for _cam_shot in $(seq 1 $_num_shots); do
-            if [ $_cam_shot -gt 1 ]; then
-                SCAN_COUNT=$((SCAN_COUNT + 1))
-                SCAN_NAME="fusion_scan_$(printf "%03d" $SCAN_COUNT)"
-                INDIVIDUAL_SCAN_DIR="$SCAN_DIR/$SCAN_NAME"
-                mkdir -p "$INDIVIDUAL_SCAN_DIR"
-            fi
-            CAPTURE_EXIT_CODE=""
-            rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-            echo "$INDIVIDUAL_SCAN_DIR" > "$SCAN_DIR/.sdk_capture_trigger"
-            for _i in $(seq 1 900); do
-                [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
-                [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
-                kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
-                sleep 0.1
-            done
-            [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
-            if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-                _insp=$(ls "$INDIVIDUAL_SCAN_DIR"/*.insp 2>/dev/null | head -1)
-                [ -n "$_insp" ] && echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
-            else
-                echo "  ✗ cam_$((_cam_shot-1)) capture failed"
-                break
-            fi
+
+        # Pre-create all scan dirs so the SDK can write into them
+        for _cam_shot in $(seq 2 $_num_shots); do
+            SCAN_COUNT=$((SCAN_COUNT + 1))
+            mkdir -p "$SCAN_DIR/fusion_scan_$(printf "%03d" $SCAN_COUNT)"
         done
-        # Wait for background downloads to complete (SDK signals via .sdk_downloads_pending)
-        if [ $_num_shots -gt 1 ]; then
+
+        # Single trigger fires all cameras in parallel inside the SDK daemon
+        CAPTURE_EXIT_CODE=""
+        rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
+        echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.sdk_capture_trigger"
+        for _i in $(seq 1 900); do
+            [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
+            [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
+            kill -0 $SDK_CAPTURE_PID 2>/dev/null || { echo "  SDK daemon died"; CAPTURE_EXIT_CODE=1; break; }
+            sleep 0.1
+        done
+        [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
+
+        if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
+            # Wait for background downloads to deliver .insp files
             for _dw in $(seq 1 600); do
                 _pending=$(cat "$SCAN_DIR/.sdk_downloads_pending" 2>/dev/null | tr -d '[:space:]')
-                [ "$_pending" = "0" ] && break
+                [ "${_pending:-1}" = "0" ] && break
                 sleep 0.1
             done
+            # Report which cameras succeeded
+            for _cam_shot in $(seq 1 $_num_shots); do
+                _cam_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cam_shot - 1)))"
+                _insp=$(ls "$_cam_dir"/*.insp 2>/dev/null | head -1)
+                if [ -n "$_insp" ]; then
+                    echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
+                else
+                    echo "  ✗ cam_$((_cam_shot-1)) capture failed"
+                    CAPTURE_EXIT_CODE=1
+                fi
+            done
         fi
+
         # Collect LiDAR for the first scan dir, then copy to all camera scan dirs
         INDIVIDUAL_SCAN_DIR="$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"
         if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
@@ -1349,8 +1356,16 @@ else
         fi
 
         # Trajectory trigger — save for all scan dirs at this position
+        # Use the shutter event time written by the SDK daemon (midpoint estimate)
+        # rather than time.time() here, which is taken after TakePhoto() returns.
         if [ "$LIO_ENABLED" = "true" ] && [ "$TRAJECTORY_RECORDING" = "true" ]; then
-            CAPTURE_TIMESTAMP=$(python3 -c "import time; print(time.time())")
+            # Read shutter time from the first camera's shutter_event file
+            _shutter_event=$(ls "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"/capture_*.shutter_event 2>/dev/null | head -1)
+            if [ -n "$_shutter_event" ]; then
+                CAPTURE_TIMESTAMP=$(awk '{print $1}' "$_shutter_event" 2>/dev/null)
+            fi
+            # Fallback to current time if shutter event not yet written
+            [ -z "$CAPTURE_TIMESTAMP" ] && CAPTURE_TIMESTAMP=$(python3 -c "import time; print(time.time())")
             for _scan_idx in $(seq $_first_scan $SCAN_COUNT); do
                 _traj_name="fusion_scan_$(printf "%03d" $_scan_idx)"
                 _traj_dir="$SCAN_DIR/$_traj_name"

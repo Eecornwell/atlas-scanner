@@ -24,10 +24,14 @@ static std::string make_gprmc() {
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm utc{};
     gmtime_r(&t, &utc);
+    // Include centiseconds for sub-second precision (NMEA supports HH:MM:SS.ss)
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000;
+    int cs = static_cast<int>(ms / 10);  // centiseconds
     char body[96];
     std::snprintf(body, sizeof(body),
-        "GPRMC,%02d%02d%02d.00,A,0000.00,N,00000.00,E,0.0,0.0,%02d%02d%02d,,",
-        utc.tm_hour, utc.tm_min, utc.tm_sec,
+        "GPRMC,%02d%02d%02d.%02d,A,0000.00,N,00000.00,E,0.0,0.0,%02d%02d%02d,,",
+        utc.tm_hour, utc.tm_min, utc.tm_sec, cs,
         utc.tm_mday, utc.tm_mon + 1, utc.tm_year % 100);
     uint8_t cksum = 0;
     for (const char* p = body; *p; ++p) cksum ^= static_cast<uint8_t>(*p);
