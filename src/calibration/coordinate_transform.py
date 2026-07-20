@@ -172,14 +172,38 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
         'skip_rate': existing_config.get('skip_rate', 5)
     }
     
-    # Save to shared config (active calibration) and per-model calibration file
+    # Save to shared config (active calibration) and per-model calibration file.
+    # Only write to the hw-level path if no slot calibration exists for this
+    # camera — the slot path (from multi_camera.yaml) is authoritative and must
+    # not be overwritten by coordinate_transform.py which only knows camera_hw,
+    # not which physical slot this camera occupies.
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+
+    # Write to hw-level path.
     hw_config_path.parent.mkdir(parents=True, exist_ok=True)
     hw_config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    print(f"\n\u2713 Saved calibration for {camera_hw} to: {hw_config_path}")
 
-    print(f"\n✓ Saved calibration for {camera_hw} to: {hw_config_path}")
-    print(f"✓ Active calibration updated: {config_path}")
+    # When ATLAS_CALIBRATION_CAM_INDEX is set, also write to the slot path so
+    # the coloring pipeline (which reads the slot) gets the new calibration.
+    import os as _os
+    _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+    if _cam_idx:
+        try:
+            _mc_path = Path(root_path) / 'config' / 'multi_camera.yaml'
+            if _mc_path.exists():
+                _mc = yaml.safe_load(_mc_path.read_text()) or {}
+                _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+                if _calib_rel:
+                    _slot_path = Path(root_path) / 'config' / _calib_rel
+                    _slot_path.parent.mkdir(parents=True, exist_ok=True)
+                    _slot_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+                    print(f"\u2713 Saved to slot path (cam_{_cam_idx}): {_slot_path}")
+        except Exception as _e:
+            print(f"  \u26a0 Could not write slot path: {_e}")
+
+    print(f"\u2713 Active calibration updated: {config_path}")
 
 def print_calibration_comparison(root_path):
     """Compare old vs new transformation approach"""

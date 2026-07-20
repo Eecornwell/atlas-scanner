@@ -14,9 +14,13 @@ _sudo() { [ "$(id -u)" = "0" ] && "$@" || sudo "$@"; }
 # Multi-camera udev rule: creates /dev/insta symlink for the first camera found
 # and /dev/instaN for each camera indexed by kernel device order.
 RULE_FILE="/etc/udev/rules.d/99-insta.rules"
+# Per-serial symlinks ensure /dev/insta_<SERIAL> always resolves to the right
+# device node regardless of USB enumeration order. /dev/insta is kept as a
+# legacy compat link pointing to the first camera by serial (cam_0 = X5).
 RULES='SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", MODE="0777"
-SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", SYMLINK+="insta%n", MODE="0777"
-SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", RUN+="/bin/sh -c '\''test -e /dev/insta || ln -sf /dev/insta%n /dev/insta'\''"'
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", SYMLINK+="insta_%s{serial}", MODE="0777"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", RUN+="/bin/sh -c '\''test -e /dev/insta || ln -sf /dev/%k /dev/insta'\''"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", ATTR{serial}=="IAHEA26019RESN", SYMLINK+="insta", MODE="0777"'
 
 if ! diff -q <(echo "$RULES") "$RULE_FILE" > /dev/null 2>&1; then
     echo "$RULES" | _sudo tee "$RULE_FILE" > /dev/null

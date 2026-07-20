@@ -21,6 +21,31 @@ from scipy.spatial.transform import Rotation as R
 CALIB_PATH  = Path(__file__).parent.parent / 'config' / 'fusion_calibration.yaml'
 OUTPUT_DIR  = Path.home() / 'atlas_ws/output'
 
+
+def _resolve_calib_path() -> Path:
+    """Return the calibration file to read/write.
+    Prefers the slot path from multi_camera.yaml when ATLAS_CALIBRATION_CAM_INDEX
+    is set, so tune/verify always operates on the same file as the coloring pipeline."""
+    cam_idx = os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+    if cam_idx:
+        try:
+            import sys as _sys
+            _src = Path(__file__).parent.parent
+            _sys.path.insert(0, str(_src))
+            from camera_hw import calibration_path
+            mc_path = _src / 'config' / 'multi_camera.yaml'
+            if mc_path.exists():
+                import yaml as _y
+                mc = _y.safe_load(mc_path.read_text()) or {}
+                hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '')
+                if hw:
+                    p = calibration_path(hw, int(cam_idx))
+                    if p.exists():
+                        return p
+        except Exception:
+            pass
+    return CALIB_PATH
+
 _ALLOWED_DATA   = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 _ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
 
@@ -85,6 +110,7 @@ def build_T(cfg, dr=0.0, dp=0.0, dy=0.0, dtx=0.0, dty=0.0, dtz=0.0):
     return T
 
 
+
 def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size=800, flip_erp=False):
     Ry = R.from_euler('y', look_lon_deg, degrees=True).as_matrix()
     Rx = R.from_euler('x', -look_lat_deg, degrees=True).as_matrix()
@@ -107,17 +133,15 @@ def persp_overlay(erp, pts_cam, dist, look_lon_deg, look_lat_deg=0, fov=90, size
     rays = np.stack([(uu - cx) / f, -(vv - cy) / f, np.ones((size, size))], axis=-1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
     rw = (R_look.T @ rays.reshape(-1, 3).T).T.reshape(size, size, 3)
-    lat_bg = -np.arcsin(np.clip(rw[..., 1], -1, 1))
-    lon_bg = np.arctan2(rw[..., 0], rw[..., 2])
-    eu = (w * (0.5 + lon_bg / (2 * np.pi))).astype(int).clip(0, w - 1)
     if flip_erp:
-        # SDK stitch ERP: lat=arcsin(Y), lon=atan2(Z,X)+pi/2
-        Xr = rw[..., 0]; Yr = rw[..., 1]; Zr = rw[..., 2]
-        lat_bg = np.arcsin(np.clip(-Yr, -1, 1))
-        lon_bg = np.arctan2(Xr, Zr)
+        lat_bg = np.arcsin(np.clip(-rw[..., 1], -1, 1))
+        lon_bg = np.arctan2(rw[..., 0], rw[..., 2])
         eu = (w * (0.5 + lon_bg / (2 * np.pi))).astype(int) % w
-        ev = (h * (0.5 - lat_bg / np.pi)).astype(int).clip(0, h - 1)
+        ev = np.clip((h * (0.5 - lat_bg / np.pi)).astype(int), 0, h - 1)
     else:
+        lat_bg = -np.arcsin(np.clip(rw[..., 1], -1, 1))
+        lon_bg = np.arctan2(rw[..., 0], rw[..., 2])
+        eu = (w * (0.5 + lon_bg / (2 * np.pi))).astype(int).clip(0, w - 1)
         ev = (h * (0.5 - lat_bg / np.pi)).astype(int).clip(0, h - 1)
     bg = erp[ev, eu]
 
@@ -157,7 +181,7 @@ def main():
                              'If omitted, uses ~/atlas_ws/output/000000.ply + 000000.png')
     parser.add_argument('--axis', choices=['roll', 'pitch', 'yaw', 'tx', 'ty', 'tz'], default='pitch')
     parser.add_argument('--range', type=float, default=2.0,
-                        help='Sweep ±range degrees (rotation) or cm (translation)')
+                        help='Sweep \u00b1range degrees (rotation) or cm (translation)')
     parser.add_argument('--steps', type=int, default=5)
     parser.add_argument('--apply', type=float, default=None,
                         help='Apply this offset to the yaml and exit')
@@ -165,22 +189,23 @@ def main():
                         help='Generate current-state overlay without sweeping')
     args = parser.parse_args()
 
-    with open(CALIB_PATH) as f:
+    calib_path = _resolve_calib_path()
+    with open(calib_path) as f:
         cfg = yaml.safe_load(f)
 
     if args.apply is not None:
         if args.axis in ('roll', 'pitch', 'yaw'):
             key = f'manual_{args.axis}_adjustment'
             cfg[key] = float(cfg.get(key, 0.0)) + float(np.radians(args.apply))
-            with open(CALIB_PATH, 'w') as f:
+            with open(calib_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-            print(f'✓ Applied {args.apply}° to {key} -> {np.degrees(cfg[key]):.4f}° total')
+            print(f'\u2713 Applied {args.apply}\u00b0 to {key} -> {np.degrees(cfg[key]):.4f}\u00b0 total')
         else:
             key = f'{args.axis[1]}_offset'
             cfg[key] = float(cfg.get(key, 0.0)) + float(args.apply / 100.0)
-            with open(CALIB_PATH, 'w') as f:
+            with open(calib_path, 'w') as f:
                 yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-            print(f'✓ Applied {args.apply}cm to {key} -> {cfg[key]*100:.2f}cm total')
+            print(f'\u2713 Applied {args.apply}cm to {key} -> {cfg[key]*100:.2f}cm total')
         return
 
     # Resolve PLY and image sources
@@ -198,12 +223,11 @@ def main():
             print(f'Missing sensor_lidar*.ply or equirect*.jpg in {scan_dir}')
             sys.exit(1)
     else:
-        # Use calibration dataset directly from output/
         ply_path = _safe_output(OUTPUT_DIR / '000000.ply')
         img_path = _safe_output(OUTPUT_DIR / '000000.png')
         out_dir  = _safe_output(OUTPUT_DIR / 'calib_sweep')
         if not ply_path.exists():
-            print(f'No {ply_path} — run combine_scans_for_calibration.py first')
+            print(f'No {ply_path} \u2014 run combine_scans_for_calibration.py first')
             sys.exit(1)
 
     out_dir.mkdir(exist_ok=True)
@@ -226,20 +250,20 @@ def main():
     views = [('back-left', -135, 0), ('back-left-down', -135, -20),
              ('back-right', 135, 0), ('back-right-down', 135, -20)]
 
-    # SDK stitch views: lidar coverage concentrated at lon=±135, lat=-30 to +30
+    # SDK stitch views: lidar coverage concentrated at lon=\u00b1135, lat=-30 to +30
     sdk_views = [('lon+135', 135, 0), ('lon-135', -135, 0),
                  ('lon+90',   90, 0), ('lon-90',   -90, 0)]
 
     if args.verify:
         if args.scan_dir:
-            # Single explicit scan dir — original behaviour
+            # Single explicit scan dir \u2014 original behaviour
             sources = [(ply_path, img_path, scan_dir.name)]
         else:
             # Load up to 3 scans from output/ (000000, 000001, 000002)
             sources = []
             for i in range(3):
                 p = _safe_output(OUTPUT_DIR / f'{i:06d}.ply')
-                q = _safe_output(OUTPUT_DIR / 'images' / f'{i:06d}.png')  # full-res RGB (root PNG is grayscale after generate_intensity_images)
+                q = _safe_output(OUTPUT_DIR / 'images' / f'{i:06d}.png')
                 if not q.exists():
                     q = _safe_output(OUTPUT_DIR / f'{i:06d}.png')
                 if p.exists() and q.exists():
@@ -258,7 +282,6 @@ def main():
                 print(f'Could not load image: {s_img}, skipping')
                 continue
             s_erp = cv2.cvtColor(s_raw, cv2.COLOR_GRAY2BGR) if s_raw.ndim == 2 else s_raw
-            # Detect SDK stitch from sidecar
             import json as _json
             sidecar = _safe_output(OUTPUT_DIR / f'{Path(s_ply).stem}_source.json')
             is_sdk = False
@@ -277,14 +300,14 @@ def main():
 
         out = _safe_output(out_dir / 'current.jpg')
         cv2.imwrite(str(out), np.vstack(scan_grids))
-        print(f'\n✓ Saved current calibration overlay ({len(scan_grids)} scan(s)) -> {out}')
+        print(f'\n\u2713 Saved current calibration overlay ({len(scan_grids)} scan(s)) -> {out}')
         return
 
     step = args.range / args.steps
     offsets = [i * step for i in range(-args.steps, args.steps + 1)]
     is_rot = args.axis in ('roll', 'pitch', 'yaw')
     unit = 'deg' if is_rot else 'cm'
-    print(f'\nSweeping {args.axis} ±{args.range}{unit} in {len(offsets)} steps...')
+    print(f'\nSweeping {args.axis} \u00b1{args.range}{unit} in {len(offsets)} steps...')
     for off in offsets:
         dr  = np.radians(off) if args.axis == 'roll'  else 0.0
         dp  = np.radians(off) if args.axis == 'pitch' else 0.0
@@ -300,7 +323,7 @@ def main():
         cv2.imwrite(str(out), grid)
         print(f'  {out.name}')
 
-    print(f'\n✓ Saved {len(offsets)} images to {out_dir}')
+    print(f'\n\u2713 Saved {len(offsets)} images to {out_dir}')
     unit_help = 'degrees' if is_rot else 'cm'
     print(f'  python3 {__file__} --axis {args.axis} --apply <{unit_help}>')
 

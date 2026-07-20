@@ -403,9 +403,12 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
                 pass
 
         if centre_host is not None:
-            # .capture_time may contain "t_before t_after" (new format) or just
-            # "t_before" (old format).  t_before is the shutter time (TakePhoto
-            # call entry); t_after is after SD write and is NOT used for alignment.
+            # .capture_time format (written by main_multi.cpp after timing fix):
+            #   parts[0] = t_shutter_est = (t_before + t_after) / 2  (midpoint estimate)
+            #   parts[1] = t_after  (TakePhoto() return, post-SD-write)
+            #   parts[2] = cam_idx
+            #   parts[3] = original_latency  (t_after - t_before, for diagnostics)
+            # Use parts[0] directly as the shutter time estimate.
             centre = centre_host - _host_to_livox_offset
             print(f"  Scan centre: capture_time sidecar "
                   f"({centre_host:.3f}s host, offset {_host_to_livox_offset*1000:+.1f}ms applied)")
@@ -470,12 +473,37 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
         sensor_ply = scan_dir / "sensor_lidar.ply"
         save_ply(str(sensor_ply), all_points)
         print(f"  Saved sensor_lidar.ply ({len(all_points)} pts, "
-              f"{len(window_lidar)} frames in ±{half:.2f}s window)")
+              f"{len(window_lidar)} frames in \u00b1{half:.2f}s window)")
 
         if world_points:
             world_ply = scan_dir / "world_lidar.ply"
             save_ply(str(world_ply), world_points)
             print(f"  Saved world_lidar.ply")
+
+        # Propagate the motion-compensated PLY to all co-located camera scan dirs.
+        # In multi-camera stationary mode, N cameras at the same physical position
+        # produce N scan dirs (e.g. 001/002/003) sharing the same capture_time but
+        # only the primary dir (cam_0) has a rosbag. The secondary dirs keep the
+        # raw uncompensated copy from buffered_camera_capture.py (wrong point count,
+        # no motion compensation) unless we overwrite them here.
+        import shutil as _shutil
+        for _other in sorted(session_path.glob("fusion_scan_*")):
+            if _other == scan_dir or not _other.is_dir():
+                continue
+            _other_ct = None
+            for _ct_f in sorted(_other.glob("*.insp.capture_time")):
+                try:
+                    _other_ct = float(_ct_f.read_text().strip().split()[0])
+                    break
+                except Exception:
+                    pass
+            if _other_ct is None or abs(_other_ct - centre_host) > 1.0:
+                continue
+            _shutil.copy2(str(sensor_ply), str(_other / "sensor_lidar.ply"))
+            if world_points:
+                _shutil.copy2(str(scan_dir / "world_lidar.ply"),
+                              str(_other / "world_lidar.ply"))
+            print(f"  Propagated sensor_lidar.ply -> {_other.name} (co-located)")
 
         # --- Camera: decode middle frame ---
         if image_msgs_raw:
@@ -508,6 +536,10 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
     print(f"\n✓ Processed {scan_count} scans")
 
     # --- Colorization ---
+    # exact_match_fusion.py is called directly per scan above via
+    # post_process_coloring.py. Skip the session-level call here to avoid
+    # a redundant second pass that fails because it runs before masked PNGs
+    # exist and checks for world_colored_exact.ply which is no longer written.
     print("\nColorizing...")
     if camera_mode == "dual_fisheye":
         fisheye_to_erp = str(pp / "fisheye_to_erp.py")
@@ -521,6 +553,24 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
                         [sys.executable, fisheye_to_erp, str(fisheye_jpg), str(erp_path), "--dual"],
                         check=False,
                     )
+        # regenerate masks then color
+        _camera_hw = os.environ.get("CAMERA_HW", "")
+        if not _camera_hw:
+            _sess_cfg = session_path / "session_config.json"
+            if _sess_cfg.exists():
+                try:
+                    import json as _j2
+                    _camera_hw = _j2.loads(_sess_cfg.read_text()).get("camera_hw", "x5")
+                except Exception:
+                    _camera_hw = "x5"
+            else:
+                _camera_hw = "x5"
+        subprocess.run(
+            [sys.executable, str(pp / "regenerate_masked_images.py"), str(session_path),
+             "--camera-mode", camera_mode, "--sdk-stitch",
+             "--camera-hw", _camera_hw],
+            check=False,
+        )
         subprocess.run(
             [sys.executable, str(pp / "post_process_coloring.py"), str(session_path), "--use-exact"],
             check=False,
@@ -554,7 +604,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     # Stationary mode: per-scan bags inside fusion_scan_*/rosbag_*
     if not bag_dirs:
-        per_scan_bags = sorted(session_path.glob("fusion_scan_*/rosbag_*"))
+        per_scan_bags = sorted(
+            p for p in session_path.glob("fusion_scan_*/rosbag_*")
+            if not p.name.endswith('.log') and p.is_dir()
+        )
         if per_scan_bags:
             return _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_window)
         print("✗ No rosbag_* directory found in session")
@@ -876,10 +929,13 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 # t_before is TakePhoto() call entry (shutter fires).
                                 # t_after is post-SD-write; used only for latency diagnostics.
                                 _parts = _ct_f.read_text().strip().split()
-                                _host_t = float(_parts[0])  # t_before = shutter time
-                                _sd_latency = float(_parts[1]) - _host_t if len(_parts) > 1 else (_host_t - _rtc_t)
+                                _host_t = float(_parts[0])  # t_shutter_est (midpoint)
+                                # parts[3] = original latency (t_after - t_before); use it
+                                # to detect whether this is the new format.
+                                # parts[1] = t_after; SD write latency = t_after - t_shutter_est
+                                _t_after = float(_parts[1]) if len(_parts) > 1 else _host_t
+                                _sd_latency = _t_after - _host_t  # always >= 0
                                 if _sd_latency >= 0.0:
-                                    # t_before is the shutter time regardless of SD write duration
                                     _rtc_t = _host_t - _host_to_livox_offset
                                 elif abs(_host_t - _rtc_t) < 2.0:
                                     _rtc_t = _host_t - _host_to_livox_offset

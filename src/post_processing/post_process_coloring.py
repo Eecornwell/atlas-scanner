@@ -66,9 +66,11 @@ def process_scan_coloring(scan_dir, use_exact=False):
         
         # Check if colored PLY was created
         colored_candidates = [
+            scan_path / "sensor_colored_exact.ply",
+            scan_path / "sensor_colored_pointcloud.ply",
+            scan_path / "sensor_colored.ply",
             scan_path / "world_colored_exact.ply",
             scan_path / "world_colored.ply",
-            scan_path / "sensor_colored.ply"
         ]
         
         for colored_ply in colored_candidates:

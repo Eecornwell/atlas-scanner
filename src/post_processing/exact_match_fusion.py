@@ -127,12 +127,29 @@ def exact_match_calibration_tool(scan_dir):
         return False
     img_height, img_width = image.shape[:2]
 
-    # Load calibration — use per-camera calibration if .cam_index exists
+    # Load calibration — resolve by serial from .cam_index so multi-camera
+    # sessions use the correct per-slot calibration regardless of what
+    # camera_hw session_config.json records (which is always the primary hw).
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     from camera_hw import calibration_path, cam_index_for_scan, camera_hw_for_session
+    import yaml as _yaml
     _session_dir = os.path.dirname(scan_dir)
-    _hw = camera_hw_for_session(_session_dir)
     _cam_idx = cam_index_for_scan(scan_dir)
+
+    # Derive hw from the resolved slot in multi_camera.yaml (serial-based),
+    # not from session_config.json which only stores the primary camera hw.
+    _hw = camera_hw_for_session(_session_dir)  # fallback
+    try:
+        _src = os.path.join(os.path.dirname(__file__), '..')
+        _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
+        if os.path.exists(_mc_path):
+            _mc = _yaml.safe_load(open(_mc_path).read()) or {}
+            _slot_cfg = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
+            if _slot_cfg.get('camera_hw'):
+                _hw = _slot_cfg['camera_hw']
+    except Exception:
+        pass
+
     config_path = str(calibration_path(_hw, _cam_idx))
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -143,14 +160,10 @@ def exact_match_calibration_tool(scan_dir):
     t_x   = config['x_offset']
     t_y   = config['y_offset']
     t_z   = config['z_offset']
-    skip_rate = config.get('skip_rate', 1)
 
     print(f"Transformation (T_camera_lidar):")
     print(f"  Translation: [{t_x:.4f}, {t_y:.4f}, {t_z:.4f}]")
     print(f"  Rotation (RPY): [{roll:.4f}, {pitch:.4f}, {yaw:.4f}]")
-
-    if skip_rate > 1:
-        points = points[::skip_rate]
 
     # Build T_camera_lidar: sensor LiDAR frame -> camera frame
     R_matrix = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
@@ -158,10 +171,15 @@ def exact_match_calibration_tool(scan_dir):
     T_camera_lidar[:3, :3] = R_matrix
     T_camera_lidar[:3, 3] = [t_x, t_y, t_z]
 
-    # Filter points
+    # Transform all points to camera frame first, then filter.
+    # Filtering in sensor frame (e.g. points[:,2] > 0.05) is wrong because the
+    # LiDAR Z-axis is not aligned with the camera Z-axis after T_camera_lidar.
+    # The only correct depth filter is camera-frame Z > 0 (point is in front
+    # of the camera), which also implicitly rejects behind-camera points that
+    # would otherwise wrap around the ERP and get wrong colors.
     distances = np.linalg.norm(points, axis=1)
-    valid_mask = (distances > 0.8) & (distances < 8.0) & (points[:, 2] > 0.05)
-    points = points[valid_mask]
+    range_mask = (distances > 0.3) & (distances < 30.0)
+    points = points[range_mask]
 
     print(f"Processing {len(points)} points...")
 
@@ -169,7 +187,13 @@ def exact_match_calibration_tool(scan_dir):
     points_camera = (T_camera_lidar @ points_h.T).T[:, :3]
 
     # Equirectangular projection (matches direct_visual_lidar_calibration)
-    bearing = points_camera / np.linalg.norm(points_camera, axis=1, keepdims=True)
+    cam_depths = np.linalg.norm(points_camera, axis=1)
+    depth_valid = cam_depths > 0.1
+    points        = points[depth_valid]
+    points_camera = points_camera[depth_valid]
+    cam_depths    = cam_depths[depth_valid]
+
+    bearing = points_camera / cam_depths[:, np.newaxis]
     lat = -np.arcsin(np.clip(bearing[:, 1], -1, 1))
     lon = np.arctan2(bearing[:, 0], bearing[:, 2])
     u = img_width  * (0.5 + lon / (2 * np.pi))
@@ -225,10 +249,6 @@ def exact_match_calibration_tool(scan_dir):
     sensor_output = str(_safe_data(safe_scan / "sensor_colored_exact.ply"))
     write_ply(sensor_output, valid_points, colors)
     print(f"\u2713 Saved sensor-frame colored points to {sensor_output}")
-
-    # world_colored_exact.ply: same sensor-frame data (world transform applied by posegraph/merge)
-    world_output = str(_safe_data(safe_scan / "world_colored_exact.ply"))
-    write_ply(world_output, valid_points, colors)
     return True
 
 if __name__ == '__main__':

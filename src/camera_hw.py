@@ -92,24 +92,39 @@ def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
     """Return the calibration YAML for a camera.
 
     Resolution order:
-    1. Per-camera slot path from multi_camera.yaml (cam_index → calibration field)
-       e.g. cam_1 → calibrations/x3/left/fusion_calibration.yaml
+    1. Per-camera slot path from multi_camera.yaml matched by BOTH cam_index
+       AND camera_hw — prevents a single-camera session (cam_index=0) from
+       picking up cam_0's slot when the connected camera is actually cam_1 or cam_2.
     2. Legacy per-hw/cam_N path: calibrations/<hw>/cam_<N>/fusion_calibration.yaml
     3. Per-hw path: calibrations/<hw>/fusion_calibration.yaml
     4. Active shared calibration: config/fusion_calibration.yaml
     """
-    # Priority 1: per-camera slot path from multi_camera.yaml
     if cam_index is not None:
         mc_path = _SRC / 'config' / 'multi_camera.yaml'
         if mc_path.exists():
             try:
                 mc = yaml.safe_load(mc_path.read_text()) or {}
-                cam_cfg = mc.get('cameras', {}).get(f'cam_{cam_index}', {})
-                calib_rel = cam_cfg.get('calibration', '')
-                if calib_rel:
-                    slot_path = _SRC / 'config' / calib_rel
-                    if slot_path.exists():
-                        return slot_path
+                cameras = mc.get('cameras', {})
+
+                # Priority 1a: exact match on both index AND hw
+                cam_cfg = cameras.get(f'cam_{cam_index}', {})
+                if cam_cfg.get('camera_hw', '') == camera_hw:
+                    calib_rel = cam_cfg.get('calibration', '')
+                    if calib_rel:
+                        slot_path = _SRC / 'config' / calib_rel
+                        if slot_path.exists():
+                            return slot_path
+
+                # Priority 1b: index matches but hw differs — find the slot
+                # whose hw matches (handles single-camera sessions where the
+                # SDK assigns index 0 regardless of physical slot position).
+                for slot_key, slot_cfg in cameras.items():
+                    if slot_cfg.get('camera_hw', '') == camera_hw:
+                        calib_rel = slot_cfg.get('calibration', '')
+                        if calib_rel:
+                            slot_path = _SRC / 'config' / calib_rel
+                            if slot_path.exists():
+                                return slot_path
             except Exception:
                 pass
         # Priority 2: legacy per-hw/cam_N path
@@ -125,11 +140,35 @@ def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
 
 
 def cam_index_for_scan(scan_dir) -> int:
-    """Read .cam_index from a scan directory. Returns 0 if not present."""
-    ci = Path(scan_dir) / '.cam_index'
-    if ci.exists():
-        try:
-            return int(ci.read_text().strip())
-        except (ValueError, OSError):
-            pass
-    return 0
+    """Read .cam_index from a scan directory.
+
+    New format (written by main_multi.cpp): "<sdk_index> <serial>"
+    Old format: "<sdk_index>"
+
+    When a serial is present, resolve the multi_camera.yaml slot by serial
+    so the correct calibration is used regardless of USB enumeration order.
+    Returns the slot index (0/1/2) that matches the serial, or the raw
+    sdk_index as fallback.
+    """
+    ci_path = Path(scan_dir) / '.cam_index'
+    if not ci_path.exists():
+        return 0
+    try:
+        parts = ci_path.read_text().strip().split()
+        sdk_index = int(parts[0])
+        if len(parts) < 2:
+            return sdk_index  # old format — no serial
+        serial = parts[1]
+        # Look up which multi_camera.yaml slot has this serial
+        mc_path = _SRC / 'config' / 'multi_camera.yaml'
+        if mc_path.exists():
+            try:
+                mc = yaml.safe_load(mc_path.read_text()) or {}
+                for slot_key, cam_cfg in mc.get('cameras', {}).items():
+                    if cam_cfg.get('serial', '') == serial:
+                        return int(slot_key.split('_')[1])
+            except Exception:
+                pass
+        return sdk_index
+    except (ValueError, OSError):
+        return 0

@@ -25,6 +25,8 @@
 
 namespace fs = std::filesystem;
 
+static int _main(int argc, char* argv[]);  // forward declaration
+
 // Multi-camera continuous mode: host-controlled alternating TakePhoto() loop.
 //
 // Supports 1-3 cameras. When N cameras are connected, shots are fired in
@@ -101,9 +103,23 @@ static bool http_download(const std::string& url_base, const std::string& remote
 }
 
 static bool open_session(ins_camera::Camera* cam) {
-    auto f = std::async(std::launch::async, [cam]() { return cam->Open(); });
-    if (f.wait_for(std::chrono::seconds(8)) != std::future_status::ready) { LOG_ERR("Open() timed out"); return false; }
-    return f.get();
+    auto f = std::async(std::launch::async, [cam]() {
+        try { return cam->Open(); }
+        catch (...) { return false; }
+    });
+    if (f.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+        LOG_ERR("Open() timed out");
+        // Must call f.get() or let f go out of scope cleanly before returning.
+        // Abandoning a std::future whose async thread is still running causes
+        // std::terminate() when the future destructor fires.
+        // Detach by moving into a thread that waits in the background.
+        std::thread([f = std::move(f)]() mutable {
+            try { f.get(); } catch (...) {}
+        }).detach();
+        return false;
+    }
+    try { return f.get(); }
+    catch (...) { return false; }
 }
 
 // Cached settings parsed once from env vars, applied uniformly to all cameras.
@@ -241,6 +257,34 @@ struct DownloadJob {
 };
 
 int main(int argc, char* argv[]) {
+    // Install a terminate handler so SDK-internal throws that escape to
+    // std::terminate produce a log line instead of a silent abort.
+    std::set_terminate([]() {
+        try {
+            auto eptr = std::current_exception();
+            if (eptr) std::rethrow_exception(eptr);
+        } catch (const std::exception& e) {
+            std::cerr << "[fatal] uncaught exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[fatal] uncaught unknown exception" << std::endl;
+        }
+        std::cerr << "[fatal] std::terminate called — exiting cleanly" << std::endl;
+        std::cerr.flush();
+        _exit(1);  // skip destructors to avoid secondary crashes
+    });
+
+    try {
+    return _main(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "[fatal] exception in main: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "[fatal] unknown exception in main" << std::endl;
+        return 1;
+    }
+}
+
+int _main(int argc, char* argv[]) {
     // --discover mode: list cameras and exit
     if (argc > 1 && std::string(argv[1]) == "--discover") {
         flush_usb_endpoints();
@@ -300,13 +344,20 @@ int main(int argc, char* argv[]) {
                     slot.cam->SetServicePort(8090 + slot.index);
 
                     bool opened = false;
-                    for (int retry = 1; retry <= 3 && !opened; ++retry) {
-                        if (retry > 1)
-                            std::this_thread::sleep_for(std::chrono::seconds(retry * 2));
+                    for (int retry = 1; retry <= 5 && !opened; ++retry) {
+                        if (retry > 1) {
+                            // Exponential backoff: 2s, 4s, 6s, 8s
+                            // The OneX2 needs up to 15s to recover from a stuck state.
+                            int wait_s = retry * 2;
+                            LOG_OUT("[open] cam '" << target_sn << "' retry " << retry
+                                    << " in " << wait_s << "s...");
+                            std::this_thread::sleep_for(std::chrono::seconds(wait_s));
+                        }
                         if (open_session(slot.cam)) {
                             opened = true;
                         } else {
                             delete slot.cam;
+                            slot.cam = nullptr;
                             auto fresh = g_discovery.GetAvailableDevices();
                             for (auto& d : fresh) {
                                 if (sanitise(d.serial_number) == sn) {
@@ -316,6 +367,7 @@ int main(int argc, char* argv[]) {
                                     break;
                                 }
                             }
+                            if (!slot.cam) break;  // device disappeared
                         }
                     }
                     if (opened) {
@@ -563,7 +615,7 @@ int main(int argc, char* argv[]) {
                             << job.t_shutter << " " << job.t_after << " " << job.cam_idx;
 
                         std::ofstream ci(scan_dir / ".cam_index");
-                        ci << job.cam_idx;
+                        ci << job.cam_idx << " " << slots[job.cam_idx].serial;
 
                         LOG_OUT("[dl] saved shot " << job.global_shot << " cam[" << job.cam_idx << "]: "
                                 << sanitise(insp_name.string()));
@@ -828,7 +880,7 @@ int main(int argc, char* argv[]) {
                     write_shutter_event(session_dir, shot, t_shutter_stat, ci);
 
                     // Write cam_index and capture_time immediately
-                    { std::ofstream cif(fs::path(cam_dir) / ".cam_index"); cif << ci; }
+                    { std::ofstream cif(fs::path(cam_dir) / ".cam_index"); cif << ci << " " << slots[ci].serial; }
                     { std::ofstream ct(results[ci].local_path + ".capture_time");
                       ct << std::fixed << std::setprecision(6)
                          << t_before << " " << t_after << " " << ci; }
@@ -880,4 +932,4 @@ int main(int argc, char* argv[]) {
         delete slot.cam;
     }
     return 0;
-}
+}  // end _main

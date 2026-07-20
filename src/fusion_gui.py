@@ -1421,9 +1421,13 @@ sys.exit(0 if ok[0] else 4)
                     continue
                 name = subprocess.run(['xdotool', 'getwindowname', wid],
                                       capture_output=True, text=True).stdout.strip()
-                if not name.endswith('- RViz2') and not name.endswith('- RViz'):
+                if not name.endswith('- RViz2') and not name.endswith('- RViz') \
+                        and name != 'RViz2' and name != 'RViz':
                     continue
-                # Only accept windows whose owning PID started after this session
+                # Only accept windows whose owning PID started after boot + some margin.
+                # Use a generous window (session start - 300s) to handle the case where
+                # RViz launches during startup but embed_rviz() is called much later
+                # (e.g. after the camera session is ready, 2+ minutes after RViz starts).
                 pid_out = subprocess.run(['xdotool', 'getwindowpid', wid],
                                          capture_output=True, text=True).stdout.strip()
                 if not pid_out.isdigit():
@@ -1434,8 +1438,8 @@ sys.exit(0 if ok[0] else 4)
                             fields = f.read().split(')')
                             start_ticks = int(fields[-1].split()[19])
                             pid_start_wall = btime + start_ticks / clk_tck
-                            if pid_start_wall < search_start_wall - 30:
-                                continue  # process predates this session by more than 30s
+                            if pid_start_wall < search_start_wall - 300:
+                                continue  # process predates this session by more than 5 min
                     except Exception:
                         continue
                 candidates.append(wid)
@@ -2087,12 +2091,19 @@ sys.exit(0 if ok[0] else 4)
 
     def _cal_run_full_pipeline(self):
         """Run all calibration steps in sequence using the current dropdown settings."""
-        scene = self._cal_scene_var.get()
-        guess = self._cal_guess_var.get()
+        # Capture all GUI state on the main thread before launching the background
+        # thread. Tkinter widget accessors (.get(), .config()) are not thread-safe
+        # and silently crash when called from a non-main thread.
+        scene    = self._cal_scene_var.get()
+        guess    = self._cal_guess_var.get()
+        cam_idx  = self._cal_cam_var.get().split('_')[1]
+        hw       = self._cal_hw()
+        src      = self._cal_src()
+        sess     = self._pp_session()
+        mask_file = self._cal_get_mask()
         dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
         output = str(pathlib.Path.home() / 'atlas_ws/output')
         erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
-        mask_file = self._cal_get_mask()
         import threading as _th
         import subprocess as _sp
 
@@ -2106,8 +2117,6 @@ sys.exit(0 if ok[0] else 4)
                 ) if k in os.environ
             }
             _safe_env['PYTHONUNBUFFERED'] = '1'
-            # Pass per-camera calibration mask and camera index
-            cam_idx = self._cal_cam_var.get().split('_')[1]
             _safe_env['ATLAS_CALIBRATION_CAM_INDEX'] = cam_idx
             if mask_file and _os.path.isfile(mask_file):
                 _safe_env['ATLAS_CALIBRATION_MASK'] = mask_file
@@ -2115,17 +2124,17 @@ sys.exit(0 if ok[0] else 4)
                                 f'  Calibration mask: {_os.path.basename(mask_file)}\n')
             else:
                 self.root.after(0, self._cal_log_write,
-                                f'  ⚠ No calibration mask applied (mask_file={mask_file!r})\n')
+                                f'  \u26a0 No calibration mask applied (mask_file={mask_file!r})\n')
             _superglue_dir = str(pathlib.Path.home() / 'atlas_ws/SuperGluePretrainedNetwork')
             _existing_pp = _safe_env.get('PYTHONPATH', '')
             _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
 
-            _cam_args = ['--cam-index', self._cal_cam_var.get().split('_')[1]]
+            _cam_args = ['--cam-index', cam_idx]
 
             steps = [
                 ("1. Combine Scans", [sys.executable,
                     str(self.script_dir / 'calibration' / 'combine_scans_for_calibration.py'),
-                    self._pp_session() or output] + _cam_args),
+                    sess or output] + _cam_args),
                 ("2. Generate Intensity Images", [sys.executable,
                     str(self.script_dir / 'calibration' / 'generate_intensity_images.py'), output]),
                 (f"3. Match Features (SuperGlue {scene})", [sys.executable, str(erp_matcher),
@@ -2133,7 +2142,6 @@ sys.exit(0 if ok[0] else 4)
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
-            # Step 4b: initial guess
             if guess == 'auto':
                 steps.append(("5. Initial Guess (Auto)", [
                     str(dvl / 'initial_guess_auto'), '--data_path', output]))
@@ -2145,18 +2153,19 @@ sys.exit(0 if ok[0] else 4)
                     '--nid_bins', '32', '--nelder_mead_convergence_criteria', '1e-10']),
                 ("7. Apply Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
-                    self._cal_src(), '--camera-hw', self._cal_hw()]),
+                    src, '--camera-hw', hw]),
             ]
 
             for label, cmd in steps:
                 safe_cmd = ' '.join(str(a) for a in cmd)
                 self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
-                # Skip session arg if no session selected
-                if not self._pp_session() and 'combine_scans' in safe_cmd:
+                if not sess and 'combine_scans' in safe_cmd:
                     self.root.after(0, self._cal_log_write, '  Skipped (no session selected)\n')
                     continue
+                step_env = {**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx} \
+                    if 'coordinate_transform' in safe_cmd else _safe_env
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                                 text=True, bufsize=1, env=_safe_env, cwd=str(dvl))
+                                 text=True, bufsize=1, env=step_env, cwd=str(dvl))
                 for line in proc.stdout:
                     self.root.after(0, self._cal_log_write, line.replace('\r', ''))
                 proc.wait()
@@ -2167,7 +2176,7 @@ sys.exit(0 if ok[0] else 4)
                                     f'Pipeline stopped at: {label}\n')
                     return
             self.root.after(0, self._cal_log_write,
-                            '\n✓ Full calibration pipeline complete. Run Verify Calibration to inspect.\n')
+                            '\n\u2713 Full calibration pipeline complete. Run Verify Calibration to inspect.\n')
 
         _th.Thread(target=_run, daemon=True).start()
 
@@ -2272,7 +2281,8 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] No session selected.\n")
             return
         hw = self._cal_hw()
-        # Write current GUI seed values first
+        cam_idx = self._cal_cam_var.get().split('_')[1]
+        env_with_idx = {**os.environ, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx}
         try:
             fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
@@ -2286,20 +2296,22 @@ sys.exit(0 if ok[0] else 4)
                 '--left', str(left_in),
                 '--up', str(up_in),
                 '--yaw', str(yaw_deg),
-            ], capture_output=True)
+            ], capture_output=True, env=env_with_idx)
         except ValueError:
-            pass  # use whatever is already saved
+            pass
         result = subprocess.run(
             [sys.executable,
              str(self.script_dir / 'calibration' / 'verify_seed_overlay.py'),
-             sess],
-            capture_output=True, text=True
+             sess, '--cam-index', cam_idx],
+            capture_output=True, text=True, env=env_with_idx
         )
         self._cal_log_write(result.stdout)
         if result.returncode != 0:
             self._cal_log_write(result.stderr)
             return
-        edge_path = pathlib.Path(sess) / 'seed_edges.jpg'
+        edge_path = pathlib.Path(sess) / 'seed_composite.jpg'
+        if not edge_path.exists():
+            edge_path = pathlib.Path(sess) / 'seed_edges.jpg'
         if edge_path.exists():
             subprocess.Popen(['xdg-open', str(edge_path)])
 
@@ -2311,7 +2323,7 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] No session selected.\n")
             return
         hw = self._cal_hw()
-        # Write the current GUI seed values first so the viewer starts with them
+        cam_idx = self._cal_cam_var.get().split('_')[1]
         try:
             fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
@@ -2321,6 +2333,7 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] Invalid seed field values — fix before opening viewer.\n")
             return
         import subprocess as _sp, os as _os
+        env_with_idx = {**os.environ, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx}
         _sp.run([
             sys.executable,
             str(self.script_dir / 'calibration' / 'physical_seed.py'),
@@ -2329,20 +2342,21 @@ sys.exit(0 if ok[0] else 4)
             '--left', str(left_in),
             '--up', str(up_in),
             '--yaw', str(yaw_deg),
-        ], capture_output=True)
+        ], capture_output=True, env=env_with_idx)
         subprocess.Popen([
             sys.executable,
             str(self.script_dir / 'calibration' / 'interactive_seed.py'),
             sess, '--camera-hw', hw,
-        ])
+        ], env=env_with_idx)
 
     def _cal_apply(self):
+        cam_idx = self._cal_cam_var.get().split('_')[1]  # '0', '1', or '2'
         self._cal_run("Apply Calibration", [
             sys.executable,
             str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
             self._cal_src(),
             '--camera-hw', self._cal_hw()
-        ])
+        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
 
     def _cal_verify(self):
         sess = self._pp_session()
@@ -2351,6 +2365,20 @@ sys.exit(0 if ok[0] else 4)
             scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
             if scans:
                 scan_dir = str(scans[-1])
+        # Resolve cam_idx from the scan's .cam_index serial (stable) rather than
+        # the GUI dropdown (which reflects the slot, not the SDK runtime index).
+        # This ensures verify always reads the calibration that matches the
+        # camera that actually captured the scan.
+        cam_idx = self._cal_cam_var.get().split('_')[1]  # GUI dropdown fallback
+        if scan_dir:
+            import sys as _sys
+            _sys.path.insert(0, str(self.script_dir))
+            try:
+                from camera_hw import cam_index_for_scan
+                resolved = cam_index_for_scan(scan_dir)
+                cam_idx = str(resolved)
+            except Exception:
+                pass
         cmd = [sys.executable,
                str(self.script_dir / 'calibration' / 'tune_calibration.py'),
                '--verify']
@@ -2396,7 +2424,8 @@ sys.exit(0 if ok[0] else 4)
             safe_cmd = ' '.join(str(a) for a in cmd)
             self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
-                             text=True, bufsize=1, env=_safe_env)
+                             text=True, bufsize=1,
+                             env={**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
             for line in proc.stdout:
                 self.root.after(0, self._cal_log_write, line.replace('\r', ''))
             proc.wait()
@@ -2441,7 +2470,9 @@ sys.exit(0 if ok[0] else 4)
                '--axis', axis, '--range', str(rng), '--steps', '5']
         if scan_dir:
             cmd.insert(2, scan_dir)
-        self._cal_run(f'Tune {axis} sweep ±{rng}', cmd)
+        cam_idx = self._cal_cam_var.get().split('_')[1]
+        self._cal_run(f'Tune {axis} sweep ±{rng}', cmd,
+                      env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
 
     def _cal_color_calibrate(self):
         sess = self._pp_session()

@@ -34,13 +34,14 @@ def load_x5_orientation():
     return cfg['roll_offset'], cfg['pitch_offset'], cfg['yaw_offset']
 
 
-def load_seed_values(camera_hw):
-    """Load saved translation and yaw from the camera's calibration file.
-    Returns (fwd_in, left_in, up_in, yaw_deg) in inches/degrees,
-    back-computed from T_camera_lidar."""
-    calib_path = _CALIB_DIR / camera_hw / 'fusion_calibration.yaml'
-    if not calib_path.exists():
-        calib_path = _SRC / 'config' / 'fusion_calibration.yaml'
+def load_seed_values(camera_hw, cam_index=None):
+    """Load saved translation and yaw from the camera's slot calibration file.
+    Resolves through calibration_path() so it always reads the same file
+    that exact_match_fusion.py uses during coloring."""
+    import sys as _sys
+    _sys.path.insert(0, str(_SRC))
+    from camera_hw import calibration_path as _calib_path
+    calib_path = _calib_path(camera_hw, cam_index)
     if not calib_path.exists():
         return 3.0, 0.0, 0.0, 0.0
     with open(calib_path) as f:
@@ -50,16 +51,13 @@ def load_seed_values(camera_hw):
     with open(x5_path) as f:
         x5 = yaml.safe_load(f)
 
-    # Yaw offset relative to X5 reference
     yaw_deg = float(np.degrees(cfg['yaw_offset'] - x5['yaw_offset']))
 
-    # Back-compute position in LiDAR frame from T_camera_lidar
-    # t_cam = R_cam_lidar @ (-cam_pos_lidar)  =>  cam_pos_lidar = -R_cam_lidar.T @ t_cam
     R_mat = R.from_euler('xyz', [
         cfg['roll_offset'], cfg['pitch_offset'], cfg['yaw_offset']
     ]).as_matrix()
     t_cam = np.array([cfg['x_offset'], cfg['y_offset'], cfg['z_offset']])
-    cam_pos_lidar = -R_mat.T @ t_cam  # meters
+    cam_pos_lidar = -R_mat.T @ t_cam
 
     fwd_in  = cam_pos_lidar[0] / INCHES_TO_METERS
     left_in = cam_pos_lidar[1] / INCHES_TO_METERS
@@ -96,6 +94,9 @@ def main():
     parser = argparse.ArgumentParser(description='Interactive calibration seed viewer')
     parser.add_argument('session_dir', help='Session directory with fusion_scan_* subdirs')
     parser.add_argument('--camera-hw', default=None, help='Camera hardware (auto-detected if not set)')
+    parser.add_argument('--cam-index', type=int, default=None,
+                        help='Camera slot index (0/1/2). Required for multi-camera rigs to '
+                             'load and save the correct slot calibration.')
     args = parser.parse_args()
 
     session = Path(args.session_dir)
@@ -109,6 +110,14 @@ def main():
             camera_hw = json.loads(sess_cfg.read_text()).get('camera_hw', 'x5')
         else:
             camera_hw = 'x5'
+
+    # Resolve the slot calibration path — same file coloring uses
+    import sys as _sys
+    _sys.path.insert(0, str(_SRC))
+    from camera_hw import calibration_path as _calib_path
+    slot_calib_path = _calib_path(camera_hw, args.cam_index)
+    print(f"Camera HW: {camera_hw}  cam_index={args.cam_index}")
+    print(f"Calibration file: {slot_calib_path}")
 
     # Find first scan
     scan_dirs = sorted(d for d in session.iterdir()
@@ -173,7 +182,7 @@ def main():
 
     # Load X5 reference orientation and current seed values
     x5_roll, x5_pitch, x5_yaw = load_x5_orientation()
-    init_fwd, init_left, init_up, init_yaw = load_seed_values(camera_hw)
+    init_fwd, init_left, init_up, init_yaw = load_seed_values(camera_hw, args.cam_index)
     print(f"Loaded seed: fwd={init_fwd:.2f}\" left={init_left:.2f}\" up={init_up:.2f}\" yaw={init_yaw:.1f}°")
 
     # Slider ranges: generous enough to not max out
@@ -203,6 +212,7 @@ def main():
     print(f"  Image: {disp_w}x{disp_h} (scaled from {full_w}x{full_h})")
 
     saved = False
+    show_edges = False  # press V to toggle edge overlay on top of dots
     while True:
         # Read slider values
         fwd_in   = (cv2.getTrackbarPos('Fwd (in)',   win) - T_RANGE) * T_SCALE
@@ -224,57 +234,71 @@ def main():
         # Project
         u, v_px, valid, depths = project_points(points, T, disp_w, disp_h)
 
-        # Create overlay
+        # Create overlay — original behavior: TURBO dots on camera
+        # Press V to toggle edge overlay on top
         display = cam_img.copy()
-        # Apply mask to display
         display[~cam_mask] = display[~cam_mask] // 4
 
-        # Depth-colored LiDAR projection (dilated for visibility)
         depth_img = np.zeros((disp_h, disp_w), dtype=np.float32)
         depth_img[v_px, u] = depths
-        # Dilate to make points larger
-        kernel = np.ones((3, 3), np.uint8)
-        depth_img = cv2.dilate(depth_img, kernel)
-        # Normalize depth for colormap (clip to reasonable range)
-        d_valid = depths[depths > 0]
+        # Larger kernel than original (9x9 vs 3x3) for better visibility
+        depth_img = cv2.dilate(depth_img,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        depth_img[~cam_mask] = 0
+
+        d_valid = depth_img[depth_img > 0]
         if len(d_valid) > 0:
             d_min, d_max = np.percentile(d_valid, [5, 95])
             depth_norm = np.clip((depth_img - d_min) / max(d_max - d_min, 0.1), 0, 1)
             depth_u8 = (depth_norm * 255).astype(np.uint8)
         else:
             depth_u8 = np.zeros((disp_h, disp_w), dtype=np.uint8)
-
-        # Mask LiDAR
         depth_u8[~cam_mask] = 0
-        lid_mask = depth_u8 > 0
+        lid_mask_bool = depth_u8 > 0
 
-        # Apply colormap (TURBO: blue=near, red=far)
+        # Original: TURBO colormap blended onto camera (70% lidar, 30% camera)
         lid_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+        display[lid_mask_bool] = cv2.addWeighted(
+            cam_img, 0.3, lid_color, 0.7, 0)[lid_mask_bool]
 
-        # Blend colored LiDAR onto camera (only where LiDAR has points)
-        display[lid_mask] = cv2.addWeighted(
-            display[lid_mask], 0.5, lid_color[lid_mask], 0.5, 0
-        )
+        # Optional: edge overlay toggled with V
+        if show_edges:
+            cam_gray = cv2.cvtColor(cam_img, cv2.COLOR_BGR2GRAY)
+            cam_edges = cv2.Canny(cam_gray, 30, 90)
+            cam_edges[~cam_mask] = 0
+            cam_edges = cv2.dilate(cam_edges, np.ones((2, 2), np.uint8))
+            lid_edges = cv2.Canny(depth_u8, 10, 40)
+            lid_edges = cv2.dilate(lid_edges, np.ones((2, 2), np.uint8))
+            display[cam_edges > 0] = (50, 50, 255)
+            display[lid_edges > 0] = (50, 255, 50)
+            display[(cam_edges > 0) & (lid_edges > 0)] = (0, 255, 255)
+            edge_hint = '  V=edges OFF'
+        else:
+            edge_hint = '  V=edges ON'
 
-        # Info text
-        cv2.putText(display, f"T: Fwd={fwd_in:.2f}\" Left={left_in:.2f}\" Up={up_in:.2f}\"",
-                   (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(display, f"R: Roll={roll_deg:.1f} Pitch={pitch_deg:.1f} Yaw={yaw_deg:.1f} deg",
-                   (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(display, "S=Save  Q=Quit",
-                   (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        # Info text with black outline so it reads on any background
+        def _put(img, txt, pos, scale=0.6, color=(255, 255, 255)):
+            cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, color, 1, cv2.LINE_AA)
+
+        _put(display, f'T: Fwd={fwd_in:.2f}" Left={left_in:.2f}" Up={up_in:.2f}"',
+             (10, 28))
+        _put(display, f'R: Roll={roll_deg:.1f} Pitch={pitch_deg:.1f} Yaw={yaw_deg:.1f} deg',
+             (10, 54))
+        _put(display, f'S=Save  Q=Quit{edge_hint}', (10, 80),
+             scale=0.5, color=(0, 255, 255))
 
         cv2.imshow(win, display)
-        key = cv2.waitKey(30) & 0xFF
-
-        if key == ord('q') or key == 27:
+        key = cv2.waitKey(30)
+        if key == -1:
+            pass
+        elif key & 0xFF in (ord('q'), 27):
             break
-        elif key == ord('s'):
-            # Save calibration
-            from calibration.physical_seed import compute_physical_seed
-            import sys
-            sys.path.insert(0, str(_SRC / 'calibration'))
-
+        elif key & 0xFF == ord('v'):
+            show_edges = not show_edges
+        elif key & 0xFF == ord('s'):
             calib = {
                 'roll_offset': float(roll_rad),
                 'pitch_offset': float(pitch_rad),
@@ -294,21 +318,19 @@ def main():
                 'use_fisheye': False,
                 'skip_rate': 5,
             }
-
-            out_path = _CALIB_DIR / camera_hw / 'fusion_calibration.yaml'
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(yaml.dump(calib, default_flow_style=False, sort_keys=False))
-
-            active_path = _SRC / 'config' / 'fusion_calibration.yaml'
-            active_path.write_text(yaml.dump(calib, default_flow_style=False, sort_keys=False))
-
-            print(f"\n✓ Saved calibration for {camera_hw}:")
-            print(f"  T: Fwd={fwd_in:.2f} Left={left_in:.2f} Up={up_in:.2f} (inches)")
-            print(f"  R: Roll={roll_deg:.1f} Pitch={pitch_deg:.1f} Yaw={yaw_deg:.1f} deg")
-            print(f"  {out_path}")
+            text = yaml.dump(calib, default_flow_style=False, sort_keys=False)
+            slot_calib_path.parent.mkdir(parents=True, exist_ok=True)
+            slot_calib_path.write_text(text)
+            hw_path = _CALIB_DIR / camera_hw / 'fusion_calibration.yaml'
+            hw_path.parent.mkdir(parents=True, exist_ok=True)
+            hw_path.write_text(text)
+            (_SRC / 'config' / 'fusion_calibration.yaml').write_text(text)
+            print(f'\n\u2713 Saved calibration:')
+            print(f'  Slot: {slot_calib_path}')
+            print(f'  T: Fwd={fwd_in:.2f} Left={left_in:.2f} Up={up_in:.2f} (inches)')
+            print(f'  R: Roll={roll_deg:.1f} Pitch={pitch_deg:.1f} Yaw={yaw_deg:.1f} deg')
             saved = True
             break
-
     cv2.destroyAllWindows()
     if not saved:
         print("\nQuit without saving.")

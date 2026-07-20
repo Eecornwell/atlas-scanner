@@ -114,9 +114,27 @@ fi
 _SDK_BIN="$SCRIPT_DIR/capture/sdk/build"
 
 # Point all tools at the per-model calibration file.
-# Falls back to the shared config/fusion_calibration.yaml if not present.
+# For multi-camera sessions the active fusion_calibration.yaml is not used
+# for coloring (each scan uses its slot path via multi_camera.yaml).
+# For single-camera sessions, copy the slot calibration if it exists,
+# otherwise fall back to the hw-level file.
 _hw_calib="$_CAM_CALIB_DIR/${CAMERA_HW}/fusion_calibration.yaml"
-if [ -f "$_hw_calib" ]; then
+_slot_calib=""
+if [ -f "$_MULTI_CAM_YAML" ]; then
+    _slot_calib=$(python3 -c "
+import yaml, sys
+d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
+cams = d.get('cameras', {})
+for c in cams.values():
+    if c.get('camera_hw','') == '$CAMERA_HW' and c.get('calibration',''):
+        print('$SCRIPT_DIR/config/' + c['calibration'])
+        break
+" 2>/dev/null)
+fi
+if [ -n "$_slot_calib" ] && [ -f "$_slot_calib" ]; then
+    cp "$_slot_calib" "$SCRIPT_DIR/config/fusion_calibration.yaml"
+    echo "Loaded calibration: $_slot_calib"
+elif [ -f "$_hw_calib" ]; then
     cp "$_hw_calib" "$SCRIPT_DIR/config/fusion_calibration.yaml"
     echo "Loaded calibration: $_hw_calib"
 else
@@ -283,7 +301,10 @@ cleanup() {
         echo "Data saved in: $SCAN_DIR"
         echo ""
 
-        # Coloring
+        # Coloring — stationary mode only.
+        # Continuous mode coloring is handled entirely inside reconstruct_from_bag.py
+        # (stitch → mask → color_normalize → post_process_coloring), so running it
+        # again here would operate on already-processed dirs and produce no output.
         if [ "$CAPTURE_MODE" = "stationary" ] && [ "$SKIP_LIVE_FUSION" = "true" ] && [ "$AUTO_CREATE_COLORED" = "true" ]; then
             # Stationary mode: reconstruct each per-scan bag centred on the
             # .insp.capture_time sidecar (exact shutter time) with per-frame
@@ -421,7 +442,8 @@ cleanup() {
         fi
 
         # Web viewer
-        [ -z "$MERGED_FILE" ] && MERGED_FILE=$(find "$SCAN_DIR" -name "world_colored_exact.ply" | head -1)
+        [ -z "$MERGED_FILE" ] && MERGED_FILE=$(find "$SCAN_DIR" -name "merged_pointcloud*.ply" | head -1)
+        [ -z "$MERGED_FILE" ] && MERGED_FILE=$(find "$SCAN_DIR" -name "sensor_colored_exact.ply" | head -1)
         if [ -n "$MERGED_FILE" ] && [ -f "$MERGED_FILE" ]; then
             echo "Opening 3D viewer..."
             DISPLAY="${DISPLAY:-:0}" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
@@ -492,7 +514,13 @@ fi
 if [ "$USE_EXISTING_CALIBRATION" = "true" ]; then
     python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --use-existing --camera-hw "$CAMERA_HW"
 else
-    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --camera-hw "$CAMERA_HW"
+    # Always use --use-existing at session startup.
+    # coordinate_transform.py without --use-existing reads calib.json which may
+    # contain a stale result from a different camera's calibration run, silently
+    # overwriting the hw-level calibration file with the wrong values.
+    # The slot calibrations (written by calibrate_camera.sh) are authoritative
+    # and are never touched by coordinate_transform.py.
+    python3 "$ROS_WS_DIR/src/atlas-scanner/src/calibration/coordinate_transform.py" "$ROS_WS_DIR/src/atlas-scanner/src" --use-existing --camera-hw "$CAMERA_HW"
 fi
 
 # Kill stale processes (use pgrep+kill to avoid pkill matching its own cmdline args)
@@ -524,29 +552,44 @@ _pkill() {
 
 # Block until all insta360_capture processes have fully exited.
 _wait_camera_dead() {
-    # Skip entirely if no camera processes are running
     if ! pgrep -f "insta360_capture" > /dev/null 2>&1; then
         return 0
     fi
-    local _usb_dev
-    _usb_dev=$(readlink -f /dev/insta 2>/dev/null)
-    # Primary gate: fuser on the USB device node — cleared only when the last
-    # process releases its libusb fd, which happens after Close() completes.
-    if [ -n "$_usb_dev" ]; then
+    # In multi-camera mode, watch all serial-pinned device nodes.
+    # Fall back to /dev/insta for single-camera sessions.
+    _insta_devs=()
+    for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+        [ -e "/dev/insta_${_serial}" ] && _insta_devs+=("/dev/insta_${_serial}")
+    done
+    [ ${#_insta_devs[@]} -eq 0 ] && [ -e /dev/insta ] && _insta_devs=("/dev/insta")
+    if [ ${#_insta_devs[@]} -gt 0 ]; then
         for _i in $(seq 1 60); do
-            fuser "$_usb_dev" > /dev/null 2>&1 || break
+            _any_held=false
+            for _dev in "${_insta_devs[@]}"; do
+                fuser "$_dev" > /dev/null 2>&1 && _any_held=true && break
+            done
+            [ "$_any_held" = "false" ] && break
             sleep 0.5
         done
-        if fuser "$_usb_dev" > /dev/null 2>&1; then
-            echo "  Force-killing USB device holders..."
-            fuser "$_usb_dev" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | xargs -r kill -KILL 2>/dev/null || true
+        _any_held=false
+        for _dev in "${_insta_devs[@]}"; do
+            if fuser "$_dev" > /dev/null 2>&1; then
+                echo "  Force-killing holders of $_dev..."
+                fuser "$_dev" 2>/dev/null | tr ' ' '\n' | grep -v '^$' | xargs -r kill -KILL 2>/dev/null || true
+                _any_held=true
+            fi
+        done
+        if [ "$_any_held" = "true" ]; then
             for _i in $(seq 1 20); do
-                fuser "$_usb_dev" > /dev/null 2>&1 || break
+                _still=false
+                for _dev in "${_insta_devs[@]}"; do
+                    fuser "$_dev" > /dev/null 2>&1 && _still=true && break
+                done
+                [ "$_still" = "false" ] && break
                 sleep 0.5
             done
         fi
     else
-        # No /dev/insta — fall back to pgrep
         for _i in $(seq 1 20); do
             pgrep -f "insta360_capture" > /dev/null 2>&1 || break
             sleep 1
@@ -687,27 +730,33 @@ fi
 # session sentinel exists — this means the camera was just plugged in fresh
 # and resetting would trigger the USB mode selection prompt again.
 if [ "${_USE_CAMERAS:-1}" -gt 1 ]; then
-    # Multi-camera: force-reset ALL Insta360 USB devices to clear stale state
+    # Multi-camera: reset each camera by its serial-pinned /dev/insta_<SERIAL> symlink.
+    # This is reliable regardless of USB enumeration order, unlike the old approach
+    # of scanning /sys/bus/usb/devices/ which races with udev symlink creation.
     echo "Resetting all Insta360 USB devices for multi-camera mode..."
-    for _usb_dev in $(find /sys/bus/usb/devices/ -name "idVendor" -exec grep -l "2e1a" {} \; 2>/dev/null); do
-        _busdev=$(dirname "$_usb_dev")
-        _busdev_name=$(basename "$_busdev")
-        _devnode=$(find /dev/bus/usb -name "*" -exec udevadm info -q property -n {} \; 2>/dev/null | grep -B20 "ID_VENDOR_ID=2e1a" | grep "DEVNAME=" | head -1 | cut -d= -f2)
-        if [ -n "$_devnode" ]; then
-            sudo python3 -c "
+    _reset_count=0
+    for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+        _devnode="/dev/insta_${_serial}"
+        [ -e "$_devnode" ] || continue
+        sudo python3 -c "
 import fcntl, sys
 USBDEVFS_RESET = 0x5514
 try:
     with open('$_devnode', 'wb') as f:
         fcntl.ioctl(f, USBDEVFS_RESET, 0)
-except Exception:
+    print('  Reset: $_devnode')
+except Exception as e:
+    print(f'  Reset failed: $_devnode: {e}', file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null && echo "  Reset: $_devnode" || true
-        fi
+" 2>/dev/null && _reset_count=$((_reset_count + 1)) || true
     done
+    if [ "$_reset_count" -eq 0 ]; then
+        echo "  ⚠ No /dev/insta_<SERIAL> symlinks found — udev rules may need reload"
+        echo "  Run: sudo udevadm control --reload-rules && sudo udevadm trigger"
+    fi
     sleep 5
-    echo "✓ USB reset complete"
-elif [ "${CAMERA_HW:-onex2}" = "x5" ] || [ "$_DETECTED_CAMERAS" -gt 1 ]; then
+    echo "✓ USB reset complete ($_reset_count cameras)"
+elif [ "${CAMERA_HW:-onex2}" = "x5" ] || [ "${_DETECTED_CAMERAS:-0}" -gt 1 ]; then
     if [ -f /tmp/.insta360_session_ran ]; then
         _usb_force_reset_camera
     else

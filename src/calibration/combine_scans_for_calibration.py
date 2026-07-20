@@ -50,32 +50,18 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
     
     # Filter by camera index if specified
     if cam_index is not None:
-        # Check if this is a single-camera session (all scans have same cam_index)
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from camera_hw import cam_index_for_scan
+        # Check if this is a single-camera session (all scans resolve to same slot)
         unique_indices = set()
         for d in fusion_dirs:
-            ci_file = d / '.cam_index'
-            if ci_file.exists():
-                try:
-                    unique_indices.add(int(ci_file.read_text().strip()))
-                except (ValueError, OSError):
-                    pass
+            unique_indices.add(cam_index_for_scan(str(d)))
         if len(unique_indices) <= 1:
             # Single-camera session — use all scans regardless of cam_index filter
             print(f"  Single-camera session detected, using all {len(fusion_dirs)} scans")
         else:
-            filtered = []
-            for d in fusion_dirs:
-                ci_file = d / '.cam_index'
-                if ci_file.exists():
-                    try:
-                        ci = int(ci_file.read_text().strip())
-                        if ci == cam_index:
-                            filtered.append(d)
-                    except (ValueError, OSError):
-                        pass
-                elif cam_index == 0:
-                    # No .cam_index means single-camera session — treat as cam_0
-                    filtered.append(d)
+            filtered = [d for d in fusion_dirs if cam_index_for_scan(str(d)) == cam_index]
             fusion_dirs = filtered
             print(f"  Filtering for cam_{cam_index}: {len(fusion_dirs)} scans")
     

@@ -97,6 +97,26 @@ def extract(camera_hw='onex2'):
     hw_path.write_text(text)
     print(f'\n\u2713 Saved to: {hw_path}')
 
+    # If a camera slot index is set, write directly to the slot path from
+    # multi_camera.yaml so the result is always associated with the correct
+    # physical camera regardless of what --camera-hw was passed.
+    import os as _os
+    _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+    if _cam_idx:
+        try:
+            _mc_path = _SRC / 'config' / 'multi_camera.yaml'
+            if _mc_path.exists():
+                import yaml as _y
+                _mc = _y.safe_load(_mc_path.read_text()) or {}
+                _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+                if _calib_rel:
+                    _slot_path = _SRC / 'config' / _calib_rel
+                    _slot_path.parent.mkdir(parents=True, exist_ok=True)
+                    _slot_path.write_text(text)
+                    print(f'\u2713 Saved to slot path (cam_{_cam_idx}): {_slot_path}')
+        except Exception as _e:
+            print(f'  ⚠ Could not write slot path: {_e}')
+
     # Also update the shared active calibration
     shared_path = _SRC / 'config' / 'fusion_calibration.yaml'
     shared_path.write_text(text)
