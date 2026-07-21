@@ -899,6 +899,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # the LiDAR window is centred on the camera capture time, ensuring the
         # sensor-frame LiDAR points and ERP image share the same scanner pose.
         centres = []
+        _centres_cam_idx = []  # parallel list of cam_idx per centre (sdk_shot path only)
         if sdk_stitch:
             # Build shutter times from .insp filenames (camera RTC synced to host
             # clock via reset_clock).  RTC encodes the actual shutter moment to ±1s
@@ -994,14 +995,61 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 print(f"  SDK stitch: {len(centres)} shutter times from .insp RTC + capture_time "
                       f"(host\u2192Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
 
-            # Fallback 1: /camera/shutter_time bag messages
-            # msg.data = t_expected (host clock); subtract host→Livox offset
-            # to align with LiDAR/odometry which are in Livox hardware clock.
+            # Fallback 1: .sdk_shot_* capture_time files (one per camera per batch).
+            # These are authoritative: written by the download worker with cam_idx,
+            # and correctly represent each camera's individual shutter time.
+            # The /camera/shutter_time bag topic only has one message per batch
+            # (published by the shell script shot counter) so it cannot represent
+            # per-camera centres in multi-camera sessions.
+            if not centres:
+                import re as _re2
+                _shot_centres = []  # (livox_t, cam_idx)
+                _sd_lats = []
+                for _shot_dir in sorted(session_path.glob('.sdk_shot_*'),
+                                        key=lambda p: int(p.name.split('_')[-1])):
+                    for _ct_f in sorted(_shot_dir.glob('*.capture_time')):
+                        try:
+                            _ctp = _ct_f.read_text().strip().split()
+                            _host_t = float(_ctp[0])
+                            _t_after = float(_ctp[1]) if len(_ctp) > 1 else _host_t
+                            _ci = int(_ctp[2]) if len(_ctp) > 2 else 0
+                            _livox_t = _host_t - _host_to_livox_offset
+                            if t_start <= _livox_t <= t_end:
+                                _shot_centres.append((_livox_t, _ci))
+                            _sd_lats.append(_t_after - _host_t)
+                        except Exception:
+                            pass
+                if _sd_lats:
+                    _lat_arr = np.array(_sd_lats)
+                    print(f"  SD write latency: {int(np.median(_lat_arr)*1000)}ms "
+                          f"(median of {len(_sd_lats)} shots)")
+                if _shot_centres:
+                    _shot_centres.sort(key=lambda x: x[0])
+                    # Apply gyro filter
+                    if imu_msgs:
+                        _filtered = []
+                        for _livox_t, _ci in _shot_centres:
+                            _samples = [np.linalg.norm([m.angular_velocity.x,
+                                                        m.angular_velocity.y,
+                                                        m.angular_velocity.z])
+                                        for _ts, m in imu_msgs if abs(_ts - _livox_t) <= 0.25]
+                            _gyro = float(np.mean(_samples)) if _samples else 0.0
+                            if _gyro <= max_gyro:
+                                _filtered.append((_livox_t, _ci))
+                            else:
+                                print(f"    Dropped shutter at t+{_livox_t-t_start:.1f}s "
+                                      f"cam{_ci}: gyro={_gyro:.3f} rad/s > {max_gyro}")
+                        _shot_centres = _filtered
+                    centres = [(t, None) for t, _ in _shot_centres]
+                    # Store cam_idx alongside for .cam_index writing below
+                    _centres_cam_idx = [ci for _, ci in _shot_centres]
+                    print(f"  SDK stitch: {len(centres)} shutter times from .sdk_shot_* "
+                          f"(host→Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
+
+            # Fallback 2: /camera/shutter_time bag messages (single-camera sessions only —
+            # in multi-camera sessions this topic has one message per batch, not per camera).
             if not centres and shutter_msgs:
                 seen_times = set()
-                # Compute per-session SD write latency: bag_ts (file detection time)
-                # minus msg.data (RTC integer second = shutter time).
-                # Read raw bag receipt timestamps directly from the database.
                 _sd_lats = []
                 try:
                     _con2 = open_db3(bag_dir)
@@ -1021,12 +1069,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _con2.close()
                 except Exception:
                     pass
-                _sd_latency_s = float(np.median(_sd_lats)) if _sd_lats else 0.0
                 if _sd_lats:
-                    print(f"  SD write latency: {_sd_latency_s*1000:.0f}ms (median of {len(_sd_lats)} shots)")
-
-                # With TakePhoto() mode, msg.data = t_before (exact shutter time,
-                # accurate to ~10ms). Use it directly as the scan centre.
+                    print(f"  SD write latency: {int(np.median(_sd_lats)*1000)}ms "
+                          f"(median of {len(_sd_lats)} shots)")
                 for _bag_ts, msg in shutter_msgs:
                     shutter_t = round(msg.data - _host_to_livox_offset, 4)
                     if any(abs(shutter_t - s) < 1.0 for s in seen_times):
@@ -1036,7 +1081,6 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         centres.append((shutter_t, None))
                 if centres:
                     centres.sort(key=lambda x: x[0])
-                    # Apply gyro filter to drop scans where rig was moving at shutter time
                     if imu_msgs:
                         _filtered = []
                         for _ct, _ci in centres:
@@ -1257,18 +1301,22 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         with open(ev_path, 'w') as _ev:
             _ev.write(f"{centre_host:.6f}")
 
-        # Propagate cam_index from .capture_time sidecar (format: "t_before t_after cam_idx")
-        # so post-processing uses the correct per-camera calibration.
+        # Propagate cam_index: prefer _centres_cam_idx (from .sdk_shot_* path, most reliable),
+        # then fall back to .capture_time sidecar in the scan dir.
         _cam_idx_written = False
-        for _ct in sorted(scan_dir.glob('*.capture_time')):
-            try:
-                _ct_parts = _ct.read_text().strip().split()
-                if len(_ct_parts) >= 3:
-                    (scan_dir / '.cam_index').write_text(_ct_parts[2])
-                    _cam_idx_written = True
-                    break
-            except Exception:
-                pass
+        if _centres_cam_idx and idx < len(_centres_cam_idx):
+            (scan_dir / '.cam_index').write_text(str(_centres_cam_idx[idx]))
+            _cam_idx_written = True
+        if not _cam_idx_written:
+            for _ct in sorted(scan_dir.glob('*.capture_time')):
+                try:
+                    _ct_parts = _ct.read_text().strip().split()
+                    if len(_ct_parts) >= 3:
+                        (scan_dir / '.cam_index').write_text(_ct_parts[2])
+                        _cam_idx_written = True
+                        break
+                except Exception:
+                    pass
         if not _cam_idx_written and not (scan_dir / '.cam_index').exists():
             (scan_dir / '.cam_index').write_text('0')
 
@@ -1355,7 +1403,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 # Apply host→Livox offset since scan_centre is in Livox clock
                 # but capture_time sidecars are in host clock.
                 import calendar as _cal, datetime as _dt_mod
-                _all_insps = {}  # path_str -> host_clock_time
+                _all_insps = {}  # path_str -> (host_clock_time, cam_idx_or_None)
                 # From .sdk_shot_N directories
                 for _shot_dir in sorted(session_path.glob('.sdk_shot_*')):
                     for _insp in sorted(_shot_dir.glob('*.insp')):
@@ -1364,14 +1412,16 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _ct_f = _shot_dir / (_insp.name + '.capture_time')
                         if _ct_f.exists():
                             try:
-                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip().split()[0])
+                                _ctp = _ct_f.read_text().strip().split()
+                                _ci = int(_ctp[2]) if len(_ctp) >= 3 else None
+                                _all_insps[str(_insp)] = (float(_ctp[0]), _ci)
                             except Exception:
                                 pass
                         else:
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
-                                _all_insps[str(_insp)] = float(_time_mod.mktime(_cam_dt.timetuple()))
+                                _all_insps[str(_insp)] = (float(_time_mod.mktime(_cam_dt.timetuple())), None)
                             except Exception:
                                 pass
                 # From scan dirs (if previously promoted)
@@ -1382,20 +1432,34 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _ct_f = _sd / (_insp.name + '.capture_time')
                         if _ct_f.exists():
                             try:
-                                _all_insps[str(_insp)] = float(_ct_f.read_text().strip())
+                                _ctp = _ct_f.read_text().strip().split()
+                                _ci = int(_ctp[2]) if len(_ctp) >= 3 else None
+                                _all_insps[str(_insp)] = (float(_ctp[0]), _ci)
                             except Exception:
                                 pass
                         else:
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
-                                _all_insps[str(_insp)] = float(_time_mod.mktime(_cam_dt.timetuple()))
+                                _all_insps[str(_insp)] = (float(_time_mod.mktime(_cam_dt.timetuple())), None)
                             except Exception:
                                 pass
+                # Read this scan's cam_index for filtering
+                _scan_cam_idx = None
+                _cam_idx_f = scan_dir / '.cam_index'
+                if _cam_idx_f.exists():
+                    try:
+                        _scan_cam_idx = int(_cam_idx_f.read_text().strip().split()[0])
+                    except Exception:
+                        pass
                 # Match: scan_centre is in Livox clock, capture_time is in host clock
                 # host_time = livox_time + host_to_livox_offset
+                # When cam_idx is known, only consider .insp files from the same camera
+                # to avoid batch-simultaneous shots stealing each other's .insp.
                 _scan_centre_host = _scan_centre + _host_to_livox_offset if _scan_centre else None
-                for _insp_path_str, _ct_host in _all_insps.items():
+                for _insp_path_str, (_ct_host, _insp_cam_idx) in _all_insps.items():
+                    if _scan_cam_idx is not None and _insp_cam_idx is not None and _insp_cam_idx != _scan_cam_idx:
+                        continue
                     _insp_p = Path(_insp_path_str)
                     _dt = abs(_ct_host - _scan_centre_host) if _scan_centre_host else 0.0
                     if _dt < best_dt:

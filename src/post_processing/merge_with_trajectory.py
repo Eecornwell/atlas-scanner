@@ -241,8 +241,12 @@ def merge_scans_with_trajectory(session_dir):
                     traj_file = _safe_data(traj_file)
                 except ValueError:
                     break
-                with open(traj_file) as f:
-                    traj = json.load(f)
+                try:
+                    with open(traj_file) as f:
+                        traj = json.load(f)
+                except (json.JSONDecodeError, OSError) as e:
+                    print(f"  ⚠ Could not read {traj_file.name} for {scan_dir.name}: {e}")
+                    break
                 pose_matrices[scan_dir.name] = pose_matrix_from_trajectory(traj)
                 if fname == "trajectory_icp_refined.json":
                     icp_refined[scan_dir.name] = True

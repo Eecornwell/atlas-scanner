@@ -159,7 +159,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
         if not scan_dir.is_dir():
             continue
         ci_file = scan_dir / '.cam_index'
-        cam_idx = int(ci_file.read_text().strip()) if ci_file.exists() else 0
+        cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
         # Always stitch from .insp for clean calibration source
         insp_file = next(scan_dir.glob('*.insp'), None)
         if insp_file and stitch_bin.exists():
@@ -275,7 +275,7 @@ def normalize_session(session_dir: str):
         if not scan_dir.is_dir():
             continue
         ci_file = scan_dir / '.cam_index'
-        cam_idx = int(ci_file.read_text().strip()) if ci_file.exists() else 0
+        cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
 
         profile = load_color_profile(camera_hw, cam_idx)
         if profile is None:

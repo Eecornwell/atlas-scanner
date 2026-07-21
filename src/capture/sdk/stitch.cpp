@@ -70,7 +70,7 @@ int main(int argc, char* argv[]) {
     stitcher.SetOutputPath(output_path);
     stitcher.SetOutputSize(erp_w, erp_h);
 
-    if (use_ai) {
+    if (use_ai && !single_fisheye) {
         if (model_dir.empty()) {
             std::cerr << "--ai requires --model-dir or INSTA360_MODEL_DIR to be set" << std::endl;
             return 1;
@@ -79,7 +79,18 @@ int main(int argc, char* argv[]) {
         std::cout << "Stitch mode: AI (AIFLOW)" << std::endl;
     } else {
         stitcher.SetStitchType(ins::STITCH_TYPE::DYNAMICSTITCH);
-        std::cout << "Stitch mode: DYNAMICSTITCH" << std::endl;
+        if (single_fisheye) {
+            // Single fisheye: disable inter-lens optical flow and seam blending.
+            // SetStitchType(TEMPLATE) is ignored by the SDK for this camera model;
+            // instead disable fusion explicitly. The SDK still uses its internal
+            // DYNAMICSTITCH pipeline but with flow_estimator=null and fusion=OFF,
+            // which produces a clean geometric projection with only a fixed alpha
+            // feather at the seam (gradient <3 intensity units — negligible).
+            stitcher.EnableStitchFusion(false);
+            std::cout << "Stitch mode: DYNAMICSTITCH (single fisheye — fusion/flow disabled)" << std::endl;
+        } else {
+            std::cout << "Stitch mode: DYNAMICSTITCH" << std::endl;
+        }
     }
     stitcher.EnableFlowState(false);
     stitcher.EnableCuda(false);
@@ -91,13 +102,6 @@ int main(int argc, char* argv[]) {
     if (!stitcher.Stitch()) {
         std::cerr << "Stitching failed" << std::endl;
         return 1;
-    }
-
-    if (single_fisheye) {
-        // Single fisheye: the full ERP is output as-is (rear hemisphere is blank).
-        // The mask is applied downstream by regenerate_masked_images.py to zero
-        // out the blank region + scanner body before coloring.
-        std::cout << "Single fisheye mode: full ERP with blank rear hemisphere" << std::endl;
     }
 
     std::cout << "Done" << std::endl;

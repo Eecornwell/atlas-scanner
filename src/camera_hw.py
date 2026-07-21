@@ -20,14 +20,18 @@ _DEFAULTS = {
         'erp_width':         5760,
         'erp_height':        2880,
         'lidar_mask_dual':   'lidar_mask_dual_sdk.png',
-        'lidar_mask_single': 'lidar_mask_single.png',
         'display_name':      'Insta360 One X2',
+    },
+    'x3': {
+        'erp_width':         5760,
+        'erp_height':        2880,
+        'lidar_mask_dual':   'lidar_mask_dual_x3_cam_left.png',
+        'display_name':      'Insta360 X3',
     },
     'x5': {
         'erp_width':         7680,
         'erp_height':        3840,
         'lidar_mask_dual':   'lidar_mask_dual_x5.png',
-        'lidar_mask_single': 'lidar_mask_single_x5.png',
         'display_name':      'Insta360 X5',
     },
 }
@@ -73,15 +77,11 @@ def iter_scan_dirs(session_path) -> list:
 
 
 def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = True) -> Path:
-    """Return the absolute lidar mask path for the given mode.
-    sdk_stitch parameter kept for API compatibility but ignored — SDK stitch
-    is always used so the SDK mask is always selected.
-    Looks in config/masks/ first, falls back to src/ root for legacy layouts.
+    """Return the absolute lidar dual mask path for the given camera profile.
+    Single fisheye center masking is applied programmatically at runtime,
+    not via a separate mask file.
     """
-    if camera_mode == 'dual_fisheye':
-        name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
-    else:
-        name = profile.get('lidar_mask_single', 'lidar_mask_single.png')
+    name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
     p = _MASK_DIR / name
     if p.exists():
         return p
