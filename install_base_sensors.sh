@@ -52,42 +52,20 @@ git reset --hard '9d2d3f51093d906903a6ea57bc5383c39a77ebfb'
 
 # Point the ROS driver's CMakeLists.txt at the SDK in ~/LinuxSDK instead of
 # expecting headers/libs copied into the package's own include/ and lib/ dirs.
-python3 - <<'PYEOF'
-import pathlib
-path = pathlib.Path('/home/orion/atlas_ws/src/insta360_ros_driver/CMakeLists.txt')
-content = path.read_text()
-if 'CAMERA_SDK_DIR' in content:
-    print('✓ insta360_ros_driver CMakeLists.txt already patched')
-else:
-    sdk_block = '''# CameraSDK location — prefer the canonical ~/LinuxSDK path, fall back to the
-# legacy in-tree include/lib directories if someone copied files there manually.
-if(NOT DEFINED CAMERA_SDK_DIR)
-  set(CAMERA_SDK_DIR "$ENV{HOME}/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux")
-endif()
-
-'''
-    content = content.replace(
-        'include_directories(
-  include
-',
-        sdk_block + 'include_directories(
-  include
-  ${CAMERA_SDK_DIR}/include
-'
-    )
-    content = content.replace(
-        'link_directories(
-  ${PROJECT_SOURCE_DIR}/lib
-  ${PROJECT_SOURCE_DIR}/include
-)',
-        'link_directories(
-  ${CAMERA_SDK_DIR}/lib
-  ${PROJECT_SOURCE_DIR}/lib
-)'
-    )
-    path.write_text(content)
-    print('✓ insta360_ros_driver CMakeLists.txt patched to use ~/LinuxSDK')
-PYEOF
+CMAKE_FILE=~/atlas_ws/src/insta360_ros_driver/CMakeLists.txt
+if grep -q 'CAMERA_SDK_DIR' "$CMAKE_FILE"; then
+  echo "✓ insta360_ros_driver CMakeLists.txt already patched"
+else
+  # Insert SDK dir block before include_directories
+  sed -i 's|include_directories(|if(NOT DEFINED CAMERA_SDK_DIR)\n  set(CAMERA_SDK_DIR "$ENV{HOME}/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux")\nendif()\n\ninclude_directories(|' "$CMAKE_FILE"
+  # Add SDK include path
+  sed -i 's|include_directories(\n  include|include_directories(\n  include\n  ${CAMERA_SDK_DIR}/include|' "$CMAKE_FILE"
+  sed -i '/include_directories(/{ n; s|  include$|  include\n  ${CAMERA_SDK_DIR}/include| }' "$CMAKE_FILE"
+  # Replace link_directories to use SDK lib
+  sed -i 's|${PROJECT_SOURCE_DIR}/lib$|${CAMERA_SDK_DIR}/lib\n  ${PROJECT_SOURCE_DIR}/lib|' "$CMAKE_FILE"
+  sed -i '/link_directories/{ /PROJECT_SOURCE_DIR.*include/d }' "$CMAKE_FILE"
+  echo "✓ insta360_ros_driver CMakeLists.txt patched to use ~/LinuxSDK"
+fi
 
 SDK_ZIP="$HOME/Downloads/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip"
 SDK_DIR="$HOME/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux"
