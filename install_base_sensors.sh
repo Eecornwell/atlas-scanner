@@ -22,16 +22,23 @@ fi
 mkdir -p ~/atlas_ws/src
 cd ~/atlas_ws/src
 
+# Remove any broken third-party PPAs that lack a Release file
+for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+  [ -f "$f" ] && grep -q 'craftablescience' "$f" && sudo rm -f "$f" && echo "Removed broken PPA: $f"
+done
+
+# Install Kitware apt repo + key before the main apt-get update so the key
+# is trusted before any package index fetch that references the repo.
+wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | sudo tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
+sudo apt-add-repository -y "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main"
+
 # Install dependencies
 sudo apt-get update
 sudo apt-get install -y libgoogle-glog-dev libgflags-dev libatlas-base-dev libeigen3-dev libsuitesparse-dev software-properties-common lsb-release python3-sensor-msgs python3-opencv ros-humble-rosbag2-transport ffmpeg ros-humble-robot-localization ros-humble-topic-tools ros-humble-cartographer ros-humble-cartographer-ros ros-humble-slam-toolbox ros-humble-pointcloud-to-laserscan ros-humble-cv-bridge ros-humble-vision-opencv libopencv-* libomp-dev libboost-all-dev libglm-dev libglfw3-dev libpng-dev libjpeg-dev ros-humble-ament-cmake-auto ros-humble-rosidl-default-generators ros-humble-pcl-conversions ros-humble-ament-lint-auto ros-humble-ament-lint-common ros-humble-rosbag2 ros-humble-camera-info-manager ros-humble-imu-tools ros-humble-launch ros-humble-launch-ros ros-humble-launch-xml ros-humble-launch-yaml ros-humble-ros2launch ros-humble-rviz2 ros-humble-ros2topic nlohmann-json3-dev ros-humble-ros2run python3-rosdep ros-humble-rosbag2-cpp colmap
 
-# Install cmake
-wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | sudo tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
-sudo apt-add-repository "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main"
-sudo apt update
-sudo apt install kitware-archive-keyring
-sudo rm /etc/apt/trusted.gpg.d/kitware.gpg
+# Install cmake (Kitware repo already added above; just install the keyring and cmake)
+sudo apt install -y kitware-archive-keyring
+sudo rm -f /etc/apt/trusted.gpg.d/kitware.gpg
 sudo apt update
 sudo apt install -y cmake
 
@@ -43,21 +50,75 @@ fi
 cd insta360_ros_driver
 git reset --hard '9d2d3f51093d906903a6ea57bc5383c39a77ebfb'
 
-echo ""
-echo "=== MANUAL STEP REQUIRED ==="
-echo "To use this driver, you need to first have Insta360 SDK. Please apply for the SDK from the Insta360 website."
-echo "Unzip Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip (latest version) and"
-echo "find the libCameraSDK.so file and camera/ and stream/ folders"
-echo "Then, the Insta360 libraries need to be installed as follows:"
-echo "  - chmod 777 camera/ stream/ libCameraSDK.so"
-echo "  - copy the camera and stream header files inside the include directory (~/atlas_ws/src/insta360_ros_driver/include)"
-echo "  - copy the libCameraSDK.so library under the lib directory (~/atlas_ws/src/insta360_ros_driver/lib)"
-echo ""
-read -p "Press Enter once you have completed the above steps..."
+# Point the ROS driver's CMakeLists.txt at the SDK in ~/LinuxSDK instead of
+# expecting headers/libs copied into the package's own include/ and lib/ dirs.
+python3 - <<'PYEOF'
+import pathlib
+path = pathlib.Path('/home/orion/atlas_ws/src/insta360_ros_driver/CMakeLists.txt')
+content = path.read_text()
+if 'CAMERA_SDK_DIR' in content:
+    print('✓ insta360_ros_driver CMakeLists.txt already patched')
+else:
+    sdk_block = '''# CameraSDK location — prefer the canonical ~/LinuxSDK path, fall back to the
+# legacy in-tree include/lib directories if someone copied files there manually.
+if(NOT DEFINED CAMERA_SDK_DIR)
+  set(CAMERA_SDK_DIR "$ENV{HOME}/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux")
+endif()
 
-# Remove any old SDK versions and create symlink to ensure correct version is used
-rm -f ~/libCameraSDK.so ~/libCameraSDK.so.old
-ln -s ~/atlas_ws/src/insta360_ros_driver/lib/libCameraSDK.so ~/libCameraSDK.so
+'''
+    content = content.replace(
+        'include_directories(
+  include
+',
+        sdk_block + 'include_directories(
+  include
+  ${CAMERA_SDK_DIR}/include
+'
+    )
+    content = content.replace(
+        'link_directories(
+  ${PROJECT_SOURCE_DIR}/lib
+  ${PROJECT_SOURCE_DIR}/include
+)',
+        'link_directories(
+  ${CAMERA_SDK_DIR}/lib
+  ${PROJECT_SOURCE_DIR}/lib
+)'
+    )
+    path.write_text(content)
+    print('✓ insta360_ros_driver CMakeLists.txt patched to use ~/LinuxSDK')
+PYEOF
+
+SDK_ZIP="$HOME/Downloads/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip"
+SDK_DIR="$HOME/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux"
+
+if [ ! -d "$SDK_DIR" ]; then
+  echo ""
+  echo "=== MANUAL STEP REQUIRED ==="
+  echo "Download Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip from the Insta360 developer portal"
+  echo "and place it at: $SDK_ZIP"
+  echo ""
+  read -p "Press Enter once the zip is in ~/Downloads/ ..."
+
+  if [ ! -f "$SDK_ZIP" ]; then
+    echo "ERROR: $SDK_ZIP not found. Please download the SDK and re-run."
+    exit 1
+  fi
+
+  echo "Extracting CameraSDK..."
+  cd ~/Downloads
+  unzip -q "$SDK_ZIP" -d Linux_CameraSDK-2.1.1_MediaSDK-3.1.1/
+  mkdir -p ~/LinuxSDK
+  CAMERA_TAR=$(find ~/Downloads/Linux_CameraSDK-2.1.1_MediaSDK-3.1.1 -name 'CameraSDK-*-Linux.tar_*.gz' | head -1)
+  if [ -z "$CAMERA_TAR" ]; then
+    echo "ERROR: Could not find CameraSDK tarball inside the zip. Check the zip contents."
+    exit 1
+  fi
+  tar -xzf "$CAMERA_TAR" -C ~/LinuxSDK/
+  echo "✓ CameraSDK extracted to ~/LinuxSDK/"
+else
+  echo "✓ CameraSDK already present at $SDK_DIR"
+fi
 
 # Prepare the Livox ROS Driver repo
 cd ~/atlas_ws/src
@@ -162,7 +223,7 @@ patch = '''
         if (shutter > 0.0) {
             auto exposure = std::make_shared<ins_camera::ExposureSettings>();
             exposure->SetExposureMode(
-                ins_camera::PhotographyOptions_ExposureOptions_Program_MANUAL);
+                ins_camera::PhotographyOptions_ExposureMode::MANUAL);
             exposure->SetShutterSpeed(shutter);
             exposure->SetIso(iso);
             if (cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_LIVE_STREAM,

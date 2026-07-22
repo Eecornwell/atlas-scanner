@@ -133,8 +133,7 @@ cp ~/atlas_ws/src/atlas-scanner/src/install/display_point_cloud_ROS2.rviz \
 if ldconfig -p | grep -q MediaSDK; then
   echo "Building Insta360 SDK binaries (insta360_capture, insta360_stitch)..."
   mkdir -p ~/insta360-dev
-  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
-  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
+  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/*.cpp ~/insta360-dev/
   cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/CMakeLists.txt ~/insta360-dev/
   cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build.sh ~/insta360-dev/
   chmod +x ~/insta360-dev/build.sh
