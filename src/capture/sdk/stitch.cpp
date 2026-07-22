@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
     if (model_dir.empty() && std::getenv("INSTA360_MODEL_DIR"))
         model_dir = std::getenv("INSTA360_MODEL_DIR");
 
-    int erp_w = 5760, erp_h = 2880;
+    int erp_w = 11520, erp_h = 5760;
     if (auto* v = std::getenv("INSTA360_ERP_WIDTH")) {
         try {
             int val = std::stoi(v);

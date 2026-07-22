@@ -203,17 +203,15 @@ static bool apply_camera_settings(ins_camera::Camera* cam) {
 }
 
 // Drain stale data from the X5 USB bulk endpoints before the SDK attempts
-// synchronization.  After a previous session, the firmware leaves residual
-// protocol bytes in its OUT endpoint buffers.  The SDK's io_device.cpp reads
-// these as "parse packet error" and eventually times out with "No camera found".
-// By reading (and discarding) all pending data here, the SDK sees a clean pipe.
+// synchronization. After a previous session the firmware leaves residual
+// protocol bytes in its bulk IN endpoint. The SDK reads these as parse errors
+// and times out with "timeout to wait for synchronize". Draining them here
+// gives the SDK a clean pipe without needing a physical unplug.
 static void flush_usb_endpoints() {
     libusb_context* ctx = nullptr;
     if (libusb_init(&ctx) != 0) return;
 
-    // Insta360 X5 USB vendor/product IDs
     static const uint16_t VID = 0x2e1a;
-    // Try known X5 PIDs — the camera uses different PIDs in different modes
     static const uint16_t PIDS[] = {0x0002, 0x1000, 0x0001};
 
     libusb_device_handle* handle = nullptr;
@@ -223,7 +221,6 @@ static void flush_usb_endpoints() {
     }
     if (!handle) { libusb_exit(ctx); return; }
 
-    // Detach kernel driver if attached and claim interface 0
     if (libusb_kernel_driver_active(handle, 0) == 1)
         libusb_detach_kernel_driver(handle, 0);
     if (libusb_claim_interface(handle, 0) != 0) {
@@ -232,11 +229,8 @@ static void flush_usb_endpoints() {
         return;
     }
 
-    // The X5 uses bulk endpoint 0x81 (IN) for command responses.
-    // Read and discard all pending data with a short timeout.
     unsigned char buf[16384];
-    int transferred = 0;
-    int drained = 0;
+    int transferred = 0, drained = 0;
     for (int i = 0; i < 512; ++i) {
         int rc = libusb_bulk_transfer(handle, 0x81, buf, sizeof(buf), &transferred, 50);
         if (rc == LIBUSB_ERROR_TIMEOUT || rc == LIBUSB_ERROR_NO_DEVICE || transferred == 0)
@@ -249,7 +243,6 @@ static void flush_usb_endpoints() {
     libusb_release_interface(handle, 0);
     libusb_close(handle);
     libusb_exit(ctx);
-    // Brief pause to let firmware settle after drain
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 

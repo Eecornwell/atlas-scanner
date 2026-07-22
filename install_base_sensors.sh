@@ -164,29 +164,6 @@ rosdep install --from-paths src --ignore-src -r -y
 # Apply fix for insta360 library (remove unsupported SDK call)
 sed -i '/uint64_t utc_time/,/cam->SyncLocalTimeToCamera/d' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
 
-# Apply camera quality improvements
-echo "Applying camera quality improvements..."
-# 1. Update resolution to 3840x1920 (full native quality)
-sed -i 's/RES_2560_1280P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
-sed -i 's/RES_1920_960P30/RES_3840_1920P30/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
-# 2. Increase bitrate to 30 Mbps (matched to 15 fps effective output via skip_frame:=1)
-sed -i 's/param.video_bitrate = 1024 \* 1024 \* [0-9]*/param.video_bitrate = 1024 * 1024 * 30;/g' ~/atlas_ws/src/insta360_ros_driver/src/main.cpp
-# 3. Use high-quality Lanczos scaling instead of nearest neighbor
-sed -i 's/SWS_POINT/SWS_LANCZOS/g' ~/atlas_ws/src/insta360_ros_driver/src/decoder.cpp
-# 4. Update equirectangular config for new resolution
-sed -i 's/crop_size: 960/crop_size: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
-sed -i 's/out_width: 1920/out_width: 3840/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
-sed -i 's/out_height: 960/out_height: 1920/g' ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
-# 5. Update atlas-scanner configs for new resolution
-sed -i 's/image_width: 2560/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
-sed -i 's/image_height: 1280/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
-sed -i 's/image_width: 1920/image_width: 3840/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
-sed -i 's/image_height: 960/image_height: 1920/g' ~/atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml
-sed -i 's/width=1920, height=960/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
-sed -i 's/width=2560, height=1280/width=3840, height=1920/g' ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py
-# 6. Save captured frames as lossless PNG to avoid double lossy compression on top of H.264 decode
-sed -i "s/dual_fisheye_\${timestamp}.jpg/dual_fisheye_\${timestamp}.png/; s/cv2.imwrite(img_file, frame)/cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])/" ~/atlas_ws/src/atlas-scanner/src/capture/buffered_camera_capture.py
-
 # Apply manual exposure control (1/120s ISO 600 for indoor use)
 # ISO and shutter are ROS params — override at launch time without recompiling
 echo "Applying manual exposure patch..."
@@ -292,31 +269,29 @@ echo ""
 
 echo ""
 echo "=== Insta360 Camera Setup ==="
-echo "Check Insta360 settings on device:"
-echo "  - power on"
-echo "  - set in dual camera mode (legacy)"
-echo "  - set USB mode to Android"
-echo "  - connect to computer using USB-C cable"
+echo "Connect the camera:"
+echo "  - Power on the camera"
+echo "  - Connect via USB-C"
+echo "  (X5: no USB mode setting needed — SDK handles it automatically)"
+echo "  (One X2: set USB mode to Android)"
 echo ""
 read -p "Press Enter once camera is connected..."
 
 # Look for camera
-echo "Looking for camera (should see: Bus 003 Device 017: ID 2e1a:0002 Arashi Vision Insta360 ONE)"
+echo "Looking for camera (should see: Bus 003 Device 017: ID 2e1a:0002 Arashi Vision Insta360)"
 lsusb | grep -i insta || echo "Warning: Insta360 camera not found"
 
 # Enable Camera Access
-bash ~/atlas_ws/src/insta360_ros_driver/setup.sh
+bash ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
 ls -l /dev/insta
 
 echo ""
-echo "=== Testing Camera Driver ==="
-echo "To test camera driver, run:"
-echo "  cd ~/atlas_ws && source ~/atlas_ws/install/setup.bash && ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true"
-echo ""
-echo "In another terminal, run:"
-echo "  cd ~/atlas_ws && source ~/atlas_ws/install/setup.bash && ros2 topic list"
-echo ""
-echo "You should see topics like /dual_fisheye/image, /equirectangular/image, /imu/data, etc."
+echo "=== Testing Camera ==="
+echo "To test the camera, run:"
+echo "  sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh"
+echo "  ~/insta360-dev/build/insta360_capture"
+echo "  # Should print: Found camera: <serial> ... Camera session open"
+echo "  # Ctrl+C to exit"
 echo ""
 
 echo ""
@@ -330,10 +305,9 @@ echo "1. Test LiDAR (in this terminal):"
 echo "   cd ~/atlas_ws && source ~/atlas_ws/install/setup.bash && ros2 launch livox_ros_driver2 rviz_MID360_launch.py"
 echo ""
 echo "2. Test Camera (in a new terminal):"
-echo "   cd ~/atlas_ws && source ~/atlas_ws/install/setup.bash && ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true"
-echo ""
-echo "3. Verify topics (in another terminal):"
-echo "   cd ~/atlas_ws && source ~/atlas_ws/install/setup.bash && ros2 topic list"
-echo "   Expected topics: /dual_fisheye/image, /equirectangular/image, /imu/data, etc."
+echo "   sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh"
+echo "   ~/insta360-dev/build/insta360_capture"
+echo "   # Should print: Found camera: <serial> ... Camera session open"
+echo "   # Ctrl+C to exit"
 echo ""
 echo "Once validated, proceed with install_aux_deps.sh for calibration tools"

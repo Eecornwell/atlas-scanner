@@ -11,26 +11,28 @@ ATLAS supports multiple Insta360 camera models. Each model has its own:
 
 | Model | CLI flag | ERP Resolution | Config dir |
 |-------|----------|----------------|------------|
-| Insta360 One X2 | `--camera-hw onex2` | 5760 × 2880 | `config/calibrations/onex2/` |
-| Insta360 X5     | `--camera-hw x5`    | 7680 × 3840 | `config/calibrations/x5/`   |
+| Insta360 One X2 | `--camera-hw onex2` | 5760 × 2880  | `config/calibrations/onex2/` |
+| Insta360 X3     | `--camera-hw x3`    | 7680 × 3840  | `config/calibrations/x3/`   |
+| Insta360 X5     | `--camera-hw x5`    | 11520 × 5760 | `config/calibrations/x5/`   |
 
-> *Note: All calibration scripts accept `--camera-hw onex2|x5`. Always pass the correct model for the hardware you are calibrating. Calibration results are saved to the per-model directory and also copied to the shared `config/fusion_calibration.yaml` which is the active calibration used at runtime.*
+> *Note: All calibration scripts accept `--camera-hw onex2|x3|x5`. Always pass the correct model for the hardware you are calibrating. Calibration results are saved to the per-model directory and also copied to the shared `config/fusion_calibration.yaml` which is the active calibration used at runtime.*
 
 > *Note: When you start a capture session the script automatically loads `config/calibrations/<camera_hw>/fusion_calibration.yaml` based on the selected `CAMERA_HW` setting (or `--camera-hw` CLI flag / GUI dropdown). You do not need to manually copy files between captures — just set the correct model.*
 
 ---
 
-## Lidar Masks
+## Lidar/Rig Masks
 
 Each camera model requires its own lidar mask — a black/white PNG where white = use, black = ignore. Masks must match the scanner body shape for the specific camera.
 
 | File | Used for |
 |------|----------|
-| `lidar_mask_dual_sdk.png` | One X2, dual fisheye, SDK stitch |
-| `lidar_mask_dual.png` | One X2, dual fisheye, stream mode |
-| `lidar_mask_single.png` | One X2, single fisheye |
-| `lidar_mask_dual_x5.png` | X5, dual fisheye, SDK stitch *(replace placeholder)* |
-| `lidar_mask_single_x5.png` | X5, single fisheye *(replace placeholder)* |
+| `config/masks/lidar_mask_dual_sdk.png`        | One X2, dual fisheye, SDK stitch |
+| `config/masks/lidar_mask_dual.png`            | One X2, dual fisheye, stream mode |
+| `config/masks/lidar_mask_single.png`          | One X2, single fisheye |
+| `config/masks/lidar_mask_dual_x3_cam_left.png`| X3, dual fisheye |
+| `config/masks/lidar_mask_dual_x5.png`         | X5, dual fisheye |
+| `config/masks/lidar_mask_single_x5.png`       | X5, single fisheye |
 
 To create a mask for a new camera/mount combination:
 1. Capture one scan with the new camera to get a sample ERP image
@@ -40,48 +42,9 @@ To create a mask for a new camera/mount combination:
 
 ---
 
-## Fisheye to Equirectangular Calibration
+## ERP–LiDAR Calibration
 
-> *Note: Required for `single_fisheye` mode and for `dual_fisheye` stream mode (`USE_SDK_STITCH=false`). Skip for SDK stitch mode — the SDK handles stitching internally.*
-
-Start the camera:
-```bash
-sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
-cd ~/atlas_ws && source install/setup.bash
-ros2 launch insta360_ros_driver bringup.launch.xml equirectangular:=true
-```
-
-Run the equirectangular calibration tool:
-```bash
-cd ~/atlas_ws && source install/setup.bash
-export QT_QPA_PLATFORM=xcb
-ros2 run insta360_ros_driver equirectangular.py --calibrate --auto-update \
-    --ros-args --params-file ~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml
-```
-
-Starting parameters for `equirectangular.yaml`:
-```yaml
-equirectangular_node:
-  ros__parameters:
-    cx_offset: 0.0
-    cy_offset: 0.0
-    crop_size: 1920
-    translation: [-0.007, 0.007, -0.153]
-    rotation_deg: [0.7, -3.0, 1.5]
-    gpu: false
-    out_width: 3840    # One X2: 3840 — X5: 5120 (adjust to match sensor)
-    out_height: 1920   # One X2: 1920 — X5: 2560
-```
-
-**Tips:**
-- Adjust `TZ` first to align the image centre
-- Then `Pitch` to centre left/right
-- Rotate the camera on the tripod while calibrating to confirm alignment across orientations
-- Press `s` to save when satisfied
-
----
-
-## Equirectangular to Lidar Calibration
+The scanner mounts **upside-down** — lidar faces up, camera faces down, sharing the forward axis. The SDK-stitched ERP requires its own calibration procedure using manual point correspondences.
 
 ### File locations
 
@@ -91,75 +54,85 @@ equirectangular_node:
 | `config/calibrations/<hw>/fusion_calibration.yaml` | Per-model calibration (written by `coordinate_transform.py`) |
 | `config/fusion_calibration.yaml` | Active shared calibration (auto-updated at session start and by calibration scripts) |
 
+### Prerequisites
+- Insta360 SDK stitcher binary built at `~/insta360-dev/build/insta360_stitch`
+- At least **5** scans from different positions
+
 ### Procedure
 
-1. **Capture calibration scans** (5–10 from different positions) to generate sample ERP images for mask creation:
+> *All steps below are also available in the ATLAS GUI under the **Calibration** tab, including a **▶ Run Full Calibration Pipeline** button that runs the entire sequence automatically. The GUI exposes the physical seed fields (Fwd/Left/Up/Yaw), the interactive viewer, and individual step buttons for combine scans, generate intensity images, seed, run calibration, apply, verify, and fine-tune sweeps.*
+
+1. **Capture calibration scans** (5–10 from different positions):
     ```bash
     cd ~/atlas_ws/src/atlas-scanner/src
-    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw onex2
+    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw x5
     ```
-    > *Replace `onex2` with `x5` if calibrating the X5.*
+    > *Replace `x5` with `x3` or `onex2` for other models.*
 
 2. **Create a lidar mask** for your camera/mount (see [Lidar Masks](#lidar-masks) above).
 
 3. **Combine scans** into the calibration dataset:
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
-        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 2
     ```
 
-5. **Get initial guess** (choose one):
+4. **Generate lidar intensity images**:
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
+        ~/atlas_ws/output
+    ```
 
-    - *Manual (recommended)*:
-        ```bash
-        cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-        ./initial_guess_manual --data_path ~/atlas_ws/output
-        ```
+5. **Seed the initial camera position** from physical measurements (stand behind the scanner, MID360 cable facing you — +X=forward, +Y=left, +Z=up):
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/physical_seed.py \
+        --camera-hw x5 --forward 3.0 --left 0.0 --up 0.0 --yaw 0
+    ```
+    > *Measure the camera's position relative to the LiDAR center in inches. `--yaw` is rotation in degrees (0=faces forward, +90=faces left, -90=faces right).*
 
-    - *Auto*:
-        ```bash
-        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
-            ~/atlas_ws/output
-        cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-        python3 ./find_matches_superglue.py ~/atlas_ws/output --superglue indoor
-        python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_matches.py ~/atlas_ws/output
-        ./initial_guess_auto ~/atlas_ws/output
-        python3 -c "
-        import json; f=open('$HOME/atlas_ws/output/calib.json','r+')
-        d=json.load(f); d['results']['init_T_lidar_camera']=d['results']['init_T_lidar_camera_auto']
-        f.seek(0); json.dump(d,f,indent=2); f.truncate()
-        "
-        ```
+6. **Visually verify and coarsely adjust the seed** using the interactive GUI:
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/interactive_seed.py \
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} --camera-hw x5
+    ```
+    Adjust the `Fwd`, `Left`, `Up` (inches) and `Yaw` sliders until LiDAR points land on the correct surfaces. Press `V` to toggle edge overlay. Press `S` to save when satisfied.
 
-6. **Run calibration**:
+    > *This step is also available in the ATLAS GUI under the **Calibration** tab — select the session, adjust the sliders, and click **Save Seed**.*
+
+    To verify without the GUI:
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/verify_seed_overlay.py \
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} --open
+    ```
+    > *Opens `seed_composite.jpg` — left side shows edge alignment (red=camera, green=lidar, yellow=aligned), right side shows TURBO-colored lidar dots on the camera image.*
+
+7. **Seed `calib.json`** with the verified position as the initial guess for the optimizer:
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
+    ```
+
+8. **Run calibration**:
     ```bash
     cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-    ./calibrate --data_path ~/atlas_ws/output \
-        --nid_bins 32 \
-        --nelder_mead_convergence_criteria 1e-10
+    ./calibrate --data_path ~/atlas_ws/output
     ```
     > *Check the overlay with the `blend` slider. When satisfied, save the result.*
 
-    > *To seed from the current known-good calibration instead of the auto guess:*
-    > ```bash
-    > python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
-    > ```
-
-7. **Apply the calibration** — saves to both `config/calibrations/<hw>/` and the shared `config/fusion_calibration.yaml`:
+9. **Apply calibration** — saves to both `config/calibrations/<hw>/` and the shared `config/fusion_calibration.yaml`:
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
         ~/atlas_ws/src/atlas-scanner/src \
-        --camera-hw onex2
+        --camera-hw x5
     ```
-    > *Replace `onex2` with `x5` for the X5.*
+    > *Replace `x5` with `x3` or `onex2` for other models.*
 
     > *Alternatively use `extract_calibration.py` which handles the R_align undo step automatically:*
     > ```bash
     > python3 ~/atlas_ws/src/atlas-scanner/src/calibration/extract_calibration.py \
-    >     --camera-hw onex2
+    >     --camera-hw x5
     > ```
 
-8. **Verify alignment**:
+10. **Verify alignment**:
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py --verify
     eog ~/atlas_ws/output/calib_sweep/current.jpg
@@ -176,7 +149,7 @@ equirectangular_node:
     ```
     > *After `--apply`, re-run `--verify` to confirm. The updated values are written to both the active `config/fusion_calibration.yaml` and `config/calibrations/<hw>/fusion_calibration.yaml`.*
 
-9. **Calibration file reference** (`fusion_calibration.yaml`):
+11. **Calibration file reference** (`fusion_calibration.yaml`):
 
     ```yaml
     roll_offset: -3.119514987103984    # T_camera_lidar rotation (euler XYZ rad)
@@ -192,127 +165,92 @@ equirectangular_node:
     z_offset: -0.05149098901271928
     flip_x: false
     flip_y: false
-    image_width: 5760                  # ERP resolution (set from camera model profile)
-    image_height: 2880
+    image_width: 5760                  # ERP resolution — set per camera model:
+    image_height: 2880                 #   onex2: 5760×2880  x3: 7680×3840  x5: 11520×5760
     use_fisheye: false
     skip_rate: 5
     ```
 
-10. Ready to scan — see [software-run.md](software-run.md).
+12. Ready to scan — see [software-run.md](software-run.md).
 
 > ***Note: If point cloud colors appear misaligned, use `tune_calibration.py --verify` to diagnose and `--axis`/`--apply` to correct, or rerun the full procedure above.***
 
 ---
 
-## ERP–LiDAR Calibration (SDK Stitch)
+## Multi-Camera Configuration
 
-The scanner mounts **upside-down** — lidar faces up, camera faces down, sharing the forward axis. The SDK-stitched ERP is gravity-aligned with a different camera frame orientation from a standard equirectangular, requiring its own calibration procedure. This is the only calibration path — the ROS camera driver is not used.
+When using more than one camera simultaneously, the system reads `config/multi_camera.yaml` to assign each physical device to a logical slot (`cam_0`, `cam_1`, etc.) and apply shared exposure settings.
 
-### Prerequisites
-- Insta360 SDK stitcher binary built at `~/insta360-dev/build/insta360_stitch`
-- At least **2** scans from different positions
+### Finding Camera Serial Numbers
 
-### Procedure
+Serial numbers are required for deterministic slot assignment — without them, cameras can swap indices between sessions depending on USB enumeration order.
 
-1. **Capture scans**:
-    ```bash
-    cd ~/atlas_ws/src/atlas-scanner/src
-    ./atlas_fusion_capture.sh --capture stationary --camera dual_fisheye --camera-hw onex2
-    ```
+With all cameras connected, run:
 
-2. **Combine scans**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
-        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 2
-    ```
+```bash
+~/insta360-dev/build/insta360_capture_multi --discover
+```
 
-3. **Generate lidar intensity images**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
-        ~/atlas_ws/output
-    ```
-    > *SDK stitch scans are detected automatically via `.insp` files and use the corrected ERP projection.*
+Example output:
+```
+Found 2 camera(s):
+  [0] serial=IAHEA26019RESN  type=4  name=Insta360 X5
+  [1] serial=IAHEA12345ABCD  type=3  name=Insta360 X3
+```
 
-4. **Preview perspective crops** to find good matching views:
-    ```bash
-    python3 -c "
-    import sys, numpy as np, cv2
-    sys.path.insert(0, '/home/orion/atlas_ws/src/atlas-scanner/src/calibration')
-    from find_matches_superglue_erp import extract_perspective_crop
-    lid = cv2.imread('/home/orion/atlas_ws/output/000000_lidar_intensities.png', cv2.IMREAD_GRAYSCALE)
-    cam = cv2.imread('/home/orion/atlas_ws/output/000000.png', cv2.IMREAD_GRAYSCALE)
-    lid = np.roll(np.flipud(np.fliplr(lid)), lid.shape[1]//2, axis=1)
-    if cam.shape != lid.shape: lid = cv2.resize(lid, (cam.shape[1], cam.shape[0]))
-    for yaw in [0, 45, 90, 135, 180, 225, 270, 315]:
-        cc, _, _ = extract_perspective_crop(cam, yaw, 0, 90, 800)
-        lc, _, _ = extract_perspective_crop(lid, yaw, 0, 90, 800)
-        cv2.imwrite(f'/tmp/preview_y{yaw:03d}.png',
-            np.concatenate([cv2.cvtColor(cc, cv2.COLOR_GRAY2BGR),
-                            cv2.applyColorMap(lc, cv2.COLORMAP_INFERNO)], axis=1))
-    print('Saved previews to /tmp/preview_y*.png')
-    "
-    eog /tmp/preview_y*.png
-    ```
+### Authoring the Config File
 
-5. **Pick manual matches** (aim for 6–8 per view across different depths):
-    ```bash
-    cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/pick_matches.py \
-        ~/atlas_ws/output --yaw 90  --pair 000000
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/pick_matches.py \
-        ~/atlas_ws/output --yaw 270 --pair 000000
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/pick_matches.py \
-        ~/atlas_ws/output --yaw 90  --pair 000001
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/pick_matches.py \
-        ~/atlas_ws/output --yaw 270 --pair 000001
-    ```
-    **Controls:** Right-click camera (left) → camera keypoint. Right-click lidar (right) → complete pair. `Backspace` = undo. `s`/`Enter` = save. `q`/`Esc` = quit.
+Edit `~/atlas_ws/src/atlas-scanner/src/config/multi_camera.yaml`:
 
-6. **Verify matches**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/verify_matches.py \
-        ~/atlas_ws/output --pair 000000
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/verify_matches.py \
-        ~/atlas_ws/output --pair 000001
-    ```
+```yaml
+# Shared settings applied to ALL cameras (overrides per-model defaults)
+settings:
+  exposure_mode: 0   # 0=AUTO  2=SHUTTER_PRIORITY  4=ADAPTIVE
+  white_balance: 0   # 0=AUTO  1=2700K  2=4000K  3=5000K  4=6500K  5=7500K
+  ev_bias: 0
 
-7. **Estimate initial transform and run calibration**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/fix_matches.py ~/atlas_ws/output
-    cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-    ./initial_guess_auto --data_path ~/atlas_ws/output
-    python3 -c "
-    import json; f=open('$HOME/atlas_ws/output/calib.json','r+')
-    d=json.load(f); d['results']['init_T_lidar_camera']=d['results']['init_T_lidar_camera_auto']
-    f.seek(0); json.dump(d,f,indent=2); f.truncate()
-    "
-    ./calibrate --data_path ~/atlas_ws/output
-    ```
+cameras:
+  cam_0:                          # Primary/reference camera — never color-corrected
+    serial: "IAHEA26019RESN"      # From --discover output above
+    camera_hw: x5                 # x5 | x3 | onex2
+    mask_dual: lidar_mask_dual_x5_cam2.png          # Mask for dual_fisheye mode
+    mask_calibration: lidar_mask_dual_x5_calib.png  # Mask used during calibration
+    calibration: calibrations/x5/center/fusion_calibration.yaml
+  cam_1:                          # Secondary camera — color-matched to cam_0
+    serial: "IAHEA12345ABCD"
+    camera_hw: x3
+    mask_dual: lidar_mask_dual_x3_cam_left.png
+    mask_calibration: lidar_mask_dual_x3_calib.png
+    calibration: calibrations/x3/left/fusion_calibration.yaml
+```
 
-8. **Apply calibration** — specify the correct camera hardware:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
-        ~/atlas_ws/src/atlas-scanner/src \
-        --camera-hw onex2
-    ```
+**Field reference:**
 
-9. **Verify**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py --verify
-    eog ~/atlas_ws/output/calib_sweep/current.jpg
-    ```
+| Field | Required | Description |
+|-------|----------|-------------|
+| `serial` | Yes | Camera serial from `--discover`. Ensures correct slot assignment regardless of USB order. |
+| `camera_hw` | Yes | Hardware model — selects ERP resolution and default mask. |
+| `mask_dual` | Yes | Lidar mask for `dual_fisheye` mode (in `config/masks/`). |
+| `mask_calibration` | No | Mask used during single-camera calibration captures. Falls back to `mask_dual`. |
+| `mask_single` | No | Mask for `single_fisheye` mode. Falls back to `mask_dual`. |
+| `calibration` | No | Per-camera extrinsic calibration path (relative to `config/`). Falls back to `calibrations/<camera_hw>/fusion_calibration.yaml`. |
 
-10. Ready to scan — see [software-run.md](software-run.md).
+**Notes:**
+- `cam_0` is the primary reference camera. Secondary cameras (`cam_1`, `cam_2`) have color profiles applied to match it.
+- Each camera needs its own calibration run (see [ERP–LiDAR Calibration](#erp-lidar-calibration)) with only that camera connected, using its `mask_calibration` mask.
+- The `settings` block overrides per-model defaults from `config/camera_models/*.yaml` to ensure consistent exposure across mixed hardware.
 
 ---
 
-## Swapping Between Camera Models
 
 At session start the capture script automatically loads the calibration for the selected `CAMERA_HW`:
 
 ```bash
 # One X2 session
 ./atlas_fusion_capture.sh --camera dual_fisheye --camera-hw onex2
+
+# X3 session
+./atlas_fusion_capture.sh --camera dual_fisheye --camera-hw x3
 
 # X5 session
 ./atlas_fusion_capture.sh --camera dual_fisheye --camera-hw x5
@@ -324,9 +262,11 @@ Each model's calibration is stored independently:
 ```
 config/calibrations/
   onex2/fusion_calibration.yaml   ← One X2 extrinsics
+  x3/fusion_calibration.yaml      ← X3 extrinsics
   x5/fusion_calibration.yaml      ← X5 extrinsics
 config/camera_models/
   onex2.yaml                      ← ERP resolution, mask filenames
+  x3.yaml                         ← ERP resolution, mask filenames
   x5.yaml                         ← ERP resolution, mask filenames
 ```
 

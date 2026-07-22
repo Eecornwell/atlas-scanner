@@ -10,7 +10,7 @@ CAPTURE_MODE="continuous"      # stationary | continuous
 CONTINUOUS_INTERVAL=3          # seconds between captures (continuous mode only;
                                # host-controlled TakePhoto() loop; minimum ~3s
                                # limited by X5 shutter + SD write time)
-CAMERA_HW="x5"                 # onex2 | x5
+CAMERA_HW="x5"                 # onex2 | x3 | x5
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json

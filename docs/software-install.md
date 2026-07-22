@@ -13,12 +13,11 @@ git clone https://github.com/Eecornwell/atlas-scanner.git
 
 ### 1. Base Sensors Installation
 Installs camera and LiDAR drivers with optimized camera settings:
-- **Resolution**: 3840x1920 (high quality)
+- **Resolution**: 11520x5760 (X5 native full resolution)
 - **ISO**: 600 (increased light sensitivity)
 - **Exposure (shutter speed)**: 1/120 (faster shutter, motion compensation)
 - **Bitrate**: 30 Mbps (high quality, matched to 15 fps effective output)
 - **Scaling**: Lanczos interpolation (highest quality)
-- **JPEG Quality**: 100 (maximum)
 
 ```bash
 cd ~/atlas_ws/src/atlas-scanner
@@ -46,14 +45,6 @@ Test Camera (in a new terminal):
 ~/insta360-dev/build/insta360_capture
 # Should print: Found camera: <serial>  ...  Camera session open
 # Ctrl+C to exit
-```
-
-Verify LiDAR topics (in another terminal):
-```bash
-cd ~/atlas_ws
-source ~/atlas_ws/install/setup.bash
-ros2 topic list
-# Should see: /livox/lidar, /livox/imu, /rko_lio/odometry, etc.
 ```
 
 ### 2. Auxiliary Dependencies Installation
