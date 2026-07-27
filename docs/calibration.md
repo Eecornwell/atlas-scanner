@@ -55,7 +55,7 @@ The scanner mounts **upside-down** — lidar faces up, camera faces down, sharin
 | `config/fusion_calibration.yaml` | Active shared calibration (auto-updated at session start and by calibration scripts) |
 
 ### Prerequisites
-- Insta360 SDK stitcher binary built at `~/insta360-dev/build/insta360_stitch`
+- Insta360 SDK stitcher binary built at `~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_stitch`
 - At least **5** scans from different positions
 
 ### Procedure
@@ -188,7 +188,7 @@ Serial numbers are required for deterministic slot assignment — without them, 
 With all cameras connected, run:
 
 ```bash
-~/insta360-dev/build/insta360_capture_multi --discover
+~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture_multi --discover
 ```
 
 Example output:

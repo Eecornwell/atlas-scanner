@@ -106,7 +106,7 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
     ```bash
     cd ~/atlas_ws && source install/setup.bash
     sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
-    ~/insta360-dev/build/insta360_capture
+    ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture
     # Should print: Found camera: <serial> ... Camera session open
     # Ctrl+C to exit
     ```

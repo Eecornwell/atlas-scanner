@@ -838,8 +838,14 @@ class FusionCaptureGUI:
                 mc = self.script_dir / 'config' / 'multi_camera.yaml'
                 if mc.exists():
                     cfg = _y.safe_load(open(mc))
-                    hw = cfg.get('cameras', {}).get(cam, {}).get('camera_hw', '?')
+                    slot = cfg.get('cameras', {}).get(cam, {})
+                    hw = slot.get('camera_hw', '?')
                     self._cal_hw_label.config(text=f"{cam} ({hw.upper()})")
+                    pos = slot.get('seed_position')
+                    if pos and len(pos) == 3:
+                        self._seed_fwd_var.set(str(round(float(pos[0]), 3)))
+                        self._seed_left_var.set(str(round(float(pos[1]), 3)))
+                        self._seed_up_var.set(str(round(float(pos[2]), 3)))
                     return
             except Exception:
                 pass
@@ -882,12 +888,8 @@ class FusionCaptureGUI:
         self._seed_up_var = tk.StringVar(value="0.0")
         ttk.Entry(seed_frame, textvariable=self._seed_up_var, width=6).grid(row=1, column=1, padx=2)
 
-        ttk.Label(seed_frame, text="Yaw \u00b0:").grid(row=1, column=2, sticky=tk.W, padx=2)
-        self._seed_yaw_var = tk.StringVar(value="0.0")
-        ttk.Entry(seed_frame, textvariable=self._seed_yaw_var, width=6).grid(row=1, column=3, padx=2)
-
         # Help text
-        ttk.Label(seed_frame, text="+Fwd=front  -Fwd=back  |  +Left=left  -Left=right  |  Yaw: 0=fwd  +90=left  -90=right",
+        ttk.Label(seed_frame, text="+Fwd=front  -Fwd=back  |  +Left=left  -Left=right  |  Rotation copied from X5",
                   font=('Arial', 7), foreground='#666').grid(row=2, column=0, columnspan=4, sticky=tk.W, padx=2, pady=(2, 0))
 
         ttk.Button(seed_frame, text="Write Physical Seed", command=self._cal_write_physical_seed
@@ -905,22 +907,33 @@ class FusionCaptureGUI:
         _cal_sep(2, "Individual Steps")
         _cal_btn(4, 0, "1. Combine Scans",                self._cal_combine_scans)
         _cal_btn(4, 1, "2. Generate Intensity Images",    self._cal_gen_intensity)
-        _cal_btn(5, 0, "3. Match Features (SuperGlue)",   lambda: self._cal_superglue(self._cal_scene_var.get()))
-        _cal_btn(5, 1, "4. Initial Guess",                self._cal_initial_guess)
-        _cal_btn(6, 0, "5. Seed from Current Calib",      self._cal_seed)
-        _cal_btn(6, 1, "6. Run Calibration",              self._cal_run_calibration)
-        _cal_btn(7, 0, "7. Apply Calibration",            self._cal_apply)
-        _cal_btn(7, 1, "8. Verify Calibration",           self._cal_verify)
+        # SuperGlue match mode toggle
+        sg_frame = ttk.Frame(cal_btn_frame)
+        sg_frame.grid(row=5, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=3, pady=2)
+        sg_frame.columnconfigure(0, weight=1)
+        ttk.Button(sg_frame, text="3. Match Features (SuperGlue)",
+                   command=lambda: self._cal_superglue(self._cal_scene_var.get())
+                   ).grid(row=0, column=0, sticky=(tk.W, tk.E), padx=(0, 4))
+        ttk.Label(sg_frame, text="Mode:").grid(row=0, column=1, padx=(0, 2))
+        self._sg_mode_var = tk.StringVar(value='crops')
+        ttk.Combobox(sg_frame, textvariable=self._sg_mode_var,
+                     values=['crops', 'panorama'], width=9, state='readonly'
+                     ).grid(row=0, column=2)
+        _cal_btn(6, 0, "4. Initial Guess",                self._cal_initial_guess)
+        _cal_btn(6, 1, "5. Seed from Current Calib",      self._cal_seed)
+        _cal_btn(7, 0, "6. Run Calibration",              self._cal_run_calibration)
+        _cal_btn(7, 1, "7. Apply Calibration",            self._cal_apply)
+        _cal_btn(8, 0, "8. Verify Calibration",           self._cal_verify)
         # \u2500\u2500 Fine-tune \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-        _cal_sep(8, "Fine-tune")
+        _cal_sep(9, "Fine-tune")
         _cal_btn(10, 0, "Tune \u2014 Sweep Pitch",             self._cal_tune_pitch)
         _cal_btn(10, 1, "Tune \u2014 Sweep Roll",              self._cal_tune_roll)
         _cal_btn(11, 0, "Tune \u2014 Sweep Yaw",              self._cal_tune_yaw)
         _cal_btn(11, 1, "Tune \u2014 Sweep TX/TY/TZ",         self._cal_tune_t)
         # ── Multi-camera color ────────────────────────────────────────
-        _cal_sep(12, "Multi-Camera Color")
-        _cal_btn(14, 0, "Calibrate Color Profiles",       self._cal_color_calibrate)
-        _cal_btn(14, 1, "Apply Color Normalization",      self._cal_color_normalize)
+        _cal_sep(13, "Multi-Camera Color")
+        _cal_btn(15, 0, "Calibrate Color Profiles",       self._cal_color_calibrate)
+        _cal_btn(15, 1, "Apply Color Normalization",      self._cal_color_normalize)
 
         # Output log shared with post-processing tab
         ttk.Label(cal_tab, text="Output:", foreground='#888', font=('Arial', 8)).pack(anchor=tk.W, pady=(6,0))
@@ -2096,6 +2109,7 @@ sys.exit(0 if ok[0] else 4)
         # and silently crash when called from a non-main thread.
         scene    = self._cal_scene_var.get()
         guess    = self._cal_guess_var.get()
+        sg_mode  = self._sg_mode_var.get()
         cam_idx  = self._cal_cam_var.get().split('_')[1]
         hw       = self._cal_hw()
         src      = self._cal_src()
@@ -2137,8 +2151,8 @@ sys.exit(0 if ok[0] else 4)
                     sess or output] + _cam_args),
                 ("2. Generate Intensity Images", [sys.executable,
                     str(self.script_dir / 'calibration' / 'generate_intensity_images.py'), output]),
-                (f"3. Match Features (SuperGlue {scene})", [sys.executable, str(erp_matcher),
-                    output, '--superglue', scene, '--max_keypoints', '2048', '--match_threshold', '0.2']),
+                (f"3. Match Features (SuperGlue {scene}, {sg_mode})", [sys.executable, str(erp_matcher),
+                    output, '--superglue', scene, '--mode', sg_mode, '--max_keypoints', '4096', '--match_threshold', '0.2', '--crop_size', '640']),
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
@@ -2201,10 +2215,11 @@ sys.exit(0 if ok[0] else 4)
             erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
             match_cmd = [sys.executable, str(erp_matcher),
                          output, '--superglue', weights,
-                         '--max_keypoints', '2048',
-                         '--match_threshold', '0.2']
+                         '--mode', getattr(self, '_sg_mode_var', type('', (), {'get': lambda s: 'crops'})()).get(),
+                         '--max_keypoints', '4096',
+                         '--match_threshold', '0.2', '--crop_size', '640']
             self.root.after(0, self._cal_log_write,
-                            f'>> Match Features ERP (SuperGlue {weights})\n   {" ".join(match_cmd)}\n')
+                            f'>> Match Features ERP (SuperGlue {weights}, mode={self._sg_mode_var.get() if hasattr(self, "_sg_mode_var") else "crops"})\n   {" ".join(match_cmd)}\n')
             proc = _sp.Popen(match_cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                              text=True, bufsize=1, env=_safe_env,
                              cwd=str(dvl))
@@ -2254,10 +2269,9 @@ sys.exit(0 if ok[0] else 4)
     def _cal_write_physical_seed(self):
         """Compute and write calibration seed from physical measurements."""
         try:
-            fwd_in = float(self._seed_fwd_var.get())
+            fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
-            up_in = float(self._seed_up_var.get())
-            yaw_deg = float(self._seed_yaw_var.get())
+            up_in   = float(self._seed_up_var.get())
         except ValueError:
             self._cal_log_write("\n[!] Invalid numeric input in seed fields.\n")
             return
@@ -2270,7 +2284,6 @@ sys.exit(0 if ok[0] else 4)
             '--forward', str(fwd_in),
             '--left', str(left_in),
             '--up', str(up_in),
-            '--yaw', str(yaw_deg),
         ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
 
     def _cal_verify_seed(self):
@@ -2287,7 +2300,6 @@ sys.exit(0 if ok[0] else 4)
             fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
             up_in   = float(self._seed_up_var.get())
-            yaw_deg = float(self._seed_yaw_var.get())
             subprocess.run([
                 sys.executable,
                 str(self.script_dir / 'calibration' / 'physical_seed.py'),
@@ -2295,7 +2307,6 @@ sys.exit(0 if ok[0] else 4)
                 '--forward', str(fwd_in),
                 '--left', str(left_in),
                 '--up', str(up_in),
-                '--yaw', str(yaw_deg),
             ], capture_output=True, env=env_with_idx)
         except ValueError:
             pass
@@ -2328,7 +2339,6 @@ sys.exit(0 if ok[0] else 4)
             fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
             up_in   = float(self._seed_up_var.get())
-            yaw_deg = float(self._seed_yaw_var.get())
         except ValueError:
             self._cal_log_write("\n[!] Invalid seed field values — fix before opening viewer.\n")
             return
@@ -2341,7 +2351,6 @@ sys.exit(0 if ok[0] else 4)
             '--forward', str(fwd_in),
             '--left', str(left_in),
             '--up', str(up_in),
-            '--yaw', str(yaw_deg),
         ], capture_output=True, env=env_with_idx)
         subprocess.Popen([
             sys.executable,
@@ -2361,24 +2370,28 @@ sys.exit(0 if ok[0] else 4)
     def _cal_verify(self):
         sess = self._pp_session()
         scan_dir = None
+        # Always use the GUI dropdown slot index — verify must show the calibration
+        # for the camera being calibrated, not whatever camera captured the last scan.
+        cam_idx = self._cal_cam_var.get().split('_')[1]  # '0', '1', or '2'
         if sess:
-            scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
-            if scans:
-                scan_dir = str(scans[-1])
-        # Resolve cam_idx from the scan's .cam_index serial (stable) rather than
-        # the GUI dropdown (which reflects the slot, not the SDK runtime index).
-        # This ensures verify always reads the calibration that matches the
-        # camera that actually captured the scan.
-        cam_idx = self._cal_cam_var.get().split('_')[1]  # GUI dropdown fallback
-        if scan_dir:
             import sys as _sys
             _sys.path.insert(0, str(self.script_dir))
             try:
                 from camera_hw import cam_index_for_scan
-                resolved = cam_index_for_scan(scan_dir)
-                cam_idx = str(resolved)
+                # Find the most recent scan that belongs to the selected camera slot.
+                all_scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
+                for s in reversed(all_scans):
+                    if cam_index_for_scan(str(s)) == int(cam_idx):
+                        scan_dir = str(s)
+                        break
+                # Fall back to last scan if none matched (e.g. single-camera session
+                # where .cam_index has no serial and always returns 0).
+                if scan_dir is None and all_scans:
+                    scan_dir = str(all_scans[-1])
             except Exception:
-                pass
+                scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
+                if scans:
+                    scan_dir = str(scans[-1])
         cmd = [sys.executable,
                str(self.script_dir / 'calibration' / 'tune_calibration.py'),
                '--verify']

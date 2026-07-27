@@ -511,8 +511,10 @@ int main(int argc, char* argv[]) {
             std::string local_path = trigger_content + "/" + fs::path(remote_path).filename().string();
             LOG_OUT("Taking photo " << capture_index << " — downloading...");
 
-            // Write cam_index and capture_time sidecars immediately
-            { std::ofstream ci(fs::path(trigger_content) / ".cam_index"); ci << 0; }
+            // Write cam_index with serial so cam_index_for_scan() resolves the
+            // correct multi_camera.yaml slot regardless of USB enumeration order.
+            { std::ofstream ci(fs::path(trigger_content) / ".cam_index");
+              ci << 0 << " " << sanitise(g_list[0].serial_number); }
             { std::ofstream ct(local_path + ".capture_time");
               ct << std::fixed << std::setprecision(6) << host_t << " " << host_t << " 0"; }
 
@@ -520,8 +522,19 @@ int main(int argc, char* argv[]) {
             { std::ofstream pf(pending_path); pf << 1; }
             { std::ofstream df(done_path); df << "ok"; }
 
-            // Download .insp to scan dir (shell polls pending until 0)
-            bool ok = http_download(remote_path, local_path);
+            // The camera's HTTP server does not register the file immediately after
+            // TakePhoto() returns — STORAGE_UPDATE notifications show the SD write
+            // is still in progress at that point. Wait for the file to be available
+            // before attempting the download, then retry on failure.
+            std::this_thread::sleep_for(std::chrono::seconds(4));
+            bool ok = false;
+            for (int dl_try = 0; dl_try < 3 && !ok; ++dl_try) {
+                if (dl_try > 0) {
+                    LOG_OUT("Shot " << capture_index << " retrying download (attempt " << (dl_try + 1) << "/3)...");
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                }
+                ok = http_download(remote_path, local_path);
+            }
             if (ok) {
                 LOG_OUT("Shot " << capture_index << " saved");
                 if (!cam->DeleteCameraFile(remote_path))

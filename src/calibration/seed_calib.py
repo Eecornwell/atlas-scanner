@@ -16,25 +16,46 @@ from scipy.spatial.transform import Rotation as R
 YAML_PATH  = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
 CALIB_PATH = Path.home() / 'atlas_ws/output/calib.json'
 
-# Detect which camera hw was used for the output dataset via session_config.json files
-import glob as _glob
-_hw = 'onex2'
-_source_jsons = sorted(_glob.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
-if _source_jsons:
+import os as _os, glob as _glob
+_src_root = Path(__file__).parent.parent
+
+# Priority 1: per-camera-slot path from multi_camera.yaml (same source as
+# generate_intensity_images.py uses), so the seed and intensity projection
+# are always consistent.
+_cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+if _cam_idx:
     try:
-        import json as _json
-        _src = _json.loads(Path(_source_jsons[0]).read_text())
-        _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
-        if _scan_cfg.exists():
-            _hw = _json.loads(_scan_cfg.read_text()).get('camera_hw', 'onex2')
+        import yaml as _y
+        _mc_path = _src_root / 'config' / 'multi_camera.yaml'
+        if _mc_path.exists():
+            _mc = _y.safe_load(_mc_path.read_text()) or {}
+            _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+            if _calib_rel:
+                _slot_path = _src_root / 'config' / _calib_rel
+                if _slot_path.exists():
+                    YAML_PATH = _slot_path
+                    _hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', 'onex2')
+                    print(f'Using {_hw} calibration: {_slot_path}')
     except Exception:
         pass
 
-# Prefer the per-hw calibration file; fall back to shared
-_hw_yaml = Path.home() / f'atlas_ws/src/atlas-scanner/src/config/calibrations/{_hw}/fusion_calibration.yaml'
-if _hw_yaml.exists():
-    YAML_PATH = _hw_yaml
-    print(f'Using {_hw} calibration: {_hw_yaml}')
+# Priority 2: per-hw calibration detected from output dataset
+if YAML_PATH == Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml':
+    _hw = 'onex2'
+    _source_jsons = sorted(_glob.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
+    if _source_jsons:
+        try:
+            import json as _json
+            _src = _json.loads(Path(_source_jsons[0]).read_text())
+            _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
+            if _scan_cfg.exists():
+                _hw = _json.loads(_scan_cfg.read_text()).get('camera_hw', 'onex2')
+        except Exception:
+            pass
+    _hw_yaml = _src_root / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
+    if _hw_yaml.exists():
+        YAML_PATH = _hw_yaml
+        print(f'Using {_hw} calibration: {_hw_yaml}')
 
 with open(YAML_PATH) as f:
     cfg = yaml.safe_load(f)

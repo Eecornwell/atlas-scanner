@@ -132,24 +132,18 @@ cp ~/atlas_ws/src/atlas-scanner/src/install/display_point_cloud_ROS2.rviz \
 # Skip if MediaSDK is not installed -- SDK stitch mode is optional.
 if ldconfig -p | grep -q MediaSDK; then
   echo "Building Insta360 SDK binaries (insta360_capture, insta360_stitch)..."
-  mkdir -p ~/insta360-dev
-  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/*.cpp ~/insta360-dev/
-  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/CMakeLists.txt ~/insta360-dev/
-  cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build.sh ~/insta360-dev/
-  chmod +x ~/insta360-dev/build.sh
-  cd ~/insta360-dev && bash build.sh
-  if [ -f ~/insta360-dev/build/insta360_capture ] && [ -f ~/insta360-dev/build/insta360_stitch ]; then
-    echo "  ✓ insta360_capture and insta360_stitch built successfully"
+  cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk && bash build.sh
+  if [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture ] && \
+     [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_stitch ]; then
+    echo "  ✓ SDK binaries built at src/capture/sdk/build/"
   else
-    echo "  ⚠ SDK build failed -- SDK stitch mode will not be available"
-    echo "    Check ~/insta360-dev/build for errors"
+    echo "  ⚠ SDK build failed — check src/capture/sdk/build/ for errors"
   fi
 else
   echo "  Skipping Insta360 SDK build (MediaSDK not installed)"
   echo "  To enable SDK stitch mode later:"
   echo "    1. Install MediaSDK: sudo dpkg -i libMediaSDK-dev_*.deb && sudo ldconfig"
-  echo "    2. Run: cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/*.cpp ~/insta360-dev/"
-  echo "       cd ~/insta360-dev && bash build.sh"
+  echo "    2. Run: cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk && bash build.sh"
 fi
 
 # Final build of all ROS packages
@@ -168,10 +162,10 @@ echo "Your system should now be setup to run this repo's software"
 echo "Next, calibrate your system setup using the Calibration doc"
 echo ""
 echo "SDK stitch mode (USE_SDK_STITCH=true, dual_fisheye):"
-if [ -f ~/insta360-dev/build/insta360_capture ]; then
-  echo "  ✓ insta360_capture and insta360_stitch are ready at ~/insta360-dev/build/"
+if [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture ]; then
+  echo "  ✓ SDK binaries are ready at src/capture/sdk/build/"
 else
-  echo "  ⚠ Not built -- install MediaSDK .deb and re-run install_aux_deps.sh"
+  echo "  ⚠ Not built — install MediaSDK .deb and re-run install_aux_deps.sh"
 fi
 echo ""
 echo "Note: You may want to add the following to your ~/.bashrc:"

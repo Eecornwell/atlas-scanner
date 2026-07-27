@@ -199,7 +199,7 @@ def interp_pose(all_odom, target_stamp):
     return t_interp, q_interp
 
 
-def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
+def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom, motion_score=None):
     """Interpolate odometry at capture_stamp and write trajectory.json."""
     t_interp, q_interp = interp_pose(all_odom, capture_stamp)
 
@@ -232,6 +232,7 @@ def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom):
             "capture_time": capture_stamp,
             "scan_request_time": capture_stamp,
             "scan_pose_time": capture_stamp,
+            "motion_score": float(motion_score) if motion_score is not None else None,
         },
         "current_pose": {
             "timestamp": capture_stamp,
@@ -527,7 +528,8 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
 
         # --- Odometry: write trajectory.json centred on shutter time ---
         if odom_msgs and not (scan_dir / "trajectory.json").exists():
-            write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
+            write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs,
+                                  motion_score=motion_score_at(centre) if 'motion_score_at' in dir() else None)
             print(f"  Saved trajectory.json (centred on shutter time)")
 
         scan_count += 1
@@ -1287,7 +1289,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             dt_odom = abs(odom_stamp - centre)
             if dt_odom < 5.0:
                 # trajectory pose is interpolated at the shutter time (centre)
-                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs)
+                _mscore = motion_score_at(centre) if 'motion_score_at' in dir() else None
+                write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs,
+                                      motion_score=_mscore)
                 if world_points:
                     save_ply(str(scan_dir / "world_lidar.ply"), world_points)
             else:

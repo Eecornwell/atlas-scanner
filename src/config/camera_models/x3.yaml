@@ -4,8 +4,8 @@
 # 7680x3840 is a good balance of detail and processing speed.
 erp_width: 7680
 erp_height: 3840
-# Capture resolution: Size_7296_3648 (enum 18, X3 native 72MP)
-photo_size_enum: 18
+# Capture resolution: Size_6912_3456 (enum 0, X3 native 18MP equirectangular)
+photo_size_enum: 0
 # White balance: 0=AUTO (matches X5 for multi-camera consistency)
 white_balance: 0
 # Exposure mode: 0=AUTO (matches X5 for multi-camera consistency)

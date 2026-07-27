@@ -51,6 +51,18 @@ settings:
 #                as seen from this camera's position — NOT the other cameras,
 #                since they are removed during single-camera calibration capture.
 #                Falls back to mask_dual if not specified.
+#   mounting_orientation: Euler XYZ angles (degrees) of T_camera_lidar for this
+#                camera as physically mounted on the rig. Used by physical_seed.py
+#                and the interactive seed viewer as the starting rotation when
+#                no prior calibration exists. Each camera body may be oriented
+#                slightly differently in its mount, so this must be set per-slot.
+#                Format: [roll_deg, pitch_deg, yaw_deg]
+#                Run the full calibration pipeline once to get the correct values,
+#                then copy them here so future re-seeds start coarsely aligned.
+#   seed_position: Physical camera position relative to LiDAR center (inches).
+#                Format: [forward_in, left_in, up_in]
+#                +forward = toward scanner front, +left = left side, +up = above LiDAR.
+#                Used to pre-fill the seed fields in the GUI calibration panel.
 #   calibration: Per-camera extrinsic calibration path (relative to config/).
 #                Falls back to calibrations/<camera_hw>/fusion_calibration.yaml.
 #
@@ -66,15 +78,21 @@ cameras:
     mask_dual: lidar_mask_dual_x5_cam2.png
     mask_calibration: lidar_mask_dual_x5_calib.png
     calibration: calibrations/x5/center/fusion_calibration.yaml
+    mounting_orientation: [-179.77, 0.95, -91.77]
+    seed_position: [3.46, -2.11, -0.84]
   cam_1:
     serial: "XXXXXXXXXXXXXX"
     camera_hw: x3
     mask_dual: lidar_mask_dual_x3_cam_left.png
     mask_calibration: lidar_mask_dual_x3_calib.png
     calibration: calibrations/x3/left/fusion_calibration.yaml
+    mounting_orientation: [-178.54, 2.92, -81.56]
+    seed_position: [3.07, 2.47, -0.74]
   cam_2:
     serial: "XXXXXXXXXXXXXX"
     camera_hw: onex2
     mask_dual: lidar_mask_dual_onex2_cam_right.png
     mask_calibration: lidar_mask_dual_onex2_calib.png
     calibration: calibrations/onex2/right/fusion_calibration.yaml
+    mounting_orientation: [-179.0, 3.0, -98.0]
+    seed_position: [2.95, -3.4, -0.55]

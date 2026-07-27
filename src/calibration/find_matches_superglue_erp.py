@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Orion. All rights reserved.
 #
-# Description: SuperGlue matching via perspective crops extracted from ERP images.
-# Extracts perspective crops from both camera and lidar ERPs, runs SuperGlue on
-# each crop pair, then maps matched keypoints back to ERP pixel coordinates for
-# direct_visual_lidar_calibration.
+# Description: SuperGlue matching for ERP camera/lidar image pairs.
+# Two modes:
+#   --mode crops     (default) Extract perspective crops from both ERPs, run
+#                    SuperGlue on each crop pair, map keypoints back to ERP coords.
+#   --mode panorama  Run SuperGlue directly on the full downscaled ERP images.
+#                    Better when perspective crops miss features or produce poor
+#                    matches due to distortion at the crop boundaries.
 #
 # WARNING: SuperGlue is for non-commercial research use only.
 # https://github.com/magicleap/SuperGluePretrainedNetwork/blob/master/LICENSE
@@ -99,6 +102,9 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument('data_path')
+    parser.add_argument('--mode', choices={'crops', 'panorama'}, default='crops',
+                        help='crops: perspective crop matching (default); '
+                             'panorama: match directly on full downscaled ERP images')
     parser.add_argument('--superglue', choices={'indoor', 'outdoor'}, default='indoor')
     parser.add_argument('--max_keypoints', type=int, default=1024)
     parser.add_argument('--keypoint_threshold', type=float, default=0.005)
@@ -106,6 +112,10 @@ def main():
     parser.add_argument('--match_threshold', type=float, default=0.2)
     parser.add_argument('--fov', type=float, default=90.0)
     parser.add_argument('--crop_size', type=int, default=512)
+    parser.add_argument('--panorama_size', type=int, default=1024,
+                        help='Width to downscale ERP to for panorama mode (height = width/2)')
+    parser.add_argument('--ransac_threshold', type=float, default=8.0,
+                        help='RANSAC reprojection threshold in pixels for outlier filtering (panorama mode)')
     parser.add_argument('--force_cpu', action='store_true')
     opt = parser.parse_args()
     print(opt)
@@ -215,6 +225,8 @@ def main():
         for y, p in zip(_base_yaws, _pitches)
     ]
 
+    print(f'Matching mode: {opt.mode}')
+
     for bag_name in calib['meta']['bag_names']:
         print(f'\nProcessing {bag_name}')
 
@@ -230,6 +242,83 @@ def main():
         matching = Matching(config).eval().to(device)
         keys = ['keypoints', 'scores', 'descriptors']
 
+        if opt.mode == 'panorama':
+            # ── Panorama mode: match directly on full downscaled ERP ──────────
+            pano_w = opt.panorama_size
+            pano_h = pano_w // 2
+            scale_x = W / pano_w
+            scale_y = H / pano_h
+            cam_small = cv2.resize(cam_erp, (pano_w, pano_h), interpolation=cv2.INTER_AREA)
+            lid_small = cv2.resize(lid_erp, (pano_w, pano_h), interpolation=cv2.INTER_AREA)
+
+            cam_t = frame2tensor(cam_small, device)
+            lid_t = frame2tensor(lid_small, device)
+            last_data = matching.superpoint({'image': cam_t})
+            last_data = {k + '0': last_data[k] for k in keys}
+            last_data['image0'] = cam_t
+            pred = matching({**last_data, 'image1': lid_t})
+
+            kpts0      = last_data['keypoints0'][0].cpu().numpy()
+            kpts1      = pred['keypoints1'][0].cpu().numpy()
+            matches    = pred['matches0'][0].cpu().numpy()
+            confidence = pred['matching_scores0'][0].cpu().numpy()
+
+            # Scale keypoints back to full ERP coordinates
+            kpts0_erp = [[float(kp[0] * scale_x), float(kp[1] * scale_y)] for kp in kpts0]
+            kpts1_erp = [[float(kp[0] * scale_x), float(kp[1] * scale_y)] for kp in kpts1]
+
+            n_matched = int((matches >= 0).sum())
+
+            # RANSAC outlier filter on valid matches
+            valid_idx = [(i, int(m)) for i, m in enumerate(matches) if m >= 0]
+            if len(valid_idx) >= 8:
+                pts0 = np.array([kpts0_erp[i] for i, _ in valid_idx], dtype=np.float32)
+                pts1 = np.array([kpts1_erp[m] for _, m in valid_idx], dtype=np.float32)
+                _, mask = cv2.findFundamentalMat(pts0, pts1, cv2.FM_RANSAC, opt.ransac_threshold, 0.99)
+                if mask is not None:
+                    inlier_mask = mask.ravel().astype(bool)
+                    n_inliers = int(inlier_mask.sum())
+                    # Mark outlier matches as -1
+                    for k, (i, _) in enumerate(valid_idx):
+                        if not inlier_mask[k]:
+                            matches[i] = -1
+                    print(f'  Panorama mode: {n_inliers}/{n_matched} matches after RANSAC on {pano_w}x{pano_h} ERP')
+                    n_matched = n_inliers
+                else:
+                    print(f'  Panorama mode: {n_matched} matches on {pano_w}x{pano_h} ERP (RANSAC skipped)')
+            else:
+                print(f'  Panorama mode: {n_matched} matches on {pano_w}x{pano_h} ERP (too few for RANSAC)')
+
+            result = {
+                'kpts0':      np.array(kpts0_erp).flatten().tolist() if kpts0_erp else [],
+                'kpts1':      np.array(kpts1_erp).flatten().tolist() if kpts1_erp else [],
+                'matches':    matches.tolist(),
+                'confidence': confidence.tolist(),
+            }
+            with open(f'{data_path}/{bag_name}_matches.json', 'w') as f:
+                json.dump(result, f)
+
+            # Visualization on full ERP
+            canvas = np.concatenate([
+                cv2.cvtColor(cam_erp, cv2.COLOR_GRAY2BGR),
+                cv2.cvtColor(lid_erp, cv2.COLOR_GRAY2BGR),
+            ], axis=1)
+            kpts0_arr = np.array(kpts0_erp) if kpts0_erp else np.zeros((0, 2))
+            kpts1_arr = np.array(kpts1_erp) if kpts1_erp else np.zeros((0, 2))
+            conf_norm = confidence / max(confidence.max(), 1e-6)
+            cmap = matplotlib.cm.get_cmap('turbo')
+            for i, m in enumerate(matches):
+                if m < 0 or i >= len(kpts0_arr) or m >= len(kpts1_arr):
+                    continue
+                p0 = (int(kpts0_arr[i, 0]),     int(kpts0_arr[i, 1]))
+                p1 = (int(kpts1_arr[m, 0]) + W, int(kpts1_arr[m, 1]))
+                color = tuple(int(c) for c in (np.array(cmap(float(conf_norm[i]))) * 255)[:3])
+                cv2.line(canvas, p0, p1, color, 1)
+            cv2.imwrite(f'{data_path}/{bag_name}_superglue.png', canvas)
+            print(f'  Saved {bag_name}_superglue.png')
+            continue
+
+        # ── Crops mode (default) ──────────────────────────────────────────────
         global_kpts0, global_kpts1 = [], []
         global_matches, global_conf = [], []
         offset0, offset1 = 0, 0

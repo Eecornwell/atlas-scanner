@@ -134,21 +134,35 @@ def exact_match_calibration_tool(scan_dir):
     from camera_hw import calibration_path, cam_index_for_scan, camera_hw_for_session
     import yaml as _yaml
     _session_dir = os.path.dirname(scan_dir)
+    _session_hw = camera_hw_for_session(_session_dir)  # from session_config.json
+
+    # Resolve cam_index by serial when available (new .cam_index format written
+    # by main.cpp / main_multi.cpp).  For old no-serial .cam_index files the
+    # raw sdk_index (always 0 for single-camera) is returned — in that case
+    # use session_config.json's camera_hw directly rather than trusting the
+    # slot lookup, which would map sdk_index=0 → cam_0 (x5) incorrectly.
+    _ci_path = os.path.join(scan_dir, '.cam_index')
+    _ci_has_serial = False
+    try:
+        _ci_parts = open(_ci_path).read().strip().split()
+        _ci_has_serial = len(_ci_parts) >= 2
+    except OSError:
+        pass
     _cam_idx = cam_index_for_scan(scan_dir)
 
-    # Derive hw from the resolved slot in multi_camera.yaml (serial-based),
-    # not from session_config.json which only stores the primary camera hw.
-    _hw = camera_hw_for_session(_session_dir)  # fallback
-    try:
-        _src = os.path.join(os.path.dirname(__file__), '..')
-        _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
-        if os.path.exists(_mc_path):
-            _mc = _yaml.safe_load(open(_mc_path).read()) or {}
-            _slot_cfg = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
-            if _slot_cfg.get('camera_hw'):
-                _hw = _slot_cfg['camera_hw']
-    except Exception:
-        pass
+    # hw: use serial-resolved slot when available; fall back to session_config.json.
+    _hw = _session_hw
+    if _ci_has_serial:
+        try:
+            _src = os.path.join(os.path.dirname(__file__), '..')
+            _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
+            if os.path.exists(_mc_path):
+                _mc = _yaml.safe_load(open(_mc_path).read()) or {}
+                _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
+                if _slot_hw:
+                    _hw = _slot_hw
+        except Exception:
+            pass
 
     config_path = str(calibration_path(_hw, _cam_idx))
     with open(config_path, 'r') as f:

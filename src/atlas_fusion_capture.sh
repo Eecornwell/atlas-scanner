@@ -382,7 +382,7 @@ cleanup() {
         # All downstream tools respect the .blur_skip sentinel and skip marked scans.
         if [ "$FILTER_BLURRY_FRAMES" = "true" ] && [ "$SCAN_COUNT" -ge 4 ]; then
             echo "Filtering blurry frames..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/filter_blurry_scans.py" "$SCAN_DIR"
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/filter_blurry_scans.py" "$SCAN_DIR" --max-motion 0.3
         fi
 
         MERGED_FILE=""

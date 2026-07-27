@@ -42,7 +42,7 @@ ros2 launch livox_ros_driver2 rviz_MID360_launch.py
 
 Test Camera (in a new terminal):
 ```bash
-~/insta360-dev/build/insta360_capture
+~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture
 # Should print: Found camera: <serial>  ...  Camera session open
 # Ctrl+C to exit
 ```
@@ -318,7 +318,7 @@ bash ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
 ls -l /dev/insta
 
 # Verify camera connection (SDK daemon)
-~/insta360-dev/build/insta360_capture
+~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture
 # Should print: Found camera: <serial>  ...  Camera session open
 # Ctrl+C to exit
 
@@ -577,19 +577,13 @@ ls /usr/include/ins_stitcher.h  # MediaSDK 3.x header (was stitcher/stitcher.h i
 ### 3. Build insta360_capture and insta360_stitch
 
 ```bash
-mkdir -p ~/insta360-dev
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/livox_time_sync.cpp ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/CMakeLists.txt ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build.sh ~/insta360-dev/
-cd ~/insta360-dev && bash build.sh
+cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk && bash build.sh
 
 # Verify
-ls ~/insta360-dev/build/insta360_capture
-ls ~/insta360-dev/build/insta360_stitch
-ls ~/insta360-dev/build/insta360_reset_clock
-ls ~/insta360-dev/build/livox_time_sync
+ls ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture
+ls ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_stitch
+ls ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_reset_clock
+ls ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/livox_time_sync
 ```
 
 The `CMakeLists.txt` defaults to `~/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux`. If you extracted elsewhere:
@@ -602,9 +596,7 @@ set(CAMERA_SDK_DIR "/path/to/CameraSDK-20250812_192742-2.1.1-Linux")
 To rebuild after pulling repo updates:
 
 ```bash
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/main.cpp ~/insta360-dev/
-cp ~/atlas_ws/src/atlas-scanner/src/capture/sdk/stitch.cpp ~/insta360-dev/
-cd ~/insta360-dev && bash build.sh
+cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk && bash build.sh
 ```
 
 ### 4. Camera USB connection (One X2 and X5)
@@ -624,7 +616,7 @@ For the One X2, the USB Mode → Android setting is still required as before.
 ```bash
 cd ~/atlas_ws && source install/setup.bash
 sudo ~/atlas_ws/src/atlas-scanner/src/setup_camera_permissions.sh
-~/insta360-dev/build/insta360_capture
+~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture
 # Should print: Found camera: <serial>  ...  Camera session open
 # Ctrl+C to exit
 ```
