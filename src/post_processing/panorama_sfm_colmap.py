@@ -114,6 +114,47 @@ def _load_calibration(session_path=None):
     return T_camera_lidar
 
 
+def _load_calibration_for_scan(scan_dir, session_path):
+    """Load per-camera T_camera_lidar for a specific scan using .cam_index."""
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from camera_hw import (camera_hw_for_session, calibration_path,
+                           cam_index_for_scan)
+    session_hw = camera_hw_for_session(session_path)
+    cam_idx = cam_index_for_scan(scan_dir)
+
+    ci_path = scan_dir / '.cam_index'
+    hw = session_hw
+    ci_has_serial = False
+    try:
+        parts = ci_path.read_text().strip().split()
+        ci_has_serial = len(parts) >= 2
+    except OSError:
+        pass
+
+    if ci_has_serial:
+        mc_path = Path(__file__).resolve().parent.parent / 'config' / 'multi_camera.yaml'
+        if mc_path.exists():
+            try:
+                mc = yaml.safe_load(mc_path.read_text()) or {}
+                slot_hw = mc.get('cameras', {}).get(
+                    f'cam_{cam_idx}', {}).get('camera_hw', '')
+                if slot_hw:
+                    hw = slot_hw
+            except Exception:
+                pass
+
+    calib_path = calibration_path(hw, cam_idx)
+    with open(calib_path) as f:
+        calib = yaml.safe_load(f)
+    T = np.eye(4)
+    T[:3, :3] = R.from_euler(
+        'xyz', [calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']]
+    ).as_matrix()
+    T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    return T
+
+
 def _load_pose(scan_dir, T_camera_lidar):
     """Return (camera_center_colmap [3], R_c2w_colmap [3x3], R_c2w_ros [3x3]) or None."""
     traj_file = scan_dir / 'trajectory_icp_refined.json'
@@ -244,7 +285,8 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
                 continue
         if session_is_360 is None:
             session_is_360 = is_360
-        pose = _load_pose(scan_dir, T_camera_lidar)
+        T_scan = _load_calibration_for_scan(scan_dir, session_path)
+        pose = _load_pose(scan_dir, T_scan)
         if pose is None:
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
