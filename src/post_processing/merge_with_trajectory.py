@@ -29,31 +29,59 @@ def _safe_data(p) -> Path:
 
 
 def load_ply(ply_file):
-    """Load colored points from PLY, skipping uncolored (black) points"""
-    points = []
-    colors = []
-
+    """Load colored points from PLY (binary or ASCII), skipping uncolored (black) points."""
     safe = _safe_data(ply_file)
-    with open(safe, 'r') as f:
-        raw = f.read()
-    lines = raw.split(r'\n') if ('\n' not in raw and r'\n' in raw) else raw.splitlines()
+    with open(safe, 'rb') as f:
+        # Parse header as bytes
+        header_lines = []
+        while True:
+            line = f.readline().decode('ascii', errors='replace').rstrip()
+            header_lines.append(line)
+            if line.strip() == 'end_header':
+                break
+        header = '\n'.join(header_lines)
+        binary_le = 'binary_little_endian' in header
+        n_verts = int(next(l.split()[-1] for l in header_lines if l.startswith('element vertex')))
+        props = [l.split()[-1] for l in header_lines if l.startswith('property')]
 
-    header_end = next(i+1 for i, line in enumerate(lines) if line.strip() == 'end_header')
-    
-    for line in lines[header_end:]:
-        parts = line.strip().split()
-        if len(parts) >= 6:
-            try:
-                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                r, g, b = int(parts[3]), int(parts[4]), int(parts[5])
-                if r == 0 and g == 0 and b == 0:  # skip uncolored points
+        if binary_le:
+            # Build dtype from property declarations
+            type_map = {'float': '<f4', 'uchar': 'u1', 'int': '<i4', 'double': '<f8'}
+            dtype_fields = []
+            for l in header_lines:
+                if not l.startswith('property'):
                     continue
-                points.append([x, y, z])
-                colors.append([r, g, b])
-            except ValueError:
-                continue
-    
-    return np.array(points), np.array(colors)
+                parts = l.split()
+                t = type_map.get(parts[1], '<f4')
+                dtype_fields.append((parts[2], t))
+            dt = np.dtype(dtype_fields)
+            data = np.frombuffer(f.read(n_verts * dt.itemsize), dtype=dt)
+            pts = np.column_stack([data['x'].astype(np.float32),
+                                   data['y'].astype(np.float32),
+                                   data['z'].astype(np.float32)])
+            cols = np.column_stack([data['red'].astype(np.uint8),
+                                    data['green'].astype(np.uint8),
+                                    data['blue'].astype(np.uint8)])
+        else:
+            body = f.read().decode('ascii', errors='replace').splitlines()
+            pts_list, cols_list = [], []
+            for line in body:
+                parts = line.strip().split()
+                if len(parts) < 6:
+                    continue
+                try:
+                    pts_list.append([float(parts[0]), float(parts[1]), float(parts[2])])
+                    cols_list.append([int(parts[3]), int(parts[4]), int(parts[5])])
+                except ValueError:
+                    continue
+            pts  = np.array(pts_list,  dtype=np.float32)
+            cols = np.array(cols_list, dtype=np.uint8)
+
+    # Skip uncolored (black) points
+    if len(pts) and len(cols):
+        keep = cols.any(axis=1)
+        return pts[keep], cols[keep]
+    return pts, cols
 
 def merge_scans_simple(session_dir):
     """Simple merge without trajectory - just concatenate all scans"""
@@ -104,24 +132,25 @@ def merge_scans_simple(session_dir):
     return True
 
 def save_ply(output_file, points, colors):
-    """Save merged point cloud to PLY"""
+    """Save merged point cloud to binary PLY."""
     safe_out = _safe_data(output_file)
-    with open(safe_out, 'w') as f:
-        f.write('ply\n')
-        f.write('format ascii 1.0\n')
-        f.write(f'element vertex {len(points)}\n')
-        f.write('property float x\n')
-        f.write('property float y\n')
-        f.write('property float z\n')
-        f.write('property uchar red\n')
-        f.write('property uchar green\n')
-        f.write('property uchar blue\n')
-        f.write('end_header\n')
-        
-        for i in range(len(points)):
-            x, y, z = points[i]
-            r, g, b = colors[i]
-            f.write(f'{x:.6f} {y:.6f} {z:.6f} {r} {g} {b}\n')
+    n = len(points)
+    header = (
+        'ply\nformat binary_little_endian 1.0\n'
+        f'element vertex {n}\n'
+        'property float x\nproperty float y\nproperty float z\n'
+        'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n'
+    )
+    dt = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                   ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+    rec = np.empty(n, dtype=dt)
+    pts = np.asarray(points, dtype=np.float32)
+    cls = np.asarray(colors, dtype=np.uint8)
+    rec['x'] = pts[:, 0]; rec['y'] = pts[:, 1]; rec['z'] = pts[:, 2]
+    rec['r'] = cls[:, 0]; rec['g'] = cls[:, 1]; rec['b'] = cls[:, 2]
+    with open(safe_out, 'wb') as f:
+        f.write(header.encode())
+        f.write(rec.tobytes())
 
 def transform_points(points, position, orientation):
     """Transform points from sensor frame to world frame"""

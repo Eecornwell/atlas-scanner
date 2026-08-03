@@ -70,28 +70,39 @@ int main(int argc, char* argv[]) {
     stitcher.SetOutputPath(output_path);
     stitcher.SetOutputSize(erp_w, erp_h);
 
+    // Stitch type: INSTA360_STITCH_TYPE env var selects the algorithm.
+    //   0 = TEMPLATE      — pure geometric projection, no optical flow, no seam blending.
+    //                       Fastest; preserves raw lens geometry for calibration/PSNR work.
+    //   1 = OPTFLOW       — static optical flow at the seam.
+    //   2 = DYNAMICSTITCH — dynamic optical flow (previous default).
+    //   3 = AIFLOW        — AI-based (requires --ai and --model-dir).
+    // Default is TEMPLATE (0) so the output is a clean geometric stitch.
+    int stitch_type_int = 0;
+    if (auto* v = std::getenv("INSTA360_STITCH_TYPE"))
+        stitch_type_int = std::atoi(v);
     if (use_ai && !single_fisheye) {
         if (model_dir.empty()) {
             std::cerr << "--ai requires --model-dir or INSTA360_MODEL_DIR to be set" << std::endl;
             return 1;
         }
         stitcher.SetStitchType(ins::STITCH_TYPE::AIFLOW);
-        std::cout << "Stitch mode: AI (AIFLOW)" << std::endl;
+        std::cout << "Stitch mode: AIFLOW" << std::endl;
     } else {
-        stitcher.SetStitchType(ins::STITCH_TYPE::DYNAMICSTITCH);
-        if (single_fisheye) {
-            // Single fisheye: disable inter-lens optical flow and seam blending.
-            // SetStitchType(TEMPLATE) is ignored by the SDK for this camera model;
-            // instead disable fusion explicitly. The SDK still uses its internal
-            // DYNAMICSTITCH pipeline but with flow_estimator=null and fusion=OFF,
-            // which produces a clean geometric projection with only a fixed alpha
-            // feather at the seam (gradient <3 intensity units — negligible).
-            stitcher.EnableStitchFusion(false);
-            std::cout << "Stitch mode: DYNAMICSTITCH (single fisheye — fusion/flow disabled)" << std::endl;
-        } else {
-            std::cout << "Stitch mode: DYNAMICSTITCH" << std::endl;
+        ins::STITCH_TYPE stype;
+        const char* sname;
+        switch (stitch_type_int) {
+            case 1:  stype = ins::STITCH_TYPE::OPTFLOW;       sname = "OPTFLOW";       break;
+            case 2:  stype = ins::STITCH_TYPE::DYNAMICSTITCH; sname = "DYNAMICSTITCH"; break;
+            default: stype = ins::STITCH_TYPE::TEMPLATE;      sname = "TEMPLATE";      break;
         }
+        stitcher.SetStitchType(stype);
+        if (single_fisheye)
+            stitcher.EnableStitchFusion(false);
+        std::cout << "Stitch mode: " << sname
+                  << (single_fisheye ? " (single fisheye — fusion disabled)" : "") << std::endl;
     }
+    // FlowState = gyro-based automatic horizon leveling (EIS/stabilization).
+    // Always disabled — the LiDAR pose drives orientation, not the camera IMU.
     stitcher.EnableFlowState(false);
     stitcher.EnableCuda(false);
     stitcher.SetImageProcessingAccelType(ins::ImageProcessingAccel::kCPU);

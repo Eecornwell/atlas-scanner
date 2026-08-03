@@ -25,28 +25,53 @@ def _safe_data(p) -> Path:
 
 
 def load_ply_colored(path, max_pts=8000):
-    pts, cols = [], []
+    import numpy as np
     safe = _safe_data(path)
     with open(safe, 'rb') as f:
-        total = 0
+        header_lines = []
         while True:
-            line = f.readline().decode('ascii', errors='replace')
-            if 'end_header' in line:
+            line = f.readline().decode('ascii', errors='replace').rstrip()
+            header_lines.append(line)
+            if line.strip() == 'end_header':
                 break
-            if 'element vertex' in line:
-                total = int(line.split()[-1])
-        step = max(1, total // max_pts)
-        for i in range(total):
-            parts = f.readline().decode('ascii', errors='replace').split()
-            if i % step == 0 and len(parts) >= 6:
-                try:
-                    pts.append([float(parts[0]), float(parts[1]), float(parts[2])])
-                    cols.append([int(parts[3]) / 255.0,
-                                 int(parts[4]) / 255.0,
-                                 int(parts[5]) / 255.0])
-                except (ValueError, IndexError):
-                    pass
-    return np.array(pts) if pts else None, np.array(cols) if cols else None
+        binary_le = any('binary_little_endian' in l for l in header_lines)
+        total = int(next(l.split()[-1] for l in header_lines if l.startswith('element vertex')))
+
+        if binary_le:
+            type_map = {'float': '<f4', 'uchar': 'u1', 'int': '<i4', 'double': '<f8'}
+            dtype_fields = []
+            for l in header_lines:
+                if not l.startswith('property'):
+                    continue
+                parts = l.split()
+                dtype_fields.append((parts[2], type_map.get(parts[1], '<f4')))
+            dt = np.dtype(dtype_fields)
+            data = np.frombuffer(f.read(total * dt.itemsize), dtype=dt)
+            step = max(1, total // max_pts)
+            data = data[::step]
+            pts  = np.column_stack([data['x'].astype(np.float32),
+                                    data['y'].astype(np.float32),
+                                    data['z'].astype(np.float32)])
+            cols = np.column_stack([data['red'].astype(np.float32) / 255.0,
+                                    data['green'].astype(np.float32) / 255.0,
+                                    data['blue'].astype(np.float32) / 255.0])
+        else:
+            step = max(1, total // max_pts)
+            pts_list, cols_list = [], []
+            for i in range(total):
+                line = f.readline().decode('ascii', errors='replace').split()
+                if i % step == 0 and len(line) >= 6:
+                    try:
+                        pts_list.append([float(line[0]), float(line[1]), float(line[2])])
+                        cols_list.append([int(line[3]) / 255.0,
+                                          int(line[4]) / 255.0,
+                                          int(line[5]) / 255.0])
+                    except (ValueError, IndexError):
+                        pass
+            pts  = np.array(pts_list,  dtype=np.float32) if pts_list  else None
+            cols = np.array(cols_list, dtype=np.float32) if cols_list else None
+
+    return pts, cols
 
 
 def pose_from_trajectory(traj_file):

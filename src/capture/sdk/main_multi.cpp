@@ -22,6 +22,7 @@
 #include <camera/camera.h>
 #include <camera/device_discovery.h>
 #include <camera/photography_settings.h>
+#include <libusb-1.0/libusb.h>
 
 namespace fs = std::filesystem;
 
@@ -213,12 +214,65 @@ static bool apply_camera_settings(ins_camera::Camera* cam, int cam_idx) {
     return ok;
 }
 
-static void flush_usb_endpoints() {
-    // In multi-camera mode, flushing USB endpoints can interfere with the SDK's
-    // ability to discover and open subsequent cameras. The SDK's own Open()
-    // retry logic handles stale data adequately. Skip the flush entirely —
-    // it was only needed for single-camera recovery from unclean shutdowns,
-    // which the shell script's USB reset already handles.
+static void flush_usb_endpoints(const std::string& target_serial = "") {
+    // Only flush when opening a single specific camera — flushing all endpoints
+    // in multi-camera mode can interfere with cameras that are already open.
+    // When target_serial is empty (multi-camera), skip the flush.
+    if (target_serial.empty()) return;
+
+    libusb_context* ctx = nullptr;
+    if (libusb_init(&ctx) != 0) return;
+
+    static const uint16_t VID = 0x2e1a;
+    static const uint16_t PIDS[] = {0x0002, 0x1000, 0x0001, 0x0003};
+
+    libusb_device** devs = nullptr;
+    ssize_t cnt = libusb_get_device_list(ctx, &devs);
+    libusb_device_handle* handle = nullptr;
+
+    // When a serial is specified, try to match it via the string descriptor
+    // so we only flush the one camera we're about to open.
+    for (ssize_t i = 0; i < cnt && !handle; ++i) {
+        struct libusb_device_descriptor desc;
+        if (libusb_get_device_descriptor(devs[i], &desc) != 0) continue;
+        bool vid_match = desc.idVendor == VID;
+        bool pid_match = false;
+        for (auto pid : PIDS) { if (desc.idProduct == pid) { pid_match = true; break; } }
+        if (!vid_match || !pid_match) continue;
+        libusb_device_handle* h = nullptr;
+        if (libusb_open(devs[i], &h) != 0) continue;
+        char sn_buf[64] = {};
+        if (desc.iSerialNumber &&
+            libusb_get_string_descriptor_ascii(h, desc.iSerialNumber,
+                (unsigned char*)sn_buf, sizeof(sn_buf)) > 0 &&
+            target_serial == sn_buf) {
+            handle = h;
+        } else {
+            libusb_close(h);
+        }
+    }
+    if (devs) libusb_free_device_list(devs, 1);
+
+    if (!handle) { libusb_exit(ctx); return; }
+
+    if (libusb_kernel_driver_active(handle, 0) == 1)
+        libusb_detach_kernel_driver(handle, 0);
+    if (libusb_claim_interface(handle, 0) != 0) {
+        libusb_close(handle); libusb_exit(ctx); return;
+    }
+    unsigned char buf[16384];
+    int transferred = 0, drained = 0;
+    for (int i = 0; i < 512; ++i) {
+        int rc = libusb_bulk_transfer(handle, 0x81, buf, sizeof(buf), &transferred, 50);
+        if (rc == LIBUSB_ERROR_TIMEOUT || rc == LIBUSB_ERROR_NO_DEVICE || transferred == 0) break;
+        drained += transferred;
+    }
+    if (drained > 0)
+        LOG_OUT("Flushed " << drained << " stale bytes from USB endpoint (" << target_serial << ")");
+    libusb_release_interface(handle, 0);
+    libusb_close(handle);
+    libusb_exit(ctx);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 }
 
 // Parse INSTA360_CAMERA_SERIALS env var: comma-separated serial numbers.
@@ -319,6 +373,11 @@ int _main(int argc, char* argv[]) {
     std::set<std::string> opened_serials;
 
     if (!serial_filter.empty()) {
+        // When opening a single camera, flush its USB endpoint first to clear
+        // stale protocol bytes left by a previous unclean session.
+        if (serial_filter.size() == 1)
+            flush_usb_endpoints(serial_filter[0]);
+
         // Open cameras in the exact order specified by serial_filter
         for (size_t target_idx = 0; target_idx < serial_filter.size(); ++target_idx) {
             const std::string& target_sn = serial_filter[target_idx];
@@ -331,6 +390,12 @@ int _main(int argc, char* argv[]) {
                         << "': " << dev_list.size() << " device(s)");
                 for (size_t i = 0; i < dev_list.size(); ++i) {
                     std::string sn = sanitise(dev_list[i].serial_number);
+                    // Empty serial means the USB descriptor isn't readable yet
+                    // (device still re-enumerating after reset). Skip and retry.
+                    if (sn.empty()) {
+                        LOG_OUT("[discover]   [" << i << "] serial='' (not ready, will retry)");
+                        continue;
+                    }
                     LOG_OUT("[discover]   [" << i << "] serial='" << sn << "'"
                             << (opened_serials.count(sn) ? " (already opened)" : ""));
                     if (sn != target_sn) continue;
@@ -671,6 +736,16 @@ int _main(int argc, char* argv[]) {
 
                         auto url = slots[ci].cam->TakePhoto();
                         double t_after = now_sec();
+
+                        // OneX2 firmware occasionally returns NOT_CAPTURE after a
+                        // successful prior shot. One immediate retry usually recovers.
+                        if (url.Empty() || !url.IsSingleOrigin()) {
+                            LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed — retrying once");
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            t_before = now_sec();
+                            url = slots[ci].cam->TakePhoto();
+                            t_after = now_sec();
+                        }
                         cam_busy[ci].store(false);
 
                         if (url.Empty() || !url.IsSingleOrigin()) {
@@ -785,9 +860,21 @@ int _main(int argc, char* argv[]) {
             // within ~100ms of each other regardless of per-camera blocking time.
             fs::create_directories(trigger_content);
 
-            // Ensure download worker is running
+            // Ensure per-camera download workers are running (one thread per slot).
+            // Parallel workers eliminate the serial bottleneck where cam_1 and cam_2
+            // had to wait for cam_0's curl to finish before their downloads started.
             if (!dl_thread.joinable()) {
                 dl_stop.store(false);
+                // Per-camera queues so each camera downloads independently
+                static std::queue<DownloadJob> cam_dl_queues[MAX_CAMERAS];
+                static std::mutex             cam_dl_mutexes[MAX_CAMERAS];
+                static std::condition_variable cam_dl_cvs[MAX_CAMERAS];
+                for (int i = 0; i < MAX_CAMERAS; ++i)
+                    while (!cam_dl_queues[i].empty()) cam_dl_queues[i].pop();
+
+                // Redirect the shared dl_queue enqueue path: override dl_cv notify
+                // by launching a fan-out thread that reads the shared queue and
+                // routes each job to its camera's dedicated queue.
                 dl_thread = std::thread([&]() {
                     while (true) {
                         DownloadJob job;
@@ -798,20 +885,42 @@ int _main(int argc, char* argv[]) {
                             job = dl_queue.front();
                             dl_queue.pop();
                         }
-                        LOG_OUT("[dl] downloading cam[" << job.cam_idx << "] shot " << job.global_shot);
-                        bool ok = http_download(job.http_base, job.remote_path, job.local_path);
-                        if (ok) {
-                            LOG_OUT("[dl] saved: " << sanitise(fs::path(job.local_path).filename().string()));
-                            if (job.cam_idx < static_cast<int>(slots.size()))
-                                if (!slots[job.cam_idx].cam->DeleteCameraFile(job.remote_path))
-                                    LOG_ERR("[dl] delete failed: " << sanitise(fs::path(job.remote_path).filename().string()));
-                        } else {
-                            LOG_ERR("[dl] download FAILED: " << sanitise(fs::path(job.remote_path).filename().string()));
-                        }
-                        stat_dl_pending.fetch_sub(1);
-                        { std::ofstream pf(pending_path); pf << stat_dl_pending.load(); }
+                        int ci = std::max(0, std::min(job.cam_idx, MAX_CAMERAS - 1));
+                        { std::unique_lock<std::mutex> lk(cam_dl_mutexes[ci]); cam_dl_queues[ci].push(job); }
+                        cam_dl_cvs[ci].notify_one();
                     }
+                    // Drain: wake all per-camera workers so they can exit
+                    for (int i = 0; i < MAX_CAMERAS; ++i) cam_dl_cvs[i].notify_all();
                 });
+
+                // One download worker per camera slot
+                for (int ci = 0; ci < num_cameras; ++ci) {
+                    timer_threads.emplace_back([&, ci]() {
+                        while (true) {
+                            DownloadJob job;
+                            {
+                                std::unique_lock<std::mutex> lk(cam_dl_mutexes[ci]);
+                                cam_dl_cvs[ci].wait(lk, [&]{
+                                    return !cam_dl_queues[ci].empty() || dl_stop.load();
+                                });
+                                if (cam_dl_queues[ci].empty()) break;
+                                job = cam_dl_queues[ci].front();
+                                cam_dl_queues[ci].pop();
+                            }
+                            LOG_OUT("[dl] cam[" << ci << "] downloading shot " << job.global_shot);
+                            bool ok = http_download(job.http_base, job.remote_path, job.local_path);
+                            if (ok) {
+                                LOG_OUT("[dl] cam[" << ci << "] saved: " << sanitise(fs::path(job.local_path).filename().string()));
+                                if (!slots[ci].cam->DeleteCameraFile(job.remote_path))
+                                    LOG_ERR("[dl] cam[" << ci << "] delete failed: " << sanitise(fs::path(job.remote_path).filename().string()));
+                            } else {
+                                LOG_ERR("[dl] cam[" << ci << "] download FAILED: " << sanitise(fs::path(job.remote_path).filename().string()));
+                            }
+                            stat_dl_pending.fetch_sub(1);
+                            { std::ofstream pf(pending_path); pf << stat_dl_pending.load(); }
+                        }
+                    });
+                }
             }
 
             // Fire all cameras in parallel threads
@@ -861,6 +970,14 @@ int _main(int argc, char* argv[]) {
                     double t_after = now_sec();
 
                     if (url.Empty() || !url.IsSingleOrigin()) {
+                        LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed — retrying once");
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        t_before = now_sec();
+                        url = slots[ci].cam->TakePhoto();
+                        t_after = now_sec();
+                    }
+
+                    if (url.Empty() || !url.IsSingleOrigin()) {
                         LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed");
                         results[ci].ok = false;
                         return;
@@ -883,7 +1000,14 @@ int _main(int argc, char* argv[]) {
                     { std::ofstream cif(fs::path(cam_dir) / ".cam_index"); cif << ci << " " << slots[ci].serial; }
                     { std::ofstream ct(results[ci].local_path + ".capture_time");
                       ct << std::fixed << std::setprecision(6)
-                         << t_before << " " << t_after << " " << ci; }
+                         << t_shutter_stat << " " << t_after << " " << ci; }
+                    // Write shutter event directly to cam_dir so it lands in the
+                    // correct scan dir regardless of shot-number ordering.
+                    // write_shutter_event() uses shot index -> fusion_scan_{shot+1}
+                    // which is wrong when cameras fire out of cam-index order.
+                    { fs::path se_path = fs::path(cam_dir) / ("capture_" + std::to_string(shot) + ".shutter_event");
+                      std::ofstream se(se_path);
+                      se << std::fixed << std::setprecision(6) << t_shutter_stat << " " << ci; }
                 });
             }
 
@@ -922,10 +1046,11 @@ int _main(int argc, char* argv[]) {
     }
 
     timer_stop.store(true);
-    for (auto& t : timer_threads) { if (t.joinable()) t.join(); }
     dl_stop.store(true);
     dl_cv.notify_one();
+    // Wake all per-camera download CVs so stationary workers can exit
     if (dl_thread.joinable()) dl_thread.join();
+    for (auto& t : timer_threads) { if (t.joinable()) t.join(); }
 
     for (auto& slot : slots) {
         slot.cam->Close();

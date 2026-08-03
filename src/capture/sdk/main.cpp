@@ -502,10 +502,13 @@ int main(int argc, char* argv[]) {
             if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
                 LOG_ERR("SetPhotoSubMode failed (continuing)");
             LOG_OUT("Taking photo " << capture_index << "...");
+            double t_before = now_sec();  // shutter fires at TakePhoto() call entry
             auto url = cam->TakePhoto();
+            double t_after = now_sec();   // SD write complete
             if (url.Empty() || !url.IsSingleOrigin()) { std::ofstream ff(failed_path); ff << "fail"; continue; }
-            double host_t = now_sec();
-            write_shutter_event(session_dir, capture_index, host_t);
+            // Use t_before as shutter time — matches continuous path and
+            // reconstruct_from_bag.py expectation (parts[0] = shutter fires).
+            write_shutter_event(session_dir, capture_index, t_before);
             std::string remote_path = url.GetSingleOrigin();
             // Download directly to the scan dir (trigger_content = fusion_scan_NNN/)
             std::string local_path = trigger_content + "/" + fs::path(remote_path).filename().string();
@@ -515,8 +518,9 @@ int main(int argc, char* argv[]) {
             // correct multi_camera.yaml slot regardless of USB enumeration order.
             { std::ofstream ci(fs::path(trigger_content) / ".cam_index");
               ci << 0 << " " << sanitise(g_list[0].serial_number); }
+            // Format: t_before t_after 0  (matches main_multi.cpp convention)
             { std::ofstream ct(local_path + ".capture_time");
-              ct << std::fixed << std::setprecision(6) << host_t << " " << host_t << " 0"; }
+              ct << std::fixed << std::setprecision(6) << t_before << " " << t_after << " 0"; }
 
             // Signal pending=1 BEFORE done so shell waits for download to finish
             { std::ofstream pf(pending_path); pf << 1; }

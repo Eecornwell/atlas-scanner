@@ -40,7 +40,8 @@ import math
 _COV_CELL_SIZE        = 0.5
 _COV_HEIGHT_BANDS     = 3
 _COV_BAND_SIZE        = 0.4064  # 16" per band — fits the ~47" scanner extension range
-_COV_HEIGHT_ORIGIN    = 0.0     # Low: [0, 16")  Mid: [16", 32")  High: [32"+)
+_COV_HEIGHT_ORIGIN    = -0.4064 # Mid band: [-0.4064, 0)  so z_ref=0 lands in mid centre
+                                # Low: [z_ref-0.4064, z_ref)  Mid: [z_ref, z_ref+0.4064)  High: [z_ref+0.4064, z_ref+0.8128)
 _COV_MIN_VISITS       = 1
 _COV_BAND_LABELS      = ['Low', 'Mid', 'High']
 # Colour per number of covered bands (0..HEIGHT_BANDS)
@@ -60,8 +61,10 @@ _COV_COLOUR = {
 }
 
 def _cov_band(z: float, z_ref: float = 0.0) -> int:
+    # Subtract _COV_HEIGHT_ORIGIN so z==z_ref lands in the centre of the mid
+    # band rather than the bottom of the low band.
     return max(0, min(_COV_HEIGHT_BANDS - 1,
-                      int(math.floor((z - z_ref) / _COV_BAND_SIZE))))
+                      int(math.floor((z - z_ref - _COV_HEIGHT_ORIGIN) / _COV_BAND_SIZE))))
 
 
 class CoveragePanel:
@@ -93,7 +96,7 @@ class CoveragePanel:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        self._stats_var = tk.StringVar(value=f'Starting at low elevation — waiting for LiDAR perimeter…')
+        self._stats_var = tk.StringVar(value=f'Starting at mid elevation — waiting for LiDAR perimeter…')
         ttk.Label(parent, textvariable=self._stats_var,
                   font=('Consolas', 9)).grid(row=0, column=0, sticky=tk.W, padx=6, pady=(4, 0))
 

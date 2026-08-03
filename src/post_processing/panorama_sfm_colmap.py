@@ -738,6 +738,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--ImageReader.single_camera_per_folder', '1',
         '--ImageReader.camera_params', f'{f_px:.4f},{c:.1f},{c:.1f}',
         '--SiftExtraction.max_num_features', '32768',
+            '--SiftExtraction.estimate_affine_shape', '1',
     ]
     if any(mask_dir.rglob('*.png')):
         cmd += ['--ImageReader.mask_path', str(mask_dir)]

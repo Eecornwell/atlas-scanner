@@ -372,19 +372,37 @@ def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1)
         scan_blurs  = [scan_blurs[i]  for i in blur_kept]
         print(f"  Blur filter: kept {len(scan_dirs)}/{len(blur_kept) + (len(valid_scan_dirs) - len(blur_kept))} scans (threshold={min_blur:.0f})")
 
-    # Drop scans whose trajectory position is too close to an already-kept scan.
-    # Near-duplicate poses add no new geometry and produce degenerate baselines for
-    # Gaussian splatting. 10 cm is a safe minimum for a stationary scanner.
+    # Drop scans whose trajectory position is too close to an already-kept scan,
+    # but allow one scan per camera index at each physical position.
+    # In multi-camera mode cam0/cam1/cam2 are co-located by design — they carry
+    # different images and must all be kept. Only true duplicates (same camera,
+    # same position) are dropped.
     MIN_BASELINE_M = 0.10
+
+    def _cam_index(sd):
+        ci_path = sd / '.cam_index'
+        try:
+            return int(ci_path.read_text().strip().split()[0])
+        except Exception:
+            return -1
+
     kept_indices = []
-    kept_positions = []
+    # Track (position, cam_index) pairs already kept
+    kept_pos_cam = []  # list of (pos_array, cam_idx)
     for i, scan_dir in enumerate(scan_dirs):
         pos = load_trajectory_pose(scan_dir)[:3, 3]
-        if not kept_positions or min(np.linalg.norm(pos - p) for p in kept_positions) >= MIN_BASELINE_M:
-            kept_indices.append(i)
-            kept_positions.append(pos)
+        cam = _cam_index(scan_dir)
+        # A scan is a duplicate only if there is already a kept scan with the
+        # same camera index within MIN_BASELINE_M.
+        is_dup = any(
+            c == cam and np.linalg.norm(pos - p) < MIN_BASELINE_M
+            for p, c in kept_pos_cam
+        )
+        if is_dup:
+            print(f"  Skipping {scan_dir.name}: too close to an existing scan (< {MIN_BASELINE_M*100:.0f}cm, same camera)")
         else:
-            print(f"  Skipping {scan_dir.name}: too close to an existing scan (< {MIN_BASELINE_M*100:.0f}cm)")
+            kept_indices.append(i)
+            kept_pos_cam.append((pos, cam))
     scan_dirs   = [scan_dirs[i]   for i in kept_indices]
     lidar_files = [lidar_files[i] for i in kept_indices]
     ply_files   = [ply_files[i]   for i in kept_indices]

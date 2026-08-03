@@ -21,11 +21,9 @@ from nav_msgs.msg import Odometry
 CELL_SIZE        = 0.5   # XY metres per floor cell
 HEIGHT_BANDS     = 3     # number of Z bands (low / mid / high)
 HEIGHT_BAND_SIZE = 0.6   # metres per height band
-HEIGHT_ORIGIN    = -0.6  # Low: [-0.6,0.0)  Mid: [0.0,+0.6)  High: [+0.6,+1.2)
-                         # (mid elevation on the pole). With 0.6m bands:
-                         # Low:  z in [-0.9, -0.3) — pole lowered ~0.6m from start
-                         # Mid:  z in [-0.3, +0.3) — centred on starting height
-                         # High: z in [+0.3, +0.9) — pole raised ~0.6m from start
+HEIGHT_ORIGIN    = -0.9  # Low: [-0.9,-0.3)  Mid: [-0.3,+0.3)  High: [+0.3,+0.9)
+                         # z=0 (RKO-LIO start) is the centre of the mid band,
+                         # so the display starts at M regardless of small init drift.
 MIN_VISITS_PER_BAND = 2  # visits in a band before it counts as "covered"
 RENDER_INTERVAL  = 3.0   # seconds between redraws
 MAX_GRID_CELLS   = 50    # max display width/height in cells
@@ -73,10 +71,10 @@ class CoverageTracker(Node):
         self._smooth = (0.0, 0.0, 0.0)   # x, y, z (EMA-filtered)
         self._smooth_init = False            # first odom seeds the EMA
         self._display_cell = (0, 0)          # current marker cell (stable)
-        self._display_band = 0               # current height band (stable)
+        self._display_band = 1               # start at mid — z=0 is mid band centre
         self._candidate_cell = (0, 0)        # proposed new cell
         self._candidate_count = 0            # frames candidate has been consistent
-        self._candidate_band = 0             # proposed new height band
+        self._candidate_band = 1             # proposed new height band
         self._band_count = 0                 # frames band candidate consistent
         self._total_poses = 0
 
@@ -93,6 +91,12 @@ class CoverageTracker(Node):
         self._current = (p.x, p.y, p.z)
         self._total_poses += 1
 
+        # Coverage grid uses raw position (accurate for coverage accounting)
+        key = (int(math.floor(p.x / CELL_SIZE)), int(math.floor(p.y / CELL_SIZE)))
+        band = _height_band(p.z)
+        cell = self._grid.setdefault(key, {})
+        cell[band] = cell.get(band, 0) + 1
+
         # EMA smoothing for display position
         if not self._smooth_init:
             self._smooth = (p.x, p.y, p.z)
@@ -102,6 +106,7 @@ class CoverageTracker(Node):
             self._display_band = _height_band(p.z)
             self._candidate_band = self._display_band
             self._smooth_init = True
+            return  # first message fully committed — skip debounce logic below
         else:
             a = POS_ALPHA
             sx = self._smooth[0] * (1 - a) + p.x * a
@@ -124,8 +129,10 @@ class CoverageTracker(Node):
             self._candidate_cell = new_cell
             self._candidate_count = 1
 
-        # Stable height band: same consecutive-frame logic for Z
-        new_band = _height_band(sz)
+        # Stable height band: same consecutive-frame logic for Z.
+        # Use raw p.z (not EMA) so slow pole raises aren't swallowed by the
+        # aggressive XY smoothing alpha.
+        new_band = _height_band(p.z)
         if new_band == self._display_band:
             self._band_count = 0
         elif new_band == self._candidate_band:
@@ -136,13 +143,6 @@ class CoverageTracker(Node):
         else:
             self._candidate_band = new_band
             self._band_count = 1
-
-        # Coverage grid uses raw position (accurate for coverage accounting)
-        key = (int(math.floor(p.x / CELL_SIZE)), int(math.floor(p.y / CELL_SIZE)))
-        band = _height_band(p.z)
-
-        cell = self._grid.setdefault(key, {})
-        cell[band] = cell.get(band, 0) + 1
 
     def _render(self):
         if not self._grid:
@@ -199,7 +199,7 @@ class CoverageTracker(Node):
             f'',
             f'  @ = current pos  |  Cell {CELL_SIZE}m  |  Band height {HEIGHT_BAND_SIZE}m  |  '
             f'Min visits/band: {MIN_VISITS_PER_BAND}',
-            f'  Pos: ({self._smooth[0]:.1f}, {self._smooth[1]:.1f}, {self._smooth[2]:.1f}) m  '
+            f'  Pos: ({self._smooth[0]:.1f}, {self._smooth[1]:.1f}, {self._current[2]:.1f}) m  '
             f'Height band: {_BAND_LABELS[self._display_band]}  |  Poses: {self._total_poses}',
             f'  Cells: {total_cells}  |  Full ({HEIGHT_BANDS}-band): {full_cells} ({pct:.0f}%)  |  '
             f'Partial: {partial_cells}  |  Unvisited: {total_cells - full_cells - partial_cells}',

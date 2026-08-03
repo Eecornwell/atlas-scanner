@@ -14,8 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 # ─── User Configuration ────────────────────────────────────────────────────────
-CAMERA_MODE="dual_fisheye"        # dual_fisheye | single_fisheye
-CAPTURE_MODE="continuous"         # stationary | continuous
+CAMERA_MODE="single_fisheye"        # dual_fisheye | single_fisheye
+CAPTURE_MODE="stationary"         # stationary | continuous
 CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (continuous mode)
                                   # All cameras fire simultaneously, then you have this many
                                   # seconds to move before the next batch fires.
@@ -345,26 +345,34 @@ cleanup() {
                     done
                 fi
 
-                # SDK stitching: use MediaSDK for high-quality ERP from .insp files
-                echo "Converting fisheye images to ERP (SDK stitcher)..."
+                # SDK stitching: run all scans in parallel (one job per CPU core)
+                echo "Converting fisheye images to ERP (SDK stitcher, parallel)..."
+                _stitch_args=""
+                [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
+                [ "$USE_AI_STITCH" = "true" ] && _stitch_args="$_stitch_args --ai --model-dir $SCRIPT_DIR/capture/sdk/models"
+                _stitch_jobs=()
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
                     [ -d "$scan_dir" ] || continue
-                    # If we have a raw .insp file, stitch it directly
                     INSP_FILE=$(find "$scan_dir" -maxdepth 1 -name "*.insp" | head -1)
                     if [ -n "$INSP_FILE" ]; then
-                        _stitch_args=""
-                        [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
-                        if [ "$USE_AI_STITCH" = "true" ]; then
-                            _stitch_args="$_stitch_args --ai --model-dir $SCRIPT_DIR/capture/sdk/models"
+                        (
+                            "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
+                                --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
+                                $_stitch_args \
+                                || echo "  Warning: SDK stitch failed for $(basename $scan_dir)"
+                        ) &
+                        _stitch_jobs+=($!)
+                        # Limit parallelism to nproc so we don't thrash memory
+                        if [ ${#_stitch_jobs[@]} -ge "$(nproc)" ]; then
+                            wait "${_stitch_jobs[0]}"
+                            _stitch_jobs=("${_stitch_jobs[@]:1}")
                         fi
-                        "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
-                            --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
-                            $_stitch_args \
-                            || echo "  Warning: SDK stitch failed for $(basename $scan_dir), skipping"
                     else
                         echo "  Warning: No .insp file for $(basename $scan_dir), skipping"
                     fi
                 done
+                # Wait for remaining stitch jobs
+                [ ${#_stitch_jobs[@]} -gt 0 ] && wait "${_stitch_jobs[@]}"
                 # SDK stitcher handles seam blending internally, no need for blend_erp_seams
                 # Apply per-camera color normalization (if profiles exist)
                 if ls "$SCAN_DIR"/fusion_scan_*/.cam_index > /dev/null 2>&1; then
@@ -393,7 +401,7 @@ cleanup() {
             else
                 echo "Merging scans using trajectory poses..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/merge_with_trajectory.py" "$SCAN_DIR"
-                MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
+                [ -f "$SCAN_DIR/merged_pointcloud.ply" ] && MERGED_FILE="$SCAN_DIR/merged_pointcloud.ply"
                 if [ "$SAVE_E57" = "true" ] && [ -f "$MERGED_FILE" ]; then
                     python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/ply_to_e57.py" "$MERGED_FILE" "${MERGED_FILE%.ply}.e57"
                 fi
@@ -729,6 +737,16 @@ fi
 # EXCEPTION: Skip the reset if /dev/insta is already present AND no previous
 # session sentinel exists — this means the camera was just plugged in fresh
 # and resetting would trigger the USB mode selection prompt again.
+# Detect camera count now so the reset branch is correct even before the SDK
+# daemon startup block sets _USE_CAMERAS and _DETECTED_CAMERAS.
+_DETECTED_CAMERAS=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+if [ "$NUM_CAMERAS" -gt 0 ] 2>/dev/null; then
+    _USE_CAMERAS=$NUM_CAMERAS
+else
+    _USE_CAMERAS=$_DETECTED_CAMERAS
+fi
+[ "$_USE_CAMERAS" -gt 3 ] && _USE_CAMERAS=3
+[ "$_USE_CAMERAS" -lt 1 ] && _USE_CAMERAS=1
 if [ "${_USE_CAMERAS:-1}" -gt 1 ]; then
     # Multi-camera: reset each camera by its serial-pinned /dev/insta_<SERIAL> symlink.
     # This is reliable regardless of USB enumeration order, unlike the old approach
@@ -754,7 +772,30 @@ except Exception as e:
         echo "  ⚠ No /dev/insta_<SERIAL> symlinks found — udev rules may need reload"
         echo "  Run: sudo udevadm control --reload-rules && sudo udevadm trigger"
     fi
-    sleep 5
+    # Wait for all reset cameras to re-enumerate before starting the SDK daemon.
+    # A flat sleep is unreliable — the OneX2 takes longer than X5/X3 to come back.
+    echo "Waiting for cameras to re-enumerate..."
+    _enum_timeout=30
+    for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+        _devnode="/dev/insta_${_serial}"
+        [ -e "$_devnode" ] || continue  # skip cameras that weren't reset
+        _w=0
+        while [ $_w -lt $_enum_timeout ]; do
+            # Device is ready when udev has re-created the symlink AND
+            # the USB configuration value is non-zero (interface claimed by firmware)
+            _busdev=$(udevadm info --query=path --name="$(readlink -f "$_devnode" 2>/dev/null)" 2>/dev/null | grep -oP '[0-9]+-[0-9.]+$')
+            _cfg=$(cat "/sys/bus/usb/devices/${_busdev}/bConfigurationValue" 2>/dev/null | tr -d '[:space:]')
+            [ -n "$_cfg" ] && [ "$_cfg" != "0" ] && break
+            sleep 1; _w=$((_w + 1))
+        done
+        if [ $_w -ge $_enum_timeout ]; then
+            echo "  ⚠ $_serial did not re-enumerate within ${_enum_timeout}s"
+        else
+            echo "  ✓ $_serial ready (${_w}s)"
+        fi
+    done
+    # Extra settle time for firmware HTTP server to become ready
+    sleep 3
     echo "✓ USB reset complete ($_reset_count cameras)"
 elif [ "${CAMERA_HW:-onex2}" = "x5" ] || [ "${_DETECTED_CAMERAS:-0}" -gt 1 ]; then
     if [ -f /tmp/.insta360_session_ran ]; then
@@ -1019,19 +1060,48 @@ for i in range(3):
     echo "Waiting for SDK camera session..."
     _sdk_timeout=120
     [ "$_USE_CAMERAS" -gt 1 ] && _sdk_timeout=180
+    _sdk_early_exit=0
     for _i in $(seq 1 $_sdk_timeout); do
         [ -f "$SCAN_DIR/.sdk_ready" ] && break
         if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
-            echo "✗ SDK capture daemon exited — check $SCAN_DIR/sdk_capture.log"
-            exit 1
+            echo "✗ SDK capture daemon exited early (stale USB data) — force-resetting and retrying..."
+            _sdk_early_exit=1
+            break
         fi
         sleep 1
     done
     if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
-        echo "✗ SDK camera session timed out — force-resetting camera and retrying once..."
+        echo "✗ SDK camera session timed out or exited — force-resetting camera and retrying once..."
         kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
         wait $SDK_CAPTURE_PID 2>/dev/null || true
-        _usb_force_reset_camera
+        # Reset all cameras in multi-camera mode, not just /dev/insta (X5)
+        if [ "${_USE_CAMERAS:-1}" -gt 1 ]; then
+            for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+                _devnode="/dev/insta_${_serial}"
+                [ -e "$_devnode" ] || continue
+                sudo python3 -c "
+import fcntl, sys
+USBDEVFS_RESET = 0x5514
+try:
+    with open('$_devnode', 'wb') as f: fcntl.ioctl(f, USBDEVFS_RESET, 0)
+except Exception as e: pass
+" 2>/dev/null || true
+            done
+            # Wait for re-enumeration
+            for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+                _devnode="/dev/insta_${_serial}"
+                [ -e "$_devnode" ] || continue
+                for _w in $(seq 1 20); do
+                    _busdev=$(udevadm info --query=path --name="$(readlink -f "$_devnode" 2>/dev/null)" 2>/dev/null | grep -oP '[0-9]+-[0-9.]+$')
+                    _cfg=$(cat "/sys/bus/usb/devices/${_busdev}/bConfigurationValue" 2>/dev/null | tr -d '[:space:]')
+                    [ -n "$_cfg" ] && [ "$_cfg" != "0" ] && break
+                    sleep 1
+                done
+            done
+            sleep 3
+        else
+            _usb_force_reset_camera
+        fi
         rm -f "$SCAN_DIR/.sdk_ready"
         # One retry after force reset
         INSTA360_SESSION_DIR="$SCAN_DIR" \
@@ -1318,35 +1388,15 @@ else
         done
         [ -z "$CAPTURE_EXIT_CODE" ] && { echo "  SDK capture timed out"; CAPTURE_EXIT_CODE=1; }
 
-        if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-            # Wait for background downloads to deliver .insp files
-            for _dw in $(seq 1 600); do
-                _pending=$(cat "$SCAN_DIR/.sdk_downloads_pending" 2>/dev/null | tr -d '[:space:]')
-                [ "${_pending:-1}" = "0" ] && break
-                sleep 0.1
-            done
-            # Report which cameras succeeded
-            for _cam_shot in $(seq 1 $_num_shots); do
-                _cam_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cam_shot - 1)))"
-                _insp=$(ls "$_cam_dir"/*.insp 2>/dev/null | head -1)
-                if [ -n "$_insp" ]; then
-                    echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
-                else
-                    echo "  ✗ cam_$((_cam_shot-1)) capture failed"
-                    CAPTURE_EXIT_CODE=1
-                fi
-            done
-        fi
-
-        # Collect LiDAR for the first scan dir, then copy to all camera scan dirs
+        # Collect LiDAR immediately — don't wait for downloads first.
+        # Downloads run in background inside the SDK daemon; LiDAR collection
+        # is independent and overlapping them saves the full download time (~15-30s).
         INDIVIDUAL_SCAN_DIR="$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"
         if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-            # Collect LiDAR point cloud from live topics
             FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
             ROS_DISABLE_LOANED_MESSAGES=1 \
             timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
                 "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
-            # Copy LiDAR PLY to all other camera scan dirs for this position
             if [ $_num_shots -gt 1 ]; then
                 for _cs in $(seq 2 $_num_shots); do
                     _other_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cs - 1)))"
@@ -1358,6 +1408,32 @@ else
             fi
         fi
 
+        # Now wait for downloads (running in background during LiDAR collection above)
+        if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
+            for _dw in $(seq 1 600); do
+                _pending=$(cat "$SCAN_DIR/.sdk_downloads_pending" 2>/dev/null | tr -d '[:space:]')
+                [ "${_pending:-1}" = "0" ] && break
+                sleep 0.1
+            done
+            _failed_cams=0
+            _primary_failed=0
+            for _cam_shot in $(seq 1 $_num_shots); do
+                _cam_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cam_shot - 1)))"
+                _insp=$(ls "$_cam_dir"/*.insp 2>/dev/null | head -1)
+                if [ -n "$_insp" ]; then
+                    echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
+                else
+                    echo "  ⚠ cam_$((_cam_shot-1)) capture failed (continuing with remaining cameras)"
+                    _failed_cams=$((_failed_cams + 1))
+                    [ $((_cam_shot - 1)) -eq 0 ] && _primary_failed=1
+                fi
+            done
+            if [ "$_primary_failed" -eq 1 ] || [ "$_failed_cams" -eq "$_num_shots" ]; then
+                echo "  ✗ Primary camera or all cameras failed"
+                CAPTURE_EXIT_CODE=1
+            fi
+        fi
+
 
         # Stop rosbag — send SIGINT to the setsid process group so zstd compressor flushes cleanly
         if kill -0 $ROSBAG_PID 2>/dev/null; then
@@ -1366,32 +1442,38 @@ else
             else
                 kill -INT $ROSBAG_PID
             fi
+            # Wait for recorder process to exit (it exits before zstd finishes)
             for _i in $(seq 1 20); do
                 kill -0 $ROSBAG_PID 2>/dev/null || break
                 sleep 0.5
             done
+            # Wait for zstd compressor child to finish BEFORE sending SIGKILL.
+            # The recorder exits after handing off to zstd; zstd runs as a child
+            # of the setsid process group and may still be writing when the
+            # recorder process is gone. Poll the .zstd file size until stable
+            # (5 consecutive unchanged readings = done) before killing the group.
+            for _zstd in "$ROSBAG_DIR"/*.zstd; do
+                [ -f "$_zstd" ] || continue
+                _prev=0; _stable=0
+                for _si in $(seq 1 240); do
+                    _cur=$(stat -c%s "$_zstd" 2>/dev/null || echo 0)
+                    if [ "$_cur" = "$_prev" ] && [ "$_cur" -gt 0 ]; then
+                        _stable=$((_stable + 1))
+                        [ "$_stable" -ge 5 ] && break
+                    else
+                        _stable=0
+                    fi
+                    _prev=$_cur; sleep 0.5
+                done
+            done
+            # Now safe to kill the process group (zstd is done or timed out)
             if kill -0 $ROSBAG_PID 2>/dev/null; then
                 [ -n "$ROSBAG_PGID" ] && kill -KILL -$ROSBAG_PGID 2>/dev/null || kill -KILL $ROSBAG_PID 2>/dev/null
+            elif [ -n "$ROSBAG_PGID" ]; then
+                kill -KILL -$ROSBAG_PGID 2>/dev/null || true
             fi
             wait $ROSBAG_PID 2>/dev/null || true
         fi
-        # Wait for zstd compressor to finish flushing after the bag recorder exits.
-        # With --compression-mode file, files are named *.db3.zstd (no plain .db3).
-        # Poll all .zstd files until they stop growing.
-        for _zstd in "$ROSBAG_DIR"/*.zstd; do
-            [ -f "$_zstd" ] || continue
-            _prev=0; _stable=0
-            for _si in $(seq 1 120); do
-                _cur=$(stat -c%s "$_zstd" 2>/dev/null || echo 0)
-                if [ "$_cur" = "$_prev" ] && [ "$_cur" -gt 0 ]; then
-                    _stable=$((_stable + 1))
-                    [ "$_stable" -ge 3 ] && break
-                else
-                    _stable=0
-                fi
-                _prev=$_cur; sleep 0.5
-            done
-        done
         # Also remove any leftover uncompressed .db3 files
         for _db3 in "$ROSBAG_DIR"/*.db3; do
             [ -f "$_db3" ] || continue
@@ -1408,17 +1490,29 @@ else
         # Use the shutter event time written by the SDK daemon (midpoint estimate)
         # rather than time.time() here, which is taken after TakePhoto() returns.
         if [ "$LIO_ENABLED" = "true" ] && [ "$TRAJECTORY_RECORDING" = "true" ]; then
-            # Read shutter time from the first camera's shutter_event file
-            _shutter_event=$(ls "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"/capture_*.shutter_event 2>/dev/null | head -1)
-            if [ -n "$_shutter_event" ]; then
-                CAPTURE_TIMESTAMP=$(awk '{print $1}' "$_shutter_event" 2>/dev/null)
-            fi
-            # Fallback to current time if shutter event not yet written
-            [ -z "$CAPTURE_TIMESTAMP" ] && CAPTURE_TIMESTAMP=$(python3 -c "import time; print(time.time())")
+            # Use each camera's own shutter event for its trajectory timestamp.
+            # Cameras fire in parallel and may get shot numbers out of cam-index
+            # order, so sharing cam_0's timestamp for all scans gives wrong poses.
             for _scan_idx in $(seq $_first_scan $SCAN_COUNT); do
                 _traj_name="fusion_scan_$(printf "%03d" $_scan_idx)"
                 _traj_dir="$SCAN_DIR/$_traj_name"
-                echo "{\"scan_name\": \"$_traj_name\", \"scan_dir\": \"$_traj_dir\", \"capture_time\": $CAPTURE_TIMESTAMP}" \
+                # Match shutter event to this scan's own camera index.
+                # In stationary multi-camera mode the SDK writes the global-shot-
+                # indexed shutter event into the wrong scan dir (race on the shot
+                # counter), so a dir can contain events from other cameras.
+                # Read .cam_index and pick the event whose second field matches.
+                _cam_idx=$(awk '{print $1}' "$_traj_dir/.cam_index" 2>/dev/null)
+                _se=""
+                if [ -n "$_cam_idx" ]; then
+                    _se=$(grep -rl "^[0-9.]* ${_cam_idx}$" "$_traj_dir"/capture_*.shutter_event 2>/dev/null | head -1)
+                fi
+                [ -z "$_se" ] && _se=$(ls "$_traj_dir"/capture_*.shutter_event 2>/dev/null | head -1)
+                if [ -n "$_se" ]; then
+                    _cam_ts=$(awk '{print $1}' "$_se" 2>/dev/null)
+                else
+                    _cam_ts=$(python3 -c "import time; print(time.time())")
+                fi
+                echo "{\"scan_name\": \"$_traj_name\", \"scan_dir\": \"$_traj_dir\", \"capture_time\": $_cam_ts}" \
                     > "$SCAN_DIR/.save_trajectory_${_traj_name}"
             done
             echo "✓ Trajectory trigger saved for $_num_shots scan(s)"

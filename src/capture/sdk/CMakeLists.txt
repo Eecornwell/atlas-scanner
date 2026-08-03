@@ -55,9 +55,9 @@ set_target_properties(insta360_stitch PROPERTIES
 # Multi-camera capture daemon (supports 1-3 cameras with alternating shutter)
 add_executable(insta360_capture_multi main_multi.cpp)
 target_include_directories(insta360_capture_multi PRIVATE
-    ${CAMERA_SDK_DIR}/include /usr/include)
+    ${CAMERA_SDK_DIR}/include /usr/include ${LIBUSB_INCLUDE_DIRS})
 target_link_directories(insta360_capture_multi PRIVATE ${CAMERA_SDK_DIR}/lib /usr/lib)
-target_link_libraries(insta360_capture_multi PRIVATE CameraSDK)
+target_link_libraries(insta360_capture_multi PRIVATE CameraSDK ${LIBUSB_LIBRARIES})
 set_target_properties(insta360_capture_multi PROPERTIES
     BUILD_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"
     INSTALL_RPATH "${CAMERA_SDK_DIR}/lib;/usr/lib"

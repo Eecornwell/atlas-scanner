@@ -250,15 +250,24 @@ def exact_match_calibration_tool(scan_dir):
         except ValueError as e:
             print(f"Error: write_ply path rejected: {e}")
             return
-        with open(safe_path, 'w') as f:
-            f.write('ply\nformat ascii 1.0\n')
-            f.write(f'element vertex {len(pts)}\n')
-            f.write('property float x\nproperty float y\nproperty float z\n')
-            f.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
-            for i in range(len(pts)):
-                x, y, z = pts[i]
-                r, g, b = cols[i]
-                f.write(f'{x:.6f} {y:.6f} {z:.6f} {int(r)} {int(g)} {int(b)}\n')
+        n = len(pts)
+        header = (
+            'ply\nformat binary_little_endian 1.0\n'
+            f'element vertex {n}\n'
+            'property float x\nproperty float y\nproperty float z\n'
+            'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n'
+        )
+        # Pack as struct-of-arrays: 3×float32 + 3×uint8 per point.
+        # numpy structured array gives a single tobytes() call instead of
+        # N string-format + N write() calls (300k points: ~50× faster).
+        dt = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                       ('r', 'u1'), ('g', 'u1'), ('b', 'u1')])
+        rec = np.empty(n, dtype=dt)
+        rec['x'] = pts[:, 0]; rec['y'] = pts[:, 1]; rec['z'] = pts[:, 2]
+        rec['r'] = cols[:, 0]; rec['g'] = cols[:, 1]; rec['b'] = cols[:, 2]
+        with open(safe_path, 'wb') as f:
+            f.write(header.encode())
+            f.write(rec.tobytes())
 
     sensor_output = str(_safe_data(safe_scan / "sensor_colored_exact.ply"))
     write_ply(sensor_output, valid_points, colors)
