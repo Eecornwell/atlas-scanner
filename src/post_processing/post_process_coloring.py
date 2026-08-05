@@ -98,7 +98,17 @@ def post_process_session_coloring(session_dir, use_exact=False):
     method = "exact match" if use_exact else "original method"
     print(f"Post-processing coloring for {len(scan_dirs)} scans using {method} (parallel)...")
 
-    n_workers = min(len(scan_dirs), os.cpu_count() or 4)
+    # Cap workers by available RAM — each ProcessPoolExecutor worker loads one
+    # decoded ERP (H*W*4 bytes for masked PNG) plus scipy KDTree intermediates
+    # (~3x the ERP size). Use at most 50% of available RAM for coloring workers.
+    import psutil as _psutil
+    _probe_erp = next(session_path.glob('fusion_scan_*/equirect_*_masked.png'), None) or \
+                 next(session_path.glob('fusion_scan_*/equirect_*.jpg'), None)
+    # Estimate decoded size from file size: masked PNGs compress ~4:1 from raw RGBA
+    _erp_bytes = (os.path.getsize(_probe_erp) * 4 * 4) if _probe_erp else (11520 * 5760 * 4 * 4)
+    _avail = _psutil.virtual_memory().available
+    _mem_workers = max(1, int(_avail * 0.5 / _erp_bytes))
+    n_workers = min(len(scan_dirs), os.cpu_count() or 4, _mem_workers)
     success_count = 0
 
     if use_exact:

@@ -1320,23 +1320,37 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             (scan_dir / '.cam_index').write_text('0')
 
         scan_count += 1
-        # In SDK stitch mode, warn if the scanner was moving at shutter time.
-        # The SDK ERP is gravity-aligned by the camera's own IMU (FlowState/EIS),
-        # which applies a rotation correction that does NOT match the LiDAR motion
-        # compensation. At high angular velocity the EIS correction diverges from
-        # the LiDAR sensor frame, causing colour-to-geometry misalignment.
+        # In SDK stitch mode, warn if the scanner was moving during TakePhoto().
+        # The ERP is integrated over the full [t_before, t_after] window — if the
+        # scanner rotates significantly during that time the ERP content won't match
+        # the sensor_lidar.ply geometry (which is frozen to t_before via motion comp).
         motion_warn = ''
-        if sdk_stitch and imu_msgs:
-            _gyro_samples = [np.linalg.norm([m.angular_velocity.x,
-                                             m.angular_velocity.y,
-                                             m.angular_velocity.z])
-                             for ts, m in imu_msgs if abs(ts - centre) <= 0.3]
-            if _gyro_samples:
-                _gyro_mean = float(np.mean(_gyro_samples))
-                if _gyro_mean > 0.3:
-                    motion_warn = f'  ⚠ HIGH MOTION at shutter ({_gyro_mean:.2f} rad/s) — ERP/LiDAR misalignment likely'
-                elif _gyro_mean > 0.1:
-                    motion_warn = f'  ⚠ motion at shutter ({_gyro_mean:.2f} rad/s)'
+        if sdk_stitch and odom_msgs:
+            # Read t_after from the capture_time sidecar to get the full TakePhoto() window.
+            _t_after_host = None
+            for _ct_f in sorted(scan_dir.glob('*.insp.capture_time')):
+                try:
+                    _parts = _ct_f.read_text().strip().split()
+                    if len(_parts) >= 2:
+                        _t_after_host = float(_parts[1])
+                    break
+                except Exception:
+                    pass
+            if _t_after_host is not None:
+                _t_after_livox = _t_after_host - _host_to_livox_offset
+                _odom_times = np.array([ts for ts, _ in odom_msgs])
+                if centre >= _odom_times[0] and _t_after_livox <= _odom_times[-1]:
+                    _ps, _qs = interp_pose(odom_msgs, centre)
+                    _pe, _qe = interp_pose(odom_msgs, min(_t_after_livox, _odom_times[-1]))
+                    _dpos = float(np.linalg.norm(_pe - _ps))
+                    _dangle = float(np.degrees(np.linalg.norm(
+                        (Rotation.from_quat(_qs).inv() * Rotation.from_quat(_qe)).as_rotvec())))
+                    _latency = _t_after_host - (centre + _host_to_livox_offset)
+                    if _dangle > 15.0:
+                        motion_warn = (f'  ✗ MOVED DURING CAPTURE: {_dangle:.0f}deg / {_dpos:.2f}m'
+                                       f' over {_latency:.1f}s — ERP will not match LiDAR')
+                    elif _dangle > 5.0:
+                        motion_warn = f'  ⚠ moved during capture: {_dangle:.0f}deg / {_dpos:.2f}m over {_latency:.1f}s'
         print(f"  ✓ {scan_name}: {len(all_points)} pts  "
               f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s{motion_warn}")
 
@@ -1479,9 +1493,31 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _model_dir = os.environ.get('INSTA360_MODEL_DIR', '')
                     if _ai and _model_dir:
                         _stitch_cmd += ['--ai', '--model-dir', _model_dir]
+                    # Resolve per-slot ERP resolution from multi_camera.yaml so
+                    # each camera stitches at its own native resolution rather
+                    # than inheriting the primary camera's (session-level) dims.
+                    _stitch_env = os.environ.copy()
+                    try:
+                        from camera_hw import load_camera_profile, cam_index_for_scan
+                        import yaml as _yaml2
+                        _mc_path2 = str(Path(__file__).resolve().parents[1] / 'config' / 'multi_camera.yaml')
+                        _slot_hw2 = None
+                        if os.path.exists(_mc_path2):
+                            _mc2 = _yaml2.safe_load(open(_mc_path2).read()) or {}
+                            _ci2 = cam_index_for_scan(scan_dir)
+                            _slot_hw2 = _mc2.get('cameras', {}).get(f'cam_{_ci2}', {}).get('camera_hw', '')
+                        if _slot_hw2:
+                            _prof2 = load_camera_profile(_slot_hw2)
+                            _stitch_env['INSTA360_ERP_WIDTH']  = str(_prof2.get('erp_width',  5760))
+                            _stitch_env['INSTA360_ERP_HEIGHT'] = str(_prof2.get('erp_height', 2880))
+                            print(f"    stitch: cam_{_ci2} ({_slot_hw2}) "
+                                  f"{_stitch_env['INSTA360_ERP_WIDTH']}x{_stitch_env['INSTA360_ERP_HEIGHT']}")
+                    except Exception as _e:
+                        pass  # fall back to inherited env
                     result = subprocess.run(
                         _stitch_cmd,
                         capture_output=True,
+                        env=_stitch_env,
                     )
                     if result.returncode == 0 and erp_path.exists():
                         # Skip legacy WB correction in multi-camera sessions —

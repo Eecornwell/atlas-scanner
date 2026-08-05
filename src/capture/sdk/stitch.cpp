@@ -72,12 +72,12 @@ int main(int argc, char* argv[]) {
 
     // Stitch type: INSTA360_STITCH_TYPE env var selects the algorithm.
     //   0 = TEMPLATE      — pure geometric projection, no optical flow, no seam blending.
-    //                       Fastest; preserves raw lens geometry for calibration/PSNR work.
-    //   1 = OPTFLOW       — static optical flow at the seam.
-    //   2 = DYNAMICSTITCH — dynamic optical flow (previous default).
+    //                       Fastest; preserves raw lens geometry but shows hard seam ghosting.
+    //   1 = OPTFLOW       — DIS (Dense Inverse Search) static optical flow at the seam. Best quality.
+    //   2 = DYNAMICSTITCH — dynamic optical flow (recomputed per-frame). Similar speed to OPTFLOW.
     //   3 = AIFLOW        — AI-based (requires --ai and --model-dir).
-    // Default is TEMPLATE (0) so the output is a clean geometric stitch.
-    int stitch_type_int = 0;
+    // Default is OPTFLOW (1): best seam quality at the same cost as DYNAMICSTITCH.
+    int stitch_type_int = 1;
     if (auto* v = std::getenv("INSTA360_STITCH_TYPE"))
         stitch_type_int = std::atoi(v);
     if (use_ai && !single_fisheye) {

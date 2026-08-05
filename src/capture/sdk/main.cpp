@@ -286,6 +286,17 @@ int main(int argc, char* argv[]) {
     if (!apply_camera_settings(cam))
         LOG_ERR("Failed to apply settings — continuing with defaults");
 
+    // Register shutter callback. is_capture=true fires when the sensor opens,
+    // before SD write, giving a more accurate shutter time than t_before.
+    std::atomic<double> t_shutter_callback{0.0};
+    std::atomic<bool>   shutter_fired{false};
+    cam->SetCaptureStateNotification([&](bool is_capture) {
+        if (is_capture) {
+            t_shutter_callback.store(now_sec());
+            shutter_fired.store(true);
+        }
+    });
+
     g_http_base = cam->GetHttpBaseUrl();
     LOG_OUT("HTTP base: " << sanitise(g_http_base));
 
@@ -441,6 +452,7 @@ int main(int argc, char* argv[]) {
                             << std::fixed << std::setprecision(1)
                             << (host_t - t_start) << "s");
 
+                    shutter_fired.store(false);
                     double t_before = now_sec();
 
                     // TakePhoto blocks until shutter fires + SD write (~3-9s on X5).
@@ -464,13 +476,19 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    // t_before = shutter fires (TakePhoto call entry).
-                    // t_after  = SD write complete (used only for latency diagnostics).
-                    double t_shutter = t_before;
-                    LOG_OUT("[continuous] shot " << shot
-                            << " TakePhoto latency: "
-                            << std::fixed << std::setprecision(3)
-                            << (t_after - t_before) << "s");
+                    // Use callback shutter time if it fired; fall back to midpoint.
+                    double t_shutter;
+                    if (shutter_fired.load()) {
+                        t_shutter = t_shutter_callback.load();
+                        LOG_OUT("[continuous] shot " << shot << " latency: "
+                                << std::fixed << std::setprecision(3)
+                                << (t_after - t_before) << "s  shutter_cb=" << std::setprecision(6) << t_shutter);
+                    } else {
+                        t_shutter = t_before + (t_after - t_before) * 0.5;
+                        LOG_OUT("[continuous] shot " << shot << " latency: "
+                                << std::fixed << std::setprecision(3)
+                                << (t_after - t_before) << "s  shutter_est(fallback)=" << std::setprecision(6) << t_shutter);
+                    }
                     write_shutter_event(session_dir, shot, t_shutter);
                     { std::unique_lock<std::mutex> lk(timer_mutex); timer_timestamps.push_back(t_shutter); }
 
@@ -502,13 +520,23 @@ int main(int argc, char* argv[]) {
             if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
                 LOG_ERR("SetPhotoSubMode failed (continuing)");
             LOG_OUT("Taking photo " << capture_index << "...");
-            double t_before = now_sec();  // shutter fires at TakePhoto() call entry
+            shutter_fired.store(false);
+            double t_before = now_sec();
             auto url = cam->TakePhoto();
-            double t_after = now_sec();   // SD write complete
+            double t_after = now_sec();
             if (url.Empty() || !url.IsSingleOrigin()) { std::ofstream ff(failed_path); ff << "fail"; continue; }
-            // Use t_before as shutter time — matches continuous path and
-            // reconstruct_from_bag.py expectation (parts[0] = shutter fires).
-            write_shutter_event(session_dir, capture_index, t_before);
+            // Use callback shutter time if it fired; fall back to midpoint.
+            double t_shutter_stat;
+            if (shutter_fired.load()) {
+                t_shutter_stat = t_shutter_callback.load();
+                LOG_OUT("Shutter callback: " << std::fixed << std::setprecision(6) << t_shutter_stat
+                        << "  latency=" << std::setprecision(3) << (t_after - t_before) << "s");
+            } else {
+                t_shutter_stat = t_before + (t_after - t_before) * 0.5;
+                LOG_OUT("Shutter est(fallback): " << std::fixed << std::setprecision(6) << t_shutter_stat
+                        << "  latency=" << std::setprecision(3) << (t_after - t_before) << "s");
+            }
+            write_shutter_event(session_dir, capture_index, t_shutter_stat);
             std::string remote_path = url.GetSingleOrigin();
             // Download directly to the scan dir (trigger_content = fusion_scan_NNN/)
             std::string local_path = trigger_content + "/" + fs::path(remote_path).filename().string();
@@ -518,9 +546,9 @@ int main(int argc, char* argv[]) {
             // correct multi_camera.yaml slot regardless of USB enumeration order.
             { std::ofstream ci(fs::path(trigger_content) / ".cam_index");
               ci << 0 << " " << sanitise(g_list[0].serial_number); }
-            // Format: t_before t_after 0  (matches main_multi.cpp convention)
+            // Format: t_shutter t_after 0  (matches main_multi.cpp convention)
             { std::ofstream ct(local_path + ".capture_time");
-              ct << std::fixed << std::setprecision(6) << t_before << " " << t_after << " 0"; }
+              ct << std::fixed << std::setprecision(6) << t_shutter_stat << " " << t_after << " 0"; }
 
             // Signal pending=1 BEFORE done so shell waits for download to finish
             { std::ofstream pf(pending_path); pf << 1; }

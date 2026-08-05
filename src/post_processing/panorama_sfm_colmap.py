@@ -235,10 +235,7 @@ def _tile_size_for_erp(erp_w):
     to avoid upsampling (which causes grain/blur)."""
     px_per_deg_equator = erp_w / 360.0
     px_per_deg_edge = px_per_deg_equator * np.cos(np.radians(FOV_DEG / 2))
-    max_tile = int(px_per_deg_edge * FOV_DEG)
-    # Round down to nearest power of 2 for GPU-friendly sizes
-    p = int(2 ** int(np.log2(max_tile)))
-    return max(512, min(2048, p))
+    return max(512, int(px_per_deg_edge * FOV_DEG))
 
 
 def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LANCZOS4):
@@ -322,10 +319,27 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     print(f"  Kept {len(panoramas)} panoramas after baseline filter")
 
     _probe_img = cv2.imread(str(panoramas[0]['erp_src']), cv2.IMREAD_UNCHANGED)
-    tile_size = _tile_size_for_erp(_probe_img.shape[1]) if _probe_img is not None else 1024
-    f_px = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
+    _default_tile_size = _tile_size_for_erp(_probe_img.shape[1]) if _probe_img is not None else 1024
+    _default_f_px = _default_tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
     print(f"  ERP width: {_probe_img.shape[1] if _probe_img is not None else '?'}px "
-          f"-> tile_size: {tile_size}px  f_px: {f_px:.1f}")
+          f"-> tile_size: {_default_tile_size}px  f_px: {_default_f_px:.1f}")
+
+    # Canonical tile size per face: the smallest native tile size among all
+    # panoramas. This avoids upsampling lower-res cameras (X3) to match
+    # higher-res ones (X5), while keeping single_camera_per_folder valid
+    # (all tiles in a face folder must be the same dimensions).
+    # Downsampling X5 tiles to X3 size is lossless in information terms.
+    from collections import Counter
+    _all_erp_widths = []
+    for p in panoramas:
+        img_probe = cv2.imread(str(p['erp_src']), cv2.IMREAD_UNCHANGED)
+        if img_probe is not None:
+            _all_erp_widths.append(img_probe.shape[1])
+    _canonical_tile_size = _tile_size_for_erp(min(_all_erp_widths)) if _all_erp_widths else _default_tile_size
+    _canonical_f_px = _canonical_tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
+    if _canonical_tile_size != _default_tile_size:
+        print(f"  Mixed ERP widths detected: canonical tile_size={_canonical_tile_size}px "
+              f"f_px={_canonical_f_px:.1f} (using smallest to avoid upsampling)")
 
     for pano_idx, pano in enumerate(panoramas, start=1):
         erp_img = cv2.imread(str(pano['erp_src']), cv2.IMREAD_UNCHANGED)
@@ -333,6 +347,12 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         if erp_img is not None and erp_img.ndim == 3 and erp_img.shape[2] == 4:
             erp_mask = erp_img[:, :, 3]
             erp_img = erp_img[:, :, :3]
+
+        # All tiles use the canonical size so single_camera_per_folder is valid.
+        # X5 tiles are downsampled to canonical (no information loss).
+        # X3 tiles are already at or below canonical (no upsampling).
+        tile_size = _canonical_tile_size
+        f_px = _canonical_f_px
 
         # Apply a seam exclusion strip to the mask. The dual-fisheye stitch seam
         # runs vertically at the left/right ERP edges (u=0 and u=W, which wrap).
@@ -387,6 +407,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
 def write_rig_config(colmap_dir, panoramas):
     """Write rig_config.json for rig_configurator CLI."""
+    # All tiles use the canonical size so f_px and c are uniform across faces.
     f_px = panoramas[0]['f_px']
     c = panoramas[0]['tile_size'] / 2.0
 
@@ -725,6 +746,10 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     if db_path.exists():
         db_path.unlink()
 
+    # Use the canonical f_px (derived from the smallest ERP width) as the
+    # prior for all cameras. All tiles are the same size so single_camera_per_folder
+    # works correctly — one camera model per face, shared across all panoramas.
+    # canonical f_px and tile_size are stored on every panorama by extract_tiles
     f_px = panoramas[0]['f_px']
     c = panoramas[0]['tile_size'] / 2.0
 

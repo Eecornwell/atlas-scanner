@@ -26,6 +26,27 @@ def _safe_data(p) -> Path:
     return resolved
 
 
+def _stitch_env_for_cam(cam_idx: int) -> dict:
+    """Return os.environ copy with INSTA360_ERP_WIDTH/HEIGHT set to the
+    per-slot camera's native resolution from multi_camera.yaml."""
+    import os, yaml as _y
+    env = os.environ.copy()
+    try:
+        mc_path = _SRC / 'config' / 'multi_camera.yaml'
+        if mc_path.exists():
+            mc = _y.safe_load(mc_path.read_text()) or {}
+            slot_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '')
+            if slot_hw:
+                hw_yaml = _SRC / 'config' / 'camera_models' / f'{slot_hw}.yaml'
+                if hw_yaml.exists():
+                    hw_cfg = _y.safe_load(hw_yaml.read_text()) or {}
+                    env['INSTA360_ERP_WIDTH']  = str(hw_cfg.get('erp_width',  5760))
+                    env['INSTA360_ERP_HEIGHT'] = str(hw_cfg.get('erp_height', 2880))
+    except Exception:
+        pass
+    return env
+
+
 def load_color_profile(camera_hw: str, cam_index: int) -> dict | None:
     """Load a pre-calibrated color profile for a specific camera.
     
@@ -167,6 +188,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             result = subprocess.run(
                 [str(stitch_bin), str(insp_file), str(clean_erp)],
                 capture_output=True,
+                env=_stitch_env_for_cam(cam_idx),
             )
             if result.returncode == 0 and clean_erp.exists():
                 cam_scans.setdefault(cam_idx, []).append((scan_dir, clean_erp))
@@ -293,6 +315,7 @@ def normalize_session(session_dir: str):
             result = subprocess.run(
                 [str(stitch_bin), str(insp_file), str(clean_erp)],
                 capture_output=True,
+                env=_stitch_env_for_cam(cam_idx),
             )
             if result.returncode == 0 and clean_erp.exists():
                 img = cv2.imread(str(clean_erp))

@@ -298,6 +298,12 @@ struct CameraSlot {
     std::string         http_base;
     int                 index = 0;
     bool                active = false;
+    // Shutter timestamp from SetCaptureStateNotification(is_capture=true).
+    // Fires when the sensor opens — before SD write — eliminating USB
+    // command round-trip latency (~50-200ms) from the t_before estimate.
+    // Heap-allocated so CameraSlot remains movable for std::vector.
+    std::shared_ptr<std::atomic<double>> t_shutter_callback{std::make_shared<std::atomic<double>>(0.0)};
+    std::shared_ptr<std::atomic<bool>>   shutter_fired{std::make_shared<std::atomic<bool>>(false)};
 };
 
 struct DownloadJob {
@@ -529,6 +535,16 @@ int _main(int argc, char* argv[]) {
             LOG_OUT("Camera [" << slot.index << "] " << slot.serial << " configured OK");
         else
             LOG_OUT("Camera [" << slot.index << "] " << slot.serial << " configured with warnings");
+        // Register shutter callback. is_capture=true fires when the sensor
+        // opens (before SD write), giving a more accurate shutter time than
+        // t_before which includes USB command round-trip latency (~50-200ms).
+        slot.cam->SetCaptureStateNotification(
+            [&slot](bool is_capture) {
+                if (is_capture) {
+                    slot.t_shutter_callback->store(now_sec());
+                    slot.shutter_fired->store(true);
+                }
+            });
     }
 
     int num_cameras = static_cast<int>(slots.size());
@@ -730,6 +746,9 @@ int _main(int argc, char* argv[]) {
 
                         cam_busy[ci].store(true);
                         double t_before = now_sec();
+                        // Clear the callback flag before calling TakePhoto() so we
+                        // can detect a fresh is_capture=true for this specific shot.
+                        slots[ci].shutter_fired->store(false);
 
                         LOG_OUT("[cam" << ci << "] taking shot " << shot_num << " at t+"
                                 << std::fixed << std::setprecision(1) << (t_before - t_start) << "s");
@@ -742,6 +761,7 @@ int _main(int argc, char* argv[]) {
                         if (url.Empty() || !url.IsSingleOrigin()) {
                             LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed — retrying once");
                             std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                            slots[ci].shutter_fired->store(false);
                             t_before = now_sec();
                             url = slots[ci].cam->TakePhoto();
                             t_after = now_sec();
@@ -753,14 +773,20 @@ int _main(int argc, char* argv[]) {
                             continue;
                         }
 
-                        double t_latency = t_after - t_before;
-                        // Best estimate of actual shutter time: midpoint of TakePhoto() call.
-                        // t_before is the call entry; the sensor fires somewhere in the middle.
-                        // Using the midpoint halves the worst-case error vs using t_before alone.
-                        double t_shutter_est = t_before + t_latency * 0.5;
-                        LOG_OUT("[cam" << ci << "] shot " << shot_num
-                                << " latency: " << std::fixed << std::setprecision(3)
-                                << t_latency << "s  shutter_est=" << std::setprecision(6) << t_shutter_est);
+                        // Use the callback shutter time if it fired; fall back to
+                        // midpoint estimate if the callback didn't arrive (e.g. older fw).
+                        double t_shutter_est;
+                        if (slots[ci].shutter_fired->load()) {
+                            t_shutter_est = slots[ci].t_shutter_callback->load();
+                            LOG_OUT("[cam" << ci << "] shot " << shot_num
+                                    << " latency: " << std::fixed << std::setprecision(3)
+                                    << (t_after - t_before) << "s  shutter_cb=" << std::setprecision(6) << t_shutter_est);
+                        } else {
+                            t_shutter_est = t_before + (t_after - t_before) * 0.5;
+                            LOG_OUT("[cam" << ci << "] shot " << shot_num
+                                    << " latency: " << std::fixed << std::setprecision(3)
+                                    << (t_after - t_before) << "s  shutter_est(fallback)=" << std::setprecision(6) << t_shutter_est);
+                        }
                         write_shutter_event(session_dir, shot_num, t_shutter_est, ci);
 
                         std::string remote_path = url.GetSingleOrigin();
@@ -770,7 +796,7 @@ int _main(int argc, char* argv[]) {
                         {
                             std::unique_lock<std::mutex> lk(dl_mutex);
                             dl_queue.push({shot_num, ci, slots[ci].http_base,
-                                          remote_path, local_path, t_before, t_after});
+                                          remote_path, local_path, t_shutter_est, t_after});
                         }
                         dl_cv.notify_one();
                     }
@@ -965,6 +991,7 @@ int _main(int argc, char* argv[]) {
                     fs::create_directories(cam_dir);
 
                     LOG_OUT("[stat] cam[" << ci << "] firing shot " << shot << "...");
+                    slots[ci].shutter_fired->store(false);
                     double t_before = now_sec();
                     auto url = slots[ci].cam->TakePhoto();
                     double t_after = now_sec();
@@ -972,6 +999,7 @@ int _main(int argc, char* argv[]) {
                     if (url.Empty() || !url.IsSingleOrigin()) {
                         LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed — retrying once");
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        slots[ci].shutter_fired->store(false);
                         t_before = now_sec();
                         url = slots[ci].cam->TakePhoto();
                         t_after = now_sec();
@@ -984,16 +1012,21 @@ int _main(int argc, char* argv[]) {
                     }
 
                     results[ci].ok = true;
-                    double t_latency_stat = t_after - t_before;
-                    double t_shutter_stat = t_before + t_latency_stat * 0.5;
+                    double t_shutter_stat;
+                    if (slots[ci].shutter_fired->load()) {
+                        t_shutter_stat = slots[ci].t_shutter_callback->load();
+                        LOG_OUT("[stat] cam[" << ci << "] shot " << shot
+                                << " latency: " << std::fixed << std::setprecision(3)
+                                << (t_after - t_before) << "s  shutter_cb=" << std::setprecision(6) << t_shutter_stat);
+                    } else {
+                        t_shutter_stat = t_before + (t_after - t_before) * 0.5;
+                        LOG_OUT("[stat] cam[" << ci << "] shot " << shot
+                                << " latency: " << std::fixed << std::setprecision(3)
+                                << (t_after - t_before) << "s  shutter_est(fallback)=" << std::setprecision(6) << t_shutter_stat);
+                    }
                     results[ci].t_shutter = t_shutter_stat;
                     results[ci].remote_path = url.GetSingleOrigin();
                     results[ci].local_path = cam_dir + "/" + fs::path(results[ci].remote_path).filename().string();
-
-                    LOG_OUT("[stat] cam[" << ci << "] shot " << shot
-                            << " latency: " << std::fixed << std::setprecision(3)
-                            << t_latency_stat << "s  shutter_est=" << std::setprecision(6) << t_shutter_stat);
-
                     write_shutter_event(session_dir, shot, t_shutter_stat, ci);
 
                     // Write cam_index and capture_time immediately

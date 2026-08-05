@@ -30,7 +30,7 @@ CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
 COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
 FILTER_BLURRY_FRAMES=true         # remove bottom 20% of scans by sharpness before merge/ICP/COLMAP
-USE_AI_STITCH=false                # use AIFLOW stitching (better seam quality); false = DYNAMICSTITCH (optical flow, no model needed)
+USE_AI_STITCH=false                # use AIFLOW stitching (better seam quality, requires model); false = OPTFLOW (best seam quality, no model needed)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
 while [[ $# -gt 0 ]]; do
@@ -355,9 +355,25 @@ cleanup() {
                     [ -d "$scan_dir" ] || continue
                     INSP_FILE=$(find "$scan_dir" -maxdepth 1 -name "*.insp" | head -1)
                     if [ -n "$INSP_FILE" ]; then
+                        # Resolve per-slot ERP resolution from multi_camera.yaml
+                        # so each camera stitches at its own native resolution.
+                        _slot_w="$INSTA360_ERP_WIDTH"
+                        _slot_h="$INSTA360_ERP_HEIGHT"
+                        if [ -f "$scan_dir/.cam_index" ] && [ -f "$_MULTI_CAM_YAML" ]; then
+                            _ci=$(awk '{print $1}' "$scan_dir/.cam_index" 2>/dev/null)
+                            _slot_hw=$(python3 -c "
+import yaml, sys
+d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
+print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
+" "$_ci" 2>/dev/null)
+                            if [ -n "$_slot_hw" ] && [ -f "$_CAM_MODEL_DIR/${_slot_hw}.yaml" ]; then
+                                _slot_w=$(python3 -c "import yaml; d=yaml.safe_load(open('$_CAM_MODEL_DIR/${_slot_hw}.yaml')); print(d.get('erp_width', $_slot_w))" 2>/dev/null || echo "$_slot_w")
+                                _slot_h=$(python3 -c "import yaml; d=yaml.safe_load(open('$_CAM_MODEL_DIR/${_slot_hw}.yaml')); print(d.get('erp_height', $_slot_h))" 2>/dev/null || echo "$_slot_h")
+                            fi
+                        fi
                         (
                             "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
-                                --width "$INSTA360_ERP_WIDTH" --height "$INSTA360_ERP_HEIGHT" \
+                                --width "$_slot_w" --height "$_slot_h" \
                                 $_stitch_args \
                                 || echo "  Warning: SDK stitch failed for $(basename $scan_dir)"
                         ) &

@@ -150,19 +150,19 @@ def exact_match_calibration_tool(scan_dir):
         pass
     _cam_idx = cam_index_for_scan(scan_dir)
 
-    # hw: use serial-resolved slot when available; fall back to session_config.json.
+    # hw: use serial-resolved slot when available; fall back to multi_camera.yaml
+    # by cam_index alone (index is correct even without serial), then session hw.
     _hw = _session_hw
-    if _ci_has_serial:
-        try:
-            _src = os.path.join(os.path.dirname(__file__), '..')
-            _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
-            if os.path.exists(_mc_path):
-                _mc = _yaml.safe_load(open(_mc_path).read()) or {}
-                _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
-                if _slot_hw:
-                    _hw = _slot_hw
-        except Exception:
-            pass
+    try:
+        _src = os.path.join(os.path.dirname(__file__), '..')
+        _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
+        if os.path.exists(_mc_path):
+            _mc = _yaml.safe_load(open(_mc_path).read()) or {}
+            _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
+            if _slot_hw:
+                _hw = _slot_hw
+    except Exception:
+        pass
 
     config_path = str(calibration_path(_hw, _cam_idx))
     with open(config_path, 'r') as f:

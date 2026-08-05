@@ -119,7 +119,16 @@ def regenerate_masked_images(session_dir, camera_mode="dual_fisheye", sdk_stitch
         return n
 
     scan_dirs = sorted(session_path.glob("fusion_scan_*"))
-    n_workers = min(len(scan_dirs) or 1, 8)
+    # Cap workers by available RAM — each worker holds one decoded ERP
+    # (read: H*W*3 bytes) plus the RGBA output (H*W*4 bytes).
+    # Use at most 40% of available RAM for this step.
+    import psutil as _psutil
+    _probe_path = next(session_path.glob('fusion_scan_*/equirect_*.jpg'), None)
+    # Estimate decoded size: JPEG compresses ~30:1 from raw RGB; read+write = *2
+    _erp_bytes = (os.path.getsize(_probe_path) * 30 * 2) if _probe_path else (11520 * 5760 * 7)
+    _avail = _psutil.virtual_memory().available
+    _mem_workers = max(1, int(_avail * 0.4 / _erp_bytes))
+    n_workers = min(len(scan_dirs) or 1, 8, _mem_workers)
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         count = sum(pool.map(_process_scan, scan_dirs))
     print(f"\u2713 Regenerated {count} masked images from blended ERPs")

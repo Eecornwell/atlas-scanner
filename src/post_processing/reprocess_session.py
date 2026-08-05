@@ -28,7 +28,7 @@ def _safe_data(p) -> Path:
 
 
 def _stitch_scan(scan_dir: Path, camera_mode: str, erp_width: int, erp_height: int) -> bool:
-    """Stitch .insp → equirect_dual_fisheye.jpg if not already present."""
+    """Stitch .insp -> equirect_dual_fisheye.jpg if not already present."""
     erp = scan_dir / 'equirect_dual_fisheye.jpg'
     if erp.exists():
         return True
@@ -36,15 +36,34 @@ def _stitch_scan(scan_dir: Path, camera_mode: str, erp_width: int, erp_height: i
     if insp is None:
         return False
     if not _STITCH_BIN.exists():
-        print(f"  ⚠ insta360_stitch not found at {_STITCH_BIN}")
+        print(f"  \u26a0 insta360_stitch not found at {_STITCH_BIN}")
         return False
+    # Resolve per-slot ERP resolution from multi_camera.yaml so each camera
+    # stitches at its own native resolution, not the session primary's.
+    slot_w, slot_h = erp_width, erp_height
+    try:
+        import yaml as _y
+        ci_file = scan_dir / '.cam_index'
+        cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
+        mc_path = Path(__file__).resolve().parents[1] / 'config' / 'multi_camera.yaml'
+        if mc_path.exists():
+            mc = _y.safe_load(mc_path.read_text()) or {}
+            slot_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '')
+            if slot_hw:
+                hw_yaml = mc_path.parent / 'camera_models' / f'{slot_hw}.yaml'
+                if hw_yaml.exists():
+                    hw_cfg = _y.safe_load(hw_yaml.read_text()) or {}
+                    slot_w = hw_cfg.get('erp_width',  erp_width)
+                    slot_h = hw_cfg.get('erp_height', erp_height)
+    except Exception:
+        pass
     cmd = [str(_STITCH_BIN), str(insp), str(erp),
-           '--width', str(erp_width), '--height', str(erp_height)]
+           '--width', str(slot_w), '--height', str(slot_h)]
     if camera_mode == 'single_fisheye':
         cmd.append('--single')
     env = os.environ.copy()
-    env['INSTA360_ERP_WIDTH']  = str(erp_width)
-    env['INSTA360_ERP_HEIGHT'] = str(erp_height)
+    env['INSTA360_ERP_WIDTH']  = str(slot_w)
+    env['INSTA360_ERP_HEIGHT'] = str(slot_h)
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     return result.returncode == 0 and erp.exists()
 
