@@ -122,34 +122,40 @@ def apply_color_profile(img_bgr: np.ndarray, profile: dict) -> np.ndarray:
 
 def compute_profile_from_images(ref_img: np.ndarray, src_img: np.ndarray) -> dict:
     """Compute a color profile that transforms src to match ref.
-    
-    Uses a conservative diagonal CCM (white balance correction only)
-    clamped to reasonable bounds to prevent overcorrection when cameras
-    see slightly different scene content.
+
+    Uses LAB space only:
+      - L_gain: multiplicative luminance correction (ref_L / src_L)
+      - a/b offsets: additive color cast correction (ref_ab - src_ab)
+
+    RGB CCM is intentionally not used — cameras at different physical positions
+    see different scene content even in the shared pixel region, making
+    per-channel RGB ratios scene-dependent rather than camera-dependent.
+    LAB a/b offsets are scene-independent because they measure the color cast
+    of the sensor/white-balance, not the scene reflectance.
     """
-    # Compute channel means over valid (non-black) pixels
     ref_mask = ref_img.max(axis=2) > 20
     src_mask = src_img.max(axis=2) > 20
-    if not ref_mask.any() or not src_mask.any():
+    shared = ref_mask & src_mask
+    if not shared.any():
         return {'ccm': np.eye(3, dtype=np.float32),
                 'gain_lab': np.array([1.0, 1.0, 1.0], dtype=np.float32),
                 'offset_lab': np.array([0.0, 0.0, 0.0], dtype=np.float32),
                 'gamma': np.array([1.0, 1.0, 1.0], dtype=np.float32)}
 
-    # RGB channel means (BGR -> RGB)
-    ref_rgb = ref_img[ref_mask].astype(np.float32).mean(axis=0)[::-1]
-    src_rgb = src_img[src_mask].astype(np.float32).mean(axis=0)[::-1]
+    ref_lab = cv2.cvtColor(ref_img, cv2.COLOR_BGR2LAB).astype(np.float32)
+    src_lab = cv2.cvtColor(src_img, cv2.COLOR_BGR2LAB).astype(np.float32)
 
-    # Diagonal CCM: simple white balance correction
-    # Clamp gains to [0.8, 1.2] to prevent extreme overcorrection
-    diag = np.clip(ref_rgb / np.maximum(src_rgb, 1e-6), 0.8, 1.2)
-    ccm = np.diag(diag).astype(np.float32)
+    ref_L = float(ref_lab[:, :, 0][shared].mean())
+    src_L = float(src_lab[:, :, 0][shared].mean())
+    L_gain = np.clip(ref_L / max(src_L, 1e-6), 0.7, 1.5)
 
-    # No LAB offset — it's too aggressive for non-colocated cameras
+    a_off = float(ref_lab[:, :, 1][shared].mean() - src_lab[:, :, 1][shared].mean())
+    b_off = float(ref_lab[:, :, 2][shared].mean() - src_lab[:, :, 2][shared].mean())
+
     return {
-        'ccm': ccm,
-        'gain_lab': np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        'offset_lab': np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        'ccm': np.eye(3, dtype=np.float32),
+        'gain_lab': np.array([L_gain, 1.0, 1.0], dtype=np.float32),
+        'offset_lab': np.array([0.0, a_off, b_off], dtype=np.float32),
         'gamma': np.array([1.0, 1.0, 1.0], dtype=np.float32),
     }
 
@@ -178,6 +184,8 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
 
     for scan_dir in sorted(session_path.glob('fusion_scan_*')):
         if not scan_dir.is_dir():
+            continue
+        if (scan_dir / '.blur_skip').exists() or (scan_dir / '.corrupt_bag').exists():
             continue
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
@@ -222,9 +230,9 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
 
         print(f"\nComputing profile for cam_{cam_idx} ({len(scans)} images)...")
 
-        # Use up to 5 image pairs for robust statistics
+        # Use up to 20 image pairs for robust statistics; reject outliers
         profiles = []
-        for src_dir, src_erp in scans[:10]:
+        for src_dir, src_erp in scans[:20]:
             # Find closest reference image by scan index
             src_num = int(src_dir.name.split('_')[-1])
             best_ref = min(ref_images, key=lambda r: abs(int(r[0].name.split('_')[-1]) - src_num))
@@ -242,24 +250,25 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             p = compute_profile_from_images(ref_img, src_img)
             profiles.append(p)
 
-            if len(profiles) >= 5:
-                break
-
         if not profiles:
             print(f"  No valid image pairs found for cam_{cam_idx}")
             continue
 
-        # Average the profiles
+        # Median across all pairs — robust to outlier pairs where cameras
+        # see very different scene content despite being co-located in time.
         avg_profile = {
             'gain_lab': np.median([p['gain_lab'] for p in profiles], axis=0),
             'offset_lab': np.median([p['offset_lab'] for p in profiles], axis=0),
             'ccm': np.median([p['ccm'] for p in profiles], axis=0),
             'gamma': np.array([1.0, 1.0, 1.0], dtype=np.float32),
         }
-
-        print(f"  LAB gain: [{avg_profile['gain_lab'][0]:.3f}, {avg_profile['gain_lab'][1]:.3f}, {avg_profile['gain_lab'][2]:.3f}]")
-        print(f"  LAB offset: [{avg_profile['offset_lab'][0]:.2f}, {avg_profile['offset_lab'][1]:.2f}, {avg_profile['offset_lab'][2]:.2f}]")
-        print(f"  CCM diag: [{avg_profile['ccm'][0,0]:.3f}, {avg_profile['ccm'][1,1]:.3f}, {avg_profile['ccm'][2,2]:.3f}]")
+        # Log per-pair values so outliers are visible
+        L_gains = [p['gain_lab'][0] for p in profiles]
+        b_offs  = [p['offset_lab'][2] for p in profiles]
+        print(f"  Per-pair L_gain: {['{:.3f}'.format(v) for v in L_gains]}")
+        print(f"  Per-pair b_off:  {['{:.2f}'.format(v) for v in b_offs]}")
+        print(f"  L_gain: {avg_profile['gain_lab'][0]:.3f}")
+        print(f"  offset_lab (L,a,b): [{avg_profile['offset_lab'][0]:.2f}, {avg_profile['offset_lab'][1]:.2f}, {avg_profile['offset_lab'][2]:.2f}]")
 
         save_color_profile(camera_hw, cam_idx, avg_profile)
 
@@ -295,6 +304,8 @@ def normalize_session(session_dir: str):
     normalized = 0
     for scan_dir in sorted(session_path.glob('fusion_scan_*')):
         if not scan_dir.is_dir():
+            continue
+        if (scan_dir / '.blur_skip').exists() or (scan_dir / '.corrupt_bag').exists():
             continue
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0

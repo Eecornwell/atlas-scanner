@@ -394,6 +394,33 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
         con = open_db3(bag_dir)
     except Exception as e:
         print(f"  ✗ Could not open bag: {e}")
+        # Mark this scan and all co-located scans as corrupt so they are
+        # excluded from merge, COLMAP, and ICP — the live-capture PLY left
+        # behind is a wide-window uncompensated accumulation and will cause
+        # misalignment if included.
+        (scan_dir / '.corrupt_bag').write_text(str(e))
+        print(f"  ✗ Marked {scan_dir.name} as corrupt (live-capture PLY is unusable)")
+        # Propagate to co-located camera scans
+        centre_host_corrupt = None
+        for _ct_f in sorted(scan_dir.glob('*.insp.capture_time')):
+            try:
+                centre_host_corrupt = float(_ct_f.read_text().strip().split()[0])
+                break
+            except Exception:
+                pass
+        if centre_host_corrupt is not None:
+            for _other in sorted(session_path.glob('fusion_scan_*')):
+                if _other == scan_dir or not _other.is_dir():
+                    continue
+                for _ct_f in sorted(_other.glob('*.insp.capture_time')):
+                    try:
+                        _other_ct = float(_ct_f.read_text().strip().split()[0])
+                        if abs(_other_ct - centre_host_corrupt) <= 12.0:
+                            (_other / '.corrupt_bag').write_text('co-located with corrupt bag')
+                            print(f"  ✗ Marked {_other.name} as corrupt (co-located)")
+                        break
+                    except Exception:
+                        pass
         return False
 
     topics = topic_map(con)

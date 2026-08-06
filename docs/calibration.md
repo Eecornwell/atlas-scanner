@@ -60,7 +60,7 @@ The scanner mounts **upside-down** — lidar faces up, camera faces down, sharin
 
 ### Procedure
 
-> *All steps below are also available in the ATLAS GUI under the **Calibration** tab, including a **▶ Run Full Calibration Pipeline** button that runs the entire sequence automatically. The GUI exposes the physical seed fields (Fwd/Left/Up/Yaw), the interactive viewer, and individual step buttons for combine scans, generate intensity images, seed, run calibration, apply, verify, and fine-tune sweeps.*
+> *All steps below are also available in the ATLAS GUI under the **Calibration** tab. The **▶ Run Full Calibration Pipeline** button runs the entire sequence automatically. Individual step buttons (numbered 1–8) let you re-run any single step in isolation — useful when iterating on a bad match or re-seeding after physical adjustments.*
 
 1. **Capture calibration scans** (5–10 from different positions):
     ```bash
@@ -71,26 +71,14 @@ The scanner mounts **upside-down** — lidar faces up, camera faces down, sharin
 
 2. **Create a lidar mask** for your camera/mount (see [Lidar Masks](#lidar-masks) above).
 
-3. **Combine scans** into the calibration dataset:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
-        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 2
-    ```
-
-4. **Generate lidar intensity images**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
-        ~/atlas_ws/output
-    ```
-
-5. **Seed the initial camera position** from physical measurements (stand behind the scanner, MID360 cable facing you — +X=forward, +Y=left, +Z=up):
+3. **Seed the initial camera position** from physical measurements (stand behind the scanner, MID360 cable facing you — +X=forward, +Y=left, +Z=up):
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/physical_seed.py \
         --camera-hw x5 --forward 3.0 --left 0.0 --up 0.0 --yaw 0
     ```
     > *Measure the camera's position relative to the LiDAR center in inches. `--yaw` is rotation in degrees (0=faces forward, +90=faces left, -90=faces right).*
 
-6. **Visually verify and coarsely adjust the seed** using the interactive GUI:
+4. **Visually verify and coarsely adjust the seed** using the interactive GUI:
     ```bash
     python3 ~/atlas_ws/src/atlas-scanner/src/calibration/interactive_seed.py \
         ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} --camera-hw x5
@@ -106,50 +94,124 @@ The scanner mounts **upside-down** — lidar faces up, camera faces down, sharin
     ```
     > *Opens `seed_composite.jpg` — left side shows edge alignment (red=camera, green=lidar, yellow=aligned), right side shows TURBO-colored lidar dots on the camera image.*
 
-7. **Seed `calib.json`** with the verified position as the initial guess for the optimizer:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
-    ```
+---
 
-8. **Run calibration**:
-    ```bash
-    cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
-    ./calibrate --data_path ~/atlas_ws/output
-    ```
-    > *Check the overlay with the `blend` slider. When satisfied, save the result.*
+The following steps (1–8) correspond directly to the numbered buttons in the GUI **Calibration** tab and to the sequence run by **▶ Run Full Calibration Pipeline**:
 
-9. **Apply calibration** — saves to both `config/calibrations/<hw>/` and the shared `config/fusion_calibration.yaml`:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
-        ~/atlas_ws/src/atlas-scanner/src \
-        --camera-hw x5
-    ```
-    > *Replace `x5` with `x3` or `onex2` for other models.*
+**Step 1 — Combine Scans**
 
-    > *Alternatively use `extract_calibration.py` which handles the R_align undo step automatically:*
-    > ```bash
-    > python3 ~/atlas_ws/src/atlas-scanner/src/calibration/extract_calibration.py \
-    >     --camera-hw x5
-    > ```
+Merges point clouds and camera images from the session into a single calibration dataset at `~/atlas_ws/output/`:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} 2
+```
 
-10. **Verify alignment**:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py --verify
-    eog ~/atlas_ws/output/calib_sweep/current.jpg
-    ```
-    > *Points should land on the correct surfaces. Near objects (blue) offset = translation error. All objects shift same amount = rotation error.*
+**Step 2 — Generate Intensity Images**
 
-    Fine-tune if needed:
-    ```bash
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py \
-        --axis pitch --range 2.0 --steps 5
-    # Then apply the best offset:
-    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py \
-        --axis pitch --apply <degrees>
-    ```
-    > *After `--apply`, re-run `--verify` to confirm. The updated values are written to both the active `config/fusion_calibration.yaml` and `config/calibrations/<hw>/fusion_calibration.yaml`.*
+Projects each merged point cloud into the camera frame using the current seed calibration, producing a lidar intensity ERP image alongside each camera ERP. These paired images are the input to feature matching:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
+    ~/atlas_ws/output
+```
 
-11. **Calibration file reference** (`fusion_calibration.yaml`):
+**Step 3 — Match Features**
+
+Runs SuperGlue on each camera/lidar ERP pair to find pixel correspondences. The GUI exposes Indoor/Outdoor model buttons; the CLI defaults to indoor:
+```bash
+# From the SuperGlue environment:
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/find_matches_superglue_erp.py \
+    ~/atlas_ws/output
+```
+> *SuperGlue is for non-commercial research use only. See its [LICENSE](https://github.com/magicleap/SuperGluePretrainedNetwork/blob/master/LICENSE) before use.*
+
+**Step 4 — Initial Guess**
+
+Computes a coarse initial transform for the optimizer. The GUI button tries `initial_guess_auto` first and falls back to `initial_guess_manual` if auto fails. You can also run them directly:
+```bash
+# Automatic (preferred):
+~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration/initial_guess_auto \
+    --data_path ~/atlas_ws/output
+
+# Manual (opens an interactive viewer to set the initial pose by hand):
+~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration/initial_guess_manual \
+    --data_path ~/atlas_ws/output
+```
+
+**Step 5 — Seed from Current Calib**
+
+Overwrites the `T_lidar_camera` initial guess in `calib.json` with the values from the existing `fusion_calibration.yaml`. Use this instead of Step 4 when you already have a good calibration and want the optimizer to start close to it:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
+```
+> *Steps 4 and 5 are mutually exclusive — run one or the other, not both. For a first-time calibration use Step 4. For a re-calibration or fine-tune use Step 5.*
+
+**Step 6 — Run Calibration**
+
+Runs the direct visual-LiDAR calibration optimizer. Opens an interactive viewer — use the `blend` slider to inspect the camera/lidar overlay, then save when satisfied:
+```bash
+cd ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration
+./calibrate --data_path ~/atlas_ws/output
+```
+
+**Step 7 — Apply Calibration**
+
+Converts the raw `calib.json` output into `fusion_calibration.yaml` format and saves it to both `config/calibrations/<hw>/` and the shared `config/fusion_calibration.yaml`:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
+    ~/atlas_ws/src/atlas-scanner/src \
+    --camera-hw x5
+```
+> *Replace `x5` with `x3` or `onex2` for other models. Alternatively, `extract_calibration.py` handles the R_align undo step automatically:*
+> ```bash
+> python3 ~/atlas_ws/src/atlas-scanner/src/calibration/extract_calibration.py --camera-hw x5
+> ```
+
+**Step 8 — Verify Calibration**
+
+Renders a color-coded overlay of LiDAR points on the camera image and opens it automatically:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py --verify
+eog ~/atlas_ws/output/calib_sweep/current.jpg
+```
+> *Points should land on the correct surfaces. Near objects (blue) offset = translation error. All objects shift the same amount = rotation error.*
+
+Fine-tune if needed:
+```bash
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py \
+    --axis pitch --range 2.0 --steps 5
+# Then apply the best offset:
+python3 ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py \
+    --axis pitch --apply <degrees>
+```
+> *After `--apply`, re-run `--verify` to confirm. Updated values are written to both `config/fusion_calibration.yaml` and `config/calibrations/<hw>/fusion_calibration.yaml`.*
+
+---
+
+### Color Calibration (multi-camera rigs only)
+
+> *This step is only needed when using multiple cameras simultaneously (e.g. X5 + X3). Single-camera setups skip it entirely.*
+
+When cameras from different models are combined, their color response and exposure differ. Color calibration computes a per-camera correction profile (CCM + LAB luminance gain) that matches each secondary camera to the primary (`cam_0`).
+
+In the GUI, use the **Calibrate Color Profiles** and **Apply Color Normalization** buttons at the bottom of the Calibration tab. On the CLI:
+
+```bash
+# Compute and save color profiles from a session with both cameras:
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/color_normalize.py calibrate \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+
+# Apply saved profiles to a session's panoramas:
+python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/color_normalize.py normalize \
+    ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+```
+
+Profiles are saved to `config/calibrations/<hw>/cam_<N>/color_profile.npz`. The primary camera (`cam_0`) is never modified — all secondary cameras are adjusted to match it.
+
+> *Use a session captured in a well-lit, texturally varied indoor environment. Avoid sessions where one camera is pointed at a bright window or a uniformly dark surface — scene-content differences will corrupt the gain estimate. The calibration uses the intersection of valid (non-masked) pixels between each camera pair, so both cameras must have overlapping scene coverage in the shared scans.*
+
+> *After updating a color profile, re-run `normalize` on any previously processed sessions to apply the new correction.*
+
+### Calibration file reference (`fusion_calibration.yaml`)
 
     ```yaml
     roll_offset: -3.119514987103984    # T_camera_lidar rotation (euler XYZ rad)
@@ -171,7 +233,7 @@ The scanner mounts **upside-down** — lidar faces up, camera faces down, sharin
     skip_rate: 5
     ```
 
-12. Ready to scan — see [software-run.md](software-run.md).
+Ready to scan — see [software-run.md](software-run.md).
 
 > ***Note: If point cloud colors appear misaligned, use `tune_calibration.py --verify` to diagnose and `--axis`/`--apply` to correct, or rerun the full procedure above.***
 

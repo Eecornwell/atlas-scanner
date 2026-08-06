@@ -93,7 +93,7 @@ def merge_scans_simple(session_dir):
     
     scan_dirs = sorted([d for d in session_path.iterdir() 
                        if d.is_dir() and d.name.startswith('fusion_scan_')
-                       and not (d / '.blur_skip').exists()])
+                       and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()])
     
     all_points = []
     all_colors = []
@@ -236,7 +236,7 @@ def merge_scans_with_trajectory(session_dir):
 
     scan_dirs = sorted([d for d in session_path.iterdir()
                         if d.is_dir() and d.name.startswith('fusion_scan_')
-                        and not (d / '.blur_skip').exists()])
+                        and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()])
 
     if not scan_dirs:
         print("No scan directories found")

@@ -90,7 +90,7 @@ def post_process_session_coloring(session_dir, use_exact=False):
 
     scan_dirs = sorted([d for d in session_path.iterdir()
                         if d.is_dir() and d.name.startswith('fusion_scan_')
-                        and not (d / '.blur_skip').exists()])
+                        and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()])
     if not scan_dirs:
         print("No scan directories found")
         return

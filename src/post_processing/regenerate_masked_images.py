@@ -90,7 +90,7 @@ def regenerate_masked_images(session_dir, camera_mode="dual_fisheye", sdk_stitch
         return _mask_cache[key]
 
     def _process_scan(scan_dir: Path) -> int:
-        if not scan_dir.is_dir() or (scan_dir / '.blur_skip').exists():
+        if not scan_dir.is_dir() or (scan_dir / '.blur_skip').exists() or (scan_dir / '.corrupt_bag').exists():
             return 0
         cam_idx = cam_index_for_scan(scan_dir)
         per_cam_mask = _mask_for_cam(cam_idx, camera_mode)

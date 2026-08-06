@@ -63,16 +63,19 @@ def camera_hw_for_session(session_dir) -> str:
 
 
 def is_blur_skipped(scan_dir) -> bool:
-    """Return True if this scan has been marked blurry by filter_blurry_scans.py."""
-    return (Path(scan_dir) / '.blur_skip').exists()
+    """Return True if this scan should be excluded from processing.
+    Covers both blur-filtered scans and scans with corrupt rosbags."""
+    p = Path(scan_dir)
+    return (p / '.blur_skip').exists() or (p / '.corrupt_bag').exists()
 
 
 def iter_scan_dirs(session_path) -> list:
-    """Return sorted fusion_scan_* dirs that have not been blur-filtered."""
+    """Return sorted fusion_scan_* dirs that have not been blur-filtered or corrupt-bagged."""
     return sorted(
         d for d in Path(session_path).iterdir()
         if d.is_dir() and d.name.startswith('fusion_scan_')
         and not (d / '.blur_skip').exists()
+        and not (d / '.corrupt_bag').exists()
     )
 
 

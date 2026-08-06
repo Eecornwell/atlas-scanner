@@ -265,7 +265,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
     scan_dirs = sorted(d for d in session_path.iterdir()
                        if d.is_dir() and d.name.startswith('fusion_scan_')
-                       and not (d / '.blur_skip').exists())
+                       and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists())
 
     panoramas = []
     session_is_360 = None
@@ -864,7 +864,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     all_lidar_cols = []
     scan_dirs_map  = {int(d.name.split('_')[-1]): d
                       for d in sorted(session_path.glob('fusion_scan_*'))
-                      if d.is_dir() and not (d / '.blur_skip').exists()}
+                      if d.is_dir() and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()}
     for pi, scan_dir in sorted(scan_dirs_map.items()):
         ply_dense  = scan_dir / 'sensor_lidar.ply'
         ply_color  = scan_dir / 'sensor_colored_exact.ply'

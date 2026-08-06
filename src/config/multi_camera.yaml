@@ -76,8 +76,8 @@ cameras:
     serial: "XXXXXXXXXXXXXX"
     camera_hw: x5
     mask_dual: lidar_mask_dual_x5_cam2.png
-    mask_calibration: lidar_mask_dual_x5_calib.png
-    calibration: calibrations/x5/center/fusion_calibration.yaml
+    mask_calibration: lidar_mask_dual_x5_calib_right.png
+    calibration: calibrations/x5/right/fusion_calibration.yaml
     mounting_orientation: [-179.77, 0.95, -91.77]
     seed_position: [3.46, -2.11, -0.84]
   cam_1:
