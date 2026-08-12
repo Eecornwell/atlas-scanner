@@ -130,6 +130,9 @@
 ### Software Installation
 Please review [Software Installation documentation](docs/software-install.md)
 
+### System Architecture
+Please review [System Architecture diagram](docs/architecture.md)
+
 ### Hardware Build
 Please review [Hardware Build documentation](docs/atlas-hw-build-v1.pdf)
 
