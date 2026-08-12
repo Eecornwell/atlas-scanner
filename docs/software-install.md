@@ -638,6 +638,70 @@ The capture script selects the correct mask automatically based on `CAMERA_HW` a
 
 ---
 
+## OAK-1 Camera Setup (Luxonis)
+
+The OAK-1 is a USB3 perspective (pinhole) camera. It does **not** use the Insta360 SDK — it is driven by the DepthAI Python library. Intrinsics are read directly from the device eeprom at session start; no separate calibration file is needed for the camera itself.
+
+### 1. Install DepthAI
+
+```bash
+pip3 install depthai
+```
+
+### 2. USB device rules
+
+The OAK-1 requires a udev rule so it is accessible without `sudo`:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' \
+    | sudo tee /etc/udev/rules.d/80-movidius.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+### 3. Connect and verify
+
+```bash
+# Connect OAK-1 via USB cable
+python3 -c "import depthai as dai; d = dai.Device(); print('OAK-1 MxId:', d.getMxId())"
+# Should print: OAK-1 MxId: <14-char hex string>
+```
+
+> **USB speed note:** The BOSGAME DNB20 routes all external USB ports through a USB2-only PCH controller. The OAK-1 will operate at USB2 (480 Mbps) on this machine, limiting capture resolution to 640×400. Full resolution (1920×1080+) requires a USB3 port — either a USB3 PCIe expansion card or a machine with accessible USB3 ports. To change resolution once USB3 is available, update `image_width` and `image_height` in `config/camera_models/oak1.yaml`.
+
+### 4. Test snapshot and intrinsics pull
+
+```bash
+mkdir -p ~/atlas_ws/data/oak1_test
+python3 ~/atlas_ws/src/atlas-scanner/src/capture/oak1_capture.py \
+    ~/atlas_ws/data/oak1_test
+# In a second terminal, trigger a capture:
+echo ~/atlas_ws/data/oak1_test/oak1_test_scan > ~/atlas_ws/data/oak1_test/.oak1_trigger
+# Expected output:
+#   ✓ OAK-1 connected: <MxId>  [⚠ USB2 — HIGH]
+#   ✓ AE/AWB converged (mean=...)
+#   ✓ Saved: .../oak1_<timestamp>.png (raw_mean=... enhanced_mean=...)
+#   ✓ Undistorted: oak1_<timestamp>_undistorted.png
+# Ctrl+C to exit
+```
+
+The `camera_info.yaml` written alongside each image contains the factory intrinsics:
+```yaml
+width: 4056
+height: 3040
+fx: 3273.1
+fy: 3270.2
+cx: 1960.9
+cy: 1553.7
+distortion_model: rational_polynomial
+D: [k1, k2, p1, p2, k3, k4, k5, k6]  # 14-coefficient rational polynomial
+```
+
+> The OAK-1 saves both a raw distorted PNG (`oak1_<timestamp>.png`) and an undistorted PNG (`oak1_<timestamp>_undistorted.png`). The undistorted version is used for COLMAP and calibration; the raw version is kept for reference.
+
+> The OAK-1 is a **perspective** camera — it does not produce ERP images and does not use the Insta360 SDK stitcher. LiDAR–camera calibration uses the pinhole model; see [calibration.md](calibration.md) for the OAK-1 calibration procedure.
+
+---
+
 ## Desktop Shortcuts
 
 ### ATLAS GUI

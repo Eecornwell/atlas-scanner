@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Orion. All rights reserved.
+#
+# Description: Capture node for the Luxonis OAK-1 (fixed-focus) camera.
+# Compatible with DepthAI v3 (depthai >= 3.0).
+#
+# Architecture: each depthai session runs in a fresh subprocess (not fork)
+# so depthai's internal threads start clean and pipeline.stop() segfaults
+# or firmware crashes cannot affect the parent trigger loop.
+
+import os
+import sys
+import time
+import subprocess
+import tempfile
+import yaml
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+
+_ALLOWED_DATA = Path.home() / "atlas_ws" / "data"
+_SELF = Path(__file__).resolve()
+
+
+def _safe(p: Path) -> Path:
+    resolved = p.resolve()
+    if _ALLOWED_DATA.resolve() not in [resolved, *resolved.parents]:
+        raise ValueError(f"Path '{resolved}' escapes allowed root")
+    return resolved
+
+
+# ── helpers used only in subprocess workers ──────────────────────────────────
+
+def _worker_imports():
+    try:
+        import depthai as dai
+        import cv2
+        return dai, cv2
+    except ImportError as e:
+        print(f"✗ Import error: {e}", flush=True)
+        sys.exit(1)
+
+
+def _build_pipeline(dai, width: int, height: int):
+    pipeline = dai.Pipeline()
+    cam = pipeline.create(dai.node.Camera, dai.CameraBoardSocket.CAM_A)
+    cam.build()
+    stream_out = cam.requestOutput((width, height), dai.ImgFrame.Type.BGR888p)
+    q = stream_out.createOutputQueue(maxSize=4, blocking=False)
+    ctrl_q = cam.inputControl.createInputQueue()
+    return pipeline, q, ctrl_q
+
+
+def _apply_isp(dai, ctrl_q, settle_s: float = 0.0):
+    if settle_s > 0:
+        time.sleep(settle_s)
+    ctrl = dai.CameraControl()
+    ctrl.setAutoWhiteBalanceMode(dai.CameraControl.AutoWhiteBalanceMode.AUTO)
+    ctrl.setSaturation(2)
+    ctrl.setSharpness(1)
+    ctrl_q.send(ctrl)
+
+
+def _wait_ae(stream_q, timeout=12.0):
+    """Wait for AE to stabilise: 3 consecutive frames within 5% brightness delta.
+    Timeout increased to 12s to handle USB2 slow AE ramp-up."""
+    prev, stable, last_frame = 0.0, 0, None
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        f = stream_q.tryGet()
+        if f is not None:
+            import cv2
+            fr = f.getCvFrame()
+            m = float(fr.mean())
+            if m > 10:
+                if abs(m - prev) / max(prev, 1.0) < 0.05:
+                    stable += 1
+                    if stable >= 3:
+                        return fr
+                else:
+                    stable = 0
+                prev = m
+                last_frame = fr
+        time.sleep(0.05)
+    return last_frame
+
+
+# ── subprocess entry points ───────────────────────────────────────────────────
+
+def _cmd_warmup(width: int, height: int, out_yaml: str):
+    """Subprocess: connect, read intrinsics, warm AE, write yaml. No stop()."""
+    dai, cv2 = _worker_imports()
+    try:
+        pipeline, stream_q, ctrl_q = _build_pipeline(dai, width, height)
+        pipeline.start()
+        device = pipeline.getDefaultDevice()
+        spd = device.getUsbSpeed()
+        tag = "⚠ USB2" if spd == dai.UsbSpeed.HIGH else "✓ USB3"
+        print(f"✓ OAK-1 connected: {device.getDeviceId()} [{tag} — {spd.name}]", flush=True)
+        calib = device.readCalibration()
+        M = calib.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, width, height)
+        D = calib.getDistortionCoefficients(dai.CameraBoardSocket.CAM_A)
+        info = {
+            "width": width, "height": height,
+            "fx": float(M[0][0]), "fy": float(M[1][1]),
+            "cx": float(M[0][2]), "cy": float(M[1][2]),
+            "distortion_model": "rational_polynomial",
+            "D": [float(d) for d in D],
+        }
+        print(f"✓ Intrinsics: fx={info['fx']:.1f} fy={info['fy']:.1f} "
+              f"cx={info['cx']:.1f} cy={info['cy']:.1f}", flush=True)
+        Path(out_yaml).write_text(yaml.dump(info, default_flow_style=False))
+        _apply_isp(dai, ctrl_q)
+        t0 = time.time()
+        while time.time() - t0 < 6.0:
+            f = stream_q.tryGet()
+            if f is not None and f.getCvFrame().mean() > 40:
+                print(f"✓ AE/AWB converged (mean={f.getCvFrame().mean():.1f})", flush=True)
+                break
+            time.sleep(0.05)
+        # Never call pipeline.stop() — crashes firmware on USB2. OS cleans up.
+        sys.exit(0)
+    except Exception as e:
+        print(f"✗ Warmup error: {e}", flush=True)
+        sys.exit(1)
+
+
+def _cmd_capture(width: int, height: int, out_png: str):
+    """Subprocess: connect, capture one frame, write png. No stop()."""
+    dai, cv2 = _worker_imports()
+    try:
+        pipeline, stream_q, ctrl_q = _build_pipeline(dai, width, height)
+        pipeline.start()
+        _apply_isp(dai, ctrl_q, settle_s=1.0)
+        frame = _wait_ae(stream_q)
+        # drain for freshest frame
+        if frame is not None:
+            t1 = time.time()
+            while time.time() - t1 < 5.0:
+                f = stream_q.tryGet()
+                if f is not None:
+                    frame = f.getCvFrame()
+                elif frame is not None:
+                    break
+                time.sleep(0.02)
+        if frame is not None:
+            cv2.imwrite(out_png, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            sys.exit(0)
+        else:
+            sys.exit(1)
+    except Exception as e:
+        print(f"✗ Capture error: {e}", flush=True)
+        sys.exit(1)
+
+
+# ── parent-side helpers ───────────────────────────────────────────────────────
+
+def _run_subprocess(args: list, timeout: int) -> subprocess.CompletedProcess:
+    """Run a fresh Python interpreter with the given args, streaming output."""
+    return subprocess.run(
+        [sys.executable, str(_SELF)] + args,
+        timeout=timeout,
+    )
+
+
+def _usb_reset_oak1():
+    """USBDEVFS_RESET ioctl, then poll until device is UNBOOTED."""
+    import fcntl
+    import depthai as dai
+    USBDEVFS_RESET = 0x5514
+    try:
+        for vendor_file in Path("/sys/bus/usb/devices").glob("*/idVendor"):
+            if vendor_file.read_text().strip() == "03e7":
+                devpath = vendor_file.parent
+                busnum = int((devpath / "busnum").read_text().strip())
+                devnum = int((devpath / "devnum").read_text().strip())
+                node = f"/dev/bus/usb/{busnum:03d}/{devnum:03d}"
+                with open(node, "wb") as f:
+                    fcntl.ioctl(f, USBDEVFS_RESET, 0)
+                print(f"✓ USB reset: {node}", flush=True)
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if dai.Device.getAllAvailableDevices():
+                        print("✓ Device ready", flush=True)
+                        return
+                print("⚠ Device did not re-enumerate", flush=True)
+                return
+    except Exception as e:
+        print(f"⚠ USB reset failed: {e}", flush=True)
+        time.sleep(3.0)
+
+
+def _enhance_frame(frame: np.ndarray) -> np.ndarray:
+    import cv2
+    mean = float(frame.mean())
+    if mean > 120:
+        clip = 1.5
+    elif mean > 60:
+        clip = 2.5
+    else:
+        return frame
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(16, 16))
+    lab = cv2.merge([clahe.apply(l), a, b])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+def _write_colmap_camera(info: dict, scan_dir: Path, actual_w: int, actual_h: int):
+    sx, sy = actual_w / info["width"], actual_h / info["height"]
+    D = info["D"]
+    k1, k2, p1, p2 = D[0], D[1], D[2], D[3]
+    k3 = D[4] if len(D) > 4 else 0.0
+    k4 = D[5] if len(D) > 5 else 0.0
+    k5 = D[6] if len(D) > 6 else 0.0
+    k6 = D[7] if len(D) > 7 else 0.0
+    line = (f"1 FULL_OPENCV {actual_w} {actual_h} "
+            f"{info['fx']*sx} {info['fy']*sy} {info['cx']*sx} {info['cy']*sy} "
+            f"{k1} {k2} {p1} {p2} {k3} {k4} {k5} {k6}")
+    (scan_dir / "colmap_camera.txt").write_text("# COLMAP cameras.txt\n" + line + "\n")
+
+
+def _undistort_and_save(frame: np.ndarray, info: dict, out_path: Path):
+    import cv2
+    h, w = frame.shape[:2]
+    sx, sy = w / info["width"], h / info["height"]
+    K = np.array([[info["fx"]*sx, 0, info["cx"]*sx],
+                  [0, info["fy"]*sy, info["cy"]*sy],
+                  [0, 0, 1]], dtype=np.float64)
+    dist = np.array(info["D"][:8], dtype=np.float64)
+    new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0.0)
+    undist = cv2.undistort(frame, K, dist, None, new_K)
+    cv2.imwrite(str(out_path), undist, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+
+def _run_capture(width: int, height: int, max_attempts: int = 3):
+    """Run capture subprocess, retry with USB reset on failure."""
+    import cv2
+    for attempt in range(max_attempts):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+            tmp = tf.name
+        try:
+            result = _run_subprocess(["--capture", str(width), str(height), tmp],
+                                     timeout=30)
+            if result.returncode == 0 and os.path.getsize(tmp) > 0:
+                frame = cv2.imread(tmp)
+                if frame is not None:
+                    return frame
+            print(f"✗ Capture attempt {attempt+1}/{max_attempts} failed "
+                  f"(rc={result.returncode})", flush=True)
+        except subprocess.TimeoutExpired:
+            print(f"✗ Capture attempt {attempt+1}/{max_attempts} timed out", flush=True)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        if attempt < max_attempts - 1:
+            _usb_reset_oak1()
+    return None
+
+
+# ── main trigger loop ─────────────────────────────────────────────────────────
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: oak1_capture.py <scan_dir>", flush=True)
+        sys.exit(1)
+
+    scan_dir = Path(sys.argv[1])
+    try:
+        scan_dir = _safe(scan_dir)
+    except ValueError as e:
+        print(f"✗ {e}", flush=True)
+        sys.exit(1)
+    scan_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional --cam-index for multi-camera sessions (e.g. oak1 as cam_3)
+    cam_index = "0"
+    if "--cam-index" in sys.argv:
+        idx = sys.argv.index("--cam-index")
+        if idx + 1 < len(sys.argv):
+            cam_index = sys.argv[idx + 1]
+
+    _src = _SELF.parent.parent
+    hw_yaml = _src / "config" / "camera_models" / "oak1.yaml"
+    cfg = yaml.safe_load(hw_yaml.read_text()) if hw_yaml.exists() else {}
+    width = int(cfg.get("image_width", 4056))
+    height = int(cfg.get("image_height", 3040))
+
+    # Warmup: fresh subprocess reads intrinsics + warms AE, writes tmp yaml
+    print(f"Building pipeline ({width}x{height})...", flush=True)
+    with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as tf:
+        tmp_info = tf.name
+    try:
+        result = _run_subprocess(["--warmup", str(width), str(height), tmp_info],
+                                 timeout=30)
+        if result.returncode != 0 or not os.path.exists(tmp_info):
+            print("✗ Warmup failed", flush=True)
+            sys.exit(1)
+        info = yaml.safe_load(Path(tmp_info).read_text())
+    except subprocess.TimeoutExpired:
+        print("✗ Warmup timed out", flush=True)
+        sys.exit(1)
+    finally:
+        try:
+            os.unlink(tmp_info)
+        except OSError:
+            pass
+
+    # USB reset after warmup so device returns to UNBOOTED for capture workers
+    _usb_reset_oak1()
+
+    _safe(scan_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
+    (scan_dir / ".sdk_ready").touch()
+    print("Waiting for capture trigger...", flush=True)
+
+    while True:
+        if (scan_dir / ".oak1_quit_trigger").exists():
+            (scan_dir / ".oak1_quit_trigger").unlink(missing_ok=True)
+            print("Quit trigger — exiting", flush=True)
+            break
+
+        trigger = scan_dir / ".oak1_trigger"
+        if trigger.exists():
+            target_line = trigger.read_text().strip()
+            trigger.unlink(missing_ok=True)
+            target_dir = Path(target_line) if target_line else scan_dir
+            try:
+                target_dir = _safe(target_dir)
+            except ValueError:
+                target_dir = scan_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
+
+            print("Capturing...", flush=True)
+            frame = _run_capture(width, height)
+
+            # Retry once if AE didn't converge (dark frame)
+            if frame is not None and frame.mean() < 40:
+                print(f"⚠ Dark frame (mean={frame.mean():.1f}) — retrying after USB reset", flush=True)
+                _usb_reset_oak1()
+                frame = _run_capture(width, height)
+                if frame is not None:
+                    print(f"  Retry mean={frame.mean():.1f}", flush=True)
+
+            if frame is not None:
+                import cv2
+                raw_mean = frame.mean()
+                frame = _enhance_frame(frame)
+                capture_ts = time.time()
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_path = _safe(target_dir / f"oak1_{timestamp}.png")
+                cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                print(f"✓ Saved: {out_path} "
+                      f"(raw_mean={raw_mean:.1f} enhanced_mean={frame.mean():.1f})", flush=True)
+                _write_colmap_camera(info, target_dir, frame.shape[1], frame.shape[0])
+                undist_path = _safe(target_dir / f"oak1_{timestamp}_undistorted.png")
+                _undistort_and_save(frame, info, undist_path)
+                print(f"✓ Undistorted: {undist_path.name}", flush=True)
+                _safe(target_dir / "capture_0.shutter_event").write_text(
+                    f"{capture_ts:.6f} {cam_index}\n")
+                _safe(target_dir / ".cam_index").write_text(f"{cam_index}\n")
+                (target_dir / ".oak1_capture").touch()
+                (scan_dir / ".sdk_downloads_pending").write_text("0")
+                (scan_dir / ".sdk_capture_done").touch()
+            else:
+                print("✗ No frame received", flush=True)
+                (scan_dir / ".sdk_capture_failed").touch()
+
+        time.sleep(0.05)
+
+
+# ── subprocess dispatch ───────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2 and sys.argv[1] == "--warmup":
+        _, _, w, h, out = sys.argv
+        _cmd_warmup(int(w), int(h), out)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "--capture":
+        _, _, w, h, out = sys.argv
+        _cmd_capture(int(w), int(h), out)
+    else:
+        main()

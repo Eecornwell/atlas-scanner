@@ -107,6 +107,17 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                     fisheye_jpg_to_erp(str(src), erp_cfg, str(dst))
                 equirect_files = [dst]
                 print(f"  Synthesised ERP from single fisheye for {fusion_dir.name}")
+
+        # OAK-1 fallback: use undistorted PNG directly (already in pinhole space)
+        if not equirect_files:
+            oak1_files = [f for f in sorted(fusion_dir.glob('oak1_*_undistorted.png'))]
+            if not oak1_files:
+                # Fall back to raw if undistorted not available
+                oak1_files = [f for f in sorted(fusion_dir.glob('oak1_*.png'))
+                              if '_undistorted' not in f.name]
+            if oak1_files:
+                equirect_files = [oak1_files[0]]
+                print(f"  Using OAK-1 image for {fusion_dir.name}: {oak1_files[0].name}")
         
         ply_files = list(fusion_dir.glob("sensor_lidar*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
         
@@ -158,8 +169,19 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                 # whether to undo the trajectory pose before projecting
                 import json as _json
                 is_world_frame = ply_files[0].name == 'world_lidar.ply'
+                # Detect camera_hw from session_config.json so generate_intensity_images
+                # can load the correct calibration without relying on multi_camera.yaml
+                _sess_cfg = fusion_dir.parent / 'session_config.json'
+                _cam_hw = ''
+                if _sess_cfg.exists():
+                    try:
+                        _cam_hw = _json.loads(_sess_cfg.read_text()).get('camera_hw', '')
+                    except Exception:
+                        pass
                 with open(_safe_output(output_dir, f"{total_count:06d}_source.json"), 'w') as sf:
-                    _json.dump({'scan_dir': str(_safe_resolve(fusion_dir)), 'world_frame': is_world_frame}, sf)
+                    _json.dump({'scan_dir': str(_safe_resolve(fusion_dir)),
+                                'world_frame': is_world_frame,
+                                'camera_hw': _cam_hw}, sf)
                 
                 # Create timestamp entry
                 timestamps.append({
@@ -181,45 +203,108 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
     first_root = _cv2.imread(str(_safe_output(output_dir, "000000.png")))
     img_h, img_w = first_root.shape[:2] if first_root is not None else (MATCHER_H, MATCHER_W)
 
+    # Detect camera model from source session
+    _is_oak1 = False
+    _oak1_intrinsics = None
+    _oak1_distortion = None
+    _source_jsons = sorted(Path(output_dir).glob('*_source.json'))
+    if _source_jsons:
+        try:
+            _sd = json.loads(_source_jsons[0].read_text())
+            if _sd.get('camera_hw') == 'oak1':
+                _is_oak1 = True
+                _scan_p = Path(_sd.get('scan_dir', ''))
+                _ci_p = _scan_p / 'camera_info.yaml'
+                if not _ci_p.exists():
+                    _ci_p = _scan_p.parent.parent / 'camera_info.yaml'
+                if _ci_p.exists():
+                    import yaml as _yaml
+                    _ci = _yaml.safe_load(_ci_p.read_text())
+                    _sx = img_w / _ci['width']
+                    _sy = img_h / _ci['height']
+                    _oak1_intrinsics = [
+                        _ci['fx']*_sx, _ci['fy']*_sy,
+                        _ci['cx']*_sx, _ci['cy']*_sy
+                    ]
+                    _oak1_distortion = _ci['D'][:8]
+        except Exception:
+            pass
+
     # Create metadata files
     bag_names = [f"{i:06d}" for i in range(total_count)]
 
-    calib_data = {
-        "camera": {
-            "camera_model": "equirectangular",
-            "distortion_coeffs": [],
-            "intrinsics": [img_w, img_h]
-        },
-        "meta": {
-            "bag_names": bag_names,
-            "camera_info_topic": "/camera/camera_info",
-            "data_path": output_dir,
-            "image_topic": "/equirectangular/image",
-            "intensity_channel": "intensity",
-            "points_topic": "/livox/lidar"
-        },
-        "results": {
-            "T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-            "init_T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    if _is_oak1 and _oak1_intrinsics:
+        calib_data = {
+            "camera": {
+                "camera_model": "plumb_bob",
+                "distortion_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+                "intrinsics": _oak1_intrinsics
+            },
+            "meta": {
+                "bag_names": bag_names,
+                "camera_info_topic": "/camera/camera_info",
+                "data_path": output_dir,
+                "image_topic": "/camera/image",
+                "intensity_channel": "intensity",
+                "points_topic": "/livox/lidar"
+            },
+            "results": {
+                "T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                "init_T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            }
         }
-    }
+        print(f"  OAK-1: using plumb_bob camera model  fx={_oak1_intrinsics[0]:.0f} fy={_oak1_intrinsics[1]:.0f}")
+    else:
+        calib_data = {
+            "camera": {
+                "camera_model": "equirectangular",
+                "distortion_coeffs": [],
+                "intrinsics": [img_w, img_h]
+            },
+            "meta": {
+                "bag_names": bag_names,
+                "camera_info_topic": "/camera/camera_info",
+                "data_path": output_dir,
+                "image_topic": "/equirectangular/image",
+                "intensity_channel": "intensity",
+                "points_topic": "/livox/lidar"
+            },
+            "results": {
+                "T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                "init_T_lidar_camera": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+            }
+        }
     
     with open(_safe_output(output_dir, "calib.json"), 'w') as f:
         json.dump(calib_data, f, indent=2)
 
     # Create preprocessing metadata
-    metadata = {
-        "camera_model": "equirectangular",
-        "image_size": [img_w, img_h],
-        "camera_intrinsics": [img_w, img_h, img_w, img_h],
-        "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0],
-        "image_topic": "/equirectangular/image",
-        "points_topic": "/livox/lidar",
-        "intensity_channel": "intensity",
-        "num_images": total_count,
-        "num_points": total_count,
-        "timestamps": timestamps
-    }
+    if _is_oak1 and _oak1_intrinsics:
+        metadata = {
+            "camera_model": "plumb_bob",
+            "image_size": [img_w, img_h],
+            "camera_intrinsics": _oak1_intrinsics,
+            "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0, 0.0],
+            "image_topic": "/camera/image",
+            "points_topic": "/livox/lidar",
+            "intensity_channel": "intensity",
+            "num_images": total_count,
+            "num_points": total_count,
+            "timestamps": timestamps
+        }
+    else:
+        metadata = {
+            "camera_model": "equirectangular",
+            "image_size": [img_w, img_h],
+            "camera_intrinsics": [img_w, img_h, img_w, img_h],
+            "camera_distortion_coeffs": [0.0, 0.0, 0.0, 0.0],
+            "image_topic": "/equirectangular/image",
+            "points_topic": "/livox/lidar",
+            "intensity_channel": "intensity",
+            "num_images": total_count,
+            "num_points": total_count,
+            "timestamps": timestamps
+        }
 
     with open(_safe_output(output_dir, "preprocessing_result.json"), 'w') as f:
         json.dump(metadata, f, indent=2)

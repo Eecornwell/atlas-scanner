@@ -29,6 +29,13 @@
         - USB-C tethered control via CameraSDK
     - [Insta360 One X2](https://www.insta360.com/product/insta360-onex2) (legacy)
         - 4K max resolution at 30fps
+- Perspective (Pinhole) Camera (optional, secondary)
+    - [Luxonis OAK-1](https://shop.luxonis.com/products/oak-1)
+        - IMX378 sensor, 12MP (4056×3040 native)
+        - Fixed-focus, ~66° diagonal FOV
+        - USB2/USB3 tethered via DepthAI Python library
+        - Factory intrinsics stored in device eeprom (no separate intrinsic calibration needed)
+        - Can run standalone (`--camera-hw oak1`) or as a secondary camera alongside an Insta360
 - Compute
     - 3.4GHz Quad Core, x64 architecture
     - 16GB DDR4 RAM
@@ -62,7 +69,7 @@
 - Drivers
     - [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) - ([MIT](https://github.com/Livox-SDK/livox_ros_driver2?tab=License-1-ov-file#readme))
     - [Insta360 CameraSDK](https://www.insta360.com/developer/home) - (proprietary, USB device control + capture)
-    - [Insta360 MediaSDK](https://www.insta360.com/developer/home) - (proprietary, .insp → ERP stitching)
+    - [DepthAI](https://github.com/luxonis/depthai-python) - ([MIT](https://github.com/luxonis/depthai-python/blob/main/LICENSE)) — OAK-1 capture
 - Tools
     - Calibration
         - [koide3/direct_visual_lidar_calibration](https://github.com/koide3/direct_visual_lidar_calibration) - ([MIT](https://github.com/koide3/direct_visual_lidar_calibration/blob/main/README.md))
@@ -105,11 +112,11 @@
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
 | Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
-| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (`dual_fisheye`) or full ERP with rear hemisphere blanked + masked (`single_fisheye`)        |
+| Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (`dual_fisheye`) or full ERP with rear hemisphere blanked + masked (`single_fisheye`); OAK-1 saves undistorted 4032×3040 PNGs        |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
-| Colorize point cloud                | Yes       | Projects the image onto lidar using calibration                                                                  |
-| Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting                                            |
-| Export Colmap model files           | Yes       | Retriangulate poses, merges color pointcloud with colmap reconstructed point cloud                               |
+| Colorize point cloud                | Yes       | Projects the image onto lidar using calibration; ERP (equirectangular) for Insta360, pinhole for OAK-1          |
+| Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting (Insta360 only)                            |
+| Export Colmap model files           | Yes       | Retriangulate poses, merges color pointcloud with colmap reconstructed point cloud; mixed X5+OAK-1 sessions include both camera types |
 | Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for 3 seconds per scan (mostly used for calibration)           |
 | Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                                        |
 | Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                                 |
@@ -138,7 +145,9 @@ Please review [Running the Software documentation](docs/software-run.md)
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
 
-- The system uses the Insta360 CameraSDK exclusively — no ROS camera driver. The `insta360_capture` daemon owns the USB device for the entire session. In continuous mode it calls `TakePhoto()` on a host-controlled timer at `CONTINUOUS_INTERVAL` (default 3s). Each `.insp` raw file is downloaded concurrently via HTTP and a shutter event is published for bag recording. In `single_fisheye` mode the same `.insp` is stitched to a full 360° ERP with the rear hemisphere blank; a per-hardware mask (`lidar_mask_single_x5.png`) is applied before coloring to exclude the blank region and scanner body
+- The system uses the Insta360 CameraSDK exclusively for Insta360 cameras — no ROS camera driver. The `insta360_capture` daemon owns the USB device for the entire session. In continuous mode it calls `TakePhoto()` on a host-controlled timer at `CONTINUOUS_INTERVAL` (default 3s). Each `.insp` raw file is downloaded concurrently via HTTP and a shutter event is published for bag recording. In `single_fisheye` mode the same `.insp` is stitched to a full 360° ERP with the rear hemisphere blank; a per-hardware mask (`lidar_mask_single_x5.png`) is applied before coloring to exclude the blank region and scanner body
+
+- The **OAK-1** is driven by `oak1_capture.py` (DepthAI Python library) independently of the Insta360 SDK. It can run standalone (`CAMERA_HW=oak1`) or as a **secondary camera** alongside an Insta360 primary. In secondary mode it automatically detects the OAK-1 alongside the Insta360 and allocates a dedicated `fusion_scan_NNN` directory for each OAK-1 capture, with LiDAR copied from the primary scan. The OAK-1 uses per-capture USB reconnect to avoid XLink instability on USB 2.0; each capture takes ~3–4s. Intrinsics are read from device eeprom at startup and saved as `camera_info.yaml` per scan.
 
 - Acquisition is camera-triggered — the system waits for `TakePhoto()` to return before recording the shutter event, making the SDK response time the primary timing factor
 

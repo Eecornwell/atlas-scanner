@@ -10,7 +10,7 @@ CAPTURE_MODE="continuous"      # stationary | continuous
 CONTINUOUS_INTERVAL=3          # seconds between captures (continuous mode only;
                                # host-controlled TakePhoto() loop; minimum ~3s
                                # limited by X5 shutter + SD write time)
-CAMERA_HW="x5"                 # onex2 | x3 | x5
+CAMERA_HW="x5"                 # onex2 | x3 | x5 | oak1
 
 SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
@@ -21,12 +21,14 @@ DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
 RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session
 ```
 
-| `CAMERA_MODE` | `CAPTURE_MODE` | Use case |
-|---|---|---|
-| `dual_fisheye` | `stationary` | Tripod scanning, full 360° ERP images |
-| `single_fisheye` | `stationary` | Tripod scanning, LiDAR-facing fisheye only |
-| `dual_fisheye` | `continuous` | Walking capture, full 360° images |
-| `single_fisheye` | `continuous` | Walking capture, LiDAR-facing fisheye only |
+| `CAMERA_MODE` | `CAPTURE_MODE` | `CAMERA_HW` | Use case |
+|---|---|---|---|
+| `dual_fisheye` | `stationary` | `x5` | Tripod scanning, full 360° ERP images |
+| `single_fisheye` | `stationary` | `x5` | Tripod scanning, LiDAR-facing fisheye only |
+| `dual_fisheye` | `continuous` | `x5` | Walking capture, full 360° images |
+| `single_fisheye` | `continuous` | `x5` | Walking capture, LiDAR-facing fisheye only |
+| `single_fisheye` | `stationary` | `oak1` | Tripod scanning, perspective pinhole camera only |
+| `single_fisheye` | `stationary` | `x5` + OAK-1 | Tripod scanning, X5 360° + OAK-1 perspective (auto-detected) |
 
 All modes use the Insta360 CameraSDK + MediaSDK exclusively — the ROS camera driver is not used. The `insta360_capture` daemon takes ownership of the USB device for the whole session, captures `.insp` files via a host-controlled `TakePhoto()` loop (continuous) or single `TakePhoto` calls (stationary), and `insta360_stitch` produces the ERP during post-processing. For `single_fisheye`, the full 360° ERP is output with the rear hemisphere blank; a per-hardware LiDAR mask is then applied to exclude the blank region and scanner body before coloring.
 
@@ -132,10 +134,13 @@ python3 ~/atlas_ws/src/atlas-scanner/src/post_processing/merge_with_trajectory.p
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera single_fisheye --capture stationary
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --capture continuous --interval 5
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera-hw x5
+    ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --camera-hw oak1
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --bag-only           # record bag, skip post-processing
     ~/atlas_ws/src/atlas-scanner/src/atlas_fusion_capture.sh --no-sync-benchmark  # skip sync benchmark
     ```
 
+
+> **OAK-1 + Insta360 simultaneous capture:** Set `CAMERA_HW=x5` (or another Insta360 model). If an OAK-1 is also connected, it is detected automatically and launched as a secondary camera. Each scan produces two `fusion_scan_NNN` directories — one for the Insta360 (ERP) and one for the OAK-1 (perspective PNG). No extra configuration is needed.
 - In **stationary** mode: press `ENTER` to capture each scan, `q` to finish
 - In **continuous** mode: walk the space, press `Ctrl+C` when done — scans are reconstructed automatically from the recorded bag
 

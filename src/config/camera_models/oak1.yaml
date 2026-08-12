@@ -1,0 +1,12 @@
+# Camera model profile: Luxonis OAK-1 (fixed focus)
+# Perspective (pinhole) camera — produces a single rectilinear image, not ERP.
+# Intrinsics are read directly from the device via DepthAI at session start.
+#
+# image_width / image_height: capture resolution sent to the IMX378 sensor.
+# 4032x3040 is the full 12MP native resolution; use 1920x1080 for faster USB3
+# throughput if full resolution is not required.
+image_width: 4056
+image_height: 3040
+# No lidar_mask_dual — the OAK-1 has no scanner body in its field of view.
+# Display name
+display_name: "Luxonis OAK-1"

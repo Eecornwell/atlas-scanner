@@ -140,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument("session_dir")
     parser.add_argument("--camera-mode", default="dual_fisheye", choices=["dual_fisheye", "single_fisheye"])
     parser.add_argument("--sdk-stitch", action="store_true")
-    parser.add_argument("--camera-hw", default="onex2", choices=["onex2", "x3", "x5"])
+    parser.add_argument("--camera-hw", default="onex2", choices=["onex2", "x3", "x5", "oak1"])
     args = parser.parse_args()
     try:
         _safe_data(args.session_dir)

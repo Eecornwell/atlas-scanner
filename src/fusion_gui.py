@@ -649,7 +649,7 @@ class FusionCaptureGUI:
         ttk.Label(mode_frame, text="Camera HW:").grid(row=1, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.camera_hw_var = tk.StringVar(value="onex2")
         ttk.Combobox(mode_frame, textvariable=self.camera_hw_var,
-                     values=["onex2", "x3", "x5"],
+                     values=["onex2", "x3", "x5", "oak1"],
                      state="readonly", width=14).grid(row=1, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
         ttk.Label(mode_frame, text="Cameras:").grid(row=2, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.num_cameras_var = tk.StringVar(value="auto")
@@ -829,9 +829,10 @@ class FusionCaptureGUI:
 
         ttk.Label(opt_frame, text="Camera:").pack(side=tk.LEFT, padx=(0, 4))
         self._cal_cam_var = tk.StringVar(value="cam_0")
-        ttk.Combobox(opt_frame, textvariable=self._cal_cam_var,
+        self._cal_cam_combo = ttk.Combobox(opt_frame, textvariable=self._cal_cam_var,
                      values=["cam_0", "cam_1", "cam_2"], state="readonly", width=7
-                     ).pack(side=tk.LEFT)
+                     )
+        self._cal_cam_combo.pack(side=tk.LEFT)
 
         # Keep the calibrating-camera indicator in sync with the Camera dropdown
         def _on_cal_cam_change(*_):
@@ -855,6 +856,33 @@ class FusionCaptureGUI:
             self._cal_hw_label.config(text=cam)
         self._cal_cam_var.trace_add('write', _on_cal_cam_change)
         _on_cal_cam_change()
+
+        def _update_cal_cam_slots(*_):
+            hw = self.camera_hw_var.get()
+            if hw == 'oak1':
+                slots = ['cam_0']
+                label = 'cam_0 (OAK-1)'
+                self._seed_fwd_var.set('3.0')
+                self._seed_left_var.set('0.0')
+                self._seed_up_var.set('0.0')
+            elif hw in ('onex2', 'x3', 'x5'):
+                # read num_cameras to know how many slots are active
+                try:
+                    n = int(self.num_cameras_var.get())
+                except ValueError:
+                    n = 3  # auto — show all
+                slots = [f'cam_{i}' for i in range(n)]
+                label = f'cam_0 ({hw.upper()})'
+            else:
+                slots = ['cam_0', 'cam_1', 'cam_2']
+                label = f'cam_0 ({hw.upper()})'
+            self._cal_cam_combo.config(values=slots)
+            if self._cal_cam_var.get() not in slots:
+                self._cal_cam_var.set(slots[0])
+            self._cal_hw_label.config(text=label)
+
+        self.camera_hw_var.trace_add('write', _update_cal_cam_slots)
+        self.num_cameras_var.trace_add('write', _update_cal_cam_slots)
 
         # ── Action buttons ──────────────────────────────────────────
         cal_btn_frame = ttk.Frame(cal_tab)
@@ -899,6 +927,8 @@ class FusionCaptureGUI:
                    ).grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
         ttk.Button(seed_frame, text="Interactive Viewer", command=self._cal_interactive_seed
                    ).grid(row=2, column=2, columnspan=2, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
+        ttk.Button(seed_frame, text="🟢 3D Colorize (OAK-1)", command=self._cal_oak1_colorize
+                   ).grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), padx=2, pady=(3, 3))
 
         # \u2500\u2500 Full pipeline (one click) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         ttk.Button(cal_btn_frame, text="\u25b6  Run Full Calibration Pipeline",
@@ -1578,21 +1608,28 @@ sys.exit(0 if ok[0] else 4)
             if not scan_path.exists():
                 return
             images = None
-            for pattern in [
-                'fusion_scan_*/equirect_*_masked.png',
-                'fusion_scan_*/equirect_dual_fisheye.jpg',
-                'fusion_scan_*/equirect_*.jpg',
-                'fusion_scan_*/dual_fisheye_*.png',
-                'fusion_scan_*/fisheye_*.jpg',
-                'fusion_scan_*/dual_fisheye_*.jpg',
-            ]:
-                try:
-                    found = sorted(scan_path.glob(pattern), key=lambda p: p.stat().st_mtime)
-                except Exception:
-                    continue
-                if found:
-                    images = found
+            # Retry for up to 8s to allow OAK-1 async capture to finish
+            for _attempt in range(16):
+                for pattern in [
+                    'fusion_scan_*/equirect_*_masked.png',
+                    'fusion_scan_*/equirect_dual_fisheye.jpg',
+                    'fusion_scan_*/equirect_*.jpg',
+                    'fusion_scan_*/dual_fisheye_*.png',
+                    'fusion_scan_*/fisheye_*.jpg',
+                    'fusion_scan_*/dual_fisheye_*.jpg',
+                    'fusion_scan_*/oak1_*_undistorted.png',
+                    'fusion_scan_*/oak1_*.png',
+                ]:
+                    try:
+                        found = sorted(scan_path.glob(pattern), key=lambda p: p.stat().st_mtime)
+                    except Exception:
+                        continue
+                    if found:
+                        images = found
+                        break
+                if images:
                     break
+                _time.sleep(0.5)
             if not images:
                 return
             img_path = images[-1]
@@ -1658,8 +1695,8 @@ sys.exit(0 if ok[0] else 4)
         # Guard against accidental stop within 5s of system becoming ready
         # (can happen from stray keyboard events during RViz embedding)
         _ready_time = getattr(self, '_system_ready_time', 0)
-        if time.time() - _ready_time < 5.0:
-            self.log_message("⚠ Ignoring stop request (system just became ready — wait 5s)")
+        if time.time() - _ready_time < 2.0:
+            self.log_message("⚠ Ignoring stop request (system just became ready — wait 2s)")
             return
 
         # Log the call stack to help diagnose unexpected stops
@@ -1669,6 +1706,7 @@ sys.exit(0 if ok[0] else 4)
 
         self.log_message("Stopping fusion system...")
         self.update_status("Processing and shutting down...", "orange")
+        self.stop_button.config(state="disabled")
         
         # Write quit trigger file for GUI mode; also write to stdin as fallback
         proc = self.fusion_process
@@ -2033,7 +2071,10 @@ sys.exit(0 if ok[0] else 4)
 
     def _cal_hw(self):
         """Return camera hardware for the selected calibration camera.
-        Reads from multi_camera.yaml if available, falls back to global setting."""
+        Uses the session hardware (camera_hw_var) as the authoritative source
+        when it matches a slot in multi_camera.yaml, otherwise reads from the
+        selected cam slot."""
+        session_hw = self.camera_hw_var.get()
         cam = self._cal_cam_var.get()  # e.g. "cam_0"
         try:
             import yaml
@@ -2041,12 +2082,20 @@ sys.exit(0 if ok[0] else 4)
             if mc_path.exists():
                 with open(mc_path) as f:
                     cfg = yaml.safe_load(f)
-                hw = cfg.get('cameras', {}).get(cam, {}).get('camera_hw', '')
+                cameras = cfg.get('cameras', {})
+                # If session_hw exists as a camera_hw in any slot, use it
+                # directly — the dropdown slot index is irrelevant for
+                # single-hw sessions (e.g. oak1 shows cam_0 but is cam_3)
+                if any(v.get('camera_hw') == session_hw
+                       for v in cameras.values()):
+                    return session_hw
+                # Multi-camera session: use the selected slot's hw
+                hw = cameras.get(cam, {}).get('camera_hw', '')
                 if hw:
                     return hw
         except Exception:
             pass
-        return self.camera_hw_var.get()
+        return session_hw
 
     def _cal_combine_scans(self):
         sess = self._pp_session()
@@ -2076,14 +2125,22 @@ sys.exit(0 if ok[0] else 4)
 
     def _cal_get_mask(self):
         """Return the calibration mask path for the currently selected camera."""
+        hw = self._cal_hw()
         cam = self._cal_cam_var.get()
         try:
             import yaml
             mc_path = self.script_dir / 'config' / 'multi_camera.yaml'
             if mc_path.exists():
                 cfg = yaml.safe_load(mc_path.read_text())
-                c = cfg.get('cameras', {}).get(cam, {})
-                # Prefer mask_calibration, fall back to mask_dual
+                cameras = cfg.get('cameras', {})
+                # First try exact slot match
+                c = cameras.get(cam, {})
+                # If the slot's hw doesn't match the active hw, find the
+                # correct slot by hw (e.g. oak1 session uses cam_0 dropdown
+                # but oak1 is cam_3 in multi_camera.yaml)
+                if c.get('camera_hw', '') != hw:
+                    c = next((v for v in cameras.values()
+                              if v.get('camera_hw', '') == hw), {})
                 mask_name = c.get('mask_calibration', c.get('mask_dual', ''))
                 if mask_name:
                     mask_path = str(self.script_dir / 'config' / 'masks' / mask_name)
@@ -2107,9 +2164,6 @@ sys.exit(0 if ok[0] else 4)
 
     def _cal_run_full_pipeline(self):
         """Run all calibration steps in sequence using the current dropdown settings."""
-        # Capture all GUI state on the main thread before launching the background
-        # thread. Tkinter widget accessors (.get(), .config()) are not thread-safe
-        # and silently crash when called from a non-main thread.
         scene    = self._cal_scene_var.get()
         guess    = self._cal_guess_var.get()
         sg_mode  = self._sg_mode_var.get()
@@ -2121,6 +2175,22 @@ sys.exit(0 if ok[0] else 4)
         dvl = pathlib.Path.home() / 'atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration'
         output = str(pathlib.Path.home() / 'atlas_ws/output')
         erp_matcher = self.script_dir / 'calibration' / 'find_matches_superglue_erp.py'
+
+        # Resolve the actual multi_camera.yaml slot index for this hw.
+        # The dropdown always shows cam_0 for single-hw sessions, but the
+        # physical slot may be cam_3 (oak1). Scripts that read multi_camera.yaml
+        # by slot index need the real index.
+        actual_slot_idx = cam_idx
+        try:
+            import yaml as _yaml
+            mc = _yaml.safe_load((self.script_dir / 'config' / 'multi_camera.yaml').read_text())
+            for slot_key, slot_cfg in mc.get('cameras', {}).items():
+                if slot_cfg.get('camera_hw', '') == hw:
+                    actual_slot_idx = slot_key.split('_')[1]
+                    break
+        except Exception:
+            pass
+
         import threading as _th
         import subprocess as _sp
 
@@ -2134,19 +2204,19 @@ sys.exit(0 if ok[0] else 4)
                 ) if k in os.environ
             }
             _safe_env['PYTHONUNBUFFERED'] = '1'
-            _safe_env['ATLAS_CALIBRATION_CAM_INDEX'] = cam_idx
+            _safe_env['ATLAS_CALIBRATION_CAM_INDEX'] = actual_slot_idx
             if mask_file and _os.path.isfile(mask_file):
                 _safe_env['ATLAS_CALIBRATION_MASK'] = mask_file
                 self.root.after(0, self._cal_log_write,
                                 f'  Calibration mask: {_os.path.basename(mask_file)}\n')
             else:
                 self.root.after(0, self._cal_log_write,
-                                f'  \u26a0 No calibration mask applied (mask_file={mask_file!r})\n')
+                                f'  No calibration mask (hw={hw})\n')
             _superglue_dir = str(pathlib.Path.home() / 'atlas_ws/SuperGluePretrainedNetwork')
             _existing_pp = _safe_env.get('PYTHONPATH', '')
             _safe_env['PYTHONPATH'] = str(dvl) + ':' + _superglue_dir + (':' + _existing_pp if _existing_pp else '')
 
-            _cam_args = ['--cam-index', cam_idx]
+            _cam_args = ['--cam-index', actual_slot_idx]
 
             steps = [
                 ("1. Combine Scans", [sys.executable,
@@ -2159,7 +2229,12 @@ sys.exit(0 if ok[0] else 4)
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
-            if guess == 'auto':
+            # OAK-1: SuperGlue matches at 320x240 (lower res works better for
+            # depth vs texture images). Skip initial_guess_manual — it ignores
+            # calib.json and overwrites the seed with a hardcoded default.
+            if hw == 'oak1':
+                pass  # keep Match Features step, skip initial_guess_manual below
+            elif guess == 'auto':
                 steps.append(("5. Initial Guess (Auto)", [
                     str(dvl / 'initial_guess_auto'), '--data_path', output]))
             else:
@@ -2179,7 +2254,7 @@ sys.exit(0 if ok[0] else 4)
                 if not sess and 'combine_scans' in safe_cmd:
                     self.root.after(0, self._cal_log_write, '  Skipped (no session selected)\n')
                     continue
-                step_env = {**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx} \
+                step_env = {**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': actual_slot_idx} \
                     if 'coordinate_transform' in safe_cmd else _safe_env
                 proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                                  text=True, bufsize=1, env=step_env, cwd=str(dvl))
@@ -2329,6 +2404,23 @@ sys.exit(0 if ok[0] else 4)
         if edge_path.exists():
             subprocess.Popen(['xdg-open', str(edge_path)])
 
+    def _cal_oak1_colorize(self):
+        """Launch the 3D LiDAR colorize tool for OAK-1 calibration."""
+        sess = self._pp_session()
+        if not sess:
+            self._cal_log_write('\n[!] No session selected.\n')
+            return
+        hw = self._cal_hw()
+        cam_idx = self._cal_cam_var.get().split('_')[1]
+        import subprocess as _sp
+        _sp.Popen([
+            sys.executable,
+            str(self.script_dir / 'calibration' / 'oak1_lidar_colorize.py'),
+            sess,
+            '--camera-hw', hw,
+            '--cam-index', cam_idx,
+        ], env={**os.environ, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
+
     def _cal_interactive_seed(self):
         """Write current seed values then launch interactive seed viewer window."""
         import subprocess
@@ -2358,7 +2450,7 @@ sys.exit(0 if ok[0] else 4)
         subprocess.Popen([
             sys.executable,
             str(self.script_dir / 'calibration' / 'interactive_seed.py'),
-            sess, '--camera-hw', hw,
+            sess, '--camera-hw', hw, '--cam-index', cam_idx,
         ], env=env_with_idx)
 
     def _cal_apply(self):
@@ -2405,6 +2497,9 @@ sys.exit(0 if ok[0] else 4)
             import subprocess as _sp, os as _os
             candidates = []
             if scan_dir:
+                # Session-level calib_sweep (new location)
+                candidates.append(pathlib.Path(scan_dir).parent / 'calib_sweep' / 'current.jpg')
+                # Scan-level fallback (old location)
                 candidates.append(pathlib.Path(scan_dir) / 'calib_sweep' / 'current.jpg')
             candidates.append(pathlib.Path.home() / 'atlas_ws/output/calib_sweep/current.jpg')
             for p in candidates:

@@ -29,12 +29,23 @@ if _cam_idx:
         _mc_path = _src_root / 'config' / 'multi_camera.yaml'
         if _mc_path.exists():
             _mc = _y.safe_load(_mc_path.read_text()) or {}
-            _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+            # Try exact slot, then fall back to hw match via source.json
+            _slot_cfg = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
+            if not _slot_cfg.get('calibration'):
+                _source_jsons0 = sorted(_glob.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
+                if _source_jsons0:
+                    import json as _json0
+                    _sess_hw = _json0.loads(Path(_source_jsons0[0]).read_text()).get('camera_hw', '')
+                    if _sess_hw:
+                        _slot_cfg = next(
+                            (v for v in _mc.get('cameras', {}).values()
+                             if v.get('camera_hw') == _sess_hw), {})
+            _calib_rel = _slot_cfg.get('calibration', '')
             if _calib_rel:
                 _slot_path = _src_root / 'config' / _calib_rel
                 if _slot_path.exists():
                     YAML_PATH = _slot_path
-                    _hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', 'onex2')
+                    _hw = _slot_cfg.get('camera_hw', 'onex2')
                     print(f'Using {_hw} calibration: {_slot_path}')
     except Exception:
         pass

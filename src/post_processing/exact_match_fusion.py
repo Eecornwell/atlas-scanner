@@ -103,6 +103,27 @@ def exact_match_calibration_tool(scan_dir):
         elif ('equirect' in f or 'equirectangular' in f) and f.endswith('.jpg'):
             image_file = str(candidate)
 
+    # Fallback: any PNG in the scan dir that isn't masked/raw (e.g. oak1_TIMESTAMP.png)
+    # For oak1: prefer the undistorted image since calibration used zero distortion.
+    if not mask_file and not image_file:
+        undistorted_candidates = []
+        regular_candidates = []
+        for f in sorted(os.listdir(str(safe_scan))):
+            if not f.endswith('.png') or '_masked' in f or '_raw' in f:
+                continue
+            try:
+                candidate = str(_safe_data(safe_scan / f))
+            except ValueError:
+                continue
+            if '_undistorted' in f:
+                undistorted_candidates.append(candidate)
+            else:
+                regular_candidates.append(candidate)
+        # Prefer undistorted for oak1 (calibrated with zero distortion)
+        candidates = undistorted_candidates or regular_candidates
+        if candidates:
+            image_file = candidates[0]
+
     if mask_file and os.path.exists(mask_file):
         image = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED)
         if image is not None and image.ndim == 3 and image.shape[2] == 4:
@@ -131,7 +152,7 @@ def exact_match_calibration_tool(scan_dir):
     # sessions use the correct per-slot calibration regardless of what
     # camera_hw session_config.json records (which is always the primary hw).
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from camera_hw import calibration_path, cam_index_for_scan, camera_hw_for_session
+    from camera_hw import calibration_path, cam_index_for_scan, camera_hw_for_session, load_camera_profile
     import yaml as _yaml
     _session_dir = os.path.dirname(scan_dir)
     _session_hw = camera_hw_for_session(_session_dir)  # from session_config.json
@@ -159,10 +180,18 @@ def exact_match_calibration_tool(scan_dir):
         if os.path.exists(_mc_path):
             _mc = _yaml.safe_load(open(_mc_path).read()) or {}
             _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
+            # Always use the slot hw when available — it's more specific than session hw
+            # (e.g. cam_3=oak1 in an x5 session gets oak1 calibration, not x5)
             if _slot_hw:
                 _hw = _slot_hw
     except Exception:
         pass
+
+    # _is_perspective must be based on the SCAN's actual hw, not the session hw.
+    # In a multi-camera session (e.g. x5+oak1), oak1 scans need pinhole projection
+    # even though session_hw=x5 which has perspective=False.
+    _profile = load_camera_profile(_hw)
+    _is_perspective = _profile.get('perspective', False)
 
     config_path = str(calibration_path(_hw, _cam_idx))
     with open(config_path, 'r') as f:
@@ -207,11 +236,33 @@ def exact_match_calibration_tool(scan_dir):
     points_camera = points_camera[depth_valid]
     cam_depths    = cam_depths[depth_valid]
 
-    bearing = points_camera / cam_depths[:, np.newaxis]
-    lat = -np.arcsin(np.clip(bearing[:, 1], -1, 1))
-    lon = np.arctan2(bearing[:, 0], bearing[:, 2])
-    u = img_width  * (0.5 + lon / (2 * np.pi))
-    v = img_height * (0.5 - lat / np.pi)
+    # Projection: pinhole for perspective cameras (oak1), ERP for fisheye
+    if _is_perspective:
+        # Pinhole projection using calibration intrinsics
+        # Load intrinsics from camera_info.yaml (scaled to actual image size)
+        _ci_path = os.path.join(scan_dir, 'camera_info.yaml')
+        if not os.path.exists(_ci_path):
+            _ci_path = os.path.join(_session_dir, 'camera_info.yaml')
+        _ci = _yaml.safe_load(open(_ci_path).read())
+        _sx = img_width  / _ci['width']
+        _sy = img_height / _ci['height']
+        _fx = _ci['fx'] * _sx
+        _fy = _ci['fy'] * _sy
+        _cx = _ci['cx'] * _sx
+        _cy = _ci['cy'] * _sy
+        # Simple pinhole projection (zero distortion — using undistorted image)
+        _front = points_camera[:, 2] > 0.1
+        u = np.full(len(points_camera), -1.0)
+        v = np.full(len(points_camera), -1.0)
+        u[_front] = _fx * points_camera[_front, 0] / points_camera[_front, 2] + _cx
+        v[_front] = _fy * points_camera[_front, 1] / points_camera[_front, 2] + _cy
+    else:
+        # Equirectangular projection (fisheye cameras)
+        bearing = points_camera / cam_depths[:, np.newaxis]
+        lat = -np.arcsin(np.clip(bearing[:, 1], -1, 1))
+        lon = np.arctan2(bearing[:, 0], bearing[:, 2])
+        u = img_width  * (0.5 + lon / (2 * np.pi))
+        v = img_height * (0.5 - lat / np.pi)
 
     print(f"Projection range: u=[{u.min():.1f}, {u.max():.1f}], v=[{v.min():.1f}, {v.max():.1f}]")
 
@@ -228,8 +279,7 @@ def exact_match_calibration_tool(scan_dir):
 
     print(f"Valid projections: {len(valid_points)} points")
 
-    # Bilinear interpolation — blends 4 surrounding pixels for each projected
-    # point instead of snapping to nearest pixel, giving sharper color edges.
+    # Bilinear interpolation
     u0 = np.clip(np.floor(valid_u).astype(int), 0, img_width - 1)
     v0 = np.clip(np.floor(valid_v).astype(int), 0, img_height - 1)
     u1 = np.clip(u0 + 1, 0, img_width - 1)
@@ -242,7 +292,10 @@ def exact_match_calibration_tool(scan_dir):
     c11 = image[v1, u1].astype(np.float32)
     colors_bgr = (c00 * (1 - fu) * (1 - fv) + c10 * fu * (1 - fv) +
                   c01 * (1 - fu) * fv       + c11 * fu * fv)
-    colors = np.clip(colors_bgr, 0, 255).astype(np.uint8)[:, [2, 1, 0]]  # BGR to RGB
+    valid_colors = np.clip(colors_bgr, 0, 255).astype(np.uint8)[:, [2, 1, 0]]  # BGR to RGB
+
+    out_points = valid_points
+    colors = valid_colors
 
     def write_ply(path, pts, cols):
         try:
@@ -270,7 +323,7 @@ def exact_match_calibration_tool(scan_dir):
             f.write(rec.tobytes())
 
     sensor_output = str(_safe_data(safe_scan / "sensor_colored_exact.ply"))
-    write_ply(sensor_output, valid_points, colors)
+    write_ply(sensor_output, out_points, colors)
     print(f"\u2713 Saved sensor-frame colored points to {sensor_output}")
     return True
 

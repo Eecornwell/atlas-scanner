@@ -54,6 +54,7 @@ _ORIENTATION_FALLBACK = {
     'x5':    (-179.77,  0.95, -91.77),
     'x3':    (-178.54,  2.92, -81.56),
     'onex2': (-179.0,  3.0, -98.0),
+    'oak1':  (-45.0,  0.0, -90.0),
 }
 
 
@@ -136,6 +137,42 @@ def project_points(points, T_cam_lidar, width, height):
     return u, v, valid, norm[valid]
 
 
+def project_points_pinhole(points, T_cam_lidar, K, dist, width, height):
+    """Project points onto a rectilinear image using pinhole + distortion model."""
+    pts_cam = (T_cam_lidar[:3, :3] @ points.T).T + T_cam_lidar[:3, 3]
+    # Only points in front of the camera
+    valid = pts_cam[:, 2] > 0.3
+    pts_f = pts_cam[valid]
+    norm = np.linalg.norm(pts_f, axis=1)
+    # Normalised image coords
+    xn = pts_f[:, 0] / pts_f[:, 2]
+    yn = pts_f[:, 1] / pts_f[:, 2]
+    # Rational polynomial distortion (k1..k6, p1, p2)
+    r2 = xn**2 + yn**2
+    r4, r6 = r2**2, r2**3
+    k1, k2, p1, p2 = dist[0], dist[1], dist[2], dist[3]
+    k3 = dist[4] if len(dist) > 4 else 0.0
+    k4 = dist[5] if len(dist) > 5 else 0.0
+    k5 = dist[6] if len(dist) > 6 else 0.0
+    k6 = dist[7] if len(dist) > 7 else 0.0
+    num = 1 + k1*r2 + k2*r4 + k3*r6
+    den = 1 + k4*r2 + k5*r4 + k6*r6
+    radial = num / np.where(den == 0, 1e-9, den)
+    xd = xn*radial + 2*p1*xn*yn + p2*(r2 + 2*xn**2)
+    yd = yn*radial + p1*(r2 + 2*yn**2) + 2*p2*xn*yn
+    u = (K[0, 0]*xd + K[0, 2]).astype(int)
+    v = (K[1, 1]*yd + K[1, 2]).astype(int)
+    in_frame = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+    # Return in same shape as ERP version: u, v, valid_mask, depths
+    u_out = u[in_frame]
+    v_out = v[in_frame]
+    # Build full-length valid mask combining front-of-camera and in-frame
+    full_valid = np.zeros(len(points), dtype=bool)
+    idx = np.where(valid)[0][in_frame]
+    full_valid[idx] = True
+    return u_out, v_out, full_valid, norm[in_frame]
+
+
 def _clamp_to_slider(val, half_range, scale, center=0.0):
     """Convert an absolute value to a slider tick position, clamped to range."""
     ticks = int(round((val - center) / scale))
@@ -183,8 +220,34 @@ def main():
     cam_files = sorted(first_scan.glob('equirect_*_masked.png'))
     if not cam_files:
         cam_files = sorted(first_scan.glob('equirect_dual_fisheye.jpg'))
+    # OAK-1: rectilinear PNG
+    oak1_files = sorted(first_scan.glob('oak1_*.png'))
+    oak1_files = [f for f in oak1_files if '_undistorted' not in f.name]
+    is_pinhole = False
+    pinhole_K = None
+    pinhole_dist = None
+    if not cam_files and oak1_files:
+        cam_files = oak1_files
+        is_pinhole = True
+        # Load intrinsics from camera_info.yaml in the scan dir
+        info_path = first_scan / 'camera_info.yaml'
+        if not info_path.exists():
+            info_path = session / 'camera_info.yaml'
+        if info_path.exists():
+            _info = yaml.safe_load(info_path.read_text())
+            # Scale K to actual image size (depthai delivers 4000x3000 not 4056x3040)
+            _img_probe = cv2.imread(str(cam_files[0]))
+            _ah, _aw = _img_probe.shape[:2] if _img_probe is not None else (_info['height'], _info['width'])
+            sx, sy = _aw / _info['width'], _ah / _info['height']
+            pinhole_K = np.array([
+                [_info['fx']*sx, 0, _info['cx']*sx],
+                [0, _info['fy']*sy, _info['cy']*sy],
+                [0, 0, 1]], dtype=np.float64)
+            pinhole_dist = np.array(_info['D'][:8], dtype=np.float64)
+        else:
+            print("⚠ No camera_info.yaml found — projection may be inaccurate")
     if not cam_files:
-        print("No ERP image found")
+        print("No camera image found (equirect or oak1 PNG)")
         return
 
     cam_img_full = cv2.imread(str(cam_files[0]))
@@ -256,6 +319,17 @@ def main():
 
     saved = False
     show_edges = False
+    # For pinhole: track crop region so user can zoom into where points land
+    crop_enabled = is_pinhole
+    crop_cx, crop_cy = disp_w // 2, disp_h // 2
+    CROP_W, CROP_H = min(960, disp_w), min(720, disp_h)
+
+    def _put(img, txt, pos, scale=0.55, color=(255, 255, 255)):
+        cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, 1, cv2.LINE_AA)
+
     while True:
         roll_deg  = _read_slider(cv2.getTrackbarPos('Roll (deg)',  win), R_RANGE, R_SCALE, ROLL_CENTER)
         pitch_deg = _read_slider(cv2.getTrackbarPos('Pitch (deg)', win), R_RANGE, R_SCALE, PITCH_CENTER)
@@ -269,63 +343,128 @@ def main():
                       left_in * INCHES_TO_METERS,
                       up_in * INCHES_TO_METERS)
 
-        u, v_px, valid, depths = project_points(points, T, disp_w, disp_h)
+        if is_pinhole and pinhole_K is not None:
+            u, v_px, valid, depths = project_points_pinhole(
+                points, T, pinhole_K, pinhole_dist, disp_w, disp_h)
+        else:
+            u, v_px, valid, depths = project_points(points, T, disp_w, disp_h)
 
         display = cam_img.copy()
         display[~cam_mask] = display[~cam_mask] // 4
 
+        # Build depth image
         depth_img = np.zeros((disp_h, disp_w), dtype=np.float32)
-        depth_img[v_px, u] = depths
-        depth_img = cv2.dilate(depth_img,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
-        depth_img[~cam_mask] = 0
+        if len(u) > 0:
+            depth_img[v_px, u] = depths
 
-        d_valid = depth_img[depth_img > 0]
+        # --- Range-discontinuity edges: much more readable than depth colormap ---
+        # Dilate slightly just to fill gaps between sparse points, then find
+        # where depth changes sharply (structural edges in the scene).
+        depth_filled = cv2.dilate(depth_img,
+                                  cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        depth_filled[~cam_mask] = 0
+
+        d_valid = depth_filled[depth_filled > 0]
         if len(d_valid) > 0:
-            d_min, d_max = np.percentile(d_valid, [5, 95])
-            depth_u8 = np.clip((depth_img - d_min) / max(d_max - d_min, 0.1), 0, 1)
+            d_min, d_max = np.percentile(d_valid, [2, 98])
+            depth_u8 = np.clip((depth_filled - d_min) / max(d_max - d_min, 0.1), 0, 1)
             depth_u8 = (depth_u8 * 255).astype(np.uint8)
         else:
             depth_u8 = np.zeros((disp_h, disp_w), dtype=np.uint8)
         depth_u8[~cam_mask] = 0
-        lid_mask_bool = depth_u8 > 0
 
-        lid_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
-        display[lid_mask_bool] = cv2.addWeighted(
-            cam_img, 0.3, lid_color, 0.7, 0)[lid_mask_bool]
-
-        if show_edges:
-            cam_gray = cv2.cvtColor(cam_img, cv2.COLOR_BGR2GRAY)
-            cam_edges = cv2.Canny(cam_gray, 30, 90)
-            cam_edges[~cam_mask] = 0
-            cam_edges = cv2.dilate(cam_edges, np.ones((2, 2), np.uint8))
-            lid_edges = cv2.Canny(depth_u8, 10, 40)
-            lid_edges = cv2.dilate(lid_edges, np.ones((2, 2), np.uint8))
-            display[cam_edges > 0] = (50, 50, 255)
-            display[lid_edges > 0] = (50, 255, 50)
-            display[(cam_edges > 0) & (lid_edges > 0)] = (0, 255, 255)
-            edge_hint = '  V=edges OFF'
+        # Compute range-gradient edges from the depth image
+        # Sobel on depth highlights depth discontinuities = structural edges
+        if depth_u8.max() > 0:
+            dx = cv2.Sobel(depth_u8.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+            dy = cv2.Sobel(depth_u8.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+            grad = np.sqrt(dx**2 + dy**2)
+            grad_thresh = np.percentile(grad[grad > 0], 70) if (grad > 0).any() else 1
+            lidar_edges = (grad > grad_thresh).astype(np.uint8) * 255
+            lidar_edges = cv2.dilate(lidar_edges, np.ones((2, 2), np.uint8))
         else:
-            edge_hint = '  V=edges ON'
+            lidar_edges = np.zeros((disp_h, disp_w), dtype=np.uint8)
 
-        def _put(img, txt, pos, scale=0.6, color=(255, 255, 255)):
-            cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                        scale, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(img, txt, pos, cv2.FONT_HERSHEY_SIMPLEX,
-                        scale, color, 1, cv2.LINE_AA)
+        # Camera image edges
+        cam_gray = cv2.cvtColor(cam_img, cv2.COLOR_BGR2GRAY)
+        cam_edges = cv2.Canny(cam_gray, 20, 60)
+        cam_edges[~cam_mask] = 0
 
-        _put(display, f'T: Fwd={fwd_in:.2f}" Left={left_in:.2f}" Up={up_in:.2f}"', (10, 28))
-        _put(display, f'R: Roll={roll_deg:.0f} Pitch={pitch_deg:.0f} Yaw={yaw_deg:.0f} deg (absolute)', (10, 54))
-        _put(display, f'S=Save  Q=Quit{edge_hint}', (10, 80), scale=0.5, color=(0, 255, 255))
+        # Composite: dim image, overlay LiDAR depth as thin colormap dots,
+        # then overlay LiDAR structural edges in bright green,
+        # camera edges in dim blue, coincident edges in yellow.
+        display = (cam_img.astype(np.float32) * 0.5).astype(np.uint8)
 
-        cv2.imshow(win, display)
+        # Thin dot overlay for depth context (small dilation only)
+        depth_dots = cv2.dilate(depth_img,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        depth_dots[~cam_mask] = 0
+        if depth_dots.max() > 0:
+            d2 = np.clip((depth_dots - d_min) / max(d_max - d_min, 0.1), 0, 1)
+            d2_u8 = (d2 * 255).astype(np.uint8)
+            dot_color = cv2.applyColorMap(d2_u8, cv2.COLORMAP_TURBO)
+            dot_mask = depth_dots > 0
+            display[dot_mask] = cv2.addWeighted(
+                cam_img, 0.2, dot_color, 0.8, 0)[dot_mask]
+
+        # LiDAR structural edges: bright green
+        display[lidar_edges > 0] = (30, 220, 30)
+        # Camera edges: dim blue
+        display[cam_edges > 0] = np.clip(
+            display[cam_edges > 0].astype(int) + [60, 30, 0], 0, 255).astype(np.uint8)
+        # Coincident (aligned) edges: bright yellow
+        coincident = (lidar_edges > 0) & (cam_edges > 0)
+        display[coincident] = (0, 255, 255)
+
+        n_pts = len(u)
+        n_coincident = int(coincident.sum())
+
+        # --- Crop view for pinhole: zoom into where points actually land ---
+        if crop_enabled and n_pts > 0:
+            # Centre crop on median of projected points
+            crop_cx = int(np.median(u))
+            crop_cy = int(np.median(v_px))
+            crop_cx = max(CROP_W//2, min(disp_w - CROP_W//2, crop_cx))
+            crop_cy = max(CROP_H//2, min(disp_h - CROP_H//2, crop_cy))
+            x0 = crop_cx - CROP_W//2; x1 = x0 + CROP_W
+            y0 = crop_cy - CROP_H//2; y1 = y0 + CROP_H
+            crop = display[y0:y1, x0:x1].copy()
+            # Scale crop up to fill display width
+            scale_up = min(disp_w / CROP_W, disp_h / CROP_H)
+            cw = int(CROP_W * scale_up); ch = int(CROP_H * scale_up)
+            crop_big = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_NEAREST)
+            # Draw crop rectangle on full view
+            cv2.rectangle(display, (x0, y0), (x1, y1), (0, 200, 255), 2)
+            # Show side by side: full (left) | crop zoomed (right)
+            full_resized = cv2.resize(display, (disp_w, disp_h))
+            # Pad crop to same height
+            pad_top = (disp_h - ch) // 2
+            pad_bot = disp_h - ch - pad_top
+            if pad_top >= 0 and pad_bot >= 0:
+                crop_padded = cv2.copyMakeBorder(crop_big, pad_top, pad_bot, 0, 0,
+                                                  cv2.BORDER_CONSTANT, value=(20, 20, 20))
+                combined = np.hstack([full_resized, crop_padded])
+            else:
+                combined = full_resized
+            out_img = combined
+        else:
+            out_img = display
+
+        _put(out_img, f'T: Fwd={fwd_in:.2f}" Left={left_in:.2f}" Up={up_in:.2f}"', (10, 28))
+        _put(out_img, f'R: Roll={roll_deg:.0f} Pitch={pitch_deg:.0f} Yaw={yaw_deg:.0f} deg', (10, 54))
+        _put(out_img, f'pts={n_pts}  aligned={n_coincident}  S=Save Q=Quit C=crop', (10, 80),
+             scale=0.5, color=(0, 255, 255))
+        _put(out_img, 'GREEN=LiDAR edges  YELLOW=aligned  BLUE=camera edges', (10, out_img.shape[0] - 10),
+             scale=0.45, color=(180, 180, 180))
+
+        cv2.imshow(win, out_img)
         key = cv2.waitKey(30)
         if key == -1:
             pass
         elif key & 0xFF in (ord('q'), 27):
             break
-        elif key & 0xFF == ord('v'):
-            show_edges = not show_edges
+        elif key & 0xFF == ord('c'):
+            crop_enabled = not crop_enabled
         elif key & 0xFF == ord('s'):
             roll_rad  = np.radians(roll_deg)
             pitch_rad = np.radians(pitch_deg)

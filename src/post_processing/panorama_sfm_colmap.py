@@ -255,6 +255,162 @@ def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.I
     return cv2.remap(erp_img, u, v, interpolation, borderMode=cv2.BORDER_WRAP)
 
 
+def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs):
+    """Add OAK-1 pinhole images from a mixed session into face_oak1/.
+    Called after ERP tiling so both camera types end up in COLMAP."""
+    images_dir = colmap_dir / 'images' / 'face_oak1'
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    panoramas = []
+    for scan_dir in scan_dirs:
+        img_src = next((f for f in sorted(scan_dir.glob('oak1_*_undistorted.png'))), None)
+        if img_src is None:
+            continue
+
+        ci_path = scan_dir / 'camera_info.yaml'
+        if not ci_path.exists():
+            ci_path = session_path / 'camera_info.yaml'
+        if not ci_path.exists():
+            continue
+        import yaml as _yaml
+        ci = _yaml.safe_load(ci_path.read_text())
+        img = cv2.imread(str(img_src))
+        if img is None:
+            continue
+        ih, iw = img.shape[:2]
+        sx, sy = iw / ci['width'], ih / ci['height']
+        fx = ci['fx'] * sx
+        fy = ci['fy'] * sy
+        cx_k = ci['cx'] * sx
+        cy_k = ci['cy'] * sy
+        f_px = (fx + fy) / 2.0
+
+        T_scan = _load_calibration_for_scan(scan_dir, session_path)
+        pose = _load_pose(scan_dir, T_scan)
+        if pose is None:
+            continue
+        C_col, R_c2w_col, R_c2w_ros = pose
+
+        fname = f"pano_{len(panoramas):03d}.png"
+        dst = images_dir / fname
+        import shutil as _shutil
+        _shutil.copy2(str(img_src), str(dst))
+
+        R_w2c = R_c2w_col.T
+        T_tile = -R_w2c @ C_col
+        q = R.from_matrix(R_w2c).as_quat()
+        if q[3] < 0:
+            q = -q
+
+        panoramas.append({
+            'scan_dir': scan_dir,
+            'erp_src': img_src,
+            'center': C_col,
+            'R_c2w': R_c2w_col,
+            'R_c2w_ros': R_c2w_ros,
+            'f_px': f_px,
+            'tile_size': iw,
+            'cx': cx_k, 'cy': cy_k,
+            'img_w': iw, 'img_h': ih,
+            'active_faces': [0],
+            'tiles': [{
+                'face': 0,
+                'rel_path': f'face_oak1/{fname}',
+                'quat_wxyz': [q[3], q[0], q[1], q[2]],
+                'trans': T_tile.tolist(),
+            }],
+        })
+
+    return panoramas
+
+
+def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
+    """Prepare COLMAP images for a pinhole (OAK-1) session.
+    Copies undistorted PNGs directly — no ERP tiling needed.
+    Returns panorama list compatible with the rest of the pipeline."""
+    images_dir = colmap_dir / 'images' / 'face_00'
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    scan_dirs = sorted(d for d in session_path.iterdir()
+                       if d.is_dir() and d.name.startswith('fusion_scan_')
+                       and not (d / '.blur_skip').exists())
+
+    panoramas = []
+    for scan_dir in scan_dirs:
+        # Find undistorted image
+        img_src = next((f for f in sorted(scan_dir.glob('oak1_*_undistorted.png'))), None)
+        if img_src is None:
+            img_src = next((f for f in sorted(scan_dir.glob('oak1_*.png'))
+                            if '_undistorted' not in f.name), None)
+        if img_src is None:
+            continue
+
+        # Load intrinsics
+        ci_path = scan_dir / 'camera_info.yaml'
+        if not ci_path.exists():
+            ci_path = session_path / 'camera_info.yaml'
+        if not ci_path.exists():
+            continue
+        import yaml as _yaml
+        ci = _yaml.safe_load(ci_path.read_text())
+        img = cv2.imread(str(img_src))
+        if img is None:
+            continue
+        ih, iw = img.shape[:2]
+        sx, sy = iw / ci['width'], ih / ci['height']
+        fx = ci['fx'] * sx
+        fy = ci['fy'] * sy
+        cx_k = ci['cx'] * sx
+        cy_k = ci['cy'] * sy
+        # Use mean focal length as SIMPLE_PINHOLE f
+        f_px = (fx + fy) / 2.0
+
+        T_scan = _load_calibration_for_scan(scan_dir, session_path)
+        pose = _load_pose(scan_dir, T_scan)
+        if pose is None:
+            continue
+        C_col, R_c2w_col, R_c2w_ros = pose
+
+        fname = f"pano_{len(panoramas):03d}.png"
+        dst = images_dir / fname
+        import shutil as _shutil
+        _shutil.copy2(str(img_src), str(dst))
+
+        R_w2c = R_c2w_col.T
+        T_tile = -R_w2c @ C_col
+        q = R.from_matrix(R_w2c).as_quat()  # xyzw
+        if q[3] < 0:
+            q = -q
+
+        panoramas.append({
+            'scan_dir': scan_dir,
+            'erp_src': img_src,   # reuse field name for compatibility
+            'center': C_col,
+            'R_c2w': R_c2w_col,
+            'R_c2w_ros': R_c2w_ros,
+            'f_px': f_px,
+            'tile_size': iw,      # full image width
+            'cx': cx_k, 'cy': cy_k,
+            'img_w': iw, 'img_h': ih,
+            'active_faces': [0],
+            'tiles': [{
+                'face': 0,
+                'rel_path': f'face_00/{fname}',
+                'quat_wxyz': [q[3], q[0], q[1], q[2]],
+                'trans': T_tile.tolist(),
+            }],
+        })
+
+    if not panoramas:
+        print('  No OAK-1 undistorted images found')
+        return []
+
+    print(f'  OAK-1 pinhole: {len(panoramas)} images copied to face_00/')
+    print(f'  f_px={panoramas[0]["f_px"]:.1f}  '
+          f'cx={panoramas[0]["cx"]:.1f}  cy={panoramas[0]["cy"]:.1f}')
+    return panoramas
+
+
 def prepare_images(session_path, colmap_dir, T_camera_lidar):
     images_dir = colmap_dir / 'images'
     mask_dir = colmap_dir / 'masks'
@@ -269,6 +425,28 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
     panoramas = []
     session_is_360 = None
+
+    # OAK-1: detect perspective (pinhole) session
+    _is_oak1 = False
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent))
+        from camera_hw import camera_hw_for_session, load_camera_profile
+        _hw = camera_hw_for_session(str(session_path))
+        _profile = load_camera_profile(_hw)
+        _is_oak1 = _profile.get('perspective', False)
+    except Exception:
+        pass
+
+    if _is_oak1:
+        return _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar)
+
+    # Mixed session: check if any scan dirs have OAK-1 images alongside ERP
+    _has_oak1_scans = any(
+        list(sd.glob('oak1_*_undistorted.png'))
+        for sd in scan_dirs
+    )
+
     for scan_dir in scan_dirs:
         erp_src, is_360 = _find_erp_image(scan_dir)
         if erp_src is None:
@@ -402,6 +580,15 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         pano['active_faces'] = active_faces
 
     print(f"  Generated tiles for {len(panoramas)} panoramas")
+
+    # Mixed session: also add OAK-1 pinhole images into face_oak1/
+    if _has_oak1_scans:
+        oak1_panos = _prepare_images_pinhole_extra(
+            session_path, colmap_dir, scan_dirs)
+        if oak1_panos:
+            panoramas.extend(oak1_panos)
+            print(f"  Added {len(oak1_panos)} OAK-1 pinhole images (face_oak1/)")
+
     return panoramas
 
 
@@ -448,9 +635,33 @@ def write_rig_config(colmap_dir, panoramas):
         cameras.append(entry)
 
     rig_config_path = colmap_dir / 'rig_config.json'
+    rigs = [{"cameras": cameras}]
+
+    # Mixed session: add OAK-1 as a separate independent rig
+    conn2 = sqlite3.connect(str(db_path))
+    has_oak1 = conn2.execute(
+        "SELECT 1 FROM images WHERE name LIKE 'face_oak1/%' LIMIT 1"
+    ).fetchone()
+    conn2.close()
+    if has_oak1:
+        # OAK-1 images have independent poses — single-camera rig, identity rotation
+        oak1_panos = [p for p in panoramas if 'cx' in p]
+        if oak1_panos:
+            oak1_fpx = oak1_panos[0]['f_px']
+            oak1_cx  = oak1_panos[0]['cx']
+            oak1_cy  = oak1_panos[0]['cy']
+            rigs.append({"cameras": [{
+                "image_prefix": "face_oak1/",
+                "camera_model_name": "PINHOLE",
+                "camera_params": [oak1_fpx, oak1_fpx, oak1_cx, oak1_cy],
+                "ref_sensor": True,
+            }]})
+            print(f"  OAK-1 rig: PINHOLE f={oak1_fpx:.1f} cx={oak1_cx:.1f} cy={oak1_cy:.1f}")
+
     with open(rig_config_path, 'w') as f:
-        json.dump([{"cameras": cameras}], f, indent=2)
-    print(f"  Rig config: {len(cameras)} faces (present in DB)")
+        json.dump(rigs, f, indent=2)
+    print(f"  Rig config: {len(cameras)} ERP faces" +
+          (f" + OAK-1" if has_oak1 else ""))
     return rig_config_path
 
 
@@ -469,6 +680,11 @@ def write_init_model_bin(colmap_dir, panoramas):
         ).fetchone()
         if row:
             face_camera_ids[face_idx] = row[0]
+    # Also get OAK-1 camera ID from face_oak1/
+    oak1_cam_row = conn.execute(
+        "SELECT camera_id FROM images WHERE name LIKE 'face_oak1/%' LIMIT 1"
+    ).fetchone()
+    oak1_camera_id = oak1_cam_row[0] if oak1_cam_row else None
     db_images = {name: img_id for img_id, name in
                  conn.execute('SELECT image_id, name FROM images').fetchall()}
     db_cameras = conn.execute(
@@ -487,16 +703,24 @@ def write_init_model_bin(colmap_dir, panoramas):
 
     # images.bin — only tiles that were actually written to disk
     all_tiles = []
+    _oak1_count = 0
     for pano in panoramas:
         for tile in pano['tiles']:
             img_id = db_images.get(tile['rel_path'])
-            cam_id = face_camera_ids.get(tile['face'])
+            # Use OAK-1 camera ID for face_oak1 tiles, numeric face ID for ERP
+            if 'face_oak1' in tile['rel_path']:
+                cam_id = oak1_camera_id
+                _oak1_count += 1
+            else:
+                cam_id = face_camera_ids.get(tile['face'])
             if img_id is not None and cam_id is not None:
                 # Verify the image file actually exists (not skipped as blank)
                 img_file = colmap_dir / 'images' / tile['rel_path']
                 if img_file.exists():
                     all_tiles.append((img_id, tile['quat_wxyz'], tile['trans'],
                                       cam_id, tile['rel_path']))
+    if _oak1_count > 0:
+        oak1_included = sum(1 for _,_,_,_,n in all_tiles if 'face_oak1' in n)
 
     with open(sparse_dir / 'images.bin', 'wb') as f:
         f.write(struct.pack('Q', len(all_tiles)))
@@ -714,6 +938,79 @@ def _write_merged_to_points3d(output_dir, lidar_pts_world, lidar_cols_world, lid
     print(f'✓ points3D.bin: {n_lidar} LiDAR points')
 
 
+def _write_oak1_list(colmap_dir):
+    """Write a text file listing face_oak1/*.png for COLMAP image_list_path."""
+    oak1_dir = colmap_dir / 'images' / 'face_oak1'
+    list_path = colmap_dir / 'oak1_image_list.txt'
+    with open(list_path, 'w') as f:
+        for img in sorted(oak1_dir.glob('*.png')):
+            f.write(f'face_oak1/{img.name}\n')
+    return list_path
+
+
+def _inject_known_pose_images(output_dir, init_sparse, oak1_panos):
+    """Append OAK-1 images with known poses to sparse/0/images.bin.
+    point_triangulator drops images with no triangulated points, so we
+    re-inject them directly from init_sparse after triangulation."""
+    # Read existing images.bin
+    images_bin = output_dir / 'images.bin'
+    existing = []
+    existing_names = set()
+    with open(images_bin, 'rb') as f:
+        n = struct.unpack('Q', f.read(8))[0]
+        for _ in range(n):
+            img_id = struct.unpack('I', f.read(4))[0]
+            qw,qx,qy,qz = struct.unpack('dddd', f.read(32))
+            tx,ty,tz = struct.unpack('ddd', f.read(24))
+            cam_id = struct.unpack('I', f.read(4))[0]
+            name = b''
+            while True:
+                c = f.read(1)
+                if c == b'\x00': break
+                name += c
+            name = name.decode()
+            n_pts = struct.unpack('Q', f.read(8))[0]
+            pts_data = f.read(n_pts * 24)
+            existing.append((img_id, qw,qx,qy,qz, tx,ty,tz, cam_id, name, n_pts, pts_data))
+            existing_names.add(name)
+
+    # Read OAK-1 entries from init_sparse
+    init_bin = init_sparse / 'images.bin'
+    oak1_entries = []
+    with open(init_bin, 'rb') as f:
+        n = struct.unpack('Q', f.read(8))[0]
+        for _ in range(n):
+            img_id = struct.unpack('I', f.read(4))[0]
+            qw,qx,qy,qz = struct.unpack('dddd', f.read(32))
+            tx,ty,tz = struct.unpack('ddd', f.read(24))
+            cam_id = struct.unpack('I', f.read(4))[0]
+            name = b''
+            while True:
+                c = f.read(1)
+                if c == b'\x00': break
+                name += c
+            name = name.decode()
+            f.read(8)  # n_pts2D = 0
+            if 'face_oak1' in name and name not in existing_names:
+                oak1_entries.append((img_id, qw,qx,qy,qz, tx,ty,tz, cam_id, name, 0, b''))
+
+    if not oak1_entries:
+        return
+
+    # Write combined images.bin
+    all_entries = existing + oak1_entries
+    with open(images_bin, 'wb') as f:
+        f.write(struct.pack('Q', len(all_entries)))
+        for img_id, qw,qx,qy,qz, tx,ty,tz, cam_id, name, n_pts, pts_data in all_entries:
+            f.write(struct.pack('I', img_id))
+            f.write(struct.pack('dddd', qw,qx,qy,qz))
+            f.write(struct.pack('ddd', tx,ty,tz))
+            f.write(struct.pack('I', cam_id))
+            f.write(name.encode('utf-8') + b'\x00')
+            f.write(struct.pack('Q', n_pts))
+            f.write(pts_data)
+
+
 def _strip_rig_from_db(db_path):
     """Remove rig/frame tables so point_triangulator treats images independently."""
     conn = sqlite3.connect(str(db_path))
@@ -753,21 +1050,74 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     f_px = panoramas[0]['f_px']
     c = panoramas[0]['tile_size'] / 2.0
 
-    print("2. Extracting features (SIMPLE_PINHOLE, one camera per face folder)...")
+    # OAK-1: use PINHOLE with actual cx/cy; ERP tiles use SIMPLE_PINHOLE
+    _is_pinhole_session = 'cx' in panoramas[0]
+    # Mixed session: some panoramas are ERP, some are OAK-1 pinhole
+    _oak1_panos = [p for p in panoramas if 'cx' in p]
+    _erp_panos  = [p for p in panoramas if 'cx' not in p]
+    _is_mixed = bool(_oak1_panos and _erp_panos)
+
+    if _is_pinhole_session and not _is_mixed:
+        _cx = panoramas[0]['cx']
+        _cy = panoramas[0]['cy']
+        _cam_model = 'PINHOLE'
+        _cam_params = f'{f_px:.4f},{f_px:.4f},{_cx:.4f},{_cy:.4f}'
+        print(f"2. Extracting features (PINHOLE, fx=fy={f_px:.1f} cx={_cx:.1f} cy={_cy:.1f})...")
+    else:
+        _cam_model = 'SIMPLE_PINHOLE'
+        _cam_params = f'{f_px:.4f},{c:.1f},{c:.1f}'
+        if _is_mixed:
+            print(f"2. Extracting features (mixed: SIMPLE_PINHOLE for ERP + PINHOLE for OAK-1)...")
+        else:
+            print("2. Extracting features (SIMPLE_PINHOLE, one camera per face folder)...")
     mask_dir = colmap_dir / 'masks'
+    # For mixed sessions, first pass only processes ERP faces (not face_oak1)
+    _erp_image_path = colmap_dir / 'images'
     cmd = [
         'colmap', 'feature_extractor',
         '--database_path', str(db_path),
-        '--image_path', str(colmap_dir / 'images'),
-        '--ImageReader.camera_model', 'SIMPLE_PINHOLE',
+        '--image_path', str(_erp_image_path),
+        '--ImageReader.camera_model', _cam_model,
         '--ImageReader.single_camera_per_folder', '1',
-        '--ImageReader.camera_params', f'{f_px:.4f},{c:.1f},{c:.1f}',
+        '--ImageReader.camera_params', _cam_params,
         '--SiftExtraction.max_num_features', '32768',
             '--SiftExtraction.estimate_affine_shape', '1',
     ]
+    if _is_mixed:
+        # Exclude face_oak1 from first pass by listing only ERP face dirs
+        import shutil as _shutil
+        _oak1_tmp = colmap_dir / '_face_oak1_tmp'
+        _oak1_src = colmap_dir / 'images' / 'face_oak1'
+        if _oak1_tmp.exists():
+            _shutil.rmtree(str(_oak1_tmp))
+        if _oak1_src.exists():
+            _oak1_src.rename(_oak1_tmp)
     if any(mask_dir.rglob('*.png')):
         cmd += ['--ImageReader.mask_path', str(mask_dir)]
     subprocess.run(cmd, check=True)
+    if _is_mixed and _oak1_tmp.exists():
+        _oak1_tmp.rename(_oak1_src)
+
+    # Mixed session: run a second feature extraction pass for OAK-1 face_oak1/
+    # with PINHOLE model and actual intrinsics — no mask needed for OAK-1
+    if _is_mixed and _oak1_panos:
+        _oak1_cx = _oak1_panos[0]['cx']
+        _oak1_cy = _oak1_panos[0]['cy']
+        _oak1_fpx = _oak1_panos[0]['f_px']
+        _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
+        print(f"   OAK-1 pass: PINHOLE fx=fy={_oak1_fpx:.1f} cx={_oak1_cx:.1f} cy={_oak1_cy:.1f}")
+        cmd_oak1 = [
+            'colmap', 'feature_extractor',
+            '--database_path', str(db_path),
+            '--image_path', str(colmap_dir / 'images'),
+            '--image_list_path', str(_write_oak1_list(colmap_dir)),
+            '--ImageReader.camera_model', 'PINHOLE',
+            '--ImageReader.single_camera_per_folder', '1',
+            '--ImageReader.camera_params', _oak1_params,
+            '--SiftExtraction.max_num_features', '32768',
+                '--SiftExtraction.estimate_affine_shape', '1',
+        ]
+        subprocess.run(cmd_oak1, check=True)
 
     print("3. Configuring rig...")
     rig_config_path = write_rig_config(colmap_dir, panoramas)
@@ -818,6 +1168,14 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--Mapper.tri_complete_max_reproj_error', '16.0',
         '--Mapper.tri_re_max_angle_error', '8.0',
     ], check=True)
+
+    # Inject OAK-1 images with known poses into sparse/0/images.bin.
+    # point_triangulator drops images with no triangulated points, but OAK-1
+    # images have pose priors and don't need triangulated points to be useful.
+    _oak1_panos = [p for p in panoramas if 'cx' in p]
+    if _oak1_panos:
+        _inject_known_pose_images(output_dir, init_sparse, _oak1_panos)
+        print(f"  Injected {len(_oak1_panos)} OAK-1 images with known poses")
 
     if bundle_adjustment:
         print("7. Restoring rig for bundle adjustment...")

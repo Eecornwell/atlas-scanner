@@ -16,7 +16,7 @@
 #
 # Output example:
 #   Found 2 camera(s):
-#     [0] serial=XXXXXXXXXXXXXX  type=4  name=Insta360 X5
+#     [0] serial=XXXXXXXXXXXXXX type=4  name=Insta360 X5
 #     [1] serial=XXXXXXXXXXXXXX  type=3  name=Insta360 ONE X2
 #
 # Copy the serial strings into the cam_0/cam_1 entries below.
@@ -75,7 +75,7 @@ cameras:
   cam_0:
     serial: "XXXXXXXXXXXXXX"
     camera_hw: x5
-    mask_dual: lidar_mask_dual_x5_cam2.png
+    mask_dual: lidar_mask_dual_x5_cam_right.png
     mask_calibration: lidar_mask_dual_x5_calib_right.png
     calibration: calibrations/x5/right/fusion_calibration.yaml
     mounting_orientation: [-179.77, 0.95, -91.77]
@@ -96,3 +96,9 @@ cameras:
     calibration: calibrations/onex2/right/fusion_calibration.yaml
     mounting_orientation: [-179.0, 3.0, -98.0]
     seed_position: [2.95, -3.4, -0.55]
+  cam_3:
+    serial: "XXXXXXXXXXXXXXXXXX"
+    camera_hw: oak1
+    calibration: calibrations/oak1/center/fusion_calibration.yaml
+    mounting_orientation: [0.0, -45.0, 90.0]
+    seed_position: [3.0, 0.0, 0.0]

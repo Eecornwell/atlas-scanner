@@ -9,13 +9,14 @@ ATLAS supports multiple Insta360 camera models. Each model has its own:
 - Lidar mask image
 - Calibration file stored at `config/calibrations/<model>/fusion_calibration.yaml`
 
-| Model | CLI flag | ERP Resolution | Config dir |
-|-------|----------|----------------|------------|
-| Insta360 One X2 | `--camera-hw onex2` | 5760 × 2880  | `config/calibrations/onex2/` |
-| Insta360 X3     | `--camera-hw x3`    | 7680 × 3840  | `config/calibrations/x3/`   |
-| Insta360 X5     | `--camera-hw x5`    | 11520 × 5760 | `config/calibrations/x5/`   |
+| Model | CLI flag | Image type | Resolution | Config dir |
+|-------|----------|------------|------------|------------|
+| Insta360 One X2 | `--camera-hw onex2` | ERP (360°) | 5760 × 2880  | `config/calibrations/onex2/` |
+| Insta360 X3     | `--camera-hw x3`    | ERP (360°) | 7680 × 3840  | `config/calibrations/x3/`   |
+| Insta360 X5     | `--camera-hw x5`    | ERP (360°) | 11520 × 5760 | `config/calibrations/x5/`   |
+| Luxonis OAK-1   | `--camera-hw oak1`  | Perspective (pinhole) | 4032 × 3040 | `config/calibrations/oak1/` |
 
-> *Note: All calibration scripts accept `--camera-hw onex2|x3|x5`. Always pass the correct model for the hardware you are calibrating. Calibration results are saved to the per-model directory and also copied to the shared `config/fusion_calibration.yaml` which is the active calibration used at runtime.*
+> *Note: All calibration scripts accept `--camera-hw onex2|x3|x5|oak1`. Always pass the correct model for the hardware you are calibrating. Calibration results are saved to the per-model directory and also copied to the shared `config/fusion_calibration.yaml` which is the active calibration used at runtime.*
 
 > *Note: When you start a capture session the script automatically loads `config/calibrations/<camera_hw>/fusion_calibration.yaml` based on the selected `CAMERA_HW` setting (or `--camera-hw` CLI flag / GUI dropdown). You do not need to manually copy files between captures — just set the correct model.*
 
@@ -34,11 +35,81 @@ Each camera model requires its own lidar mask — a black/white PNG where white 
 | `config/masks/lidar_mask_dual_x5.png`         | X5, dual fisheye |
 | `config/masks/lidar_mask_single_x5.png`       | X5, single fisheye |
 
+> **OAK-1 has no lidar mask** — the camera body is not visible in the OAK-1’s field of view, so no masking is needed.
+
 To create a mask for a new camera/mount combination:
 1. Capture one scan with the new camera to get a sample ERP image
 2. Open the ERP in an image editor (GIMP, Photoshop)
 3. Paint white over the scene, black over the scanner body and tripod
 4. Save to the appropriate filename above (match ERP resolution)
+
+---
+
+## OAK-1 Calibration
+
+The OAK-1 is a **perspective (pinhole)** camera. Its intrinsics (fx, fy, cx, cy, distortion) are stored in the device eeprom and are pulled automatically at session start — no separate intrinsic calibration step is needed.
+
+What you do need to calibrate is the **extrinsic** transform between the OAK-1 and the LiDAR (T_camera_lidar). The procedure is the same as for the Insta360 models with these differences:
+
+1. Use `--camera-hw oak1`.
+2. The calibration image is a rectilinear undistorted PNG (not an ERP), so `direct_visual_lidar_calibration` uses the `PINHOLE` camera model automatically.
+3. SuperGlue feature matching is **skipped** — the OAK-1’s narrow FOV and depth-image appearance make cross-modal matching unreliable. The pipeline goes directly from seed to NID optimisation.
+4. No lidar mask is needed.
+
+### Procedure
+
+1. **Capture calibration scans** (5–10 from different positions):
+    ```bash
+    cd ~/atlas_ws/src/atlas-scanner/src
+    ./atlas_fusion_capture.sh --capture stationary --camera-hw oak1
+    ```
+
+2. **Set the coarse seed** using the 3D Colorize viewer in the GUI Calibration tab, or CLI:
+    ```bash
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/oak1_lidar_colorize.py \
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}
+    # Adjust sliders until LiDAR dots align with visible surfaces. Press S to save.
+    ```
+    The seed is saved to `config/calibrations/oak1/center/fusion_calibration.yaml`.
+
+3. **Run the calibration pipeline** (Steps 1–7 in the GUI, or CLI):
+    ```bash
+    # Step 1: Combine scans
+    python3 ~/atlas_ws/src/atlas-scanner/src/calibration/combine_scans_for_calibration.py \
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP} --cam-index 3
+
+    # Step 2: Generate intensity images (pinhole projection, no mask)
+    ATLAS_CALIBRATION_CAM_INDEX=3 python3 \
+        ~/atlas_ws/src/atlas-scanner/src/calibration/generate_intensity_images.py \
+        ~/atlas_ws/output
+
+    # Step 4: Seed calib.json from current calibration
+    ATLAS_CALIBRATION_CAM_INDEX=3 python3 \
+        ~/atlas_ws/src/atlas-scanner/src/calibration/seed_calib.py
+
+    # Step 6: Run NID optimisation (SuperGlue step is skipped for OAK-1)
+    ~/atlas_ws/install/direct_visual_lidar_calibration/lib/direct_visual_lidar_calibration/calibrate \
+        --data_path ~/atlas_ws/output --nid_bins 32 --nelder_mead_convergence_criteria 1e-10
+
+    # Step 7: Apply calibration
+    ATLAS_CALIBRATION_CAM_INDEX=3 python3 \
+        ~/atlas_ws/src/atlas-scanner/src/calibration/coordinate_transform.py \
+        ~/atlas_ws/src/atlas-scanner/src --camera-hw oak1
+    ```
+
+4. **Verify calibration** using the GUI **Verify Calibration** button, or CLI:
+    ```bash
+    ATLAS_CALIBRATION_CAM_INDEX=3 python3 \
+        ~/atlas_ws/src/atlas-scanner/src/calibration/tune_calibration.py \
+        ~/atlas_ws/data/synchronized_scans/sync_fusion_{TIMESTAMP}/fusion_scan_001 --verify
+    # Opens calib_sweep/current.jpg showing LiDAR dots on the camera image
+    ```
+
+The resulting `fusion_calibration.yaml` is saved to `config/calibrations/oak1/center/`.
+
+> The `camera_info.yaml` written per-scan by `oak1_capture.py` is the authoritative intrinsics source. It is read automatically by the coloring and calibration pipelines.
+
+> **Multi-camera sessions (X5 + OAK-1):** The OAK-1 is registered as `cam_3` in `multi_camera.yaml`. Its calibration is loaded automatically from `calibrations/oak1/center/fusion_calibration.yaml` based on the `.cam_index` file written per scan. Calibrate each camera separately before running combined sessions.
 
 ---
 
@@ -326,10 +397,12 @@ config/calibrations/
   onex2/fusion_calibration.yaml   ← One X2 extrinsics
   x3/fusion_calibration.yaml      ← X3 extrinsics
   x5/fusion_calibration.yaml      ← X5 extrinsics
+  oak1/fusion_calibration.yaml    ← OAK-1 extrinsics
 config/camera_models/
   onex2.yaml                      ← ERP resolution, mask filenames
   x3.yaml                         ← ERP resolution, mask filenames
   x5.yaml                         ← ERP resolution, mask filenames
+  oak1.yaml                       ← image resolution, mask filename
 ```
 
 To add a new mount variant (same camera, different bracket position), create a new subdirectory:

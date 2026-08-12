@@ -22,8 +22,8 @@ CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (cont
                                   # Capture time per batch: ~9s (slowest camera = OneX2 ~8-9s)
                                   # Total cycle: ~9s capture + CONTINUOUS_INTERVAL move window
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
-CAMERA_HW="x5"                 # Camera hardware model: onex2 | x5
-NUM_CAMERAS=0                     # 0 = auto-detect all connected cameras (up to 3)
+CAMERA_HW="x5"                    # Camera hardware model: onex2 | x5 | x3 | oak1    
+NUM_CAMERAS=1                     # 0 = auto-detect all connected cameras (up to 3)
                                   # 1-3 = use exactly N cameras
 
 CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
@@ -61,7 +61,7 @@ AUTO_CREATE_COLORED=true
 # ─── Camera hardware model config ─────────────────────────────────────────────
 _CAM_MODEL_DIR="$SCRIPT_DIR/config/camera_models"
 _CAM_CALIB_DIR="$SCRIPT_DIR/config/calibrations"
-_VALID_HW="onex2 x3 x5"
+_VALID_HW="onex2 x3 x5 oak1"
 if ! echo "$_VALID_HW" | grep -qw "$CAMERA_HW"; then
     echo "⚠ Unknown CAMERA_HW='$CAMERA_HW', defaulting to onex2"
     CAMERA_HW="onex2"
@@ -230,7 +230,12 @@ cleanup() {
                 sleep 0.2
             done
             kill -TERM "$TRAJ_PID" 2>/dev/null
-            wait "$TRAJ_PID" 2>/dev/null
+            for _tw in $(seq 1 30); do
+                kill -0 "$TRAJ_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            kill -0 "$TRAJ_PID" 2>/dev/null && kill -KILL "$TRAJ_PID" 2>/dev/null || true
+            wait "$TRAJ_PID" 2>/dev/null || true
         fi
         rm -f "$TRAJ_PID_FILE"
     fi
@@ -240,6 +245,14 @@ cleanup() {
     _pkill "coverage_tracker"
     _pkill "rviz2"
     _pkill "insta360_capture"
+    _pkill "oak1_capture"
+    # Kill secondary OAK-1 if it was launched alongside an Insta360 primary
+    if [ -n "${OAK1_SECONDARY_PID:-}" ] && kill -0 "$OAK1_SECONDARY_PID" 2>/dev/null; then
+        touch "$SCAN_DIR/.oak1_quit_trigger" 2>/dev/null || true
+        sleep 1
+        kill -0 "$OAK1_SECONDARY_PID" 2>/dev/null && kill -KILL "$OAK1_SECONDARY_PID" 2>/dev/null || true
+        wait "$OAK1_SECONDARY_PID" 2>/dev/null || true
+    fi
     _pkill "livox_ros_driver2"
     _pkill "rko_lio"
     _pkill "static_transform_publisher"
@@ -250,13 +263,21 @@ cleanup() {
     # Wait for the SDK capture daemon to call StopTimeLapse and exit cleanly.
     # It was deliberately excluded from PIDS so the loop above didn't kill it.
     if [ -n "${SDK_CAPTURE_PID:-}" ] && kill -0 "$SDK_CAPTURE_PID" 2>/dev/null; then
-        echo "Waiting for SDK capture daemon to stop timelapse..."
-        for _w in $(seq 1 300); do
-            kill -0 "$SDK_CAPTURE_PID" 2>/dev/null || break
+        if [ "${CAMERA_HW:-onex2}" = "oak1" ]; then
+            # OAK-1: signal via trigger file first, then SIGKILL if needed
+            touch "$SCAN_DIR/.oak1_quit_trigger" 2>/dev/null || true
             sleep 1
-        done
-        kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
-        wait "$SDK_CAPTURE_PID" 2>/dev/null || true
+            kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
+            wait "$SDK_CAPTURE_PID" 2>/dev/null || true
+        else
+            echo "Waiting for SDK capture daemon to stop timelapse..."
+            for _w in $(seq 1 300); do
+                kill -0 "$SDK_CAPTURE_PID" 2>/dev/null || break
+                sleep 1
+            done
+            kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
+            wait "$SDK_CAPTURE_PID" 2>/dev/null || true
+        fi
     fi
     # Clear the sentinel if the daemon exited cleanly — the firmware called
     # StopTimeLapse()+Close() and is no longer in a stuck state, so the next
@@ -717,6 +738,10 @@ except Exception as e:
 }
 
 # Kill all stale processes in parallel — capture PIDs so wait only blocks on these
+# Kill any stale atlas_fusion_capture instances (previous sessions not cleaned up)
+pgrep -f "atlas_fusion_capture.sh" | grep -v "^$$" | grep -v "^$BASHPID" | xargs -r kill -TERM 2>/dev/null || true
+sleep 1
+pgrep -f "atlas_fusion_capture.sh" | grep -v "^$$" | grep -v "^$BASHPID" | xargs -r kill -KILL 2>/dev/null || true
 _pkill "livox_ros_driver2" & _kpids=($!)
 _pkill "rko_lio" & _kpids+=($!)
 _pkill "insta360_capture" & _kpids+=($!)
@@ -742,6 +767,7 @@ if [ "$SKIP_SUDO_CHECK" != "1" ]; then
     "$SCRIPT_DIR/setup_camera_permissions.sh"
 fi
 
+if [ "$CAMERA_HW" != "oak1" ]; then
 # Always reset the USB device at startup — clears firmware streaming state from
 # a previous unclean session and ensures bConfigurationValue is set before the
 # driver attempts to claim the interface.
@@ -864,7 +890,8 @@ if [ -n "$_cam_sysfs" ]; then
         echo "  If streaming fails: on the camera go to Settings → General → USB Mode → Android"
         echo "  then reconnect the USB cable."
     fi
-fi
+fi # end if [ -n "$_cam_sysfs" ]
+fi # end CAMERA_HW != oak1
 
 echo "Starting LiDAR driver..."
 # Sync MID360 hardware clock to system time before starting the LiDAR driver.
@@ -1008,7 +1035,27 @@ fi
 # In SDK stitch mode the CameraSDK owns the USB device for the whole session
 # — no ROS driver needed. The driver is only required for stream-based capture.
 # SDK capture daemon
-    echo "SDK stitch mode: skipping camera driver (SDK owns USB device)"
+if [ "$CAMERA_HW" = "oak1" ]; then
+    echo "OAK-1 mode: launching oak1_capture.py"
+    CAMERA_STATUS="oak1_capture.py"
+    # Kill any stale oak1_capture process holding the USB device
+    pkill -f "oak1_capture.py" 2>/dev/null || true
+    sleep 2
+    python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
+    SDK_CAPTURE_PID=$!
+    echo "Waiting for OAK-1 session..."
+    for _i in $(seq 1 60); do
+        [ -f "$SCAN_DIR/.sdk_ready" ] && break
+        if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
+            echo "✗ oak1_capture.py exited early — check sdk_capture.log"; exit 1
+        fi
+        sleep 1
+    done
+    if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
+        echo "✗ OAK-1 session timed out"; exit 1
+    fi
+    echo "✓ OAK-1 session ready"
+else
     CAMERA_STATUS="SDK (insta360_capture)"
     touch /tmp/.insta360_session_ran
     # Wait for any previous SDK daemon to fully release the USB device
@@ -1143,6 +1190,45 @@ except Exception as e: pass
             _USE_CAMERAS=$_sdk_cams
         fi
     fi
+fi
+
+# ─── Secondary OAK-1 capture (alongside Insta360 primary) ────────────────────
+# When CAMERA_HW is an Insta360 model AND an OAK-1 is connected, launch
+# oak1_capture.py as a secondary camera. It writes to the same scan dirs
+# using a separate trigger file (.oak1_trigger) so it doesn't interfere
+# with the primary SDK capture flow.
+OAK1_SECONDARY_PID=""
+if [ "$CAMERA_HW" != "oak1" ]; then
+    if python3 -c "
+import depthai as dai
+devs = dai.Device.getAllAvailableDevices()
+print('found' if devs else 'none')
+" 2>/dev/null | grep -q found; then
+        echo "OAK-1 detected alongside $CAMERA_HW — launching secondary oak1_capture.py"
+        pkill -f "oak1_capture.py" 2>/dev/null || true
+        sleep 1
+        # Find oak1 cam_index from multi_camera.yaml
+        _oak1_cam_idx=$(python3 -c "
+import yaml, sys
+mc = yaml.safe_load(open('$_MULTI_CAM_YAML'))
+for k,v in mc.get('cameras',{}).items():
+    if v.get('camera_hw','') == 'oak1':
+        print(k.split('_')[1]); sys.exit(0)
+print('3')
+" 2>/dev/null || echo '3')
+        python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" --cam-index "$_oak1_cam_idx" \
+            > "$SCAN_DIR/oak1_secondary.log" 2>&1 &
+        OAK1_SECONDARY_PID=$!
+        # Wait for OAK-1 to be ready (max 60s)
+        for _i in $(seq 1 60); do
+            [ -f "$SCAN_DIR/.sdk_ready" ] && break  # reuses same flag
+            kill -0 $OAK1_SECONDARY_PID 2>/dev/null || break
+            sleep 1
+        done
+        echo "✓ Secondary OAK-1 ready"
+    fi
+fi
+
 FUSION_READY="true"
 
 echo ""
@@ -1237,16 +1323,22 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
     # before stopping the bag recorder. The daemon writes .sdk_downloads_pending
     # with the outstanding count; poll until it reaches 0.
     if [ -n "${SDK_CAPTURE_PID:-}" ]; then
-        echo "Waiting for SDK to stop timelapse and complete downloads..."
-        _sdk_wait=0
-        while [ $_sdk_wait -lt 300 ]; do
-            # Daemon exits naturally after StopTimeLapse + drain completes
-            kill -0 $SDK_CAPTURE_PID 2>/dev/null || break
-            sleep 1; _sdk_wait=$((_sdk_wait + 1))
-        done
-        # Hard kill only if daemon is still alive after 5 min
-        kill -0 $SDK_CAPTURE_PID 2>/dev/null && kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
-        wait $SDK_CAPTURE_PID 2>/dev/null || true
+        if [ "${CAMERA_HW:-onex2}" = "oak1" ]; then
+            # OAK-1: no timelapse downloads — signal via trigger file then kill
+            touch "$SCAN_DIR/.oak1_quit_trigger" 2>/dev/null || true
+            sleep 1
+            kill -0 $SDK_CAPTURE_PID 2>/dev/null && kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
+            wait $SDK_CAPTURE_PID 2>/dev/null || true
+        else
+            echo "Waiting for SDK to stop timelapse and complete downloads..."
+            _sdk_wait=0
+            while [ $_sdk_wait -lt 300 ]; do
+                kill -0 $SDK_CAPTURE_PID 2>/dev/null || break
+                sleep 1; _sdk_wait=$((_sdk_wait + 1))
+            done
+            kill -0 $SDK_CAPTURE_PID 2>/dev/null && kill -KILL $SDK_CAPTURE_PID 2>/dev/null || true
+            wait $SDK_CAPTURE_PID 2>/dev/null || true
+        fi
         echo "✓ SDK capture daemon exited"
     fi
 
@@ -1254,7 +1346,7 @@ else
     # ── Stationary mode ──────────────────────────────────────────────────────
     # Use /dev/tty if available (interactive terminal), otherwise use GUI trigger file mode
     _GUI_MODE=false
-    if [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
+    if [ "${ATLAS_GUI_MODE:-0}" = "1" ] || [ ! -r /dev/tty ] || ! { true < /dev/tty; } 2>/dev/null; then
         _GUI_MODE=true
         _TTY=/dev/null
         echo "GUI mode: waiting for trigger files in $SCAN_DIR"
@@ -1392,10 +1484,26 @@ else
             mkdir -p "$SCAN_DIR/fusion_scan_$(printf "%03d" $SCAN_COUNT)"
         done
 
+        # Allocate an extra scan dir for secondary OAK-1 if running
+        _oak1_scan_dir=""
+        if [ -n "${OAK1_SECONDARY_PID:-}" ] && kill -0 "$OAK1_SECONDARY_PID" 2>/dev/null; then
+            SCAN_COUNT=$((SCAN_COUNT + 1))
+            _oak1_scan_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $SCAN_COUNT)"
+            mkdir -p "$_oak1_scan_dir"
+        fi
+
         # Single trigger fires all cameras in parallel inside the SDK daemon
         CAPTURE_EXIT_CODE=""
         rm -f "$SCAN_DIR/.sdk_capture_done" "$SCAN_DIR/.sdk_capture_failed"
-        echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.sdk_capture_trigger"
+        if [ "$CAMERA_HW" = "oak1" ]; then
+            echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.oak1_trigger"
+        else
+            echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.sdk_capture_trigger"
+            # Trigger secondary OAK-1 into its own dedicated scan dir
+            if [ -n "$_oak1_scan_dir" ]; then
+                echo "$_oak1_scan_dir" > "$SCAN_DIR/.oak1_trigger"
+            fi
+        fi
         for _i in $(seq 1 900); do
             [ -f "$SCAN_DIR/.sdk_capture_done" ] && { CAPTURE_EXIT_CODE=0; break; }
             [ -f "$SCAN_DIR/.sdk_capture_failed" ] && { CAPTURE_EXIT_CODE=1; break; }
@@ -1409,10 +1517,18 @@ else
         # is independent and overlapping them saves the full download time (~15-30s).
         INDIVIDUAL_SCAN_DIR="$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)"
         if [ $CAPTURE_EXIT_CODE -eq 0 ]; then
-            FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
-            ROS_DISABLE_LOANED_MESSAGES=1 \
-            timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
-                "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
+            if [ "$CAMERA_HW" = "oak1" ]; then
+                # OAK-1: image already saved by oak1_capture.py, just collect LiDAR
+                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+                ROS_DISABLE_LOANED_MESSAGES=1 \
+                timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
+                    "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
+            else
+                FASTRTPS_DEFAULT_PROFILES_FILE="$ROS_WS_DIR/src/atlas-scanner/src/config/fastdds_capture.xml" \
+                ROS_DISABLE_LOANED_MESSAGES=1 \
+                timeout 25 python3 "$ROS_WS_DIR/src/atlas-scanner/src/capture/buffered_camera_capture.py" \
+                    "$INDIVIDUAL_SCAN_DIR" 15 2.0 --lidar-only || echo "  ⚠ LiDAR capture failed"
+            fi
             if [ $_num_shots -gt 1 ]; then
                 for _cs in $(seq 2 $_num_shots); do
                     _other_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cs - 1)))"
@@ -1421,6 +1537,13 @@ else
                     done
                 done
                 echo "  ✓ LiDAR copied to all $_num_shots scan dirs"
+            fi
+            # Copy LiDAR to secondary OAK-1 scan dir if allocated
+            if [ -n "${_oak1_scan_dir:-}" ]; then
+                for _ply in "$INDIVIDUAL_SCAN_DIR"/sensor_lidar_*.ply "$INDIVIDUAL_SCAN_DIR"/world_lidar_*.ply; do
+                    [ -f "$_ply" ] && cp "$_ply" "$_oak1_scan_dir/" 2>/dev/null
+                done
+                echo "  ✓ LiDAR copied to OAK-1 scan dir: $(basename $_oak1_scan_dir)"
             fi
         fi
 
@@ -1436,8 +1559,10 @@ else
             for _cam_shot in $(seq 1 $_num_shots); do
                 _cam_dir="$SCAN_DIR/fusion_scan_$(printf "%03d" $((_first_scan + _cam_shot - 1)))"
                 _insp=$(ls "$_cam_dir"/*.insp 2>/dev/null | head -1)
-                if [ -n "$_insp" ]; then
-                    echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
+                _oak1=$(ls "$_cam_dir"/.oak1_capture 2>/dev/null | head -1)
+                if [ -n "$_insp" ] || [ -n "$_oak1" ]; then
+                    [ -n "$_insp" ] && echo "  ✓ cam_$((_cam_shot-1)) raw: $(basename "$_insp")"
+                    [ -n "$_oak1" ] && echo "  ✓ cam_$((_cam_shot-1)) oak1 capture confirmed"
                 else
                     echo "  ⚠ cam_$((_cam_shot-1)) capture failed (continuing with remaining cameras)"
                     _failed_cams=$((_failed_cams + 1))
@@ -1531,7 +1656,8 @@ else
                 echo "{\"scan_name\": \"$_traj_name\", \"scan_dir\": \"$_traj_dir\", \"capture_time\": $_cam_ts}" \
                     > "$SCAN_DIR/.save_trajectory_${_traj_name}"
             done
-            echo "✓ Trajectory trigger saved for $_num_shots scan(s)"
+            _traj_count=$(( SCAN_COUNT - _first_scan + 1 ))
+            echo "✓ Trajectory trigger saved for $_traj_count scan(s)"
         fi
 
         # Rename PLY to canonical names in all scan dirs for this position

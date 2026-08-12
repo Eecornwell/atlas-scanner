@@ -1,0 +1,17 @@
+roll_offset: 0.008818266534199704
+pitch_offset: -0.7946548579746086
+yaw_offset: 1.5722492806171422
+manual_roll_adjustment: 0.0
+manual_pitch_adjustment: 0.0
+manual_yaw_adjustment: 0.0
+azimuth_offset: 0.0
+elevation_offset: 0.0
+x_offset: 0.002365987121828683
+y_offset: -0.05711115067232861
+z_offset: -0.05478482064114769
+flip_x: false
+flip_y: false
+image_width: 5760
+image_height: 2880
+use_fisheye: false
+skip_rate: 5

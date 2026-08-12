@@ -472,12 +472,19 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
     centre_host = None
     for _ct_f in sorted(scan_dir.glob("*.insp.capture_time")):
         try:
-            # Format: "t_before" (old) or "t_before t_after" (new).
-            # t_before = TakePhoto() call entry = shutter fires.
             centre_host = float(_ct_f.read_text().strip().split()[0])
             break
         except Exception:
             pass
+
+    # OAK-1: fall back to capture_0.shutter_event (written by oak1_capture.py)
+    if centre_host is None:
+        _se = scan_dir / 'capture_0.shutter_event'
+        if _se.exists():
+            try:
+                centre_host = float(_se.read_text().strip().split()[0])
+            except Exception:
+                pass
 
     if centre_host is not None:
         # .capture_time format (written by main_multi.cpp after timing fix):

@@ -141,19 +141,25 @@ def main():
     with open(f'{data_path}/calib.json') as f:
         calib = json.load(f)
 
-    # Detect SDK stitch from sidecar files
+    # Detect SDK stitch and OAK-1 from sidecar files
     import json as _json
     from pathlib import Path as _P
     first_sidecar = _P(data_path) / '000000_source.json'
     is_sdk = False
+    is_oak1_session = False
     if first_sidecar.exists():
         sd = _json.load(open(first_sidecar))
         scan_path = _P(sd.get('scan_dir', ''))
         is_sdk = bool(list(scan_path.glob('*.insp'))) if scan_path.is_dir() else False
+        is_oak1_session = sd.get('camera_hw', '') == 'oak1'
     if is_sdk:
         print('Detected SDK stitch mode — using perspective crop matching')
-
-    # Read seed calibration yaw to bias crop directions toward camera FOV.
+    if is_oak1_session:
+        print('Detected OAK-1 session — using direct image matching (no ERP crops)')
+        opt.mode = 'panorama'  # reuse panorama path: direct full-image match, no ERP reprojection
+        # For oak1 override panorama_size to match the actual image dimensions
+        # so we don\'t resize a pinhole image to ERP dimensions
+        opt.panorama_size = -1  # sentinel: use native image size    # Read seed calibration yaw to bias crop directions toward camera FOV.
     # When the camera has a large yaw offset (e.g. cam_1 faces right at -90°),
     # the LiDAR intensity image is projected into that rotated frame, so content
     # appears at a different ERP location than for a forward-facing camera.
@@ -189,7 +195,20 @@ def main():
                 _mc_path = _src_root / 'config' / 'multi_camera.yaml'
                 if _mc_path.exists():
                     _mc = _yaml.safe_load(_mc_path.read_text()) or {}
-                    _calib_rel = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('calibration', '')
+                    # Try exact slot first, then find by hw match
+                    _slot_cfg = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
+                    if not _slot_cfg:
+                        # cam_idx is the dropdown index (0), find the real slot by hw
+                        _src_jsons2 = sorted(_glob.glob(f'{data_path}/*_source.json'))
+                        _sess_hw = ''
+                        if _src_jsons2:
+                            _s = _json.load(open(_src_jsons2[0]))
+                            _sess_hw = _s.get('camera_hw', '')
+                        if _sess_hw:
+                            _slot_cfg = next(
+                                (v for v in _mc.get('cameras', {}).values()
+                                 if v.get('camera_hw') == _sess_hw), {})
+                    _calib_rel = _slot_cfg.get('calibration', '')
                     if _calib_rel:
                         _slot_path = _src_root / 'config' / _calib_rel
                         if _slot_path.exists():
@@ -212,6 +231,9 @@ def main():
         if _calib_path and _calib_path.exists():
             _calib = _yaml.safe_load(_calib_path.read_text())
             seed_yaw_deg = float(np.degrees(_calib['yaw_offset'] - _x5_yaw))
+            # OAK-1: yaw offset is irrelevant since we match full image directly
+            if is_oak1_session:
+                seed_yaw_deg = 0.0
             print(f'Seed yaw offset: {seed_yaw_deg:.1f}° — biasing crop directions')
     except Exception as e:
         print(f'Could not read seed yaw: {e}')
@@ -243,11 +265,23 @@ def main():
         keys = ['keypoints', 'scores', 'descriptors']
 
         if opt.mode == 'panorama':
-            # ── Panorama mode: match directly on full downscaled ERP ──────────
-            pano_w = opt.panorama_size
-            pano_h = pano_w // 2
-            scale_x = W / pano_w
-            scale_y = H / pano_h
+            # ── Panorama / direct match mode ─────────────────────────────────
+            # For ERP images: downscale to panorama_size.
+            # For OAK-1 pinhole images (panorama_size==-1): use native size
+            # downscaled to max 640px wide so SuperPoint runs at a sensible res.
+            if opt.panorama_size == -1:
+                # OAK-1: use 320x240 — SuperGlue matches better at lower res
+                # where the depth/texture difference is less pronounced
+                max_w = 320
+                scale_x = W / max_w
+                scale_y = H / int(H * max_w / W)
+                pano_w = max_w
+                pano_h = int(H * pano_w / W)
+            else:
+                pano_w = opt.panorama_size
+                pano_h = pano_w // 2
+                scale_x = W / pano_w
+                scale_y = H / pano_h
             cam_small = cv2.resize(cam_erp, (pano_w, pano_h), interpolation=cv2.INTER_AREA)
             lid_small = cv2.resize(lid_erp, (pano_w, pano_h), interpolation=cv2.INTER_AREA)
 
@@ -282,12 +316,12 @@ def main():
                     for k, (i, _) in enumerate(valid_idx):
                         if not inlier_mask[k]:
                             matches[i] = -1
-                    print(f'  Panorama mode: {n_inliers}/{n_matched} matches after RANSAC on {pano_w}x{pano_h} ERP')
+                    print(f'  Direct match: {n_inliers}/{n_matched} matches after RANSAC on {pano_w}x{pano_h}')
                     n_matched = n_inliers
                 else:
-                    print(f'  Panorama mode: {n_matched} matches on {pano_w}x{pano_h} ERP (RANSAC skipped)')
+                    print(f'  Direct match: {n_matched} matches on {pano_w}x{pano_h} (RANSAC skipped)')
             else:
-                print(f'  Panorama mode: {n_matched} matches on {pano_w}x{pano_h} ERP (too few for RANSAC)')
+                print(f'  Direct match: {n_matched} matches on {pano_w}x{pano_h} (too few for RANSAC)')
 
             result = {
                 'kpts0':      np.array(kpts0_erp).flatten().tolist() if kpts0_erp else [],

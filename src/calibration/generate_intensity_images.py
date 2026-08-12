@@ -53,13 +53,27 @@ def remap_lidar_to_strips(image):
     return image
 
 def _load_T_cam_lidar():
-    """Load T_camera_lidar from the appropriate calibration file.
-    Checks ATLAS_CALIBRATION_CAM_INDEX env var to find the per-camera-slot
-    path from multi_camera.yaml. Falls back to per-hw then active calibration."""
-    import glob as _g, os as _os
+    """Load T_camera_lidar from the appropriate calibration file."""
+    import glob as _g, os as _os, json as _j
     src_root = Path(__file__).parent.parent
 
-    # Priority 1: per-camera-slot path from multi_camera.yaml
+    # Detect camera_hw from output source JSONs first — this is the most reliable
+    # source since it's written by combine_scans from session_config.json
+    _source_jsons = sorted(_g.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
+    _detected_hw = ''
+    if _source_jsons:
+        try:
+            _src = _j.loads(Path(_source_jsons[0]).read_text())
+            _detected_hw = _src.get('camera_hw', '')
+            if not _detected_hw:
+                _sess_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
+                if _sess_cfg.exists():
+                    _detected_hw = _j.loads(_sess_cfg.read_text()).get('camera_hw', '')
+        except Exception:
+            pass
+
+    # Priority 1: per-camera-slot from multi_camera.yaml
+    # Only use this if the detected hw matches what multi_camera.yaml has for that slot
     _cam_idx = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
     if _cam_idx:
         try:
@@ -68,36 +82,41 @@ def _load_T_cam_lidar():
             if mc_path.exists():
                 mc = _y.safe_load(mc_path.read_text()) or {}
                 cam_cfg = mc.get('cameras', {}).get(f'cam_{_cam_idx}', {})
-                calib_rel = cam_cfg.get('calibration', '')
-                if calib_rel:
-                    slot_path = src_root / 'config' / calib_rel
-                    if slot_path.exists():
-                        with open(slot_path) as f:
-                            calib = yaml.safe_load(f)
-                        T = np.eye(4)
-                        T[:3, :3] = Rotation.from_euler('xyz', [
-                            calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
-                        ]).as_matrix()
-                        T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
-                        return T
+                slot_hw = cam_cfg.get('camera_hw', '')
+                # Skip if detected hw doesn't match this slot's hw
+                if _detected_hw and slot_hw and _detected_hw != slot_hw:
+                    pass  # fall through to hw-level calibration
+                else:
+                    calib_rel = cam_cfg.get('calibration', '')
+                    if calib_rel:
+                        slot_path = src_root / 'config' / calib_rel
+                        if slot_path.exists():
+                            with open(slot_path) as f:
+                                calib = yaml.safe_load(f)
+                            T = np.eye(4)
+                            T[:3, :3] = Rotation.from_euler('xyz', [
+                                calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
+                            ]).as_matrix()
+                            T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+                            return T
         except Exception:
             pass
 
-    # Priority 2: per-hw calibration detected from output dataset
+    # Priority 2: hw-level calibration
     calib_path = src_root / 'config' / 'fusion_calibration.yaml'
-    _source_jsons = sorted(_g.glob(str(Path.home() / 'atlas_ws/output/*_source.json')))
-    if _source_jsons:
-        try:
-            import json as _j
-            _src = _j.loads(Path(_source_jsons[0]).read_text())
-            _sess_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
-            if _sess_cfg.exists():
-                _hw = _j.loads(_sess_cfg.read_text()).get('camera_hw', '')
-                _hw_path = src_root / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
-                if _hw_path.exists():
-                    calib_path = _hw_path
-        except Exception:
-            pass
+    if _detected_hw:
+        _hw_path = src_root / 'config' / 'calibrations' / _detected_hw / 'fusion_calibration.yaml'
+        if _hw_path.exists():
+            calib_path = _hw_path
+            print(f'  Using {_detected_hw} calibration: {_hw_path.name}')
+    with open(calib_path) as f:
+        calib = yaml.safe_load(f)
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_euler('xyz', [
+        calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
+    ]).as_matrix()
+    T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    return T
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
     T = np.eye(4)
@@ -205,15 +224,19 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         _safe_scan_dir = None
     use_camframe = _safe_scan_dir.is_dir() if _safe_scan_dir else False
     is_sdk_stitch = bool(_safe_scan_dir and list(_safe_scan_dir.glob('*.insp')))
+    # OAK-1: pinhole camera — detected by presence of camera_info.yaml + oak1_*.png
+    is_oak1 = bool(_safe_scan_dir and
+                   list(_safe_scan_dir.glob('oak1_*.png')) and
+                   (_safe_scan_dir / 'camera_info.yaml').exists())
     T_cam_lidar = _load_T_cam_lidar()
     # SDK stitch: full ERP, project at full resolution. Manual: halve to match strip content.
-    out_w, out_h = (width, height) if is_sdk_stitch else (width // 2, height // 2)
+    # OAK-1: use the actual camera image size (auto-detected above from camera_image probe).
+    out_w, out_h = (width, height) if (is_sdk_stitch or is_oak1) else (width // 2, height // 2)
 
     if use_camframe:
         # Read world_frame flag from sidecar to decide whether to undo trajectory pose.
-        # sensor_lidar.ply is already in sensor frame; world_lidar.ply needs trajectory undo.
         import json as _json
-        is_world_frame = False  # default: sensor_lidar.ply (sensor frame)
+        is_world_frame = False
         if _safe_scan_dir:
             for sf in sorted(_safe_scan_dir.parent.parent.glob('*_source.json')):
                 try:
@@ -225,7 +248,35 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                         break
                 except: pass
         origin, R_world_lidar = _load_trajectory_pose(_safe_scan_dir)
-        if is_sdk_stitch:
+
+        if is_oak1:
+            # OAK-1 pinhole projection — must come before ERP paths
+            import yaml as _yaml
+            _ci = _yaml.safe_load((_safe_scan_dir / 'camera_info.yaml').read_text())
+            _sx = out_w / _ci['width']
+            _sy = out_h / _ci['height']
+            _fx = _ci['fx'] * _sx
+            _fy = _ci['fy'] * _sy
+            _cx = _ci['cx'] * _sx
+            _cy = _ci['cy'] * _sy
+            if origin is not None and R_world_lidar is not None and is_world_frame:
+                pts_lidar = (R_world_lidar.T @ (points - origin).T).T
+            else:
+                pts_lidar = points
+            T_cl = _load_T_cam_lidar()
+            pts_cam = (T_cl[:3, :3] @ pts_lidar.T).T + T_cl[:3, 3]
+            front = pts_cam[:, 2] > 0.1
+            pts_f = pts_cam[front]
+            norm_c = np.linalg.norm(pts_f, axis=1).clip(1e-6)
+            # No distortion — camera image is already undistorted
+            xn = pts_f[:, 0] / pts_f[:, 2]
+            yn = pts_f[:, 1] / pts_f[:, 2]
+            u = (_fx * xn + _cx).astype(int)
+            v = (_fy * yn + _cy).astype(int)
+            intensities = intensities[front]
+            orig_indices = np.where(front)[0]
+            norm_c = norm_c
+        elif is_sdk_stitch:
             # SDK stitch: project lidar into camera ERP frame using the
             # current seed calibration. This coarsely aligns the intensity
             # image with the camera ERP so SuperGlue can find matches.
@@ -285,7 +336,7 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         v = (out_h * (0.5 - lat / np.pi)).astype(int)
 
     valid = (u >= 0) & (u < out_w) & (v >= 0) & (v < out_h)
-    if use_camframe:
+    if use_camframe or is_oak1:
         ranges = norm_c[valid]
         point_indices = orig_indices[valid]
     else:
@@ -327,7 +378,7 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # For both sensor-frame and camera-frame paths the lidar projects into the
     # outer strips (|lon|>90deg); zero the middle zone to match the camera ERP.
     is_dual = (width == 2560)
-    suppress_middle = not is_dual or is_sdk_stitch
+    suppress_middle = False if is_oak1 else (not is_dual or is_sdk_stitch)
     mid_start, mid_end = out_w // 4, out_w * 3 // 4
     BOUNDARY_MARGIN = 12
     # Expand the suppressed zone by the boundary margin before inpainting
@@ -347,9 +398,22 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     hole_mask = (blended_thick == 0).astype(np.uint8)
     if suppress_middle:
         hole_mask[:, mid_start_inpaint:mid_end_inpaint] = 0
+    # OAK-1: restrict inpainting to the bounding box of projected points
+    # so the empty region outside the camera FOV is not filled
+    if is_oak1 and len(u2) > 0:
+        fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+        u_min, u_max = max(0, u2.min() - 20), min(out_w, u2.max() + 20)
+        v_min, v_max = max(0, v2.min() - 20), min(out_h, v2.max() + 20)
+        fov_mask[v_min:v_max, u_min:u_max] = 1
+        hole_mask = hole_mask * fov_mask
     filled = cv2.inpaint(blended_thick, hole_mask, inpaintRadius=12, flags=cv2.INPAINT_TELEA)
     if suppress_middle:
         filled[:, mid_start_inpaint:mid_end_inpaint] = 0
+    # OAK-1: zero everything outside the FOV bounding box after inpainting
+    if is_oak1 and len(u2) > 0:
+        outside = np.ones((out_h, out_w), dtype=np.uint8)
+        outside[v_min:v_max, u_min:u_max] = 0
+        filled[outside > 0] = 0
 
     # 3. Erode slightly to pull back over-dilated edges
     filled = cv2.erode(filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
@@ -387,6 +451,10 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             scan_path = _safe_scan_dir
             candidates = sorted(scan_path.glob('equirect_*_masked.png')) or \
                          [f for f in sorted(scan_path.glob('equirect_*.jpg')) if '_masked' not in f.name]
+            # OAK-1 fallback
+            if not candidates:
+                candidates = [f for f in sorted(scan_path.glob('oak1_*.png'))
+                              if '_undistorted' not in f.name]
             if candidates:
                 src_erp = str(candidates[0])
         cam_src = src_erp or camera_image
@@ -410,7 +478,7 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                     _erode_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_erode_px * 2 + 1, _erode_px * 2 + 1))
                     _calib_lidar_mask = cv2.erode(_calib_lidar_mask, _erode_k)
                     cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=_calib_lidar_mask)
-            elif not is_dual:
+            elif not is_dual and not is_oak1:  # OAK-1 has no scanner body in view
                 mask_path_src = 'lidar_mask_dual.png' if (is_sdk_stitch or width > 2560) else 'lidar_mask_single.png'
                 mask_path = Path(__file__).parent.parent / mask_path_src
                 lidar_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
@@ -502,9 +570,9 @@ if __name__ == "__main__":
     print(f"\nGenerating intensity images for {len(ply_files)} PLY files...")
     _mask_env = os.environ.get('ATLAS_CALIBRATION_MASK', '')
     if _mask_env:
-        print(f"  Calibration mask: {_mask_env} (exists={os.path.isfile(_mask_env)})")
+        print(f"  Calibration mask: {os.path.basename(_mask_env)}")
     else:
-        print(f"  No ATLAS_CALIBRATION_MASK set — using default mask")
+        print(f"  No calibration mask set")
 
     for ply_file in ply_files:
         base_name = ply_file.stem

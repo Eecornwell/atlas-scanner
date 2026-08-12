@@ -34,6 +34,12 @@ _DEFAULTS = {
         'lidar_mask_dual':   'lidar_mask_dual_x5.png',
         'display_name':      'Insta360 X5',
     },
+    'oak1': {
+        'image_width':       4032,
+        'image_height':      3040,
+        'display_name':      'Luxonis OAK-1',
+        'perspective':       True,   # pinhole camera — no ERP stitching
+    },
 }
 
 
@@ -81,9 +87,10 @@ def iter_scan_dirs(session_path) -> list:
 
 def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = True) -> Path:
     """Return the absolute lidar dual mask path for the given camera profile.
-    Single fisheye center masking is applied programmatically at runtime,
-    not via a separate mask file.
+    Returns None if the profile has no mask (e.g. oak1 pinhole camera).
     """
+    if 'lidar_mask_dual' not in profile:
+        return None
     name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
     p = _MASK_DIR / name
     if p.exists():

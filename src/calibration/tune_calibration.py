@@ -218,9 +218,14 @@ def main():
         ply_path = next(scan_dir.glob('sensor_lidar*.ply'), None)
         img_path = next((f for f in sorted(scan_dir.iterdir())
                          if 'equirect' in f.name and f.suffix == '.jpg'), None)
-        out_dir  = _safe_scan(scan_dir / 'calib_sweep')
+        # OAK-1 fallback: use undistorted PNG
+        if img_path is None:
+            img_path = next((f for f in sorted(scan_dir.iterdir())
+                             if f.name.startswith('oak1_') and '_undistorted' in f.name
+                             and f.suffix == '.png'), None)
+        out_dir  = _safe_scan(scan_dir.parent / 'calib_sweep')
         if ply_path is None or img_path is None:
-            print(f'Missing sensor_lidar*.ply or equirect*.jpg in {scan_dir}')
+            print(f'Missing sensor_lidar*.ply or equirect*.jpg/oak1_*_undistorted.png in {scan_dir}')
             sys.exit(1)
     else:
         ply_path = _safe_output(OUTPUT_DIR / '000000.ply')
@@ -256,8 +261,22 @@ def main():
 
     if args.verify:
         if args.scan_dir:
-            # Single explicit scan dir \u2014 original behaviour
-            sources = [(ply_path, img_path, scan_dir.name)]
+            # Walk all fusion_scan_* dirs in the session, up to 4 scans
+            session_dir = scan_dir.parent
+            all_scans = sorted(session_dir.glob('fusion_scan_*'))
+            sources = []
+            for sd in all_scans[:4]:
+                sp = next(sd.glob('sensor_lidar*.ply'), None)
+                si = next((f for f in sorted(sd.iterdir())
+                           if f.name.startswith('oak1_') and '_undistorted' in f.name
+                           and f.suffix == '.png'), None)
+                if si is None:
+                    si = next((f for f in sorted(sd.iterdir())
+                               if 'equirect' in f.name and f.suffix == '.jpg'), None)
+                if sp and si:
+                    sources.append((sp, si, sd.name))
+            if not sources:
+                sources = [(ply_path, img_path, scan_dir.name)]
         else:
             # Load up to 3 scans from output/ (000000, 000001, 000002)
             sources = []
@@ -282,6 +301,47 @@ def main():
                 print(f'Could not load image: {s_img}, skipping')
                 continue
             s_erp = cv2.cvtColor(s_raw, cv2.COLOR_GRAY2BGR) if s_raw.ndim == 2 else s_raw
+            is_oak1_img = 'oak1' in Path(str(s_img)).name
+
+            # OAK-1: project LiDAR directly onto the full image, thick dots.
+            if is_oak1_img:
+                T = build_T(cfg, 0, 0, 0, 0, 0, 0)
+                pts_cam = (T[:3, :3] @ s_pts.T).T + T[:3, 3]
+                dist_arr = np.linalg.norm(pts_cam, axis=1)
+                mask = (dist_arr > 0.3) & (dist_arr < 10.0)
+                pts_cam, dist_arr = pts_cam[mask], dist_arr[mask]
+                _ci_path = Path(str(s_ply)).parent / 'camera_info.yaml'
+                if not _ci_path.exists() and args.scan_dir:
+                    _ci_path = scan_dir / 'camera_info.yaml'
+                if _ci_path.exists():
+                    import yaml as _yaml
+                    _ci = _yaml.safe_load(_ci_path.read_text())
+                    _H, _W = s_raw.shape[:2]
+                    _sx, _sy = _W/_ci['width'], _H/_ci['height']
+                    _fx = _ci['fx']*_sx; _fy = _ci['fy']*_sy
+                    _cx = _ci['cx']*_sx; _cy = _ci['cy']*_sy
+                else:
+                    _H, _W = s_raw.shape[:2]
+                    _fx = _fy = 3228.0; _cx = _W/2.0; _cy = _H/2.0
+                front = pts_cam[:, 2] > 0.1
+                pf = pts_cam[front]; df = dist_arr[front]
+                u_p = (_fx * pf[:,0] / pf[:,2] + _cx).astype(int)
+                v_p = (_fy * pf[:,1] / pf[:,2] + _cy).astype(int)
+                valid = (u_p>=0)&(u_p<_W)&(v_p>=0)&(v_p<_H)
+                u_p, v_p, df = u_p[valid], v_p[valid], df[valid]
+                d_norm = np.clip((df-df.min())/(df.max()-df.min()+1e-6)*255,0,255).astype(np.uint8)
+                colours = cv2.applyColorMap(d_norm.reshape(-1,1), cv2.COLORMAP_JET).reshape(-1,3)
+                overlay = s_erp.copy()
+                for i in range(len(u_p)):
+                    cv2.circle(overlay,(u_p[i],v_p[i]),8,
+                               (int(colours[i,0]),int(colours[i,1]),int(colours[i,2])),-1)
+                g = cv2.addWeighted(s_erp, 0.35, overlay, 0.65, 0)
+                # Resize to 1200px wide for readability
+                g = cv2.resize(g, (1200, int(_H*1200/_W)))
+                cv2.putText(g, label, (8,28), cv2.FONT_HERSHEY_SIMPLEX, 0.8,(255,255,255),2)
+                scan_grids.append(g)
+                continue
+
             import json as _json
             sidecar = _safe_output(OUTPUT_DIR / f'{Path(s_ply).stem}_source.json')
             is_sdk = False
