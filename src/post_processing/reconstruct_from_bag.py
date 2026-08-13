@@ -648,46 +648,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     # SDK stitch mode: delete stale fusion_scan_* dirs before opening the bag
     # so the coloring pipeline always uses freshly reconstructed sensor_lidar.ply.
-    # Preserve .insp files and .capture_time sidecars across the clear so the
-    # ERP stitching step can still find them after reconstruction.
+    # .insp files live in .sdk_shot_* dirs (authoritative) so no need to
+    # preserve them from stale fusion_scan_* dirs — those may include OAK-1
+    # dirs from a previous coloring pass which would corrupt the restoration.
     if sdk_stitch:
         import shutil as _shutil
-        # Save .insp files keyed by shot index before clearing
-        _saved_insp = {}  # idx -> list of (filename, bytes, capture_time_bytes_or_None)
-        for _scan_dir in sorted(session_path.glob('fusion_scan_*')):
-            try:
-                _idx = int(_scan_dir.name.split('_')[-1])
-            except ValueError:
-                continue
-            _files = []
-            for _insp in sorted(_scan_dir.glob('*.insp')):
-                if _insp.stat().st_size < 100000:
-                    continue
-                _ct_f = _scan_dir / (_insp.name + '.capture_time')
-                _ct_bytes = _ct_f.read_bytes() if _ct_f.exists() else None
-                _files.append((_insp.name, _insp.read_bytes(), _ct_bytes))
-            if _files:
-                _saved_insp[_idx] = _files
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
-        # Do NOT pre-populate fusion_scan_NNN/ with .insp files by shot index.
-        # Shot 0 may fire before the bag starts, making index-based promotion
-        # off by one (shot N's .insp ends up in fusion_scan_{N+1} but the
-        # scan centre for fusion_scan_001 corresponds to shot 1, not shot 0).
-        # The ERP stitching step below matches each .insp to its scan centre
-        # by capture_time proximity, which is correct regardless of index offset.
-        # Restore any .insp files that were in fusion_scan_* but not in .sdk_shot_*
-        for _idx, _files in _saved_insp.items():
-            _scan_dir = session_path / f'fusion_scan_{_idx:03d}'
-            _scan_dir.mkdir(exist_ok=True)
-            for _fname, _data, _ct_bytes in _files:
-                _dest = _scan_dir / _fname
-                if not _dest.exists():
-                    _dest.write_bytes(_data)
-                if _ct_bytes is not None and not (_scan_dir / (_fname + '.capture_time')).exists():
-                    (_scan_dir / (_fname + '.capture_time')).write_bytes(_ct_bytes)
-        # Remove corrupt .insp files from failed downloads
-        for _bad_insp in session_path.glob('fusion_scan_*/*.insp'):
+        # Remove corrupt .insp files from failed downloads in .sdk_shot_* dirs
+        for _bad_insp in session_path.glob('.sdk_shot_*/*.insp'):
             if _bad_insp.stat().st_size < 100000:
                 _bad_insp.unlink()
                 print(f"  Removed corrupt .insp: {_bad_insp.name}")
@@ -790,15 +759,13 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     # Compute host→Livox clock offset.
     # LiDAR/odometry timestamps are in Livox hardware clock; shutter times
     # from t_before are in host system clock.
-    # When PTP is active (ptp4l-livox.service running as master, phc2sys syncing
-    # system clock to /dev/ptp0), the MID360 slaves its hardware clock to the
-    # host PHC — both clocks are the same and the offset is 0.  We detect this
-    # by checking whether the measured offset is within the PTP convergence
-    # window (<5ms).  If so we zero it out and log the confirmation.
-    # Without PTP the offset is ~50-60ms and must be applied.
+    # livox_time_sync syncs the MID360 clock to the host via RMC before each
+    # session, so the measured offset should be within the sync threshold
+    # (<100ms). If so we zero it out and log the confirmation.
+    # Without sync the offset is ~50-60ms and must be applied.
     # -----------------------------------------------------------------------
     _host_to_livox_offset = 0.0
-    _ptp_active = False
+    _clocks_aligned = False
     try:
         _con_off = open_db3(bag_dir)
         _tmap_off = topic_map(_con_off)
@@ -818,15 +785,15 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             if _diffs:
                 _measured = float(np.median(_diffs))
                 # bag_t - hdr_t = delivery_latency + clock_offset.
-                # When livox_time_sync (or PTP) has synced the MID360 clock to
-                # host system_clock, the measured difference is purely DDS/UDP
+                # When livox_time_sync has synced the MID360 clock to the host
+                # system clock, the measured difference is purely DDS/UDP
                 # delivery latency (~10-70ms), NOT a real clock domain offset.
                 # Applying it would shift scan centres away from the true shutter
                 # time and cause geometric misalignment in the merged cloud.
                 # Only apply when the offset exceeds 100ms — indicating the
                 # clocks are genuinely unsynchronised.
                 if abs(_measured) < 0.1:
-                    _ptp_active = True
+                    _clocks_aligned = True
                     print(f'  Host→Livox clock offset: {_measured*1000:+.1f}ms '
                           f'(within sync threshold — clocks aligned, not applied)')
                 else:
@@ -1390,7 +1357,46 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 
-    # Write sentinel so downstream tools know this was an SDK stitch session
+    # --- Promote OAK-1 continuous shots to fusion_scan_* dirs ---
+    # In continuous mode with a secondary OAK-1, main_multi.cpp writes each
+    # OAK-1 capture to .oak1_shot_NNN/ in sync with the X5 shot.
+    # Promote these to fusion_scan_* dirs numbered after the X5 scans,
+    # copying LiDAR from the matching X5 scan.
+    import shutil as _shutil
+    _oak1_shots = sorted(session_path.glob('.oak1_shot_*'))
+    if _oak1_shots:
+        print(f"\n  Promoting {len(_oak1_shots)} OAK-1 shots to fusion_scan_* dirs...")
+        for _oak1_dir in _oak1_shots:
+            try:
+                _shot_idx = int(_oak1_dir.name.split('_')[-1])  # 1-based, matches X5 scan
+            except ValueError:
+                continue
+            scan_count += 1
+            _oak1_scan = session_path / f'fusion_scan_{scan_count:03d}'
+            _oak1_scan.mkdir(exist_ok=True)
+            for _f in list(_oak1_dir.iterdir()):
+                _dst = _oak1_scan / _f.name
+                if not _dst.exists():
+                    _shutil.move(str(_f), str(_dst))
+            try:
+                _oak1_dir.rmdir()
+            except OSError:
+                pass
+            # Remove any .insp files that ended up here from stale dir restoration
+            # — OAK-1 scans never have .insp files
+            for _insp in list(_oak1_scan.glob('*.insp')) + list(_oak1_scan.glob('*.insp.capture_time')):
+                _insp.unlink(missing_ok=True)
+            _x5_scan = session_path / f'fusion_scan_{_shot_idx:03d}'
+            if _x5_scan.exists():
+                for _ply in list(_x5_scan.glob('sensor_lidar*.ply')) + list(_x5_scan.glob('world_lidar*.ply')):
+                    _dst = _oak1_scan / _ply.name
+                    if not _dst.exists():
+                        _shutil.copy2(str(_ply), str(_dst))
+                _traj = _x5_scan / 'trajectory.json'
+                if _traj.exists() and not (_oak1_scan / 'trajectory.json').exists():
+                    _shutil.copy2(str(_traj), str(_oak1_scan / 'trajectory.json'))
+            print(f"    {_oak1_dir.name} -> {_oak1_scan.name}")
+        print(f"  ✓ OAK-1 shots promoted")
     if sdk_stitch:
         (session_path / '.sdk_stitch_continuous').touch()
     # --- ERP conversion + colorization ---

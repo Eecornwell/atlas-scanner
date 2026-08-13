@@ -11,7 +11,7 @@ white_balance: 0
 # Exposure mode: 0=AUTO (matches X5 for multi-camera consistency)
 exposure_mode: 0
 # Lidar mask filename (relative to config/masks/)
-lidar_mask_dual: lidar_mask_dual_x3_cam_left.png
-lidar_mask_single: lidar_mask_single_x5.png
+lidar_mask_dual: x3/lidar_mask_dual_x3_cam_left.png
+lidar_mask_single: x5/lidar_mask_single_x5.png
 # Display name
 display_name: "Insta360 X3"

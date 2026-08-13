@@ -9,7 +9,11 @@
   > *Note: See `Hardware Build` section below for component estimates at the time of writing this.*
 
 ## Technical Approach
+
 ![ATLAS Scanner](assets/media/atlas-splat.gif "ATLAS Scanner")
+
+![ATLAS Supported Cameras](assets/media/atlas_cameras_v1.jpeg "ATLAS Supported Cameras")
+
 ### Hardware
 - LiDAR w/ IMU
     - [Livox Mid360](https://www.livoxtech.com/mid-360)
@@ -45,7 +49,7 @@
     - See `Hardware Build` section for more information
 - Complete scanner with accessories
     - 8" wide x 8" tall x 14" deep
-    - 7lb
+    - 7lb (less if 3D printing chassis)
 
 #### OS
 - Linux Ubuntu Jammy 22.04
@@ -117,7 +121,7 @@
 | Colorize point cloud                | Yes       | Projects the image onto lidar using calibration; ERP (equirectangular) for Insta360, pinhole for OAK-1          |
 | Blend panoramic image seams         | Yes       | Blend the cubemap face seams after calibration using simple weighting (Insta360 only)                            |
 | Export Colmap model files           | Yes       | Retriangulate poses, merges color pointcloud with colmap reconstructed point cloud; mixed X5+OAK-1 sessions include both camera types |
-| Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for 3 seconds per scan (mostly used for calibration)           |
+| Record bag files                    | Yes       | Records lidar point cloud, trajectory, and images for ~4 seconds per scan (mostly used for calibration)           |
 | Record trajectory                   | Yes       | Trajectory (poses) are stored locally and updated if using ICP refinement                                        |
 | Merge scans w/ trajectory or ICP    | Yes       | Refine poses by performing pose graph based ICP, initialized from the trajectory                                 |
 | Terrestrial mode (interval scans)   | Yes       | Currently triggered with button, mostly used for calibration and debug system/sensors                            |
@@ -148,7 +152,7 @@ Please review [Running the Software documentation](docs/software-run.md)
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)
 
-- The system uses the Insta360 CameraSDK exclusively for Insta360 cameras — no ROS camera driver. The `insta360_capture` daemon owns the USB device for the entire session. In continuous mode it calls `TakePhoto()` on a host-controlled timer at `CONTINUOUS_INTERVAL` (default 3s). Each `.insp` raw file is downloaded concurrently via HTTP and a shutter event is published for bag recording. In `single_fisheye` mode the same `.insp` is stitched to a full 360° ERP with the rear hemisphere blank; a per-hardware mask (`lidar_mask_single_x5.png`) is applied before coloring to exclude the blank region and scanner body
+- The system uses the Insta360 CameraSDK exclusively for Insta360 cameras — no ROS camera driver. The `insta360_capture` daemon owns the USB device for the entire session. In continuous mode it calls `TakePhoto()` on a host-controlled timer at `CONTINUOUS_INTERVAL` (default 5s). Each `.insp` raw file is downloaded concurrently via HTTP and a shutter event is published for bag recording. In `single_fisheye` mode the same `.insp` is stitched to a full 360° ERP with the rear hemisphere blank; a per-hardware mask (`x5/lidar_mask_single_x5.png`) is applied before coloring to exclude the blank region and scanner body
 
 - The **OAK-1** is driven by `oak1_capture.py` (DepthAI Python library) independently of the Insta360 SDK. It can run standalone (`CAMERA_HW=oak1`) or as a **secondary camera** alongside an Insta360 primary. In secondary mode it automatically detects the OAK-1 alongside the Insta360 and allocates a dedicated `fusion_scan_NNN` directory for each OAK-1 capture, with LiDAR copied from the primary scan. The OAK-1 uses per-capture USB reconnect to avoid XLink instability on USB 2.0; each capture takes ~3–4s. Intrinsics are read from device eeprom at startup and saved as `camera_info.yaml` per scan.
 
@@ -174,13 +178,13 @@ Please review [Running the Software documentation](docs/software-run.md)
 
 - **MID360 clock sync (RMC):** At startup, `livox_time_sync` (built from `livox_time_sync.cpp` using Livox SDK2) connects to the MID360 before the ROS driver starts and calls `SetLivoxLidarRmcSyncTime()` with a synthesised GPRMC sentence encoding the current UTC time. This sets the device's internal wall-clock reference. The point cloud `header.stamp` domain is unaffected — the ~65ms offset correction in `reconstruct_from_bag.py` remains necessary and is always applied.
 
-- Scan centers are defined by camera frame timestamps. During reconstruction (post processing), each camera stamp is used to interpolate a pose from the bracketing pair of odometry samples (SLERP for rotation, linear for translation). The interpolation bracket half-width — half the gap between the two surrounding odom samples — bounds the worst-case pose error at each scan centre. At ~18 Hz odometry this is typically ≤28ms
+- Scan centers are defined by camera frame timestamps. During reconstruction (post processing), each camera stamp is used to interpolate a pose from the bracketing pair of odometry samples (SLERP for rotation, linear for translation). The interpolation bracket half-width — half the gap between the two surrounding odom samples — bounds the worst-case pose error at each scan centre. At ~10 Hz odometry this is typically ~50ms
 
 - Camera frames whose timestamps fall outside the odometry window (before the first or after the last odom sample) cannot be interpolated and are filtered out during reconstruction to avoid clamped extrapolation errors
 
 - Per-frame motion compensation is applied to each LiDAR scan: individual LiDAR returns within a scan are de-skewed using interpolated poses across the scan duration before the scan is projected into world frame
 
-- The Livox Mid360 IMU publishes at ~200 Hz using best-effort QoS (`SensorDataQoS`), matching RKO-LIO's subscriber. A QoS mismatch (reliable publisher vs best-effort subscriber) will cause IMU starvation and degrade odometry from ~18 Hz to ~6 Hz — the benchmark will report POOR in this case
+- The Livox Mid360 IMU publishes at ~200 Hz using best-effort QoS (`SensorDataQoS`), matching RKO-LIO's subscriber. A QoS mismatch (reliable publisher vs best-effort subscriber) will cause IMU starvation and degrade odometry from ~10 Hz to ~6 Hz — the benchmark will report POOR in this case
 
 - The sync benchmark measures five quantities: raw inter-message gaps per topic, interpolation residual (odom bracket half-width at each scan centre), odom coverage fraction over the session window, per-topic arrival jitter (std of inter-message gaps), and IMU soft-sync confidence and residual. Overall quality is rated GOOD / OK / POOR based on mean bracket half-width against a 33 ms threshold
 

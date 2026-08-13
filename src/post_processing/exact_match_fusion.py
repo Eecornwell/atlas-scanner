@@ -173,19 +173,25 @@ def exact_match_calibration_tool(scan_dir):
 
     # hw: use serial-resolved slot when available; fall back to multi_camera.yaml
     # by cam_index alone (index is correct even without serial), then session hw.
-    _hw = _session_hw
-    try:
-        _src = os.path.join(os.path.dirname(__file__), '..')
-        _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
-        if os.path.exists(_mc_path):
-            _mc = _yaml.safe_load(open(_mc_path).read()) or {}
-            _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
-            # Always use the slot hw when available — it's more specific than session hw
-            # (e.g. cam_3=oak1 in an x5 session gets oak1 calibration, not x5)
-            if _slot_hw:
-                _hw = _slot_hw
-    except Exception:
-        pass
+    # Special case: if the scan contains an oak1_* image, it is always an OAK-1
+    # scan regardless of .cam_index serial — override hw directly.
+    _is_oak1_scan = any(f.startswith('oak1_') for f in os.listdir(str(safe_scan)))
+    _hw = 'oak1' if _is_oak1_scan else _session_hw
+    if not _is_oak1_scan:
+        try:
+            _src = os.path.join(os.path.dirname(__file__), '..')
+            _mc_path = os.path.join(_src, 'config', 'multi_camera.yaml')
+            if os.path.exists(_mc_path):
+                _mc = _yaml.safe_load(open(_mc_path).read()) or {}
+                _slot_hw = _mc.get('cameras', {}).get(f'cam_{_cam_idx}', {}).get('camera_hw', '')
+                # Only trust the slot index when a serial was present in .cam_index —
+                # without a serial, sdk_index=0 always maps to cam_0 regardless of
+                # which physical camera was used, so slot lookup would give the wrong hw
+                # (e.g. cam_0=x5 for a single-camera oak1 session).
+                if _slot_hw and _ci_has_serial:
+                    _hw = _slot_hw
+        except Exception:
+            pass
 
     # _is_perspective must be based on the SCAN's actual hw, not the session hw.
     # In a multi-camera session (e.g. x5+oak1), oak1 scans need pinhole projection

@@ -74,6 +74,9 @@ def filter_blurry_scans(session_dir, percentile=20, min_blur=None, max_motion=0.
         'equirect_dual_fisheye_masked.png',
         'equirect_dual_fisheye.jpg',
     ]
+    OAK1_CANDIDATES = [
+        'oak1_undistorted.png',  # legacy name
+    ]
 
     scan_dirs = sorted(session_path.glob('fusion_scan_*'))
     if not scan_dirs:
@@ -88,44 +91,52 @@ def filter_blurry_scans(session_dir, percentile=20, min_blur=None, max_motion=0.
 
     scores = []
     for sd in scan_dirs:
-        erp = next((sd / n for n in ERP_CANDIDATES if (sd / n).exists()), None)
+        # OAK-1 scans: use undistorted PNG (glob since timestamp is in filename)
+        is_oak1 = any(sd.glob('oak1_*_undistorted.png'))
+        if is_oak1:
+            erp = next(sd.glob('oak1_*_undistorted.png'), None)
+        else:
+            erp = next((sd / n for n in ERP_CANDIDATES if (sd / n).exists()), None)
         bscore = blur_score(erp) if erp else 0.0
         mscore = motion_score(sd)
-        scores.append((sd, bscore, mscore))
+        scores.append((sd, bscore, mscore, is_oak1))
 
     if not scores:
         return [], []
 
-    all_blur_scores = [b for _, b, _ in scores]
-
-    # Determine blur threshold
+    # Compute thresholds separately for X5/ERP and OAK-1 scans so OAK-1
+    # perspective images (lower Laplacian variance by nature) aren't penalised
+    # against the ERP panorama pool.
     if min_blur is not None:
         threshold = min_blur
-    elif len(all_blur_scores) >= 4:
-        threshold = float(np.percentile(all_blur_scores, percentile))
+        oak1_threshold = min_blur
     else:
-        threshold = 0.0
+        erp_scores  = [b for _, b, _, is_o in scores if not is_o]
+        oak1_scores = [b for _, b, _, is_o in scores if is_o]
+        threshold       = float(np.percentile(erp_scores,  percentile)) if len(erp_scores)  >= 4 else 0.0
+        oak1_threshold  = float(np.percentile(oak1_scores, percentile)) if len(oak1_scores) >= 4 else 0.0
 
     kept, skipped = [], []
     print(f"\nBlur/motion filter (blur_threshold={threshold:.0f}, percentile={percentile}, max_motion={max_motion}):")
-    for sd, bscore, mscore in sorted(scores, key=lambda x: x[1], reverse=True):
+    for sd, bscore, mscore, is_oak1 in sorted(scores, key=lambda x: x[1], reverse=True):
+        thr = oak1_threshold if is_oak1 else threshold
         motion_skip = max_motion is not None and mscore is not None and mscore > max_motion
-        blur_skip_flag = bscore < threshold
+        blur_skip_flag = bscore < thr
         if not blur_skip_flag and not motion_skip:
             kept.append(sd.name)
             motion_str = f" motion={mscore:.3f}" if mscore is not None else ""
-            print(f"  ✓ {sd.name}: blur={bscore:.0f}{motion_str}  [keep]")
+            print(f"  \u2713 {sd.name}: blur={bscore:.0f}{motion_str}  [keep]")
         else:
             skipped.append(sd.name)
             reasons = []
-            if bscore < threshold:
-                reasons.append(f"blur={bscore:.0f}<{threshold:.0f}")
+            if bscore < thr:
+                reasons.append(f"blur={bscore:.0f}<{thr:.0f}")
             if motion_skip:
                 reasons.append(f"motion={mscore:.3f}>{max_motion}")
             print(f"  ✗ {sd.name}: {' '.join(reasons)}  [skip]")
             if not dry_run:
                 (sd / '.blur_skip').write_text(
-                    f"blur_score={bscore:.1f} threshold={threshold:.1f} "
+                    f"blur_score={bscore:.1f} threshold={thr:.1f} "
                     f"motion_score={mscore} max_motion={max_motion}\n"
                 )
 

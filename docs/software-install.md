@@ -256,49 +256,14 @@ sudo sysctl -p /etc/sysctl.d/99-atlas-udp.conf
 vi ~/atlas_ws/install/livox_ros_driver2/share/livox_ros_driver2/config/MID360_config.json
 
 # ── LiDAR Clock Sync ────────────────────────────────────────────────────
-# The MID360 hardware clock runs independently from the host system clock,
-# producing a fixed ~65ms offset between LiDAR header.stamp values and host
-# shutter timestamps. This offset is stable (±0.3ms) and auto-corrected in
-# post-processing, but the device's internal wall-clock reference should be
-# set to UTC at startup for accurate last_sync_time metadata.
-#
-# PRIMARY: RMC time sync via Livox SDK2 (livox_time_sync binary)
-# Calls SetLivoxLidarRmcSyncTime() with a synthesised GPRMC sentence before
-# the ROS driver starts. Runs in ~3s, requires no extra hardware.
-# Built automatically by the SDK build script (build.sh).
-# Invoked automatically by atlas_fusion_capture.sh before livox_ros_driver2.
-#
-# SUPPLEMENTARY: PTP grandmaster on enp2s0 (optional, keeps host PHC aligned)
-# The MID360 sends PTP peer-delay-request messages but does not slave its
-# point cloud timestamp domain to an external PTP master. The ptp4l/phc2sys
-# services below keep the host PHC (±0.1ms) aligned to system clock, which
-# is useful if other PTP-capable devices are on the same network segment.
-
-# Install linuxptp (required for ptp4l/phc2sys services)
-sudo apt install -y linuxptp
-
-# Run the one-time install script (copies configs, installs and enables systemd services)
-cd ~/atlas_ws/src/atlas-scanner/src
-sudo ./install_ptp.sh
-
-# Verify both services are running
-sudo systemctl status ptp4l-livox.service phc2sys-livox.service
-
-# Confirm PHC is locked to system clock (offset should be <1ms)
-sudo journalctl -u phc2sys-livox.service -n 5 --no-pager
-# Expected output:
-#   phc_sync: offset=+0.08ms  PHC=1783396948.404  sys=1783396948.404
-
-# Both services are enabled and start automatically on every boot.
-# The livox_time_sync binary (RMC sync) runs automatically at each session start.
+# The MID360 hardware clock runs independently from the host system clock.
+# The livox_time_sync binary calls SetLivoxLidarRmcSyncTime() with a
+# synthesised GPRMC sentence before the ROS driver starts. Runs in ~3s,
+# requires no extra hardware. Built automatically by build.sh and invoked
+# automatically by atlas_fusion_capture.sh before livox_ros_driver2.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Configure FastDDS profiles
-# fastdds_atlas.xml  — used by long-running driver processes (LiDAR, RKO-LIO, camera).
-# fastdds_capture.xml — used by short-lived capture processes (participantID=50 to avoid
-#                       SHM port collisions with the persistent decoder process).
-# No IP address substitution needed — all profiles use default SHM+UDP transports.
-
 # Check with Livox Viewer First to confirm can connect to lidar_configs
 cd ~/atlas_ws &&
 source ~/atlas_ws/install/setup.bash &&
@@ -520,7 +485,7 @@ export LD_LIBRARY_PATH=/home/orion/atlas_ws/install/direct_visual_lidar_calibrat
 
 ## SDK Setup
 
-> **Prerequisites:** Before running any scan sessions, ensure the LiDAR clock sync is set up. The `livox_time_sync` binary (built by `build.sh`) runs automatically at each session start and sets the MID360 wall-clock reference via `SetLivoxLidarRmcSyncTime()`. The supplementary PTP services (`ptp4l-livox`, `phc2sys-livox`) keep the host PHC aligned and are installed via `install_ptp.sh`. See the [LiDAR Clock Sync](#lidar-clock-sync) section in the manual installation steps.
+> **Prerequisites:** Before running any scan sessions, ensure the LiDAR clock sync is set up. The `livox_time_sync` binary (built by `build.sh`) runs automatically at each session start and sets the MID360 wall-clock reference via `SetLivoxLidarRmcSyncTime()`.
 
 The ATLAS pipeline uses two Insta360 SDK packages:
 
@@ -532,6 +497,8 @@ The ATLAS pipeline uses two Insta360 SDK packages:
 Download `Linux_CameraSDK-2.1.1_MediaSDK-3.1.1.zip` from the Insta360 developer portal and place it in `~/Downloads/`.
 
 ### 1. Install CameraSDK 2.1.1
+
+> **Automated:** `install_base_sensors.sh` handles this step — it extracts the CameraSDK tarball to `~/LinuxSDK/` and prompts for the zip if not already present. Only follow these steps if doing a manual installation.
 
 ```bash
 # Extract the zip (macOS metadata entries are harmless)
@@ -549,6 +516,8 @@ ls ~/LinuxSDK/CameraSDK-20250812_192742-2.1.1-Linux/
 ```
 
 ### 2. Install MediaSDK 3.1.1
+
+> **Manual step — not automated by any install script.**
 
 The MediaSDK ships as a `.deb` inside a `.tar.xz` inside the zip:
 
@@ -575,6 +544,8 @@ ls /usr/include/ins_stitcher.h  # MediaSDK 3.x header (was stitcher/stitcher.h i
 > The MediaSDK 3.x `.deb` also installs `libMNN.so`, `libtscsdk_center.so` and several CUDA stubs into `/usr/lib`. These are required at runtime by `libMediaSDK.so` and are included in the package.
 
 ### 3. Build insta360_capture and insta360_stitch
+
+> **Automated:** `install_aux_deps.sh` runs `build.sh` automatically if MediaSDK is detected. Only follow these steps if doing a manual installation or rebuilding after updates.
 
 ```bash
 cd ~/atlas_ws/src/atlas-scanner/src/capture/sdk && bash build.sh
@@ -665,8 +636,6 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 python3 -c "import depthai as dai; d = dai.Device(); print('OAK-1 MxId:', d.getMxId())"
 # Should print: OAK-1 MxId: <14-char hex string>
 ```
-
-> **USB speed note:** The BOSGAME DNB20 routes all external USB ports through a USB2-only PCH controller. The OAK-1 will operate at USB2 (480 Mbps) on this machine, limiting capture resolution to 640×400. Full resolution (1920×1080+) requires a USB3 port — either a USB3 PCIe expansion card or a machine with accessible USB3 ports. To change resolution once USB3 is available, update `image_width` and `image_height` in `config/camera_models/oak1.yaml`.
 
 ### 4. Test snapshot and intrinsics pull
 

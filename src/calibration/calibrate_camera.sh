@@ -151,7 +151,7 @@ if [ ! -f "$MASK_FILE" ]; then
     echo "  5. Save as: $MASK_FILE"
     echo ""
     echo "  Tip: Start from an existing mask and modify:"
-    echo "    cp $MASKS_DIR/lidar_mask_dual_${CAM_HW}.png $MASK_FILE"
+    echo "    cp $MASKS_DIR/${CAM_HW}/lidar_mask_dual_${CAM_HW}.png $MASK_FILE"
     echo ""
     read -p "Continue without mask? (y/n): " _cont
     [ "$_cont" != "y" ] && exit 1

@@ -479,8 +479,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                     _calib_lidar_mask = cv2.erode(_calib_lidar_mask, _erode_k)
                     cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=_calib_lidar_mask)
             elif not is_dual and not is_oak1:  # OAK-1 has no scanner body in view
-                mask_path_src = 'lidar_mask_dual.png' if (is_sdk_stitch or width > 2560) else 'lidar_mask_single.png'
-                mask_path = Path(__file__).parent.parent / mask_path_src
+                mask_path_src = 'onex2/lidar_mask_dual.png' if (is_sdk_stitch or width > 2560) else 'onex2/lidar_mask_single.png'
+                mask_path = Path(__file__).parent.parent / 'config' / 'masks' / mask_path_src
                 lidar_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
                 if lidar_mask is not None:
                     lidar_mask = cv2.resize(lidar_mask, (cam_gray.shape[1], cam_gray.shape[0]), interpolation=cv2.INTER_NEAREST)

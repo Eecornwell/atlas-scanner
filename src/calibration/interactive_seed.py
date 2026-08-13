@@ -375,7 +375,7 @@ def main():
 
         # Compute range-gradient edges from the depth image
         # Sobel on depth highlights depth discontinuities = structural edges
-        if depth_u8.max() > 0:
+        if show_edges and depth_u8.max() > 0:
             dx = cv2.Sobel(depth_u8.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
             dy = cv2.Sobel(depth_u8.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
             grad = np.sqrt(dx**2 + dy**2)
@@ -390,10 +390,8 @@ def main():
         cam_edges = cv2.Canny(cam_gray, 20, 60)
         cam_edges[~cam_mask] = 0
 
-        # Composite: dim image, overlay LiDAR depth as thin colormap dots,
-        # then overlay LiDAR structural edges in bright green,
-        # camera edges in dim blue, coincident edges in yellow.
-        display = (cam_img.astype(np.float32) * 0.5).astype(np.uint8)
+        # Composite: full image when edges off, dimmed when edges on
+        display = (cam_img.astype(np.float32) * (0.5 if show_edges else 1.0)).astype(np.uint8)
 
         # Thin dot overlay for depth context (small dilation only)
         depth_dots = cv2.dilate(depth_img,
@@ -408,13 +406,16 @@ def main():
                 cam_img, 0.2, dot_color, 0.8, 0)[dot_mask]
 
         # LiDAR structural edges: bright green
-        display[lidar_edges > 0] = (30, 220, 30)
-        # Camera edges: dim blue
-        display[cam_edges > 0] = np.clip(
-            display[cam_edges > 0].astype(int) + [60, 30, 0], 0, 255).astype(np.uint8)
-        # Coincident (aligned) edges: bright yellow
-        coincident = (lidar_edges > 0) & (cam_edges > 0)
-        display[coincident] = (0, 255, 255)
+        if show_edges:
+            display[lidar_edges > 0] = (30, 220, 30)
+            # Camera edges: dim blue
+            display[cam_edges > 0] = np.clip(
+                display[cam_edges > 0].astype(int) + [60, 30, 0], 0, 255).astype(np.uint8)
+            # Coincident (aligned) edges: bright yellow
+            coincident = (lidar_edges > 0) & (cam_edges > 0)
+            display[coincident] = (0, 255, 255)
+        else:
+            coincident = np.zeros((disp_h, disp_w), dtype=bool)
 
         n_pts = len(u)
         n_coincident = int(coincident.sum())
@@ -463,6 +464,8 @@ def main():
             pass
         elif key & 0xFF in (ord('q'), 27):
             break
+        elif key & 0xFF == ord('v'):
+            show_edges = not show_edges
         elif key & 0xFF == ord('c'):
             crop_enabled = not crop_enabled
         elif key & 0xFF == ord('s'):

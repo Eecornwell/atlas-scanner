@@ -222,8 +222,8 @@ colcon build --symlink-install
 source install/setup.bash
 
 echo ""
-echo "It is ok to have warnings and stderr output as long as all three packages finished"
-echo "Expected: Summary: 3 packages finished"
+echo "It is ok to have warnings and stderr output as long as all four packages finished"
+echo "Expected: Summary: 4 packages finished"
 echo ""
 
 # Configure MID360_config.json
@@ -246,20 +246,10 @@ echo ""
 read -p "Press Enter once you have completed the network configuration..."
 
 # Configure FastDDS profiles
-# Both profiles use SHM + UDP restricted to the wired LiDAR interface (192.168.1.50),
-# preventing WiFi/Docker interfaces from being used for sensor traffic.
 # fastdds_atlas.xml  — long-running driver processes (LiDAR, RKO-LIO, camera).
-# fastdds_capture.xml — short-lived capture processes (identical transport config).
-HOST_IP=$(ip -4 addr show | grep 'inet 192\.168\.1\.' | awk '{print $2}' | cut -d/ -f1 | head -1)
-if [ -z "$HOST_IP" ]; then
-    echo "⚠ Could not detect a 192.168.1.x address — defaulting to 192.168.1.50"
-    HOST_IP="192.168.1.50"
-fi
-echo "Configuring FastDDS profiles for host IP: $HOST_IP"
-sed -i "s|<address>192\.168\.1\.[0-9]*</address>|<address>$HOST_IP</address>|g" \
-    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_atlas.xml \
-    ~/atlas_ws/src/atlas-scanner/src/config/fastdds_capture.xml
-echo "✓ FastDDS profiles updated"
+# fastdds_capture.xml — short-lived capture processes.
+# fastdds_rosbag.xml  — per-scan bag recorder.
+# These are loaded via FASTRTPS_DEFAULT_PROFILES_FILE in atlas_fusion_capture.sh.
 
 echo ""
 echo "=== Testing Livox Viewer ==="

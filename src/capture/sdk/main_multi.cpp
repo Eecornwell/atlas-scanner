@@ -789,6 +789,19 @@ int _main(int argc, char* argv[]) {
                         }
                         write_shutter_event(session_dir, shot_num, t_shutter_est, ci);
 
+                        // Trigger secondary OAK-1 capture in sync with this X5 shot.
+                        // Always overwrite any pending trigger — oak1_capture.py will
+                        // capture the most recent shot. Skipping causes missed captures
+                        // when the previous capture takes longer than the interval.
+                        if (ci == 0) {
+                            char oak1_buf[8];
+                            std::snprintf(oak1_buf, sizeof(oak1_buf), "%03d", shot_num + 1);
+                            std::string oak1_scan = session_dir + "/.oak1_shot_" + std::string(oak1_buf);
+                            fs::create_directories(oak1_scan);
+                            std::ofstream oak1_trig(session_dir + "/.oak1_trigger");
+                            oak1_trig << oak1_scan << "\n";
+                        }
+
                         std::string remote_path = url.GetSingleOrigin();
                         std::string shot_dir = session_dir + "/.sdk_shot_" + std::to_string(shot_num);
                         fs::create_directories(shot_dir);
@@ -1027,7 +1040,6 @@ int _main(int argc, char* argv[]) {
                     results[ci].t_shutter = t_shutter_stat;
                     results[ci].remote_path = url.GetSingleOrigin();
                     results[ci].local_path = cam_dir + "/" + fs::path(results[ci].remote_path).filename().string();
-                    write_shutter_event(session_dir, shot, t_shutter_stat, ci);
 
                     // Write cam_index and capture_time immediately
                     { std::ofstream cif(fs::path(cam_dir) / ".cam_index"); cif << ci << " " << slots[ci].serial; }

@@ -22,8 +22,7 @@ _RULES_TMP=$(mktemp)
 cat > "$_RULES_TMP" << 'UDEV_EOF'
 SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", MODE="0777"
 SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", SYMLINK+="insta_%s{serial}", MODE="0777"
-SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", RUN+="/bin/sh -c 'test -e /dev/insta || ln -sf /dev/%k /dev/insta'"
-SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", ATTR{serial}=="IAHEA26019RESN", SYMLINK+="insta", MODE="0777"
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", ENV{ID_USB_INTERFACE_NUM}=="", SYMLINK+="insta", MODE="0777"
 UDEV_EOF
 
 if ! diff -q "$_RULES_TMP" "$RULE_FILE" > /dev/null 2>&1; then

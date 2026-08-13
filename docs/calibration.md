@@ -28,12 +28,12 @@ Each camera model requires its own lidar mask — a black/white PNG where white 
 
 | File | Used for |
 |------|----------|
-| `config/masks/lidar_mask_dual_sdk.png`        | One X2, dual fisheye, SDK stitch |
-| `config/masks/lidar_mask_dual.png`            | One X2, dual fisheye, stream mode |
-| `config/masks/lidar_mask_single.png`          | One X2, single fisheye |
-| `config/masks/lidar_mask_dual_x3_cam_left.png`| X3, dual fisheye |
-| `config/masks/lidar_mask_dual_x5.png`         | X5, dual fisheye |
-| `config/masks/lidar_mask_single_x5.png`       | X5, single fisheye |
+| `config/masks/onex2/lidar_mask_dual_sdk.png`        | One X2, dual fisheye, SDK stitch |
+| `config/masks/onex2/lidar_mask_dual.png`            | One X2, dual fisheye, stream mode |
+| `config/masks/onex2/lidar_mask_single.png`          | One X2, single fisheye |
+| `config/masks/x3/lidar_mask_dual_x3_cam_left.png`   | X3, dual fisheye |
+| `config/masks/x5/lidar_mask_dual_x5.png`            | X5, dual fisheye |
+| `config/masks/x5/lidar_mask_single_x5.png`          | X5, single fisheye |
 
 > **OAK-1 has no lidar mask** — the camera body is not visible in the OAK-1’s field of view, so no masking is needed.
 
@@ -344,16 +344,16 @@ settings:
 
 cameras:
   cam_0:                          # Primary/reference camera — never color-corrected
-    serial: "IAHEA26019RESN"      # From --discover output above
+    serial: "XXXXXXXXXXXXXX"      # From --discover output above
     camera_hw: x5                 # x5 | x3 | onex2
-    mask_dual: lidar_mask_dual_x5_cam2.png          # Mask for dual_fisheye mode
-    mask_calibration: lidar_mask_dual_x5_calib.png  # Mask used during calibration
+    mask_dual: x5/lidar_mask_dual_x5_cam_right.png        # Mask for dual_fisheye mode
+    mask_calibration: x5/lidar_mask_dual_x5_calib_right.png  # Mask used during calibration
     calibration: calibrations/x5/center/fusion_calibration.yaml
   cam_1:                          # Secondary camera — color-matched to cam_0
-    serial: "IAHEA12345ABCD"
+    serial: "XXXXXXXXXXXXXX"
     camera_hw: x3
-    mask_dual: lidar_mask_dual_x3_cam_left.png
-    mask_calibration: lidar_mask_dual_x3_calib.png
+    mask_dual: x3/lidar_mask_dual_x3_cam_left.png
+    mask_calibration: x3/lidar_mask_dual_x3_calib.png
     calibration: calibrations/x3/left/fusion_calibration.yaml
 ```
 

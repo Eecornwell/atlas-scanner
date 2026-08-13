@@ -63,9 +63,10 @@ def _apply_isp(dai, ctrl_q, settle_s: float = 0.0):
     ctrl_q.send(ctrl)
 
 
-def _wait_ae(stream_q, timeout=12.0):
+def _wait_ae(stream_q, timeout=6.0):
     """Wait for AE to stabilise: 3 consecutive frames within 5% brightness delta.
-    Timeout increased to 12s to handle USB2 slow AE ramp-up."""
+    Timeout reduced to 6s — with USB reset between captures device enumerates
+    faster and AE converges in 2-4s on USB2."""
     prev, stable, last_frame = 0.0, 0, None
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -121,10 +122,11 @@ def _cmd_warmup(width: int, height: int, out_yaml: str):
                 break
             time.sleep(0.05)
         # Never call pipeline.stop() — crashes firmware on USB2. OS cleans up.
-        sys.exit(0)
+        # Use os._exit to skip Python/DepthAI destructor which hangs on USB2.
+        os._exit(0)
     except Exception as e:
         print(f"✗ Warmup error: {e}", flush=True)
-        sys.exit(1)
+        os._exit(1)
 
 
 def _cmd_capture(width: int, height: int, out_png: str):
@@ -133,12 +135,12 @@ def _cmd_capture(width: int, height: int, out_png: str):
     try:
         pipeline, stream_q, ctrl_q = _build_pipeline(dai, width, height)
         pipeline.start()
-        _apply_isp(dai, ctrl_q, settle_s=1.0)
+        _apply_isp(dai, ctrl_q, settle_s=0.5)
         frame = _wait_ae(stream_q)
-        # drain for freshest frame
+        # drain briefly for freshest frame
         if frame is not None:
             t1 = time.time()
-            while time.time() - t1 < 5.0:
+            while time.time() - t1 < 1.5:
                 f = stream_q.tryGet()
                 if f is not None:
                     frame = f.getCvFrame()
@@ -147,12 +149,12 @@ def _cmd_capture(width: int, height: int, out_png: str):
                 time.sleep(0.02)
         if frame is not None:
             cv2.imwrite(out_png, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-            sys.exit(0)
+            os._exit(0)
         else:
-            sys.exit(1)
+            os._exit(1)
     except Exception as e:
         print(f"✗ Capture error: {e}", flush=True)
-        sys.exit(1)
+        os._exit(1)
 
 
 # ── parent-side helpers ───────────────────────────────────────────────────────
@@ -192,20 +194,10 @@ def _usb_reset_oak1():
         time.sleep(3.0)
 
 
-def _enhance_frame(frame: np.ndarray) -> np.ndarray:
+def _enhance_frame(frame: np.ndarray, alpha: float = 1.0, beta: int = 0) -> np.ndarray:
+    """Simple global contrast/brightness adjustment. alpha>1 increases contrast, beta shifts brightness."""
     import cv2
-    mean = float(frame.mean())
-    if mean > 120:
-        clip = 1.5
-    elif mean > 60:
-        clip = 2.5
-    else:
-        return frame
-    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(16, 16))
-    lab = cv2.merge([clahe.apply(l), a, b])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
 
 
 def _write_colmap_camera(info: dict, scan_dir: Path, actual_w: int, actual_h: int):
@@ -277,7 +269,6 @@ def main():
         sys.exit(1)
     scan_dir.mkdir(parents=True, exist_ok=True)
 
-    # Optional --cam-index for multi-camera sessions (e.g. oak1 as cam_3)
     cam_index = "0"
     if "--cam-index" in sys.argv:
         idx = sys.argv.index("--cam-index")
@@ -290,7 +281,7 @@ def main():
     width = int(cfg.get("image_width", 4056))
     height = int(cfg.get("image_height", 3040))
 
-    # Warmup: fresh subprocess reads intrinsics + warms AE, writes tmp yaml
+    # ── Warmup: read intrinsics via subprocess (safe isolation) ──────────────
     print(f"Building pipeline ({width}x{height})...", flush=True)
     with tempfile.NamedTemporaryFile(suffix=".yaml", delete=False) as tf:
         tmp_info = tf.name
@@ -310,8 +301,30 @@ def main():
         except OSError:
             pass
 
-    # USB reset after warmup so device returns to UNBOOTED for capture workers
+    # USB reset after warmup so device is in UNBOOTED state for the persistent pipeline
     _usb_reset_oak1()
+
+    # ── Start persistent pipeline — stays open for the whole session ──────────
+    # This eliminates the per-capture subprocess overhead (~8-17s) and allows
+    # capturing every X5 shot at 5s intervals.
+    try:
+        import depthai as dai
+        import cv2
+    except ImportError as e:
+        print(f"✗ Import error: {e}", flush=True)
+        sys.exit(1)
+
+    def _start_pipeline():
+        """Start pipeline and wait for AE. Returns (pipeline, stream_q, ctrl_q)."""
+        p, sq, cq = _build_pipeline(dai, width, height)
+        p.start()
+        _apply_isp(dai, cq, settle_s=0.5)
+        print("Waiting for AE...", flush=True)
+        _wait_ae(sq)
+        print("✓ AE ready", flush=True)
+        return p, sq, cq
+
+    pipeline, stream_q, ctrl_q = _start_pipeline()
 
     _safe(scan_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
     (scan_dir / ".sdk_ready").touch()
@@ -336,18 +349,38 @@ def main():
             (target_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
 
             print("Capturing...", flush=True)
-            frame = _run_capture(width, height)
+            frame = None
+            try:
+                # Drain queue and grab freshest frame (pipeline is already running)
+                t0 = time.time()
+                while time.time() - t0 < 3.0:
+                    f = stream_q.tryGet()
+                    if f is not None:
+                        frame = f.getCvFrame()
+                    else:
+                        if frame is not None:
+                            break
+                        time.sleep(0.02)
 
-            # Retry once if AE didn't converge (dark frame)
-            if frame is not None and frame.mean() < 40:
-                print(f"⚠ Dark frame (mean={frame.mean():.1f}) — retrying after USB reset", flush=True)
+                if frame is None:
+                    time.sleep(1.0)
+                    f = stream_q.tryGet()
+                    if f is not None:
+                        frame = f.getCvFrame()
+            except Exception as _e:
+                print(f"⚠ Pipeline error: {_e} — reconnecting...", flush=True)
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
                 _usb_reset_oak1()
-                frame = _run_capture(width, height)
-                if frame is not None:
-                    print(f"  Retry mean={frame.mean():.1f}", flush=True)
+                try:
+                    pipeline, stream_q, ctrl_q = _start_pipeline()
+                except Exception as _e2:
+                    print(f"✗ Reconnect failed: {_e2}", flush=True)
+                frame = None
 
             if frame is not None:
-                import cv2
                 raw_mean = frame.mean()
                 frame = _enhance_frame(frame)
                 capture_ts = time.time()
@@ -369,6 +402,22 @@ def main():
             else:
                 print("✗ No frame received", flush=True)
                 (scan_dir / ".sdk_capture_failed").touch()
+
+        else:
+            # Idle — check pipeline is still alive by peeking at the queue
+            try:
+                stream_q.tryGet()
+            except Exception as _e:
+                print(f"⚠ Pipeline dropped in idle: {_e} — reconnecting...", flush=True)
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                _usb_reset_oak1()
+                try:
+                    pipeline, stream_q, ctrl_q = _start_pipeline()
+                except Exception as _e2:
+                    print(f"✗ Reconnect failed: {_e2}", flush=True)
 
         time.sleep(0.05)
 

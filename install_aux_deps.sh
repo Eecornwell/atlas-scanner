@@ -161,8 +161,10 @@ echo "=== Auxiliary Installation Complete ==="
 echo "Your system should now be setup to run this repo's software"
 echo "Next, calibrate your system setup using the Calibration doc"
 echo ""
-echo "SDK stitch mode (USE_SDK_STITCH=true, dual_fisheye):"
-if [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture ]; then
+echo "SDK stitch mode is always enabled — the ROS camera driver is not used."
+echo "The insta360_capture daemon and insta360_stitch binary handle all image capture."
+if [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture ] && \
+   [ -f ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_stitch ]; then
   echo "  ✓ SDK binaries are ready at src/capture/sdk/build/"
 else
   echo "  ⚠ Not built — install MediaSDK .deb and re-run install_aux_deps.sh"

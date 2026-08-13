@@ -11,7 +11,7 @@ white_balance: 2
 # Exposure mode: 2=SHUTTER_PRIORITY at 1/100s (original default)
 exposure_mode: 2
 # Lidar mask filename (relative to src/)
-lidar_mask_dual: lidar_mask_dual_sdk.png
-lidar_mask_single: lidar_mask_single.png
+lidar_mask_dual: onex2/lidar_mask_dual_sdk.png
+lidar_mask_single: onex2/lidar_mask_single.png
 # Display name
 display_name: "Insta360 One X2"

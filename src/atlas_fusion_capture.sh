@@ -72,8 +72,8 @@ _hw_yaml="$_CAM_MODEL_DIR/${CAMERA_HW}.yaml"
 if [ -f "$_hw_yaml" ]; then
     INSTA360_ERP_WIDTH=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_width',5760))")
     INSTA360_ERP_HEIGHT=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_height',2880))")
-    _LIDAR_MASK_DUAL=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_dual','lidar_mask_dual_sdk.png'))")
-    _LIDAR_MASK_SINGLE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_single','lidar_mask_single.png'))")
+    _LIDAR_MASK_DUAL=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_dual','onex2/lidar_mask_dual_sdk.png'))")
+    _LIDAR_MASK_SINGLE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_single','onex2/lidar_mask_single.png'))")
     _HW_DISPLAY=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('display_name',sys.argv[1]))" "$CAMERA_HW")
     INSTA360_PHOTO_SIZE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('photo_size_enum'); print(v if v is not None else '')")
     INSTA360_WB=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('white_balance'); print(v if v is not None else '')")
@@ -82,8 +82,8 @@ else
     echo "⚠ No camera model config at $_hw_yaml — using defaults"
     INSTA360_ERP_WIDTH=5760
     INSTA360_ERP_HEIGHT=2880
-    _LIDAR_MASK_DUAL="lidar_mask_dual_sdk.png"
-    _LIDAR_MASK_SINGLE="lidar_mask_single.png"
+    _LIDAR_MASK_DUAL="onex2/lidar_mask_dual_sdk.png"
+    _LIDAR_MASK_SINGLE="onex2/lidar_mask_single.png"
     _HW_DISPLAY="$CAMERA_HW"
 fi
 export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
@@ -1072,8 +1072,17 @@ else
     if [ "$_USE_CAMERAS" -gt 1 ] && [ -x "$_SDK_BIN/insta360_capture_multi" ]; then
         _CAPTURE_BIN="$_SDK_BIN/insta360_capture_multi"
         echo "Multi-camera mode: $_USE_CAMERAS cameras detected (shot every ${CONTINUOUS_INTERVAL}s, per-camera every $((CONTINUOUS_INTERVAL * _USE_CAMERAS))s)"
+    elif [ -x "$_SDK_BIN/insta360_capture_multi" ] && python3 -c "
+import depthai as dai
+devs = dai.Device.getAllAvailableDevices()
+print('found' if devs else 'none')
+" 2>/dev/null | grep -q found; then
+        # OAK-1 detected alongside Insta360 — use multi binary so it writes
+        # .oak1_trigger after each shot for the secondary oak1_capture.py.
+        _CAPTURE_BIN="$_SDK_BIN/insta360_capture_multi"
+        echo "Single-camera mode with OAK-1 secondary: using insta360_capture_multi"
     elif [ "$_USE_CAMERAS" -eq 1 ] && [ -x "$_SDK_BIN/insta360_capture_multi" ] && [ "$_DETECTED_CAMERAS" -gt 1 ]; then
-        # Single-camera mode but multiple cameras connected — use multi binary
+        # Single-camera mode but multiple Insta360 cameras connected — use multi binary
         # with serial filter so it opens the correct one.
         _CAPTURE_BIN="$_SDK_BIN/insta360_capture_multi"
         echo "Single-camera mode: using $_USE_CAMERAS of $_DETECTED_CAMERAS cameras"

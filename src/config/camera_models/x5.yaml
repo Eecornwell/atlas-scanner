@@ -14,7 +14,7 @@ white_balance: 0
 # Exposure mode: 0=AUTO 2=SHUTTER_PRIORITY 4=ADAPTIVE
 exposure_mode: 0
 # Lidar mask filename (relative to src/)
-lidar_mask_dual: lidar_mask_dual_x5.png
-lidar_mask_single: lidar_mask_single_x5.png
+lidar_mask_dual: x5/lidar_mask_dual_x5.png
+lidar_mask_single: x5/lidar_mask_single_x5.png
 # Display name
 display_name: "Insta360 X5"

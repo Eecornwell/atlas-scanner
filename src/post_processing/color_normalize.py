@@ -189,6 +189,11 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             continue
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
+        # OAK-1 scans: use undistorted PNG directly
+        oak1_img = next(scan_dir.glob('oak1_*_undistorted.png'), None)
+        if oak1_img:
+            cam_scans.setdefault(cam_idx, []).append((scan_dir, oak1_img))
+            continue
         # Always stitch from .insp for clean calibration source
         insp_file = next(scan_dir.glob('*.insp'), None)
         if insp_file and stitch_bin.exists():
@@ -214,13 +219,19 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
     print(f"Reference camera: cam_{reference_cam} ({len(ref_images)} images)")
     print(f"Camera HW: {camera_hw}")
 
-    # Remove any existing profile for the reference camera — it must never be modified.
-    # Also remove profiles for ALL cameras so a fresh calibration starts clean.
-    for ci in range(3):
-        old_profile = _CALIB_DIR / camera_hw / f'cam_{ci}' / 'color_profile.npz'
-        if old_profile.exists():
-            old_profile.unlink()
-            print(f"  Removed old profile: cam_{ci}")
+    # Remove any existing profiles for all known cameras (fresh calibration)
+    for ci in range(4):
+        for hw in ('x5', 'x3', 'onex2', 'oak1'):
+            old_profile = _CALIB_DIR / hw / f'cam_{ci}' / 'color_profile.npz'
+            if old_profile.exists():
+                old_profile.unlink()
+                print(f"  Removed old profile: {hw}/cam_{ci}")
+
+    def _hw_for_scan(scan_dir: Path) -> str:
+        """Return camera hw for a scan dir — oak1 if oak1_* files present, else session hw."""
+        if any(scan_dir.glob('oak1_*')):
+            return 'oak1'
+        return camera_hw
 
     # For each secondary camera, find temporally adjacent reference images
     # and compute the average color transform
@@ -229,6 +240,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             continue
 
         print(f"\nComputing profile for cam_{cam_idx} ({len(scans)} images)...")
+        scan_hw = _hw_for_scan(scans[0][0])
 
         # Use up to 20 image pairs for robust statistics; reject outliers
         profiles = []
@@ -270,7 +282,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
         print(f"  L_gain: {avg_profile['gain_lab'][0]:.3f}")
         print(f"  offset_lab (L,a,b): [{avg_profile['offset_lab'][0]:.2f}, {avg_profile['offset_lab'][1]:.2f}, {avg_profile['offset_lab'][2]:.2f}]")
 
-        save_color_profile(camera_hw, cam_idx, avg_profile)
+        save_color_profile(scan_hw, cam_idx, avg_profile)
 
     print(f"\n✓ Color calibration complete. Reference: cam_{reference_cam} ({camera_hw})")
 
@@ -310,9 +322,27 @@ def normalize_session(session_dir: str):
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
 
-        profile = load_color_profile(camera_hw, cam_idx)
+        # Detect OAK-1 scans by image files
+        oak1_img = next(scan_dir.glob('oak1_*_undistorted.png'), None)
+        is_oak1 = oak1_img is not None
+        scan_hw = 'oak1' if is_oak1 else camera_hw
+
+        profile = load_color_profile(scan_hw, cam_idx)
         if profile is None:
             continue  # no profile = reference camera, leave untouched
+
+        if is_oak1:
+            # OAK-1: apply profile directly to undistorted PNG
+            if (scan_dir / '.color_normalized').exists():
+                continue
+            img = cv2.imread(str(oak1_img))
+            if img is None:
+                continue
+            corrected = apply_color_profile(img, profile)
+            cv2.imwrite(str(oak1_img), corrected, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            (scan_dir / '.color_normalized').write_text(str(cam_idx))
+            normalized += 1
+            continue
 
         erp = scan_dir / 'equirect_dual_fisheye.jpg'
         if not erp.exists():

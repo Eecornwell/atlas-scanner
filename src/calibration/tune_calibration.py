@@ -311,6 +311,8 @@ def main():
                 mask = (dist_arr > 0.3) & (dist_arr < 10.0)
                 pts_cam, dist_arr = pts_cam[mask], dist_arr[mask]
                 _ci_path = Path(str(s_ply)).parent / 'camera_info.yaml'
+                if not _ci_path.exists():
+                    _ci_path = Path(str(s_img)).parent / 'camera_info.yaml'
                 if not _ci_path.exists() and args.scan_dir:
                     _ci_path = scan_dir / 'camera_info.yaml'
                 if _ci_path.exists():
@@ -329,6 +331,10 @@ def main():
                 v_p = (_fy * pf[:,1] / pf[:,2] + _cy).astype(int)
                 valid = (u_p>=0)&(u_p<_W)&(v_p>=0)&(v_p<_H)
                 u_p, v_p, df = u_p[valid], v_p[valid], df[valid]
+                if len(df) == 0:
+                    print(f'  ⚠ No LiDAR points projected into image for {label} — check calibration or camera_info.yaml')
+                    scan_grids.append(s_erp.copy())
+                    continue
                 d_norm = np.clip((df-df.min())/(df.max()-df.min()+1e-6)*255,0,255).astype(np.uint8)
                 colours = cv2.applyColorMap(d_norm.reshape(-1,1), cv2.COLORMAP_JET).reshape(-1,3)
                 overlay = s_erp.copy()

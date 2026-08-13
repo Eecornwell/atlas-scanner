@@ -19,19 +19,19 @@ _DEFAULTS = {
     'onex2': {
         'erp_width':         5760,
         'erp_height':        2880,
-        'lidar_mask_dual':   'lidar_mask_dual_sdk.png',
+        'lidar_mask_dual':   'onex2/lidar_mask_dual_sdk.png',
         'display_name':      'Insta360 One X2',
     },
     'x3': {
         'erp_width':         5760,
         'erp_height':        2880,
-        'lidar_mask_dual':   'lidar_mask_dual_x3_cam_left.png',
+        'lidar_mask_dual':   'x3/lidar_mask_dual_x3_cam_left.png',
         'display_name':      'Insta360 X3',
     },
     'x5': {
         'erp_width':         7680,
         'erp_height':        3840,
-        'lidar_mask_dual':   'lidar_mask_dual_x5.png',
+        'lidar_mask_dual':   'x5/lidar_mask_dual_x5.png',
         'display_name':      'Insta360 X5',
     },
     'oak1': {
@@ -91,7 +91,7 @@ def mask_path(profile: dict, camera_mode: str, sdk_stitch: bool = True) -> Path:
     """
     if 'lidar_mask_dual' not in profile:
         return None
-    name = profile.get('lidar_mask_dual', 'lidar_mask_dual_sdk.png')
+    name = profile.get('lidar_mask_dual', 'onex2/lidar_mask_dual_sdk.png')
     p = _MASK_DIR / name
     if p.exists():
         return p

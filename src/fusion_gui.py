@@ -1148,9 +1148,15 @@ class FusionCaptureGUI:
                     try:
                         if rule_installed:
                             result = subprocess.run(
-                                ['udevadm', 'trigger', '--subsystem-match=usb'],
+                                ['sudo', 'udevadm', 'trigger', '--subsystem-match=usb'],
                                 text=True, timeout=10)
-                            ok = result.returncode == 0
+                            # Wait up to 5s for /dev/insta to appear
+                            import time as _time
+                            for _ in range(10):
+                                if os.path.exists('/dev/insta') and os.access('/dev/insta', os.R_OK | os.W_OK):
+                                    break
+                                _time.sleep(0.5)
+                            ok = result.returncode == 0 and os.path.exists('/dev/insta')
                         else:
                             if not os.access(perm_script, os.X_OK):
                                 os.chmod(perm_script, 0o755)
@@ -2468,6 +2474,18 @@ sys.exit(0 if ok[0] else 4)
         # Always use the GUI dropdown slot index — verify must show the calibration
         # for the camera being calibrated, not whatever camera captured the last scan.
         cam_idx = self._cal_cam_var.get().split('_')[1]  # '0', '1', or '2'
+        # Resolve the actual multi_camera.yaml slot index for this hw (e.g. oak1 is cam_3).
+        hw = self._cal_hw()
+        actual_slot_idx = cam_idx
+        try:
+            import yaml as _yaml
+            mc = _yaml.safe_load((self.script_dir / 'config' / 'multi_camera.yaml').read_text())
+            for slot_key, slot_cfg in mc.get('cameras', {}).items():
+                if slot_cfg.get('camera_hw', '') == hw:
+                    actual_slot_idx = slot_key.split('_')[1]
+                    break
+        except Exception:
+            pass
         if sess:
             import sys as _sys
             _sys.path.insert(0, str(self.script_dir))
@@ -2476,7 +2494,7 @@ sys.exit(0 if ok[0] else 4)
                 # Find the most recent scan that belongs to the selected camera slot.
                 all_scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
                 for s in reversed(all_scans):
-                    if cam_index_for_scan(str(s)) == int(cam_idx):
+                    if cam_index_for_scan(str(s)) == int(actual_slot_idx):
                         scan_dir = str(s)
                         break
                 # Fall back to last scan if none matched (e.g. single-camera session
@@ -2536,7 +2554,7 @@ sys.exit(0 if ok[0] else 4)
             self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT,
                              text=True, bufsize=1,
-                             env={**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
+                             env={**_safe_env, 'ATLAS_CALIBRATION_CAM_INDEX': actual_slot_idx})
             for line in proc.stdout:
                 self.root.after(0, self._cal_log_write, line.replace('\r', ''))
             proc.wait()
