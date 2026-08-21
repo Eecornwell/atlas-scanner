@@ -25,14 +25,18 @@ def _safe_data(p) -> Path:
     return resolved
 
 
-def blur_score(erp_path) -> float:
-    """Laplacian variance on a downsampled ERP. Higher = sharper."""
+def blur_score(erp_path, target_width=320) -> float:
+    """Laplacian variance on a downsampled image. Higher = sharper.
+    Uses target_width=320 which gives consistent scores across both
+    4056x3040 (OAK-1 full res) and 1920x1080 (OAK-1 reduced) inputs."""
     try:
         import cv2
         img = cv2.imread(str(erp_path), cv2.IMREAD_GRAYSCALE)
         if img is None:
             return 0.0
-        small = cv2.resize(img, (960, 480))
+        h, w = img.shape[:2]
+        target_h = int(target_width * h / w)
+        small = cv2.resize(img, (target_width, target_h))
         return float(cv2.Laplacian(small, cv2.CV_64F).var())
     except Exception:
         return 0.0
@@ -114,7 +118,7 @@ def filter_blurry_scans(session_dir, percentile=20, min_blur=None, max_motion=0.
         erp_scores  = [b for _, b, _, is_o in scores if not is_o]
         oak1_scores = [b for _, b, _, is_o in scores if is_o]
         threshold       = float(np.percentile(erp_scores,  percentile)) if len(erp_scores)  >= 4 else 0.0
-        oak1_threshold  = float(np.percentile(oak1_scores, percentile)) if len(oak1_scores) >= 4 else 0.0
+        oak1_threshold  = float(np.percentile(oak1_scores, percentile)) if len(oak1_scores) >= 8 else 0.0
 
     kept, skipped = [], []
     print(f"\nBlur/motion filter (blur_threshold={threshold:.0f}, percentile={percentile}, max_motion={max_motion}):")

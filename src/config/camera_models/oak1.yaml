@@ -3,10 +3,11 @@
 # Intrinsics are read directly from the device via DepthAI at session start.
 #
 # image_width / image_height: capture resolution sent to the IMX378 sensor.
-# 4032x3040 is the full 12MP native resolution; use 1920x1080 for faster USB3
-# throughput if full resolution is not required.
-image_width: 4056
-image_height: 3040
+# 1920x1080 gives ~5fps on USB2 (vs ~1fps at 4056x3040), making the
+# flush+wait capture approach reliable within the 5s X5 interval.
+# The undistorted image is still high quality for calibration and coloring.
+image_width: 1920
+image_height: 1080
 # No lidar_mask_dual — the OAK-1 has no scanner body in its field of view.
 # Display name
 display_name: "Luxonis OAK-1"

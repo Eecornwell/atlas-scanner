@@ -466,7 +466,8 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
         panoramas.append({'scan_dir': scan_dir, 'erp_src': erp_src,
-                          'center': C_col, 'R_c2w': R_c2w_col, 'R_c2w_ros': R_c2w_ros})
+                          'center': C_col, 'R_c2w': R_c2w_col, 'R_c2w_ros': R_c2w_ros,
+                          'is_360': is_360})
 
     active_faces = FACES_360 if session_is_360 else FACES_180
     if session_is_360 is None:
@@ -495,6 +496,25 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             positions.append(p['center'])
     panoramas = kept
     print(f"  Kept {len(panoramas)} panoramas after baseline filter")
+
+    # Sort panoramas by spatial position using a greedy nearest-neighbour
+    # traversal so sequential matching finds overlapping pairs efficiently.
+    # This is especially important for 360° cameras where capture order may
+    # not reflect spatial proximity (e.g. back-and-forth scanning paths).
+    if len(panoramas) > 2:
+        centers = np.array([p['center'] for p in panoramas])
+        visited = [False] * len(panoramas)
+        order = [0]
+        visited[0] = True
+        for _ in range(len(panoramas) - 1):
+            last = centers[order[-1]]
+            dists = np.linalg.norm(centers - last, axis=1)
+            dists[visited] = np.inf
+            nxt = int(np.argmin(dists))
+            order.append(nxt)
+            visited[nxt] = True
+        panoramas = [panoramas[i] for i in order]
+        print(f"  Sorted {len(panoramas)} panoramas by spatial proximity (nearest-neighbour)")
 
     _probe_img = cv2.imread(str(panoramas[0]['erp_src']), cv2.IMREAD_UNCHANGED)
     _default_tile_size = _tile_size_for_erp(_probe_img.shape[1]) if _probe_img is not None else 1024
@@ -1128,7 +1148,26 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     ], check=True)
 
     print("4. Matching features...")
-    matcher = 'exhaustive_matcher' if exhaustive else 'sequential_matcher'
+    if exhaustive:
+        matcher = 'exhaustive_matcher'
+        matcher_args = []
+    else:
+        matcher = 'sequential_matcher'
+        # 360° cameras see all directions simultaneously, so even scans several
+        # positions apart share content. overlap=10 ensures each panorama is
+        # matched against its 10 nearest spatial neighbours (in both directions)
+        # after the nearest-neighbour sort above.
+        # quadratic_overlap=1 also matches i with i+2, i+4... for robustness
+        # on non-uniform scan spacing.
+        n_panos = len(panoramas)
+        is_360 = panoramas[0].get('is_360', True) if panoramas else True
+        overlap = min(10 if is_360 else 5, max(1, n_panos - 1))
+        matcher_args = [
+            '--SequentialMatching.overlap', str(overlap),
+            '--SequentialMatching.quadratic_overlap', '1',
+        ]
+        print(f"  Sequential matching: overlap={overlap}, quadratic_overlap=1 "
+              f"({'360°' if is_360 else '180°'}, {n_panos} panoramas)")
     subprocess.run([
         'colmap', matcher,
         '--database_path', str(db_path),
@@ -1136,7 +1175,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--FeatureMatching.skip_image_pairs_in_same_frame', '1',
         '--FeatureMatching.max_num_matches', '32768',
         '--FeatureMatching.gpu_index', '-1',
-    ], check=True)
+    ] + matcher_args, check=True)
 
     print("5. Writing binary init model with known poses...")
     init_sparse = write_init_model_bin(colmap_dir, panoramas)
@@ -1353,11 +1392,15 @@ if __name__ == '__main__':
     )
     parser.add_argument('session_directory')
     parser.add_argument('--sequential', dest='exhaustive', action='store_false',
-                        help='Use sequential matcher instead of exhaustive')
+                        help='Use sequential matcher (default — images are spatially '
+                             'sorted so overlap=10 covers nearby 360° panoramas)')
+    parser.add_argument('--exhaustive', dest='exhaustive', action='store_true',
+                        help='Use exhaustive matcher (matches all pairs — slow, '
+                             'best for very small sessions)')
     parser.add_argument('--lidar-voxel-size', type=float, default=0.0,
                         help='Voxel downsample size for LiDAR cloud before merging '
                              'with COLMAP points (metres, 0 = no downsampling)')
-    parser.set_defaults(exhaustive=True)
+    parser.set_defaults(exhaustive=False)
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
                         help='Skip rig-aware bundle adjustment')

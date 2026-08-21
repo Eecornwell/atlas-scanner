@@ -74,7 +74,7 @@ def create_web_viewer(ply_file):
         <h3>Merged Point Cloud</h3>
         <p>Points: {len(pcd.points)} (showing {len(points)})</p>
         <p>Generated: {timestamp}</p>
-        <p>Use mouse to rotate, zoom, and pan</p>
+        <p>Left-drag: rotate &nbsp;|&nbsp; Right-drag: pan &nbsp;|&nbsp; Scroll: zoom</p>
     </div>
     <script>
         const scene = new THREE.Scene();
@@ -84,6 +84,13 @@ def create_web_viewer(ply_file):
         document.body.appendChild(renderer.domElement);
         
         const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.mouseButtons = {{
+            LEFT: THREE.MOUSE.ROTATE,
+            MIDDLE: THREE.MOUSE.DOLLY,
+            RIGHT: THREE.MOUSE.PAN
+        }};
+        // Prevent context menu so right-click drag pans without interruption
+        renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
         
         const geometry = new THREE.BufferGeometry();
         const positions = new Float32Array([{positions_js}]);

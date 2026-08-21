@@ -304,6 +304,7 @@ struct CameraSlot {
     // Heap-allocated so CameraSlot remains movable for std::vector.
     std::shared_ptr<std::atomic<double>> t_shutter_callback{std::make_shared<std::atomic<double>>(0.0)};
     std::shared_ptr<std::atomic<bool>>   shutter_fired{std::make_shared<std::atomic<bool>>(false)};
+    std::shared_ptr<std::atomic<int>>    current_shot{std::make_shared<std::atomic<int>>(0)};
 };
 
 struct DownloadJob {
@@ -539,10 +540,22 @@ int _main(int argc, char* argv[]) {
         // opens (before SD write), giving a more accurate shutter time than
         // t_before which includes USB command round-trip latency (~50-200ms).
         slot.cam->SetCaptureStateNotification(
-            [&slot](bool is_capture) {
+            [&slot, &session_dir](bool is_capture) {
                 if (is_capture) {
                     slot.t_shutter_callback->store(now_sec());
                     slot.shutter_fired->store(true);
+                    // Write OAK-1 trigger at shutter moment (cam_0 only) so
+                    // the OAK-1 fires while the user is still holding still
+                    // after hearing the X5 shutter click.
+                    if (slot.index == 0) {
+                        int shot = slot.current_shot->load();
+                        char buf[8];
+                        std::snprintf(buf, sizeof(buf), "%03d", shot + 1);
+                        std::string oak1_scan = session_dir + "/.oak1_shot_" + std::string(buf);
+                        fs::create_directories(oak1_scan);
+                        std::ofstream trig(session_dir + "/.oak1_trigger");
+                        trig << oak1_scan << "\n";
+                    }
                 }
             });
     }
@@ -746,8 +759,9 @@ int _main(int argc, char* argv[]) {
 
                         cam_busy[ci].store(true);
                         double t_before = now_sec();
-                        // Clear the callback flag before calling TakePhoto() so we
-                        // can detect a fresh is_capture=true for this specific shot.
+                        // Set current_shot before TakePhoto so the shutter callback
+                        // knows which shot number to use for the OAK-1 trigger.
+                        slots[ci].current_shot->store(shot_num);
                         slots[ci].shutter_fired->store(false);
 
                         LOG_OUT("[cam" << ci << "] taking shot " << shot_num << " at t+"
@@ -788,19 +802,6 @@ int _main(int argc, char* argv[]) {
                                     << (t_after - t_before) << "s  shutter_est(fallback)=" << std::setprecision(6) << t_shutter_est);
                         }
                         write_shutter_event(session_dir, shot_num, t_shutter_est, ci);
-
-                        // Trigger secondary OAK-1 capture in sync with this X5 shot.
-                        // Always overwrite any pending trigger — oak1_capture.py will
-                        // capture the most recent shot. Skipping causes missed captures
-                        // when the previous capture takes longer than the interval.
-                        if (ci == 0) {
-                            char oak1_buf[8];
-                            std::snprintf(oak1_buf, sizeof(oak1_buf), "%03d", shot_num + 1);
-                            std::string oak1_scan = session_dir + "/.oak1_shot_" + std::string(oak1_buf);
-                            fs::create_directories(oak1_scan);
-                            std::ofstream oak1_trig(session_dir + "/.oak1_trigger");
-                            oak1_trig << oak1_scan << "\n";
-                        }
 
                         std::string remote_path = url.GetSingleOrigin();
                         std::string shot_dir = session_dir + "/.sdk_shot_" + std::to_string(shot_num);

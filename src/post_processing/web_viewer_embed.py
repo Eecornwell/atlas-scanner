@@ -51,12 +51,21 @@ def embed_viewer(parent_frame, ply_path):
             return
         t, p, z = state['theta'], state['phi'], state['zoom']
         dist = extent * 1.5 * z
-        eye = center + np.array([
-            dist * np.sin(p) * np.cos(t),
-            dist * np.sin(p) * np.sin(t),
-            dist * np.cos(p),
+        # Build right and up vectors from current orbit angles for pan offset
+        fwd = np.array([
+            np.sin(p) * np.cos(t),
+            np.sin(p) * np.sin(t),
+            np.cos(p),
         ], dtype=np.float32)
-        renderer_box[0].scene.camera.look_at(center.tolist(), eye.tolist(), [0, 0, 1])
+        world_up = np.array([0, 0, 1], dtype=np.float32)
+        right = np.cross(fwd, world_up)
+        r_len = np.linalg.norm(right)
+        right = right / r_len if r_len > 1e-6 else np.array([1, 0, 0], dtype=np.float32)
+        up = np.cross(right, fwd)
+        pan_offset = right * state['pan'][0] + up * state['pan'][1]
+        target = center + pan_offset
+        eye = target + fwd * dist
+        renderer_box[0].scene.camera.look_at(target.tolist(), eye.tolist(), [0, 0, 1])
         state['dirty'] = True
 
     def _tick():
@@ -105,7 +114,7 @@ def embed_viewer(parent_frame, ply_path):
             state['theta'] -= dx * 0.01
             state['phi'] = max(0.05, min(np.pi - 0.05, state['phi'] - dy * 0.01))
         elif state['drag'] == 'right':
-            state['pan'][0] -= dx * extent * 0.002
+            state['pan'][0] += dx * extent * 0.002
             state['pan'][1] += dy * extent * 0.002
         _update_camera()
     def _scroll(e):

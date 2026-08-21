@@ -94,7 +94,7 @@ cameras:
     mounting_orientation: [-179.0, 3.0, -98.0]
     seed_position: [2.95, -3.4, -0.55]
   cam_3:
-    serial: "XXXXXXXXXXXXXXXXXXXX"
+    serial: "XXXXXXXXXXXXXX"
     camera_hw: oak1
     calibration: calibrations/oak1/center/fusion_calibration.yaml
     mounting_orientation: [0.0, -45.0, 90.0]

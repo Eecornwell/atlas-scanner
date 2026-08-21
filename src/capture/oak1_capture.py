@@ -314,17 +314,59 @@ def main():
         print(f"✗ Import error: {e}", flush=True)
         sys.exit(1)
 
-    def _start_pipeline():
+    def _start_pipeline(wait_ae=True):
         """Start pipeline and wait for AE. Returns (pipeline, stream_q, ctrl_q)."""
         p, sq, cq = _build_pipeline(dai, width, height)
         p.start()
         _apply_isp(dai, cq, settle_s=0.5)
-        print("Waiting for AE...", flush=True)
-        _wait_ae(sq)
-        print("✓ AE ready", flush=True)
+        if wait_ae:
+            print("Waiting for AE...", flush=True)
+            _wait_ae(sq)
+            # Verify frames are actually flowing after AE — XLink may have
+            # reconnected internally leaving the pipeline in a bad state.
+            t0 = time.time()
+            verified = False
+            while time.time() - t0 < 3.0:
+                f = sq.tryGet()
+                if f is not None:
+                    verified = True
+                    break
+                time.sleep(0.05)
+            if not verified:
+                raise RuntimeError("Pipeline started but no frames flowing after AE")
+            print("✓ AE ready", flush=True)
         return p, sq, cq
 
-    pipeline, stream_q, ctrl_q = _start_pipeline()
+    # Retry initial pipeline start up to 3 times with USB reset on failure.
+    # No full AE wait — warmup already converged AE, but do a stability soak
+    # to confirm the pipeline is truly stable before signaling ready.
+    for _attempt in range(3):
+        try:
+            pipeline, stream_q, ctrl_q = _start_pipeline(wait_ae=False)
+            # Stability soak: read frames for 3s to confirm pipeline is stable
+            # and AE has settled. XLink errors surface here rather than mid-session.
+            _t0 = time.time()
+            _frames_ok = 0
+            _bright_ok = False
+            while time.time() - _t0 < 5.0:
+                _f = stream_q.tryGet()
+                if _f is not None:
+                    _frames_ok += 1
+                    if _f.getCvFrame().mean() > 40:
+                        _bright_ok = True
+                time.sleep(0.05)
+            if _frames_ok == 0:
+                raise RuntimeError("No frames during stability soak")
+            print(f"✓ Pipeline stable ({_frames_ok} frames, bright={_bright_ok})", flush=True)
+            break
+        except Exception as _e:
+            print(f"⚠ Pipeline start failed (attempt {_attempt+1}/3): {_e}", flush=True)
+            # Do NOT call pipeline.stop() — the destructor crashes when XLink
+            # is in a bad state. Just reset USB and let the old pipeline go.
+            _usb_reset_oak1()
+    else:
+        print("✗ Could not start pipeline after 3 attempts", flush=True)
+        sys.exit(1)
 
     _safe(scan_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
     (scan_dir / ".sdk_ready").touch()
@@ -349,46 +391,63 @@ def main():
             (target_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
 
             print("Capturing...", flush=True)
+            trigger_time = time.time()
             frame = None
+            frame_ts = None
             try:
-                # Drain queue and grab freshest frame (pipeline is already running)
+                # Flush all frames captured before the trigger arrived,
+                # then wait for the first frame captured after the trigger.
+                # This ensures we capture while stationary (after X5 shutter)
+                # not while moving (frames buffered before the trigger).
+                while stream_q.tryGet() is not None:
+                    pass  # flush pre-trigger frames
+                # Wait up to 3s for first post-trigger frame
                 t0 = time.time()
                 while time.time() - t0 < 3.0:
                     f = stream_q.tryGet()
                     if f is not None:
                         frame = f.getCvFrame()
-                    else:
-                        if frame is not None:
-                            break
-                        time.sleep(0.02)
-
-                if frame is None:
-                    time.sleep(1.0)
-                    f = stream_q.tryGet()
-                    if f is not None:
-                        frame = f.getCvFrame()
+                        try:
+                            ts = f.getTimestampSystem()
+                            frame_ts = ts.total_seconds()
+                        except Exception:
+                            frame_ts = time.time()
+                        break
+                    time.sleep(0.02)
             except Exception as _e:
                 print(f"⚠ Pipeline error: {_e} — reconnecting...", flush=True)
-                try:
-                    pipeline.stop()
-                except Exception:
-                    pass
+                # Do NOT call pipeline.stop() — destructor crashes on bad XLink state
                 _usb_reset_oak1()
                 try:
-                    pipeline, stream_q, ctrl_q = _start_pipeline()
+                    pipeline, stream_q, ctrl_q = _start_pipeline(wait_ae=False)
+                    # Short stability soak after reconnect
+                    _t0 = time.time()
+                    _ok = 0
+                    while time.time() - _t0 < 3.0:
+                        _f = stream_q.tryGet()
+                        if _f is not None:
+                            _ok += 1
+                        time.sleep(0.05)
+                    if _ok == 0:
+                        raise RuntimeError("No frames after reconnect")
+                    # Discard ALL triggers written during reconnect — they're stale
+                    while (scan_dir / '.oak1_trigger').exists():
+                        (scan_dir / '.oak1_trigger').unlink(missing_ok=True)
+                        print("⚠ Discarded stale trigger after reconnect", flush=True)
+                        time.sleep(0.1)  # brief pause in case main_multi writes another
                 except Exception as _e2:
                     print(f"✗ Reconnect failed: {_e2}", flush=True)
-                frame = None
 
             if frame is not None:
                 raw_mean = frame.mean()
-                frame = _enhance_frame(frame)
-                capture_ts = time.time()
+                capture_ts = frame_ts if frame_ts is not None else time.time()
+                frame_age = time.time() - capture_ts
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                frame = _enhance_frame(frame)
                 out_path = _safe(target_dir / f"oak1_{timestamp}.png")
                 cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 print(f"✓ Saved: {out_path} "
-                      f"(raw_mean={raw_mean:.1f} enhanced_mean={frame.mean():.1f})", flush=True)
+                      f"(raw_mean={raw_mean:.1f} frame_age={frame_age:.2f}s)", flush=True)
                 _write_colmap_camera(info, target_dir, frame.shape[1], frame.shape[0])
                 undist_path = _safe(target_dir / f"oak1_{timestamp}_undistorted.png")
                 _undistort_and_save(frame, info, undist_path)
@@ -409,13 +468,15 @@ def main():
                 stream_q.tryGet()
             except Exception as _e:
                 print(f"⚠ Pipeline dropped in idle: {_e} — reconnecting...", flush=True)
-                try:
-                    pipeline.stop()
-                except Exception:
-                    pass
+                # Do NOT call pipeline.stop() — destructor crashes on bad XLink state
                 _usb_reset_oak1()
                 try:
-                    pipeline, stream_q, ctrl_q = _start_pipeline()
+                    pipeline, stream_q, ctrl_q = _start_pipeline(wait_ae=False)
+                    # Short stability soak
+                    _t0 = time.time()
+                    while time.time() - _t0 < 3.0:
+                        stream_q.tryGet()
+                        time.sleep(0.05)
                 except Exception as _e2:
                     print(f"✗ Reconnect failed: {_e2}", flush=True)
 

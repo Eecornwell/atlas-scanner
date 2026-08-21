@@ -2683,7 +2683,9 @@ sys.exit(0 if ok[0] else 4)
             self.root.destroy()
 
 def _setup_logging():
-    log_path = pathlib.Path.home() / f"atlas_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_dir = pathlib.Path.home() / 'atlas_ws' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"atlas_gui_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
         level=logging.DEBUG,
         format='%(asctime)s [%(levelname)s] %(message)s',
