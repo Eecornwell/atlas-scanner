@@ -111,14 +111,32 @@ def filter_blurry_scans(session_dir, percentile=20, min_blur=None, max_motion=0.
     # Compute thresholds separately for X5/ERP and OAK-1 scans so OAK-1
     # perspective images (lower Laplacian variance by nature) aren't penalised
     # against the ERP panorama pool.
+    # Use absolute thresholds — percentile-based filtering always discards
+    # the bottom N% even when all images are sharp.
+    # Defaults: X5 ERP ~1000, OAK-1 ~150 (perspective images have lower
+    # Laplacian variance by nature than 360° ERPs).
     if min_blur is not None:
         threshold = min_blur
         oak1_threshold = min_blur
     else:
         erp_scores  = [b for _, b, _, is_o in scores if not is_o]
         oak1_scores = [b for _, b, _, is_o in scores if is_o]
-        threshold       = float(np.percentile(erp_scores,  percentile)) if len(erp_scores)  >= 4 else 0.0
-        oak1_threshold  = float(np.percentile(oak1_scores, percentile)) if len(oak1_scores) >= 8 else 0.0
+        # Absolute floor: anything above this is considered sharp.
+        # Only fall back to percentile if we have enough samples and the
+        # session genuinely has a wide blur range (std > mean * 0.4).
+        ERP_ABS  = 1000.0
+        OAK1_ABS = 150.0
+        if len(erp_scores) >= 4:
+            arr = np.array(erp_scores)
+            # Only use percentile if some scores are genuinely below the absolute floor
+            threshold = float(np.percentile(arr, percentile)) if arr.min() < ERP_ABS else ERP_ABS
+        else:
+            threshold = ERP_ABS
+        if len(oak1_scores) >= 8:
+            arr = np.array(oak1_scores)
+            oak1_threshold = float(np.percentile(arr, percentile)) if arr.min() < OAK1_ABS else OAK1_ABS
+        else:
+            oak1_threshold = OAK1_ABS
 
     kept, skipped = [], []
     print(f"\nBlur/motion filter (blur_threshold={threshold:.0f}, percentile={percentile}, max_motion={max_motion}):")

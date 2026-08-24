@@ -305,6 +305,7 @@ struct CameraSlot {
     std::shared_ptr<std::atomic<double>> t_shutter_callback{std::make_shared<std::atomic<double>>(0.0)};
     std::shared_ptr<std::atomic<bool>>   shutter_fired{std::make_shared<std::atomic<bool>>(false)};
     std::shared_ptr<std::atomic<int>>    current_shot{std::make_shared<std::atomic<int>>(0)};
+    std::shared_ptr<std::atomic<int>>    num_cameras_ref{std::make_shared<std::atomic<int>>(1)};
 };
 
 struct DownloadJob {
@@ -544,9 +545,10 @@ int _main(int argc, char* argv[]) {
                 if (is_capture) {
                     slot.t_shutter_callback->store(now_sec());
                     slot.shutter_fired->store(true);
-                    // Write OAK-1 trigger at shutter moment (cam_0 only) so
-                    // the OAK-1 fires while the user is still holding still
-                    // after hearing the X5 shutter click.
+                    // Write OAK-1 trigger into a per-shot staging dir.
+                    // reconstruct_from_bag.py promotes these to fusion_scan_*
+                    // dirs after reconstruction, when the total X5 scan count
+                    // is known and there is no risk of colliding with X5 dirs.
                     if (slot.index == 0) {
                         int shot = slot.current_shot->load();
                         char buf[8];
@@ -562,6 +564,7 @@ int _main(int argc, char* argv[]) {
 
     int num_cameras = static_cast<int>(slots.size());
     LOG_OUT(num_cameras << " camera(s) active — alternating interval will be divided by " << num_cameras);
+    for (auto& s : slots) s.num_cameras_ref->store(num_cameras);
 
     // Write camera count for shell script
     { std::ofstream f(session_dir + "/.sdk_camera_count"); f << num_cameras; }
@@ -831,8 +834,19 @@ int _main(int argc, char* argv[]) {
             // The "safe to move" window starts when the last camera finishes
             // and ends when the next batch fires.
             int spacing_ms = interval_s * 1000;
-            timer_threads.emplace_back([&, spacing_ms]() {
-                // Brief initial delay so the operator is ready
+            timer_threads.emplace_back([&, spacing_ms, session_dir]() {
+                // Wait for OAK-1 secondary to be ready before firing first shot.
+                // Falls back to spacing_ms delay if no OAK-1 present (file never appears).
+                const std::string oak1_ready = session_dir + "/.oak1_ready";
+                int waited_ms = 0;
+                while (waited_ms < 30000) {
+                    if (fs::exists(oak1_ready)) { LOG_OUT("[dispatch] OAK-1 ready"); break; }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    waited_ms += 200;
+                }
+                if (waited_ms >= 30000)
+                    LOG_OUT("[dispatch] OAK-1 not detected — starting without it");
+                // Brief additional delay so operator is ready
                 std::this_thread::sleep_for(std::chrono::milliseconds(spacing_ms));
 
                 while (!timer_stop.load()) {

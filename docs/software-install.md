@@ -621,10 +621,11 @@ pip3 install depthai
 
 ### 2. USB device rules
 
-The OAK-1 requires a udev rule so it is accessible without `sudo`:
+The OAK-1 requires a udev rule for access without `sudo` and to disable USB
+autosuspend — autosuspend causes XLink connection drops during capture:
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"' \
+printf 'SUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", MODE="0666"\nSUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", ATTR{power/autosuspend}="-1"\nSUBSYSTEM=="usb", ATTRS{idVendor}=="03e7", ATTR{power/control}="on"\n' \
     | sudo tee /etc/udev/rules.d/80-movidius.rules
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```

@@ -1230,10 +1230,15 @@ print('3')
         OAK1_SECONDARY_PID=$!
         # Wait for OAK-1 to be ready (max 60s)
         for _i in $(seq 1 60); do
-            [ -f "$SCAN_DIR/.sdk_ready" ] && break  # reuses same flag
-            kill -0 $OAK1_SECONDARY_PID 2>/dev/null || break
+            [ -f "$SCAN_DIR/.sdk_ready" ] && break
+            if ! kill -0 $OAK1_SECONDARY_PID 2>/dev/null; then
+                echo "✗ oak1_capture.py exited early — check oak1_secondary.log"; exit 1
+            fi
             sleep 1
         done
+        if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
+            echo "✗ OAK-1 secondary timed out waiting for ready"; exit 1
+        fi
         echo "✓ Secondary OAK-1 ready"
     fi
 fi

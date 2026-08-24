@@ -70,7 +70,7 @@ settings:
 # cam_1+ = secondary cameras. Color profiles are applied to match cam_0.
 cameras:
   cam_0:
-    serial: "XXXXXXXXXXXXXX"
+    serial: "IAHEA26019RESN"
     camera_hw: x5
     mask_dual: x5/lidar_mask_dual_x5_cam_right.png
     mask_calibration: x5/lidar_mask_dual_x5_calib_right.png
@@ -94,7 +94,7 @@ cameras:
     mounting_orientation: [-179.0, 3.0, -98.0]
     seed_position: [2.95, -3.4, -0.55]
   cam_3:
-    serial: "XXXXXXXXXXXXXX"
+    serial: "XXXXXXXXXXXXXXXX"
     camera_hw: oak1
     calibration: calibrations/oak1/center/fusion_calibration.yaml
     mounting_orientation: [0.0, -45.0, 90.0]

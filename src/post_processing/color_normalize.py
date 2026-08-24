@@ -160,6 +160,69 @@ def compute_profile_from_images(ref_img: np.ndarray, src_img: np.ndarray) -> dic
     }
 
 
+def _extract_erp_slice_for_oak1(erp_img: np.ndarray, oak1_shape: tuple, scan_dir) -> np.ndarray:
+    """Extract ERP pixels matching each OAK-1 pixel via per-pixel ray casting
+    through the extrinsic calibration. Correctly handles orientation, FOV,
+    and ERP seam wrap-around.
+    """
+    try:
+        import yaml as _yaml
+        import sys as _sys
+        from scipy.spatial.transform import Rotation as _R
+        _src = Path(__file__).resolve().parents[1]
+        _sys.path.insert(0, str(_src))
+        from camera_hw import calibration_path, cam_index_for_scan
+
+        cam_idx = cam_index_for_scan(str(scan_dir))
+        cfg = _yaml.safe_load(calibration_path('oak1', cam_idx).read_text())
+        roll  = cfg['roll_offset']  + cfg.get('manual_roll_adjustment', 0.0)
+        pitch = cfg['pitch_offset'] + cfg.get('manual_pitch_adjustment', 0.0)
+        yaw   = cfg['yaw_offset']   + cfg.get('manual_yaw_adjustment',   0.0)
+        R_cl = _R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+
+        ci_path = scan_dir / 'camera_info.yaml'
+        if not ci_path.exists():
+            return None
+        ci = _yaml.safe_load(ci_path.read_text())
+        oh, ow = oak1_shape[:2]
+        sx, sy = ow / ci['width'], oh / ci['height']
+        fx = ci['fx'] * sx;  fy = ci['fy'] * sy
+        cx_k = ci['cx'] * sx; cy_k = ci['cy'] * sy
+
+        erp_h, erp_w = erp_img.shape[:2]
+
+        # Subsample for speed, resize result back to full resolution
+        step = 4
+        ys, xs = np.mgrid[0:oh:step, 0:ow:step]
+        rays_cam = np.stack([
+            (xs - cx_k) / fx,
+            (ys - cy_k) / fy,
+            np.ones_like(xs, dtype=np.float32)
+        ], axis=-1).reshape(-1, 3).astype(np.float32)
+        rays_cam /= np.linalg.norm(rays_cam, axis=1, keepdims=True)
+
+        # Transform rays to LiDAR frame (R_cl.T = lidar_from_camera)
+        rays_lidar = (R_cl.T @ rays_cam.T).T
+
+        # X5 ERP convention: seam at center (lon=0=back), forward at edges.
+        # Confirmed working formula: lon=atan2(-Y,X)+pi, lat=asin(Z), rotate 180°.
+        # If OAK-1 is remounted/recalibrated, re-verify visually with debug mode.
+        lon = np.arctan2(-rays_lidar[:, 1], rays_lidar[:, 0]) + np.pi
+        lat = np.arcsin(np.clip(rays_lidar[:, 2], -1.0, 1.0))
+        erp_x = ((0.5 + lon / (2 * np.pi)) * erp_w).astype(np.float32) % erp_w
+        erp_y = np.clip(((0.5 - lat / np.pi) * erp_h).astype(np.float32), 0, erp_h - 1)
+
+        sampled = cv2.remap(erp_img,
+                            erp_x.reshape(ys.shape),
+                            erp_y.reshape(ys.shape),
+                            interpolation=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_WRAP)
+        result = cv2.resize(sampled, (ow, oh))
+        return cv2.flip(result, -1)  # rotate 180°
+
+    except Exception:
+        return None
+
 def calibrate_from_session(session_dir: str, reference_cam: int = 0):
     """Build color profiles for all secondary cameras using a session's ERP images.
     
@@ -189,10 +252,21 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             continue
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
-        # OAK-1 scans: use undistorted PNG directly
-        oak1_img = next(scan_dir.glob('oak1_*_undistorted.png'), None)
-        if oak1_img:
-            cam_scans.setdefault(cam_idx, []).append((scan_dir, oak1_img))
+        # OAK-1 scans: pick the best-exposed undistorted PNG
+        oak1_imgs = sorted(scan_dir.glob('oak1_*_undistorted.png'))
+        if oak1_imgs:
+            # Prefer image closest to median brightness, skip overexposed (>200)
+            candidates = []
+            for p in oak1_imgs:
+                img = cv2.imread(str(p))
+                if img is not None:
+                    m = float(img.mean())
+                    if m < 200:
+                        candidates.append((p, m))
+            if candidates:
+                med = float(np.median([m for _, m in candidates]))
+                oak1_img = min(candidates, key=lambda x: abs(x[1] - med))[0]
+                cam_scans.setdefault(cam_idx, []).append((scan_dir, oak1_img))
             continue
         # Always stitch from .insp for clean calibration source
         insp_file = next(scan_dir.glob('*.insp'), None)
@@ -227,6 +301,12 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
                 old_profile.unlink()
                 print(f"  Removed old profile: {hw}/cam_{ci}")
 
+    # Remove .color_normalized sentinels so normalize re-applies the new profile
+    for sd in session_path.glob('fusion_scan_*'):
+        sentinel = sd / '.color_normalized'
+        if sentinel.exists():
+            sentinel.unlink()
+
     def _hw_for_scan(scan_dir: Path) -> str:
         """Return camera hw for a scan dir — oak1 if oak1_* files present, else session hw."""
         if any(scan_dir.glob('oak1_*')):
@@ -255,8 +335,15 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             if ref_img is None or src_img is None:
                 continue
 
-            # Resize to same dimensions for comparison
-            if ref_img.shape != src_img.shape:
+            # For OAK-1: extract the ERP slice that matches the OAK-1's FOV
+            # instead of comparing against the full 360° ERP.
+            if scan_hw == 'oak1':
+                ref_img = _extract_erp_slice_for_oak1(ref_img, src_img.shape, src_dir)
+                if ref_img is None:
+                    # Fallback: resize full ERP (less accurate)
+                    ref_img = cv2.imread(str(ref_erp))
+                    ref_img = cv2.resize(ref_img, (src_img.shape[1], src_img.shape[0]))
+            elif ref_img.shape != src_img.shape:
                 src_img = cv2.resize(src_img, (ref_img.shape[1], ref_img.shape[0]))
 
             p = compute_profile_from_images(ref_img, src_img)
@@ -332,14 +419,19 @@ def normalize_session(session_dir: str):
             continue  # no profile = reference camera, leave untouched
 
         if is_oak1:
-            # OAK-1: apply profile directly to undistorted PNG
+            # OAK-1: apply profile to both raw and undistorted PNG
             if (scan_dir / '.color_normalized').exists():
                 continue
-            img = cv2.imread(str(oak1_img))
-            if img is None:
-                continue
-            corrected = apply_color_profile(img, profile)
-            cv2.imwrite(str(oak1_img), corrected, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            oak1_raw = next(scan_dir.glob('oak1_*.png'), None)
+            # Exclude undistorted from raw search
+            oak1_raw = next((f for f in scan_dir.glob('oak1_*.png')
+                             if '_undistorted' not in f.name), None)
+            for img_path in filter(None, [oak1_raw, oak1_img]):
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    continue
+                corrected = apply_color_profile(img, profile)
+                cv2.imwrite(str(img_path), corrected, [cv2.IMWRITE_PNG_COMPRESSION, 1])
             (scan_dir / '.color_normalized').write_text(str(cam_idx))
             normalized += 1
             continue

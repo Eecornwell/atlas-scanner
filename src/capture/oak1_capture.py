@@ -47,7 +47,7 @@ def _build_pipeline(dai, width: int, height: int):
     pipeline = dai.Pipeline()
     cam = pipeline.create(dai.node.Camera, dai.CameraBoardSocket.CAM_A)
     cam.build()
-    stream_out = cam.requestOutput((width, height), dai.ImgFrame.Type.BGR888p)
+    stream_out = cam.requestOutput((width, height), dai.ImgFrame.Type.BGR888p, fps=2.1)
     q = stream_out.createOutputQueue(maxSize=4, blocking=False)
     ctrl_q = cam.inputControl.createInputQueue()
     return pipeline, q, ctrl_q
@@ -361,22 +361,27 @@ def main():
             break
         except Exception as _e:
             print(f"⚠ Pipeline start failed (attempt {_attempt+1}/3): {_e}", flush=True)
-            # Do NOT call pipeline.stop() — the destructor crashes when XLink
-            # is in a bad state. Just reset USB and let the old pipeline go.
-            _usb_reset_oak1()
+            # os._exit to bypass DepthAI destructor which crashes on bad XLink state.
+            # Re-launch self as a fresh process for the next attempt.
+            if _attempt < 2:
+                _usb_reset_oak1()
+                # Re-exec self so DepthAI starts with clean internal state
+                os.execv(sys.executable, [sys.executable, str(_SELF)] + sys.argv[1:])
+            os._exit(1)
     else:
         print("✗ Could not start pipeline after 3 attempts", flush=True)
         sys.exit(1)
 
     _safe(scan_dir / "camera_info.yaml").write_text(yaml.dump(info, default_flow_style=False))
     (scan_dir / ".sdk_ready").touch()
+    (scan_dir / ".oak1_ready").touch()
     print("Waiting for capture trigger...", flush=True)
 
     while True:
         if (scan_dir / ".oak1_quit_trigger").exists():
             (scan_dir / ".oak1_quit_trigger").unlink(missing_ok=True)
             print("Quit trigger — exiting", flush=True)
-            break
+            os._exit(0)
 
         trigger = scan_dir / ".oak1_trigger"
         if trigger.exists():
@@ -456,11 +461,16 @@ def main():
                     f"{capture_ts:.6f} {cam_index}\n")
                 _safe(target_dir / ".cam_index").write_text(f"{cam_index}\n")
                 (target_dir / ".oak1_capture").touch()
-                (scan_dir / ".sdk_downloads_pending").write_text("0")
-                (scan_dir / ".sdk_capture_done").touch()
+                # Only write SDK sentinels when running as primary camera.
+                # In secondary mode (alongside X5) these interfere with
+                # the X5 capture wait loop in atlas_fusion_capture.sh.
+                if cam_index == "0":
+                    (scan_dir / ".sdk_downloads_pending").write_text("0")
+                    (scan_dir / ".sdk_capture_done").touch()
             else:
                 print("✗ No frame received", flush=True)
-                (scan_dir / ".sdk_capture_failed").touch()
+                if cam_index == "0":
+                    (scan_dir / ".sdk_capture_failed").touch()
 
         else:
             # Idle — check pipeline is still alive by peeking at the queue
@@ -486,6 +496,9 @@ def main():
 # ── subprocess dispatch ───────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Handle SIGTERM with os._exit to bypass DepthAI destructor which crashes
+    import signal as _signal
+    _signal.signal(_signal.SIGTERM, lambda *_: os._exit(0))
     if len(sys.argv) >= 2 and sys.argv[1] == "--warmup":
         _, _, w, h, out = sys.argv
         _cmd_warmup(int(w), int(h), out)

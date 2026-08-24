@@ -657,19 +657,34 @@ def write_rig_config(colmap_dir, panoramas):
     rig_config_path = colmap_dir / 'rig_config.json'
     rigs = [{"cameras": cameras}]
 
-    # Mixed session: add OAK-1 as a separate independent rig
+    # Mixed session: add OAK-1 as separate rig, and ERP slices as a sensor
+    # within the ERP rig so slice<->OAK-1 matches survive rig verification.
     conn2 = sqlite3.connect(str(db_path))
     has_oak1 = conn2.execute(
         "SELECT 1 FROM images WHERE name LIKE 'face_oak1/%' LIMIT 1"
     ).fetchone()
+    has_slices = conn2.execute(
+        "SELECT 1 FROM images WHERE name LIKE 'face_erp_slice/%' LIMIT 1"
+    ).fetchone()
     conn2.close()
     if has_oak1:
-        # OAK-1 images have independent poses — single-camera rig, identity rotation
         oak1_panos = [p for p in panoramas if 'cx' in p]
         if oak1_panos:
             oak1_fpx = oak1_panos[0]['f_px']
             oak1_cx  = oak1_panos[0]['cx']
             oak1_cy  = oak1_panos[0]['cy']
+            # Add ERP slices as a sensor in the ERP rig — they are rendered at
+            # the X5 position with OAK-1 intrinsics so they share the rig frame.
+            # Identity rotation since the slice is already in the OAK-1 view direction.
+            if has_slices:
+                cameras.append({
+                    "image_prefix": "face_erp_slice/",
+                    "camera_model_name": "PINHOLE",
+                    "camera_params": [oak1_fpx, oak1_fpx, oak1_cx, oak1_cy],
+                    "cam_from_rig_rotation": [1.0, 0.0, 0.0, 0.0],
+                    "cam_from_rig_translation": [0.0, 0.0, 0.0],
+                })
+                rigs[0]["cameras"] = cameras
             rigs.append({"cameras": [{
                 "image_prefix": "face_oak1/",
                 "camera_model_name": "PINHOLE",
@@ -968,6 +983,75 @@ def _write_oak1_list(colmap_dir):
     return list_path
 
 
+def _write_oak1_cross_pairs(colmap_dir, erp_panoramas, oak1_panos, session_path, n_nearest=3):
+    """Generate ERP slices matching each OAK-1 image's FOV using the confirmed
+    extrinsic projection. Uses the X5 panorama from the same shot (matched by
+    scan index) as the primary slice, plus n_nearest-1 spatially close ones."""
+    if not oak1_panos or not erp_panoramas:
+        return None
+    import sys as _sys, numpy as _np
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from post_processing.color_normalize import _extract_erp_slice_for_oak1
+
+    slice_dir = colmap_dir / 'images' / 'face_erp_slice'
+    slice_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build scan_num -> erp_panorama lookup for direct index matching
+    erp_by_scan = {int(p['scan_dir'].name.split('_')[-1]): p for p in erp_panoramas}
+    erp_centers = _np.array([p['center'] for p in erp_panoramas])
+
+    pairs_path = colmap_dir / 'oak1_cross_pairs.txt'
+    slice_list_path = colmap_dir / 'erp_slice_list.txt'
+    slice_images = []
+
+    with open(pairs_path, 'w') as pf:
+        for oak1_p in oak1_panos:
+            oak1_fname = oak1_p['tiles'][0]['rel_path']
+            oak1_scan  = oak1_p['scan_dir']
+            oak1_img   = cv2.imread(str(oak1_p['erp_src']))
+            if oak1_img is None:
+                continue
+
+            # Primary: match by scan index (OAK-1 scan N+offset -> X5 scan N)
+            oak1_num = int(oak1_scan.name.split('_')[-1])
+            n_erp = len(erp_panoramas)
+            # The X5 scan index is oak1_num - n_erp (they are numbered sequentially)
+            x5_num = oak1_num - n_erp
+            candidate_erps = []
+            if x5_num in erp_by_scan:
+                candidate_erps.append(erp_by_scan[x5_num])
+            # Also add spatially nearest (excluding already added)
+            dists = _np.linalg.norm(erp_centers - oak1_p['center'], axis=1)
+            for ni in _np.argsort(dists):
+                if len(candidate_erps) >= n_nearest:
+                    break
+                p = erp_panoramas[ni]
+                if p not in candidate_erps:
+                    candidate_erps.append(p)
+
+            for erp_p in candidate_erps:
+                erp_img = cv2.imread(str(erp_p['erp_src']))
+                if erp_img is None:
+                    continue
+                slc = _extract_erp_slice_for_oak1(erp_img, oak1_img.shape, oak1_scan)
+                if slc is None:
+                    continue
+                pano_num = int(erp_p['scan_dir'].name.split('_')[-1])
+                oak1_idx = int(oak1_fname.split('pano_')[1].split('.')[0])
+                slice_fname = f'slice_oak{oak1_idx:03d}_erp{pano_num:03d}.png'
+                slice_path  = slice_dir / slice_fname
+                cv2.imwrite(str(slice_path), slc, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                rel = f'face_erp_slice/{slice_fname}'
+                slice_images.append((rel, erp_p))
+                pf.write(f"{oak1_fname} {rel}\n")
+
+    with open(slice_list_path, 'w') as f:
+        for rel, _ in slice_images:
+            f.write(rel + '\n')
+
+    return pairs_path, slice_list_path, slice_images
+
+
 def _inject_known_pose_images(output_dir, init_sparse, oak1_panos):
     """Append OAK-1 images with known poses to sparse/0/images.bin.
     point_triangulator drops images with no triangulated points, so we
@@ -1176,6 +1260,42 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         '--FeatureMatching.max_num_matches', '32768',
         '--FeatureMatching.gpu_index', '-1',
     ] + matcher_args, check=True)
+
+    # Cross-match OAK-1 images against ERP tiles from spatially nearest panoramas.
+    # Sequential matching only pairs OAK-1 against OAK-1 (separate rig/sequence);
+    # explicit pairs ensure OAK-1 features are matched against overlapping ERP content.
+    _erp_panos = [p for p in panoramas if 'cx' not in p]
+    _oak1_panos_match = [p for p in panoramas if 'cx' in p]
+    if _oak1_panos_match and _erp_panos:
+        _result = _write_oak1_cross_pairs(colmap_dir, _erp_panos, _oak1_panos_match, session_path)
+        if _result:
+            _cross_pairs, _slice_list, _slice_images = _result
+            # Extract features from ERP slices using same PINHOLE intrinsics as OAK-1
+            _oak1_fpx = _oak1_panos_match[0]['f_px']
+            _oak1_cx  = _oak1_panos_match[0]['cx']
+            _oak1_cy  = _oak1_panos_match[0]['cy']
+            _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
+            print(f"  Extracting features from {len(_slice_images)} ERP slices...")
+            subprocess.run([
+                'colmap', 'feature_extractor',
+                '--database_path', str(db_path),
+                '--image_path', str(colmap_dir / 'images'),
+                '--image_list_path', str(_slice_list),
+                '--ImageReader.camera_model', 'PINHOLE',
+                '--ImageReader.single_camera_per_folder', '1',
+                '--ImageReader.camera_params', _oak1_params,
+                '--SiftExtraction.max_num_features', '32768',
+                '--SiftExtraction.estimate_affine_shape', '1',
+            ], check=True)
+            print(f"  Cross-matching {len(_oak1_panos_match)} OAK-1 images against ERP slices...")
+            subprocess.run([
+                'colmap', 'matches_importer',
+                '--database_path', str(db_path),
+                '--match_list_path', str(_cross_pairs),
+                '--match_type', 'pairs',
+                '--FeatureMatching.max_num_matches', '32768',
+                '--FeatureMatching.gpu_index', '-1',
+            ], check=True)
 
     print("5. Writing binary init model with known poses...")
     init_sparse = write_init_model_bin(colmap_dir, panoramas)

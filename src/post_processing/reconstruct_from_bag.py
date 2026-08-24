@@ -653,6 +653,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     # dirs from a previous coloring pass which would corrupt the restoration.
     if sdk_stitch:
         import shutil as _shutil
+        # Stash any .oak1_shot_* dirs — they are written live during capture
+        # and must survive the stale fusion_scan_* cleanup below.
+        # (fusion_scan_* dirs are wiped; .oak1_shot_* dirs are left untouched.)
         for _stale in sorted(session_path.glob('fusion_scan_*')):
             _shutil.rmtree(str(_stale), ignore_errors=True)
         # Remove corrupt .insp files from failed downloads in .sdk_shot_* dirs
