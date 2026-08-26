@@ -1306,16 +1306,29 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
         # Propagate cam_index: prefer _centres_cam_idx (from .sdk_shot_* path, most reliable),
         # then fall back to .capture_time sidecar in the scan dir.
+        # Always preserve the serial from the existing .cam_index when present so
+        # exact_match_fusion.py can resolve the correct per-slot calibration.
+        def _read_existing_serial(sd):
+            try:
+                parts = (sd / '.cam_index').read_text().strip().split()
+                return parts[1] if len(parts) >= 2 else ''
+            except Exception:
+                return ''
+
         _cam_idx_written = False
         if _centres_cam_idx and idx < len(_centres_cam_idx):
-            (scan_dir / '.cam_index').write_text(str(_centres_cam_idx[idx]))
+            _serial = _read_existing_serial(scan_dir)
+            _entry = f"{_centres_cam_idx[idx]} {_serial}" if _serial else str(_centres_cam_idx[idx])
+            (scan_dir / '.cam_index').write_text(_entry)
             _cam_idx_written = True
         if not _cam_idx_written:
             for _ct in sorted(scan_dir.glob('*.capture_time')):
                 try:
                     _ct_parts = _ct.read_text().strip().split()
                     if len(_ct_parts) >= 3:
-                        (scan_dir / '.cam_index').write_text(_ct_parts[2])
+                        _serial = _read_existing_serial(scan_dir)
+                        _entry = f"{_ct_parts[2]} {_serial}" if _serial else _ct_parts[2]
+                        (scan_dir / '.cam_index').write_text(_entry)
                         _cam_idx_written = True
                         break
                 except Exception:
@@ -1580,13 +1593,21 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         if _ct_src.exists() and not _ct_dst.exists():
                             import shutil as _shu
                             _shu.copy2(str(_ct_src), str(_ct_dst))
-                        # Propagate cam_index from capture_time sidecar
+                        # Propagate cam_index from capture_time sidecar, preserving serial
                         _ct_for_cam = _ct_dst if _ct_dst.exists() else _ct_src
                         if _ct_for_cam.exists():
                             try:
                                 _ctp = _ct_for_cam.read_text().strip().split()
                                 if len(_ctp) >= 3:
-                                    (scan_dir / '.cam_index').write_text(_ctp[2])
+                                    _ci_file = scan_dir / '.cam_index'
+                                    _existing_serial = ''
+                                    try:
+                                        _ep = _ci_file.read_text().strip().split()
+                                        _existing_serial = _ep[1] if len(_ep) >= 2 else ''
+                                    except Exception:
+                                        pass
+                                    _entry = f"{_ctp[2]} {_existing_serial}" if _existing_serial else _ctp[2]
+                                    _ci_file.write_text(_entry)
                             except Exception:
                                 pass
                     else:

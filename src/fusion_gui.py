@@ -712,6 +712,9 @@ class FusionCaptureGUI:
         thumb_frame.columnconfigure(0, weight=1)
         self.thumb_label = ttk.Label(thumb_frame, text="No scan yet", foreground="gray", anchor='center')
         self.thumb_label.grid(row=0, column=0, sticky=(tk.W, tk.E))
+        self.oak1_rotate_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(thumb_frame, text="Rotate OAK-1 image 180°",
+                        variable=self.oak1_rotate_var).grid(row=1, column=0, sticky=tk.W)
         
         # Right panel: tabbed view — RViz2 | System Log
         notebook = ttk.Notebook(right_panel)
@@ -1652,6 +1655,8 @@ sys.exit(0 if ok[0] else 4)
                 _time.sleep(0.1)
             img = Image.open(img_path)
             img.load()  # force full decode before leaving background thread
+            if img_path.name.startswith('oak1_') and self.oak1_rotate_var.get():
+                img = img.rotate(180)
             thumb_w = 200 if not self._small_screen else 160
             ratio = thumb_w / img.width
             thumb_h = int(img.height * ratio)

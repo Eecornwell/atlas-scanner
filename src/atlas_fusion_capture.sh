@@ -23,7 +23,7 @@ CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (cont
                                   # Total cycle: ~9s capture + CONTINUOUS_INTERVAL move window
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                    # Camera hardware model: onex2 | x5 | x3 | oak1    
-NUM_CAMERAS=1                     # 0 = auto-detect all connected cameras (up to 3)
+NUM_CAMERAS=0                     # 0 = auto-detect all connected cameras (up to 3)
                                   # 1-3 = use exactly N cameras
 
 CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
