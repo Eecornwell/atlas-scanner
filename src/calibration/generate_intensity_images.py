@@ -460,7 +460,7 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         cam_src = src_erp or camera_image
         cam = cv2.imread(cam_src, cv2.IMREAD_UNCHANGED)
         if cam is not None:
-            cam_out = cam if is_dual else remap_to_strips(cam)
+            cam_out = cam if (is_dual or is_oak1) else remap_to_strips(cam)
             cam_gray = cv2.cvtColor(cam_out, cv2.COLOR_BGR2GRAY) if cam_out.ndim == 3 else cam_out
             # Per-camera calibration mask override via environment variable
             # Applied regardless of is_dual when explicitly set for calibration
@@ -486,8 +486,9 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                     lidar_mask = cv2.resize(lidar_mask, (cam_gray.shape[1], cam_gray.shape[0]), interpolation=cv2.INTER_NEAREST)
                     cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=lidar_mask)
             cam_gray = cv2.resize(cam_gray, (out_w, out_h), interpolation=cv2.INTER_AREA)
-            # Zero middle zone for non-dual (front lens has no lidar overlap)
-            if not is_dual:
+            # Zero middle zone for non-dual Insta360 (front lens has no lidar overlap).
+            # OAK-1 is a perspective camera — no middle zone to suppress.
+            if not is_dual and not is_oak1:
                 mid_s_lr = out_w // 4
                 mid_e_lr = out_w * 3 // 4
                 cam_gray[:, max(0, mid_s_lr - BOUNDARY_MARGIN):min(out_w, mid_e_lr + BOUNDARY_MARGIN)] = 0

@@ -2240,17 +2240,17 @@ sys.exit(0 if ok[0] else 4)
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
-            # OAK-1: SuperGlue matches at 320x240 (lower res works better for
-            # depth vs texture images). Skip initial_guess_manual — it ignores
-            # calib.json and overwrites the seed with a hardcoded default.
-            if hw == 'oak1':
-                pass  # keep Match Features step, skip initial_guess_manual below
-            elif guess == 'auto':
+            # Respect the dropdown for all cameras.
+            # Note: initial_guess_auto may give poor results for OAK-1 (perspective).
+            if guess == 'manual':
+                # Manual: launch the interactive window then STOP the pipeline.
+                # The user must inspect/adjust the pose and then manually run
+                # steps 6 (Run Calibration) and 7 (Apply Calibration).
+                steps.append(("5. Initial Guess (Manual — adjust pose then close window)", [
+                    str(dvl / 'initial_guess_manual'), '--data_path', output]))
+            else:
                 steps.append(("5. Initial Guess (Auto)", [
                     str(dvl / 'initial_guess_auto'), '--data_path', output]))
-            else:
-                steps.append(("5. Initial Guess (Manual — open interactive window)", [
-                    str(dvl / 'initial_guess_manual'), '--data_path', output]))
             steps += [
                 ("6. Run Calibration", [str(dvl / 'calibrate'), '--data_path', output,
                     '--nid_bins', '32', '--nelder_mead_convergence_criteria', '1e-10']),
@@ -2277,6 +2277,14 @@ sys.exit(0 if ok[0] else 4)
                 if proc.returncode not in (0, None) and 'Manual' not in label:
                     self.root.after(0, self._cal_log_write,
                                     f'Pipeline stopped at: {label}\n')
+                    return
+                # Manual initial guess: stop here so the user can inspect the
+                # pose in the interactive window before running calibration.
+                if guess == 'manual' and 'initial_guess_manual' in safe_cmd:
+                    self.root.after(0, self._cal_log_write,
+                                    '\n⚠ Pipeline paused after manual initial guess.\n'
+                                    '  Adjust the pose in the viewer window, then close it.\n'
+                                    '  When satisfied, run steps 6 and 7 individually.\n')
                     return
             self.root.after(0, self._cal_log_write,
                             '\n\u2713 Full calibration pipeline complete. Run Verify Calibration to inspect.\n')

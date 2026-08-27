@@ -225,6 +225,23 @@ def _undistort_and_save(frame: np.ndarray, info: dict, out_path: Path):
     new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), 0.0)
     undist = cv2.undistort(frame, K, dist, None, new_K)
     cv2.imwrite(str(out_path), undist, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    # Save validity mask — white where undistortion produced valid pixels,
+    # black where the crop left empty corners. Used by exact_match_fusion
+    # to reject points that land on invalid pixels.
+    ones = np.ones((h, w), dtype=np.uint8) * 255
+    valid_mask = cv2.undistort(ones, K, dist, None, new_K)
+    _, valid_mask = cv2.threshold(valid_mask, 128, 255, cv2.THRESH_BINARY)
+    cv2.imwrite(str(out_path.with_name(out_path.stem + '_mask.png')), valid_mask)
+    # Save the undistorted intrinsics alongside the image so downstream tools
+    # (exact_match_fusion, oak1_lidar_colorize) use the correct K for projection.
+    undist_info = {
+        "width": w, "height": h,
+        "fx": float(new_K[0, 0]), "fy": float(new_K[1, 1]),
+        "cx": float(new_K[0, 2]), "cy": float(new_K[1, 2]),
+        "distortion_model": "none",
+        "D": [0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    out_path.with_suffix('.yaml').write_text(yaml.dump(undist_info, default_flow_style=False))
 
 
 def _run_capture(width: int, height: int, max_attempts: int = 3):

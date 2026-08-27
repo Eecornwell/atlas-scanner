@@ -130,31 +130,27 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
             dst_img = str(_safe_output(output_dir, "images", f"{total_count:06d}.png"))
             
             import cv2
-            # Read with alpha channel if present
             img = cv2.imread(str(src_img), cv2.IMREAD_UNCHANGED)
             if img is not None:
-                # Full-res copy for post-processing reference
-                cv2.imwrite(dst_img, img)
-
-                # Downsample root copy for SuperGlue/SuperPoint — the matcher was
-                # trained on ~640px images and produces very few keypoints on
-                # 3840x1920 inputs. Scale to MATCHER_MAX_W preserving exact aspect
-                # ratio so calib.json intrinsics are derived from actual dimensions.
-                MATCHER_MAX_W = 2560
+                # Downsample to MATCHER_MAX_W for both the root copy (SuperGlue)
+                # and the images/ copy (initial_guess_manual display).
+                # The full-res original stays in the session dir; no need to
+                # duplicate it here.
+                MATCHER_MAX_W = 800
                 src_h, src_w = img.shape[:2]
                 scale = MATCHER_MAX_W / src_w
                 MATCHER_W = MATCHER_MAX_W
                 MATCHER_H = round(src_h * scale)
-                # Apply alpha mask to RGB before downsampling so masked regions
-                # (scanner body/tripod) are black and ignored by SuperPoint.
                 if img.ndim == 3 and img.shape[2] == 4:
                     alpha = img[:, :, 3:4]
                     img_rgb = (img[:, :, :3] * (alpha / 255.0)).astype(img.dtype)
                 else:
                     img_rgb = img
                 img_small = cv2.resize(img_rgb, (MATCHER_W, MATCHER_H), interpolation=cv2.INTER_AREA)
+                # Write downsampled image to both locations the tool reads
                 root_img = str(_safe_output(output_dir, f"{total_count:06d}.png"))
                 cv2.imwrite(root_img, img_small)
+                cv2.imwrite(dst_img, img_small)
 
                 # Copy PLY file
                 src_ply = _safe_resolve(ply_files[0])

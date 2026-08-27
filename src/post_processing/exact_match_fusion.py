@@ -249,6 +249,15 @@ def exact_match_calibration_tool(scan_dir):
         _ci_path = os.path.join(scan_dir, 'camera_info.yaml')
         if not os.path.exists(_ci_path):
             _ci_path = os.path.join(_session_dir, 'camera_info.yaml')
+        # Prefer the undistorted sidecar YAML (new_K) if it exists alongside
+        # the undistorted image — it has the correct post-crop intrinsics.
+        _undist_yaml = None
+        for _f in os.listdir(str(safe_scan)):
+            if _f.startswith('oak1_') and _f.endswith('_undistorted.yaml'):
+                _undist_yaml = os.path.join(str(safe_scan), _f)
+                break
+        if _undist_yaml and os.path.exists(_undist_yaml):
+            _ci_path = _undist_yaml
         _ci = _yaml.safe_load(open(_ci_path).read())
         _sx = img_width  / _ci['width']
         _sy = img_height / _ci['height']
@@ -285,20 +294,33 @@ def exact_match_calibration_tool(scan_dir):
 
     print(f"Valid projections: {len(valid_points)} points")
 
-    # Bilinear interpolation
-    u0 = np.clip(np.floor(valid_u).astype(int), 0, img_width - 1)
-    v0 = np.clip(np.floor(valid_v).astype(int), 0, img_height - 1)
-    u1 = np.clip(u0 + 1, 0, img_width - 1)
-    v1 = np.clip(v0 + 1, 0, img_height - 1)
-    fu = (valid_u - np.floor(valid_u))[:, np.newaxis]
-    fv = (valid_v - np.floor(valid_v))[:, np.newaxis]
-    c00 = image[v0, u0].astype(np.float32)
-    c10 = image[v0, u1].astype(np.float32)
-    c01 = image[v1, u0].astype(np.float32)
-    c11 = image[v1, u1].astype(np.float32)
-    colors_bgr = (c00 * (1 - fu) * (1 - fv) + c10 * fu * (1 - fv) +
-                  c01 * (1 - fu) * fv       + c11 * fu * fv)
-    valid_colors = np.clip(colors_bgr, 0, 255).astype(np.uint8)[:, [2, 1, 0]]  # BGR to RGB
+    # Nearest-neighbour sampling — avoids colour bleed at depth discontinuities
+    # where bilinear interpolation mixes foreground and background pixels.
+    u_nn = np.clip(np.round(valid_u).astype(int), 0, img_width - 1)
+    v_nn = np.clip(np.round(valid_v).astype(int), 0, img_height - 1)
+    colors_bgr = image[v_nn, u_nn].astype(np.uint8)
+
+    # For OAK-1 (perspective), reject points that land on black/invalid pixels
+    # caused by undistortion cropping artifacts at image corners.
+    if _is_perspective:
+        # Prefer the saved validity mask (precise); fall back to brightness threshold.
+        _mask_path = None
+        for _f in os.listdir(str(safe_scan)):
+            if _f.startswith('oak1_') and _f.endswith('_undistorted_mask.png'):
+                _mask_path = os.path.join(str(safe_scan), _f)
+                break
+        if _mask_path and os.path.exists(_mask_path):
+            _vmask = cv2.imread(_mask_path, cv2.IMREAD_GRAYSCALE)
+            if _vmask is not None and _vmask.shape == (img_height, img_width):
+                valid_color_mask = _vmask[v_nn, u_nn] > 128
+            else:
+                valid_color_mask = colors_bgr.max(axis=1) > 10
+        else:
+            valid_color_mask = colors_bgr.max(axis=1) > 10
+        valid_points = valid_points[valid_color_mask]
+        colors_bgr = colors_bgr[valid_color_mask]
+
+    valid_colors = colors_bgr[:, [2, 1, 0]]  # BGR to RGB
 
     out_points = valid_points
     colors = valid_colors

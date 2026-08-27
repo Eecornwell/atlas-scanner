@@ -151,12 +151,25 @@ def main():
     info_p = scan_dir / 'camera_info.yaml'
     if not info_p.exists():
         info_p = session / 'camera_info.yaml'
+    # Prefer the undistorted sidecar YAML (new_K) alongside the undistorted
+    # image — it has the correct post-crop intrinsics and zero distortion.
+    for _f in sorted(scan_dir.glob('oak1_*_undistorted.yaml')):
+        info_p = _f
+        break
     info = yaml.safe_load(info_p.read_text())
     ih, iw = img_full.shape[:2]
     info_s = dict(info, width=iw, height=ih,
                   fx=info['fx']*iw/info['width'], fy=info['fy']*ih/info['height'],
                   cx=info['cx']*iw/info['width'], cy=info['cy']*ih/info['height'])
-    undist, K = _undistort(img_full, info_s)
+    # If the sidecar already has zero distortion (undistorted image), skip
+    # the undistort step and use the image directly with the sidecar K.
+    if max(abs(d) for d in info_s.get('D', [1.0])) < 1e-9:
+        undist = img_full
+        K = np.array([[info_s['fx'], 0, info_s['cx']],
+                      [0, info_s['fy'], info_s['cy']],
+                      [0, 0, 1]], dtype=np.float64)
+    else:
+        undist, K = _undistort(img_full, info_s)
 
     # Display size
     DISP_W = 1200
