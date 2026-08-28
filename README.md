@@ -114,7 +114,7 @@
 ![Software Screenshot](assets/media/atlas-software-screenshot.png)
 | **Feature**                         | Supported | Notes                                                                                                            |
 | ------------------------------------| --------- | ---------------------------------------------------------------------------------------------------------------- |
-| Intrinsic calibration               | No        | Currently modeling as spherical camera, even single fisheye is projected to spherical model to maximize coverage |
+| Intrinsic calibration               | No        | Currently modeling as spherical camera or pinhole, even single fisheye is projected to spherical model to maximize coverage |
 | Extrinsic calibration               | Yes       | Camera to lidar, dual fish-eye lens to ERP                                                                       |
 | Image acquisition                   | Yes       | Masked panos saved as 5760×2880 (`dual_fisheye`) or full ERP with rear hemisphere blanked + masked (`single_fisheye`); OAK-1 saves undistorted 4032×3040 PNGs        |
 | Point cloud acquisition             | Yes       | Raw lidar with intensity saved with pose as .ply or optionally .e57                                              |
@@ -145,6 +145,14 @@ Please review [Calibration documentation](docs/calibration.md)
 
 ### Testing and Capturing
 Please review [Running the Software documentation](docs/software-run.md)
+
+
+### Example Results
+#### Multi-camera Color Normalization
+- Left: raw camera frames
+- Right: color normalized output using X5 as target profile
+
+![Multi-camera Color Normalization](assets/media/color-correction.png "Color Correction")
 
 #### Sample Output
 ![Point Cloud Result](assets/media/room-pointcloud.png "Result")
