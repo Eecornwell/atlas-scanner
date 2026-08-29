@@ -53,13 +53,17 @@ def _build_pipeline(dai, width: int, height: int):
     return pipeline, q, ctrl_q
 
 
-def _apply_isp(dai, ctrl_q, settle_s: float = 0.0):
+def _apply_isp(dai, ctrl_q, settle_s: float = 0.0, scene_mode: str = "indoor"):
     if settle_s > 0:
         time.sleep(settle_s)
     ctrl = dai.CameraControl()
     ctrl.setAutoWhiteBalanceMode(dai.CameraControl.AutoWhiteBalanceMode.AUTO)
+    # Outdoor scenes are much brighter — use stronger EV reduction to avoid overexposure.
+    ev = -4 if scene_mode == "outdoor" else -2
+    ctrl.setAutoExposureCompensation(ev)
     ctrl.setSaturation(2)
-    ctrl.setSharpness(1)
+    ctrl.setSharpness(0)
+    ctrl.setLumaDenoise(1)
     ctrl_q.send(ctrl)
 
 
@@ -292,6 +296,12 @@ def main():
         if idx + 1 < len(sys.argv):
             cam_index = sys.argv[idx + 1]
 
+    scene_mode = "indoor"
+    if "--scene" in sys.argv:
+        idx = sys.argv.index("--scene")
+        if idx + 1 < len(sys.argv):
+            scene_mode = sys.argv[idx + 1]
+
     _src = _SELF.parent.parent
     hw_yaml = _src / "config" / "camera_models" / "oak1.yaml"
     cfg = yaml.safe_load(hw_yaml.read_text()) if hw_yaml.exists() else {}
@@ -335,7 +345,7 @@ def main():
         """Start pipeline and wait for AE. Returns (pipeline, stream_q, ctrl_q)."""
         p, sq, cq = _build_pipeline(dai, width, height)
         p.start()
-        _apply_isp(dai, cq, settle_s=0.5)
+        _apply_isp(dai, cq, settle_s=0.5, scene_mode=scene_mode)
         if wait_ae:
             print("Waiting for AE...", flush=True)
             _wait_ae(sq)

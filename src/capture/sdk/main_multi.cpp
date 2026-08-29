@@ -381,10 +381,15 @@ int _main(int argc, char* argv[]) {
     std::set<std::string> opened_serials;
 
     if (!serial_filter.empty()) {
-        // When opening a single camera, flush its USB endpoint first to clear
-        // stale protocol bytes left by a previous unclean session.
-        if (serial_filter.size() == 1)
-            flush_usb_endpoints(serial_filter[0]);
+        // Flush each camera's USB endpoint before opening it to clear stale
+        // protocol bytes from a previous session. In multi-camera mode we
+        // flush sequentially (one at a time) before opening any camera so
+        // the libusb claim doesn't interfere with the SDK's open sequence.
+        for (const auto& sn : serial_filter)
+            flush_usb_endpoints(sn);
+
+        // When opening a single camera, flush was already done above.
+        // (kept for clarity — flush_usb_endpoints is idempotent)
 
         // Open cameras in the exact order specified by serial_filter
         for (size_t target_idx = 0; target_idx < serial_filter.size(); ++target_idx) {

@@ -24,6 +24,7 @@ CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (cont
 STATIONARY_WAIT=false             # stationary only: wait 3s before starting rosbag (allows scanner to settle)
 CAMERA_HW="x5"                    # Camera hardware model: onex2 | x5 | x3 | oak1    
 NUM_CAMERAS=0                     # 0 = auto-detect all connected cameras (up to 3)
+SCENE_MODE="indoor"               # indoor | outdoor — adjusts EV bias for ambient light level
                                   # 1-3 = use exactly N cameras
 
 CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
         --camera) CAMERA_MODE="$2"; shift 2 ;;
         --capture) CAPTURE_MODE="$2"; shift 2 ;;
         --interval) CONTINUOUS_INTERVAL="$2"; shift 2 ;;
+        --scene) SCENE_MODE="$2"; shift 2 ;;
         --bag-only) BAG_ONLY=true; shift ;;
         --no-sync-benchmark) RUN_SYNC_BENCHMARK=false; shift ;;
         --stationary-wait) STATIONARY_WAIT=true; shift ;;
@@ -109,6 +111,16 @@ if [ -f "$_MULTI_CAM_YAML" ]; then
         [ -n "$_mc_ev" ] && export INSTA360_EV_BIAS="$_mc_ev"
         echo "Multi-camera: shared settings applied (exposure=$_mc_exposure wb=$_mc_wb ev=$_mc_ev)"
     fi
+fi
+
+# ─── Scene mode EV adjustment ─────────────────────────────────────────────────
+# Outdoor scenes are much brighter than indoor — reduce EV bias to avoid
+# overexposure on all Insta360 cameras. OAK-1 EV is handled in oak1_capture.py.
+if [ "${SCENE_MODE:-indoor}" = "outdoor" ]; then
+    export INSTA360_EV_BIAS="-2"
+    echo "Scene mode: outdoor (EV bias=-2 applied to all Insta360 cameras)"
+else
+    echo "Scene mode: indoor"
 fi
 
 _SDK_BIN="$SCRIPT_DIR/capture/sdk/build"
@@ -1041,7 +1053,7 @@ if [ "$CAMERA_HW" = "oak1" ]; then
     # Kill any stale oak1_capture process holding the USB device
     pkill -f "oak1_capture.py" 2>/dev/null || true
     sleep 2
-    python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
+    python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" --scene "${SCENE_MODE:-indoor}" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
     SDK_CAPTURE_PID=$!
     echo "Waiting for OAK-1 session..."
     for _i in $(seq 1 60); do
@@ -1225,7 +1237,7 @@ for k,v in mc.get('cameras',{}).items():
         print(k.split('_')[1]); sys.exit(0)
 print('3')
 " 2>/dev/null || echo '3')
-        python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" --cam-index "$_oak1_cam_idx" \
+        python3 "$SCRIPT_DIR/capture/oak1_capture.py" "$SCAN_DIR" --cam-index "$_oak1_cam_idx" --scene "${SCENE_MODE:-indoor}" \
             > "$SCAN_DIR/oak1_secondary.log" 2>&1 &
         OAK1_SECONDARY_PID=$!
         # Wait for OAK-1 to be ready (max 60s)

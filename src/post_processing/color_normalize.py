@@ -135,6 +135,10 @@ def compute_profile_from_images(ref_img: np.ndarray, src_img: np.ndarray) -> dic
     """
     ref_mask = ref_img.max(axis=2) > 20
     src_mask = src_img.max(axis=2) > 20
+    # Exclude overexposed pixels from both images — clipped highlights
+    # bias the L_gain ratio toward 1.0 and hide true exposure differences.
+    ref_mask = ref_mask & (ref_img.max(axis=2) < 245)
+    src_mask = src_mask & (src_img.max(axis=2) < 245)
     shared = ref_mask & src_mask
     if not shared.any():
         return {'ccm': np.eye(3, dtype=np.float32),
@@ -307,10 +311,18 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
         if sentinel.exists():
             sentinel.unlink()
 
-    def _hw_for_scan(scan_dir: Path) -> str:
-        """Return camera hw for a scan dir — oak1 if oak1_* files present, else session hw."""
+    def _hw_for_scan(scan_dir: Path, cam_idx: int) -> str:
+        """Return camera hw for a scan dir from multi_camera.yaml slot."""
         if any(scan_dir.glob('oak1_*')):
             return 'oak1'
+        try:
+            import yaml as _y
+            mc = _y.safe_load((_SRC / 'config' / 'multi_camera.yaml').read_text()) or {}
+            slot_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '')
+            if slot_hw:
+                return slot_hw
+        except Exception:
+            pass
         return camera_hw
 
     # For each secondary camera, find temporally adjacent reference images
@@ -320,7 +332,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             continue
 
         print(f"\nComputing profile for cam_{cam_idx} ({len(scans)} images)...")
-        scan_hw = _hw_for_scan(scans[0][0])
+        scan_hw = _hw_for_scan(scans[0][0], cam_idx)
 
         # Use up to 20 image pairs for robust statistics; reject outliers
         profiles = []
@@ -412,7 +424,15 @@ def normalize_session(session_dir: str):
         # Detect OAK-1 scans by image files
         oak1_img = next(scan_dir.glob('oak1_*_undistorted.png'), None)
         is_oak1 = oak1_img is not None
-        scan_hw = 'oak1' if is_oak1 else camera_hw
+        if is_oak1:
+            scan_hw = 'oak1'
+        else:
+            try:
+                import yaml as _y
+                mc = _y.safe_load((_SRC / 'config' / 'multi_camera.yaml').read_text()) or {}
+                scan_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '') or camera_hw
+            except Exception:
+                scan_hw = camera_hw
 
         profile = load_color_profile(scan_hw, cam_idx)
         if profile is None:

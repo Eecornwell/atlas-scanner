@@ -1308,6 +1308,18 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         # then fall back to .capture_time sidecar in the scan dir.
         # Always preserve the serial from the existing .cam_index when present so
         # exact_match_fusion.py can resolve the correct per-slot calibration.
+        # Load serial map from .sdk_camera_map once for the whole session.
+        _sdk_cam_map = {}
+        _map_path = session_path / '.sdk_camera_map'
+        if _map_path.exists():
+            try:
+                for _line in _map_path.read_text().strip().splitlines():
+                    _parts = _line.split()
+                    if len(_parts) >= 2:
+                        _sdk_cam_map[int(_parts[0])] = _parts[1]
+            except Exception:
+                pass
+
         def _read_existing_serial(sd):
             try:
                 parts = (sd / '.cam_index').read_text().strip().split()
@@ -1315,10 +1327,17 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             except Exception:
                 return ''
 
+        def _serial_for_idx(idx):
+            """Return serial for cam index from .sdk_camera_map or existing .cam_index."""
+            if idx in _sdk_cam_map:
+                return _sdk_cam_map[idx]
+            return _read_existing_serial(scan_dir)
+
         _cam_idx_written = False
         if _centres_cam_idx and idx < len(_centres_cam_idx):
-            _serial = _read_existing_serial(scan_dir)
-            _entry = f"{_centres_cam_idx[idx]} {_serial}" if _serial else str(_centres_cam_idx[idx])
+            _ci = _centres_cam_idx[idx]
+            _serial = _serial_for_idx(_ci)
+            _entry = f"{_ci} {_serial}" if _serial else str(_ci)
             (scan_dir / '.cam_index').write_text(_entry)
             _cam_idx_written = True
         if not _cam_idx_written:
@@ -1326,8 +1345,9 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 try:
                     _ct_parts = _ct.read_text().strip().split()
                     if len(_ct_parts) >= 3:
-                        _serial = _read_existing_serial(scan_dir)
-                        _entry = f"{_ct_parts[2]} {_serial}" if _serial else _ct_parts[2]
+                        _ci = int(_ct_parts[2])
+                        _serial = _serial_for_idx(_ci)
+                        _entry = f"{_ci} {_serial}" if _serial else str(_ci)
                         (scan_dir / '.cam_index').write_text(_entry)
                         _cam_idx_written = True
                         break

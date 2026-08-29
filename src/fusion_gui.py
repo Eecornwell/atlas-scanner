@@ -668,13 +668,16 @@ class FusionCaptureGUI:
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
                         variable=self.bag_only_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.outdoor_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="Outdoor scene (reduced EV bias)",
+                        variable=self.outdoor_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.icp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
-                        variable=self.icp_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.icp_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.colmap_var = tk.BooleanVar(value=False)
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
-                        variable=self.colmap_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.colmap_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -1102,6 +1105,7 @@ class FusionCaptureGUI:
             'camera_hw_val':     self.camera_hw_var.get(),
             'num_cameras_val':   self.num_cameras_var.get(),
             'bag_only':          self.bag_only_var.get(),
+            'outdoor':           self.outdoor_var.get(),
             'stationary_wait':   self.stationary_wait_var.get(),
             'icp':               self.icp_var.get(),
             'colmap':            self.colmap_var.get(),
@@ -1198,7 +1202,8 @@ class FusionCaptureGUI:
             cmd = ['stdbuf', '-oL', './atlas_fusion_capture.sh',
                    '--camera', camera_val,
                    '--capture', capture_val,
-                   '--camera-hw', params['camera_hw_val']]
+                   '--camera-hw', params['camera_hw_val'],
+                   '--scene', 'outdoor' if params['outdoor'] else 'indoor']
             if params['num_cameras_val'] != 'auto':
                 cmd += ['--num-cameras', params['num_cameras_val']]
             if params['bag_only']:
@@ -1887,13 +1892,23 @@ sys.exit(0 if ok[0] else 4)
     def _pp_run_reconstruct(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
-        if not any(p.is_dir() and not str(p).endswith('_imu')
-                   for p in pathlib.Path(sess).glob('rosbag_*')):
+        sess_path = pathlib.Path(sess)
+        has_rosbag = any(p.is_dir() and not str(p).endswith('_imu')
+                         for p in sess_path.glob('rosbag_*'))
+        if not has_rosbag:
             self._pp_log_write("\n[!] No rosbag found in session.\n")
             self._pp_log_write("    The bag may have been deleted after processing.\n")
             self._pp_log_write("    Other utilities (ICP, merge, COLMAP, viewer) can still run on this session.\n")
             return
-        self._pp_run("Run Post-Processing", [sys.executable, str(self.script_dir / 'post_processing/reconstruct_from_bag.py'), sess])
+        cmd = [sys.executable, str(self.script_dir / 'post_processing/reconstruct_from_bag.py'), sess]
+        # Continuous SDK-stitch sessions: rosbag is at session root and .sdk_shot_* dirs
+        # contain the .insp files. Pass --sdk-stitch so reconstruct_from_bag promotes them.
+        is_continuous_sdk = (any(sess_path.glob('.sdk_shot_*')) or
+                             any(sess_path.glob('fusion_scan_*/*.insp')))
+        if is_continuous_sdk:
+            cmd += ['--sdk-stitch', '--trim-ends', '0']
+            self._pp_log_write("  Detected continuous SDK-stitch session — adding --sdk-stitch\n")
+        self._pp_run("Run Post-Processing", cmd)
 
     def _pp_reprocess(self):
         sess = self._pp_session()
@@ -2373,7 +2388,16 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] Invalid numeric input in seed fields.\n")
             return
         hw = self._cal_hw()
-        cam_idx = self._cal_cam_var.get().split('_')[1]
+        actual_slot_idx = self._cal_cam_var.get().split('_')[1]
+        try:
+            import yaml as _yaml
+            mc = _yaml.safe_load((self.script_dir / 'config' / 'multi_camera.yaml').read_text())
+            for sk, sc in mc.get('cameras', {}).items():
+                if sc.get('camera_hw', '') == hw:
+                    actual_slot_idx = sk.split('_')[1]
+                    break
+        except Exception:
+            pass
         self._cal_run("Write Physical Seed", [
             sys.executable,
             str(self.script_dir / 'calibration' / 'physical_seed.py'),
@@ -2381,7 +2405,7 @@ sys.exit(0 if ok[0] else 4)
             '--forward', str(fwd_in),
             '--left', str(left_in),
             '--up', str(up_in),
-        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
+        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': actual_slot_idx})
 
     def _cal_verify_seed(self):
         """Write current seed values, generate overlay and open it."""
@@ -2448,7 +2472,19 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] No session selected.\n")
             return
         hw = self._cal_hw()
-        cam_idx = self._cal_cam_var.get().split('_')[1]
+        cam_idx = self._cal_cam_var.get().split("_")[1]
+        # Resolve actual slot index from multi_camera.yaml (e.g. oak1=cam_3
+        # but dropdown shows cam_0 for single-hw sessions).
+        actual_slot_idx = cam_idx
+        try:
+            import yaml as _yaml
+            _mc = _yaml.safe_load((self.script_dir / "config" / "multi_camera.yaml").read_text())
+            for _sk, _sc in _mc.get("cameras", {}).items():
+                if _sc.get("camera_hw", "") == hw:
+                    actual_slot_idx = _sk.split("_")[1]
+                    break
+        except Exception:
+            pass
         try:
             fwd_in  = float(self._seed_fwd_var.get())
             left_in = float(self._seed_left_var.get())
@@ -2457,29 +2493,42 @@ sys.exit(0 if ok[0] else 4)
             self._cal_log_write("\n[!] Invalid seed field values — fix before opening viewer.\n")
             return
         import subprocess as _sp, os as _os
-        env_with_idx = {**os.environ, 'ATLAS_CALIBRATION_CAM_INDEX': cam_idx}
-        _sp.run([
+        env_with_idx = {**os.environ, 'ATLAS_CALIBRATION_CAM_INDEX': actual_slot_idx}
+        result = _sp.run([
             sys.executable,
             str(self.script_dir / 'calibration' / 'physical_seed.py'),
             '--camera-hw', hw,
             '--forward', str(fwd_in),
             '--left', str(left_in),
             '--up', str(up_in),
-        ], capture_output=True, env=env_with_idx)
+        ], capture_output=False, env=env_with_idx)
+        if result.returncode != 0:
+            self._cal_log_write(f'\n[!] physical_seed.py failed (exit {result.returncode}) — viewer may use stale seed.\n')
+            return
         subprocess.Popen([
             sys.executable,
             str(self.script_dir / 'calibration' / 'interactive_seed.py'),
-            sess, '--camera-hw', hw, '--cam-index', cam_idx,
+            sess, '--camera-hw', hw, '--cam-index', actual_slot_idx,
         ], env=env_with_idx)
 
     def _cal_apply(self):
-        cam_idx = self._cal_cam_var.get().split('_')[1]  # '0', '1', or '2'
+        hw = self._cal_hw()
+        actual_slot_idx = self._cal_cam_var.get().split('_')[1]
+        try:
+            import yaml as _yaml
+            mc = _yaml.safe_load((self.script_dir / 'config' / 'multi_camera.yaml').read_text())
+            for sk, sc in mc.get('cameras', {}).items():
+                if sc.get('camera_hw', '') == hw:
+                    actual_slot_idx = sk.split('_')[1]
+                    break
+        except Exception:
+            pass
         self._cal_run("Apply Calibration", [
             sys.executable,
             str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
             self._cal_src(),
-            '--camera-hw', self._cal_hw()
-        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': cam_idx})
+            '--camera-hw', hw
+        ], env_extra={'ATLAS_CALIBRATION_CAM_INDEX': actual_slot_idx})
 
     def _cal_verify(self):
         sess = self._pp_session()
@@ -2744,6 +2793,7 @@ def main():
     default_camera, default_capture, default_stationary_wait = 'dual_fisheye', 'continuous', False
     default_icp, default_colmap, default_colmap_lidar_voxel = False, False, 0.0
     default_camera_hw = 'onex2'
+    default_outdoor = False
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -2759,6 +2809,8 @@ def main():
                 default_colmap = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             elif line.startswith('CAMERA_HW=') and '#' not in line.split('CAMERA_HW=')[0]:
                 default_camera_hw = line.split('=', 1)[1].split('#')[0].strip('"\' ')
+            elif line.startswith('SCENE_MODE=') and '#' not in line.split('SCENE_MODE=')[0]:
+                default_outdoor = line.split('=', 1)[1].split('#')[0].strip('"\' ') == 'outdoor'
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
                 try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
                 except ValueError: pass
@@ -2787,6 +2839,7 @@ def main():
     app.icp_var.set(default_icp)
     app.colmap_var.set(default_colmap)
     app.camera_hw_var.set(default_camera_hw)
+    app.outdoor_var.set(default_outdoor)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
