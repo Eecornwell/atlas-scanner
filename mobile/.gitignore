@@ -1,0 +1,42 @@
+# Xcode
+AtlasMobile.xcodeproj/xcuserdata/
+AtlasMobile.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.hmap
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+!default.pbxuser
+!default.mode1v3
+!default.mode2v3
+!default.perspectivev3
+xcuserdata/
+
+# CocoaPods
+Pods/
+*.xcworkspace
+
+# Swift Package Manager
+.build/
+Package.resolved
+
+# Python offline pipeline
+offline_pipeline/.venv/
+offline_pipeline/__pycache__/
+*.pyc
+.ruff_cache/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Session data (large, do not commit)
+atlas_sessions/

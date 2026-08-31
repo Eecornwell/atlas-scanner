@@ -1,0 +1,32 @@
+cameras:
+  - id: insta360_primary
+    model: X5
+    serial: "CHANGE_ME"
+    extrinsic:
+      roll: 0.0
+      pitch: 0.0
+      yaw: 0.0
+      x: 0.0
+      y: 0.05
+      z: 0.03
+    mask: masks/insta360_primary.png
+    face_count: 8
+    tile_fov: 90
+
+  # Uncomment and configure for a second camera:
+  # - id: insta360_secondary
+  #   model: X4
+  #   serial: "CHANGE_ME"
+  #   extrinsic:
+  #     roll: 0.0
+  #     pitch: 180.0
+  #     yaw: 0.0
+  #     x: 0.0
+  #     y: -0.05
+  #     z: 0.03
+  #   mask: masks/insta360_secondary.png
+  #   face_count: 8
+  #   tile_fov: 90
+
+iphone:
+  mask: masks/iphone_wide.png

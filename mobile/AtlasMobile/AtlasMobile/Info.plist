@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSCameraUsageDescription</key>
+	<string>Atlas Mobile uses the camera and LiDAR sensor for 3D scene capture.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Atlas Mobile connects to Insta360 cameras over the local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_insta360._tcp</string>
+	</array>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arkit</string>
+		<string>lidar</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict/>
+</dict>
+</plist>
