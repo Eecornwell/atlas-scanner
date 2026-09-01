@@ -62,16 +62,8 @@ final class DataRecorder {
     }
 
     func saveDownloadedMedia(_ downloads: [Insta360DownloadResult]) async {
-        for download in downloads {
-            let cameraDir = sessionDirectory
-                .appendingPathComponent("raw")
-                .appendingPathComponent(download.cameraId)
-            try? FileManager.default.createDirectory(at: cameraDir, withIntermediateDirectories: true)
-
-            let destName = String(format: "scan_%03d.jpg", download.scanIndex)
-            let destURL = cameraDir.appendingPathComponent(destName)
-            try? FileManager.default.copyItem(at: download.localURL, to: destURL)
-        }
+        // Files are already written to raw/<cameraId>/scan_NNN.jpg by CameraInstance.downloadPending(into:).
+        // Nothing further to do here.
     }
 
     func saveTrajectory(_ trajectory: TrajectoryData?) async {
@@ -79,6 +71,61 @@ final class DataRecorder {
         let url = sessionDirectory.appendingPathComponent("raw/trajectory.json")
         if let data = try? encoder.encode(trajectory) {
             try? data.write(to: url)
+        }
+    }
+
+    /// URL of a downloaded Insta360 ERP for a given scan — used by CalibrationView.
+    func erpURL(cameraId: String, scanIndex: Int) -> URL? {
+        let url = sessionDirectory
+            .appendingPathComponent("raw/\(cameraId)")
+            .appendingPathComponent(String(format: "scan_%03d.jpg", scanIndex))
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    func buildExportData(sessionDirectory: URL) -> [ScanExportData] {
+        let iphoneDir = sessionDirectory.appendingPathComponent("raw/iphone")
+        guard let scanDirs = try? FileManager.default.contentsOfDirectory(
+            at: iphoneDir, includingPropertiesForKeys: nil
+        ).filter({ $0.lastPathComponent.hasPrefix("scan_") }).sorted(by: { $0.path < $1.path })
+        else { return [] }
+
+        return scanDirs.compactMap { scanDir in
+            let poseURL = scanDir.appendingPathComponent("pose.json")
+            guard let data = try? Data(contentsOf: poseURL),
+                  let pose = try? JSONDecoder().decode(ScanPose.self, from: data)
+            else { return nil }
+
+            let T = pose.transformMatrix
+            let arkitPose = simd_float4x4(columns: (
+                SIMD4(T[0][0], T[1][0], T[2][0], T[3][0]),
+                SIMD4(T[0][1], T[1][1], T[2][1], T[3][1]),
+                SIMD4(T[0][2], T[1][2], T[2][2], T[3][2]),
+                SIMD4(T[0][3], T[1][3], T[2][3], T[3][3])
+            ))
+
+            let rawDir = sessionDirectory.appendingPathComponent("raw")
+            var insta360URLs: [String: URL] = [:]
+            if let cams = try? FileManager.default.contentsOfDirectory(
+                at: rawDir, includingPropertiesForKeys: nil
+            ) {
+                for camDir in cams where camDir.lastPathComponent != "iphone" {
+                    let jpg = camDir.appendingPathComponent("\(scanDir.lastPathComponent).jpg")
+                    if FileManager.default.fileExists(atPath: jpg.path) {
+                        insta360URLs[camDir.lastPathComponent] = jpg
+                    }
+                }
+            }
+
+            return ScanExportData(
+                scanName: scanDir.lastPathComponent,
+                arkitPose: arkitPose,
+                intrinsics: pose.intrinsics,
+                imageWidth: pose.imageWidth,
+                imageHeight: pose.imageHeight,
+                depthBinURL: scanDir.appendingPathComponent("depth.bin"),
+                iphoneImageURL: scanDir.appendingPathComponent("rgb.jpg"),
+                insta360ImageURLs: insta360URLs
+            )
         }
     }
 
@@ -131,7 +178,10 @@ final class DataRecorder {
     }
 
     private func savePixelBufferAsJPEG(_ pixelBuffer: CVPixelBuffer, to url: URL) async {
-        // TODO: Convert CVPixelBuffer (YCbCr) → JPEG via CIImage + CIContext
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let data = context.jpegRepresentation(of: ciImage, colorSpace: CGColorSpaceCreateDeviceRGB()) else { return }
+        try? data.write(to: url)
     }
 
     private func matrixToArray(_ m: simd_float4x4) -> [[Float]] {

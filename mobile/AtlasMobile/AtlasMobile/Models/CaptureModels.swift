@@ -15,6 +15,7 @@ struct ARKitFrameData {
 
 struct Insta360CaptureResult {
     let cameraId: String
+    let scanIndex: Int
     let arkitTimestamp: Double
     let insta360Timestamp: Double
     let mediaIdentifier: String

@@ -9,6 +9,9 @@ final class ARKitCapture: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var trackingState: ARCamera.TrackingState = .notAvailable
 
+    /// Injected by CaptureSessionManager so continuous poses feed the shared recorder.
+    weak var trajectoryRecorder: TrajectoryRecorder?
+
     func start() {
         let config = ARWorldTrackingConfiguration()
         config.frameSemantics = [.sceneDepth, .smoothedSceneDepth]
@@ -61,5 +64,12 @@ extension ARKitCapture: ARSessionDelegate {
         DispatchQueue.main.async {
             self.trackingState = camera.trackingState
         }
+    }
+
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        trajectoryRecorder?.recordPose(
+            timestamp: frame.timestamp,
+            pose: frame.camera.transform
+        )
     }
 }

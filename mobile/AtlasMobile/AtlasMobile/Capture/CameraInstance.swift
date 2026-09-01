@@ -1,7 +1,14 @@
 import Foundation
+import INSCameraSDK
+
+/// Camera WiFi Direct defaults — Insta360 AP mode address.
+private let kCameraHost = "192.168.42.1"
+private let kCameraPort: UInt16 = 6666
+private let kHeartbeatInterval: TimeInterval = 0.5
+private let kClockSyncSamples = 10
 
 /// Represents a single connected Insta360 camera with its calibration and state.
-final class CameraInstance: Identifiable {
+final class CameraInstance: NSObject, Identifiable {
     let id: String
     let model: String
     let serial: String
@@ -10,7 +17,11 @@ final class CameraInstance: Identifiable {
 
     private(set) var clockOffset: ClockOffset?
     private(set) var isConnected = false
-    private var pendingDownloads: [String] = []
+
+    /// Pending media URIs queued for download (populated by capture()).
+    private var pendingURIs: [(scanIndex: Int, uri: String)] = []
+    private var heartbeatTimer: Timer?
+    private var kvoToken: NSKeyValueObservation?
 
     init(config: CameraConfig) {
         self.id = config.id
@@ -20,51 +31,149 @@ final class CameraInstance: Identifiable {
         self.maskPath = config.mask
     }
 
+    // MARK: - Connection
+
     func connect() async -> Bool {
-        // TODO: Connect to camera via Insta360 SDK
-        // 1. WiFi connection to camera SSID
-        // 2. Initialize SDK session
-        // 3. Calibrate clock offset
-        isConnected = true
-        return true
+        let device = INSSocketDevice(host: kCameraHost, port: kCameraPort)
+        INSCameraManager.socket().currentCamera = device as? (any INSCameraDevice)
+
+        return await withCheckedContinuation { continuation in
+            kvoToken = INSCameraManager.socket().observe(
+                \.cameraState,
+                options: [.new]
+            ) { [weak self] manager, change in
+                guard let self, let rawValue = change.newValue else { return }
+                let state = INSCameraState(rawValue: rawValue.uintValue) ?? .noConnection
+                switch state {
+                case .connected:
+                    self.kvoToken = nil
+                    self.isConnected = true
+                    self.startHeartbeat()
+                    continuation.resume(returning: true)
+                case .connectFailed:
+                    self.kvoToken = nil
+                    continuation.resume(returning: false)
+                default:
+                    break
+                }
+            }
+            INSCameraManager.socket().setup()
+        }
     }
 
     func disconnect() async {
-        // TODO: Disconnect SDK session
+        stopHeartbeat()
+        kvoToken = nil
+        INSCameraManager.socket().shutdown()
         isConnected = false
     }
 
-    func calibrateClockOffset(arkitTimestamp: Double) async -> ClockOffset {
-        // TODO: Send capture command, measure round-trip, estimate offset
-        // Same approach as atlas-scanner: median of N samples
-        let offset = ClockOffset(
-            offsetMs: 0.0,
-            sampleCount: 0,
-            stdDevMs: 0.0
-        )
-        self.clockOffset = offset
-        return offset
+    // MARK: - Clock offset
+
+    /// Estimates clock offset using the SDK's built-in sync (median of N samples).
+    func calibrateClockOffset() async -> ClockOffset {
+        return await withCheckedContinuation { continuation in
+            INSCameraManager.socket().commandsImpl.syncTimeMsToCamera(
+                withTryCount: kClockSyncSamples,
+                dTimeMsMax: 200
+            ) { [weak self] dTimeMs, error in
+                let offset = ClockOffset(
+                    offsetMs: error == nil ? Double(dTimeMs) : 0.0,
+                    sampleCount: error == nil ? kClockSyncSamples : 0,
+                    stdDevMs: 0.0
+                )
+                self?.clockOffset = offset
+                continuation.resume(returning: offset)
+            }
+        }
     }
 
-    func capture(arkitTimestamp: Double) async -> Insta360CaptureResult? {
+    // MARK: - Capture
+
+    func capture(arkitTimestamp: Double, scanIndex: Int) async -> Insta360CaptureResult? {
         guard isConnected else { return nil }
 
-        // TODO: Trigger capture via Insta360 SDK
-        // 1. Send capture command
-        // 2. Wait for completion callback
-        // 3. Record Insta360 timestamp from EXIF/sidecar
-        // 4. Compute clock offset sample
-
-        return Insta360CaptureResult(
-            cameraId: id,
-            arkitTimestamp: arkitTimestamp,
-            insta360Timestamp: 0,
-            mediaIdentifier: ""
-        )
+        return await withCheckedContinuation { continuation in
+            let options = INSTakePictureOptions()
+            INSCameraManager.socket().commandsImpl.takePicture(with: options) { [weak self] error, photoInfo in
+                guard let self, error == nil, let uri = photoInfo?.uri else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                let insta360Ts = Date().timeIntervalSince1970
+                self.pendingURIs.append((scanIndex: scanIndex, uri: uri))
+                continuation.resume(returning: Insta360CaptureResult(
+                    cameraId: self.id,
+                    scanIndex: scanIndex,
+                    arkitTimestamp: arkitTimestamp,
+                    insta360Timestamp: insta360Ts,
+                    mediaIdentifier: uri
+                ))
+            }
+        }
     }
 
-    func downloadPending() async -> [Insta360DownloadResult] {
-        // TODO: Download media files from camera via SDK
-        return []
+    // MARK: - Download
+
+    func downloadPending(into directory: URL) async -> [Insta360DownloadResult] {
+        guard isConnected, !pendingURIs.isEmpty else { return [] }
+        let toDownload = pendingURIs
+        pendingURIs.removeAll()
+
+        return await withTaskGroup(of: Insta360DownloadResult?.self) { group in
+            for item in toDownload {
+                group.addTask {
+                    await self.downloadOne(scanIndex: item.scanIndex, uri: item.uri, into: directory)
+                }
+            }
+            var results: [Insta360DownloadResult] = []
+            for await result in group {
+                if let r = result { results.append(r) }
+            }
+            return results
+        }
+    }
+
+    // MARK: - Private
+
+    private func downloadOne(scanIndex: Int, uri: String, into directory: URL) async -> Insta360DownloadResult? {
+        let destURL = directory
+            .appendingPathComponent(id)
+            .appendingPathComponent(String(format: "scan_%03d.jpg", scanIndex))
+
+        try? FileManager.default.createDirectory(
+            at: destURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        return await withCheckedContinuation { continuation in
+            INSCameraManager.socket().commandsImpl.fetchResource(
+                withURI: uri,
+                toLocalFile: destURL,
+                progress: nil
+            ) { error in
+                if error != nil {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: Insta360DownloadResult(
+                    cameraId: self.id,
+                    scanIndex: scanIndex,
+                    localURL: destURL,
+                    mediaType: .equirectangular
+                ))
+            }
+        }
+    }
+
+    private func startHeartbeat() {
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: kHeartbeatInterval, repeats: true) { _ in
+            INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+        }
+    }
+
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
     }
 }

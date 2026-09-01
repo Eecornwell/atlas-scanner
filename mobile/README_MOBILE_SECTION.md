@@ -73,26 +73,63 @@ Camera models: `PINHOLE` (fx, fy, cx, cy) for iPhone, `SIMPLE_PINHOLE` (f, cx, c
 
 ### Calibration
 
-Uses the same extrinsic calibration procedure as the desktop Atlas scanner:
+Extrinsic calibration runs **on-device** in the iOS app — no host computer required.
 
-1. **Physical seed** — measure XYZ offset and approximate RPY from mount geometry
-2. **Feature matching** — SuperGlue on LiDAR intensity projected to ERP vs Insta360 panorama (port of `find_matches_superglue_erp.py`)
-3. **Iterative refinement** — optimize 6-DOF to minimize reprojection error (port of `tune_calibration.py`)
-4. **Verification** — visual overlay of colorized LiDAR on panorama (port of `verify_seed_overlay.py`)
+1. Start a session, point the rig at a textured scene
+2. Navigate to **Calibration** tab
+3. Enter physical mount measurements (forward/left/up in inches)
+4. Tap **Capture Frame** 3–5 times from slightly different positions
+5. Tap **Run Optimisation** — Nelder-Mead 6-DOF refinement runs on-device
+6. Review the verification overlay (edge alignment + depth dots)
+7. Tap **Save to Device** — writes refined extrinsic to `Documents/atlas_sessions/multi_camera.yaml`
 
-Calibration stored in `config/multi_camera.yaml` (same format as desktop `fusion_calibration.yaml`).
+The saved `multi_camera.yaml` is automatically loaded by the app on next launch (takes priority over the bundled default). The same file is included in every exported session so the offline pipeline uses the correct extrinsic.
+
+Calibration stored in `Documents/atlas_sessions/multi_camera.yaml` (same format as desktop `fusion_calibration.yaml`).
 
 ### Offline Enhancement Pipeline
 
-Heavy ML processing runs on a GPU workstation after capture:
+Three export modes are available after each session:
 
-- **PromptDA** — uses sparse iPhone LiDAR as a prompt to guide Depth Anything V2, producing dense metrically-accurate depth at RGB resolution
-- **StableNormal** — diffusion-based surface normal estimation from RGB, captures fine geometry even with reflections/transparency
-- **COLMAP assembly** — combines enhanced depth, Insta360 face tiles, and poses into the final COLMAP model
+| Mode | Where it runs | What it produces |
+|---|---|---|
+| **COLMAP Only** (default) | On-device, instant | `colmap/sparse/0/` binary model — ready for splat-toolbox |
+| **Full On-Device** | On-device via CoreML (ANE) | COLMAP + dense depth (PromptDA) + normals (StableNormal YOSO) |
+| **Host Processing** | GPU workstation via `enhance_server.py` | COLMAP + full PromptDA ViT-L + StableNormal diffusion refinement |
+
+The export sheet appears automatically after ending a session, and is also accessible from the Sessions list via long-press on any session.
 
 ```
-Capture (iPhone)  →  Transfer  →  PromptDA + StableNormal (GPU)  →  COLMAP model  →  splat-toolbox
+Capture (iPhone)
+  └─ End Session
+       ├─ COLMAP Only      → colmap/ ready immediately
+       ├─ Full On-Device   → CoreML PromptDA + StableNormal YOSO on ANE
+       └─ Host Processing  → ZIP upload → enhance_server.py → download results
 ```
+
+#### Host processing setup
+
+```bash
+# On workstation (same WiFi network as iPhone)
+cd mobile/offline_pipeline
+bash setup.sh          # first time only
+python3 enhance_server.py
+# Prints: Local IP: http://192.168.1.X:8765
+# Enter this URL in the app under Host Processing mode
+```
+
+#### On-device CoreML models
+
+Run once on a Mac to convert PromptDA and StableNormal to CoreML:
+
+```bash
+cd mobile/offline_pipeline
+python3 convert_models.py
+# Outputs: AtlasMobile/Resources/PromptDA.mlpackage
+#          AtlasMobile/Resources/StableNormal.mlpackage
+```
+
+Then drag both `.mlpackage` files into the Xcode project (Add to targets: AtlasMobile).
 
 ### Masks
 
@@ -109,51 +146,68 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
 
 ### TODO
 
-#### Phase 1: ARKit Capture Prototype
-- [ ] ARSession with scene depth + smoothed scene depth enabled
-- [ ] Save RGB frames as JPEG with correct orientation
-- [ ] Save depth maps as Float32 binary (256×192)
-- [ ] Save confidence maps as uint8 binary
-- [ ] Save pose.json per scan (4×4 transform, intrinsics, timestamps)
-- [ ] Record continuous trajectory (all ARKit poses)
-- [ ] Simple SwiftUI interface (start/stop session, trigger capture)
-- [ ] Export session to Files app
-- [ ] Validate: load saved data in Python, verify intrinsics and poses are correct
+#### Phase 1: ARKit Capture Prototype ✅
+- [x] ARSession with scene depth + smoothed scene depth enabled
+- [x] Save RGB frames as JPEG (`CIImage` + `CIContext.jpegRepresentation`)
+- [x] Save depth maps as Float32 binary (256×192)
+- [x] Save confidence maps as uint8 binary
+- [x] Save pose.json per scan (4×4 transform, intrinsics, timestamps)
+- [x] Record continuous trajectory (ARKit delegate `didUpdate frame` → `TrajectoryRecorder`)
+- [x] Simple SwiftUI interface (start/stop session, trigger capture)
+- [x] Export session to Files app (`UIActivityViewController` + `ShareSheet`)
+- [ ] **Validate:** load saved data in Python, verify intrinsics and poses are correct
 
-#### Phase 2: Insta360 Integration
-- [ ] Integrate Insta360 CameraSDK (CocoaPods or manual framework)
-- [ ] WiFi camera discovery and connection
-- [ ] Programmatic capture trigger via SDK
-- [ ] Capture completion callback handling
-- [ ] Media download from camera to app sandbox
-- [ ] Per-camera clock offset estimation (N-sample median)
-- [ ] Multi-camera support (discover and manage N cameras from `multi_camera.yaml`)
-- [ ] Validate: timestamps, clock offset stability, download reliability
+#### Phase 2: Insta360 Integration ✅
+- [x] Integrate Insta360 CameraSDK (manual `.xcframework` embed)
+- [x] WiFi camera discovery and connection (`INSSocketDevice` + KVO on `cameraState`)
+- [x] Programmatic capture trigger (`takePicture(with:completion:)`)
+- [x] Capture completion callback handling (URI queued for download)
+- [x] Media download from camera (`fetchResource(withURI:toLocalFile:)`)
+- [x] Per-camera clock offset estimation (`syncTimeMsToCamera`, saved to `clock_offset_samples.json`)
+- [x] Multi-camera support (parallel connect/capture/download over `multi_camera.yaml`)
+- [x] Heartbeat timer (0.5 s, required for WiFi stability)
+- [ ] **Validate:** timestamps, clock offset stability, download reliability on device
 
-#### Phase 3: COLMAP Export
-- [ ] ERP → perspective tile slicing (port from `panorama_sfm_colmap.py`)
-- [ ] ARKit → COLMAP coordinate transform (`R_ARKIT2COLMAP`)
-- [ ] Derive Insta360 tile poses from rigid extrinsic + ARKit pose
-- [ ] Write cameras.bin (PINHOLE for iPhone, SIMPLE_PINHOLE for tiles)
-- [ ] Write images.bin (quaternion wxyz + translation, all cameras)
-- [ ] Write points3D.bin (from LiDAR depth unprojection)
-- [ ] Write rigs.bin + frames.bin for rig-aware BA
-- [ ] Mask slicing (ERP mask → per-face-tile masks)
-- [ ] Depth map export as uint16 PNG in millimeters
-- [ ] Validate: open output in COLMAP GUI, ingest into splat-toolbox
+#### Phase 3: COLMAP Export ✅
+- [x] ERP → perspective tile slicing (`erp_tile_slicer.py` — atlas-exact 8-face layout, Lanczos)
+- [x] ARKit → COLMAP coordinate transform (`R_ARKIT2COLMAP = diag(1,-1,-1)`)
+- [x] Derive Insta360 tile poses from rigid extrinsic + ARKit pose
+- [x] Write `cameras.bin` (PINHOLE for iPhone, SIMPLE_PINHOLE for tiles)
+- [x] Write `images.bin` (quaternion wxyz + translation, all cameras)
+- [x] Write `points3D.bin` (from LiDAR depth unprojection)
+- [x] Depth map export as uint16 PNG in millimeters (`depth_images/`)
+- [x] On-device export wired into `endSession()` (`COLMAPExporter.swift`)
+- [x] Offline assembly script (`assemble_colmap.py`) with baseline filter + mask slicing
+- [x] Write `rigs.bin` + `frames.bin` for rig-aware BA (one rig per session, iPhone as ref sensor)
+- [ ] **Validate:** open output in COLMAP GUI, ingest into splat-toolbox
 
-#### Phase 4: Offline Enhancement
-- [ ] PromptDA integration (`enhance_session.py`)
-- [ ] StableNormal integration (`enhance_session.py`)
-- [ ] Enhanced COLMAP model assembly with dense depth + normals
-- [ ] Validate: compare 3DGS quality with vs without enhancement
+#### Phase 4: Offline Enhancement ✅
+- [x] `setup.sh` — installs PromptDA, StableNormal, Flask, coremltools, and all Python deps
+- [x] `ExportMode` enum — three modes: COLMAP Only, Full On-Device, Host Processing
+- [x] `SessionExportView` — SwiftUI sheet shown after `endSession()` and from Sessions list
+- [x] `PostProcessingManager` — on-device CoreML inference for PromptDA + StableNormal YOSO
+- [x] `HostUploader` — pure-Swift zip writer (Compression framework, no SPM dependency) + real inflate for download
+- [x] `enhance_server.py` — Flask server: receives zip, runs `enhance_session.py`, streams log, serves result zip
+- [x] `convert_models.py` — one-time CoreML conversion of PromptDA ViT-L + StableNormal YOSO (macOS)
+- [x] PromptDA integration (`enhance_session.py` Stage 1 — sparse depth → dense uint16 PNG)
+- [x] StableNormal integration (`enhance_session.py` Stage 2 — RGB → normal map PNG)
+- [x] COLMAP assembly wired as Stage 3 in `enhance_session.py`
+- [ ] **Validate:** compare 3DGS quality with vs without enhancement
+- [ ] **Validate:** CoreML models on A16 — confirm ANE dispatch and per-scan timing
 
-#### Phase 5: Calibration Tooling
-- [ ] Port `physical_seed.py` for initial extrinsic guess
-- [ ] Port `find_matches_superglue_erp.py` for feature matching (adapt for sparse iPhone LiDAR)
-- [ ] Port `tune_calibration.py` for iterative refinement
-- [ ] Port `verify_seed_overlay.py` for visual verification
-- [ ] Validate: overlay accuracy on test captures
+#### Phase 5: Calibration Tooling ✅
+- [x] Physical seed from mount measurements (forward/left/up inches + RPY degrees in `CalibrationView`)
+- [x] Project iPhone LiDAR depth into ERP intensity image (`CalibrationOverlayRenderer`, `ExtrinsicOptimizer`)
+- [x] Nelder-Mead 6-DOF optimisation on ERP edge-alignment cost — **on-device, no SuperGlue needed** (`ExtrinsicOptimizer.swift`)
+- [x] Visual overlay verification — edge alignment + depth dots composite (`CalibrationOverlayRenderer.swift`)
+- [x] `CalibrationView` — SwiftUI UI: seed inputs, capture frames, run optimisation, overlay display, save
+- [x] Saves refined extrinsic to `Documents/atlas_sessions/multi_camera.yaml` (auto-loaded on next launch)
+- [x] `MultiCameraConfig.saveToDocuments()` + `loadFromDeviceOrBundle()` priority chain
+- [ ] **Validate:** overlay accuracy on test captures with known geometry
+
+> Calibration runs entirely on-device. No host computer required. The offline pipeline
+> (`calibrate_extrinsic.py`) remains available as a higher-accuracy alternative using
+> SuperGlue feature matching when a GPU workstation is available.
 
 #### Phase 6: Polish
 - [ ] Capture guidance UI (coverage indicator, scan quality, pose tracking status)
@@ -215,38 +269,49 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
 
 1. **Prerequisites**
     - Python 3.10+
-    - uv package manager
-    - CUDA GPU (for PromptDA/StableNormal)
+    - CUDA GPU recommended (≥8 GB VRAM for PromptDA + StableNormal)
+    - Internet connection on first run (model weights downloaded from HuggingFace, ~2–4 GB)
 
 2. **Install dependencies**
     ```bash
     cd mobile/offline_pipeline
-    uv sync
+    bash setup.sh
     ```
+    Re-running is safe — all steps are idempotent. Skips torch if a CUDA build is already present.
 
 3. **Run enhancement pipeline**
     ```bash
-    # Transfer session from iPhone to workstation first
-    uv run python enhance_session.py --session-dir /path/to/session_2026-08-24_10-30-00
+    # Transfer session from iPhone to workstation first (AirDrop / USB / WiFi)
+    python3 enhance_session.py --session-dir /path/to/session_2026-08-24_10-30-00
+    ```
+    Stages run in order: PromptDA → StableNormal → COLMAP assembly.
+    Use `--skip-depth` or `--skip-normals` to run individual stages.
+
+4. **Run COLMAP assembly only**
+    ```bash
+    python3 assemble_colmap.py --session-dir /path/to/session_2026-08-24_10-30-00
     ```
 
-4. **Run calibration**
+5. **Run calibration**
     ```bash
-    uv run python calibrate_extrinsic.py \
+    python3 calibrate_extrinsic.py \
         --session-dir /path/to/calibration_session \
         --camera-id insta360_primary \
         --seed-from-physical \
         --seed-y 0.05 --seed-z 0.03
     ```
 
-5. **Slice ERP tiles (standalone)**
+6. **Slice ERP tiles (standalone)**
     ```bash
-    uv run python erp_tile_slicer.py \
+    python3 erp_tile_slicer.py \
         --erp-image /path/to/panorama.jpg \
-        --output-dir /path/to/output/ \
+        --output-dir /path/to/colmap/images/ \
+        --scan-name scan_000 \
         --mask /path/to/masks/insta360_primary.png
     ```
 
 ### Specification
 
 See [docs/spec.md](docs/spec.md) for the full technical specification.
+
+See [docs/setup-and-testing.md](docs/setup-and-testing.md) for Xcode project setup, SDK embedding, device provisioning, and per-phase validation.

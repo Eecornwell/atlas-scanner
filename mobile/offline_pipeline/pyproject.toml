@@ -9,7 +9,20 @@ dependencies = [
     "open3d>=0.18",
     "scipy>=1.11",
     "torch>=2.1",
+    "torchvision>=0.16",
     "Pillow>=10.0",
+    "pyyaml>=6.0",
+    # HuggingFace / diffusion stack (PromptDA + StableNormal)
+    "huggingface_hub>=0.23",
+    "transformers>=4.40",
+    "diffusers>=0.28",
+    "accelerate>=0.30",
+    "timm>=1.0",
+    "einops>=0.7",
+    # Host server
+    "flask>=3.0",
+    # PromptDA and StableNormal are installed as local editable packages
+    # by setup.sh from models/PromptDA and models/StableNormal.
 ]
 
 [project.optional-dependencies]

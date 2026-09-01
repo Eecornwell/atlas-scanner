@@ -17,6 +17,10 @@ struct ContentView: View {
                 NavigationLink("Sessions") {
                     SessionListView()
                 }
+
+                NavigationLink("Calibration") {
+                    CalibrationView()
+                }
             }
             .padding()
             .navigationTitle("Atlas Mobile")
