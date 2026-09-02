@@ -85,6 +85,7 @@ cameras:
     calibration: calibrations/x3/right/fusion_calibration.yaml
     mounting_orientation: [177.425, 0.438, -119.584]
     seed_position: [-2.728, 4.359, -0.502]
+    photo_sub_mode: 1    # 1=HDR via FUNCTION_MODE_HDR_IMAGE
   cam_2:
     serial: "XXXXXXXXXXXXXX"
     camera_hw: onex2

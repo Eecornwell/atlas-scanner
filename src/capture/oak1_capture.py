@@ -381,6 +381,8 @@ def main():
                     _frames_ok += 1
                     if _f.getCvFrame().mean() > 40:
                         _bright_ok = True
+                if _frames_ok >= 6 and _bright_ok:
+                    break  # stable early — no need to wait the full 5s
                 time.sleep(0.05)
             if _frames_ok == 0:
                 raise RuntimeError("No frames during stability soak")

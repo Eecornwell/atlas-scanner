@@ -28,8 +28,8 @@ min_range: 0.3
 max_correspondance_distance: 1.0  # 5x voxel_size; large enough to survive IMU prediction error
 convergence_criterion: 0.001
 max_num_threads: 0           # 0 = use all available cores
-max_expected_jerk: 1.0
-min_beta: 50.0               # reduced from 200: let geometry override IMU when they disagree
+max_expected_jerk: 5.0       # raised from 1.0: allows recovery from accidental bumps without diverging
+min_beta: 200.0              # raised from 50: trust IMU strongly during sudden motion
 double_downsample: false     # use full voxel_size keypoints for ICP
 max_lidar_buffer_size: 5     # keep queue tiny so stale frames are dropped quickly, not replayed
 

@@ -6,6 +6,15 @@ erp_width: 7680
 erp_height: 3840
 # Capture resolution: Size_6912_3456 (enum 0, X3 native 18MP equirectangular)
 photo_size_enum: 0
+# HDR mode capture resolution: X3 firmware caps HDR at Size_5952_2976 (enum 12).
+# Enum 0 (6912x3456) is silently ignored under FUNCTION_MODE_HDR_IMAGE and the
+# firmware falls back to 5952x2976. Set explicitly so apply_camera_settings
+# uses the correct enum when photo_sub_mode=1 (HDR).
+photo_size_enum_hdr: 12
+# EV bias for HDR mode: +2 lifts shadow exposure without affecting the X5.
+# HDR auto-exposure meters toward highlights, leaving shadows underexposed.
+# Range: -8 to +8 (Insta360 SDK units, each step ~0.5 EV).
+ev_bias_hdr: 2
 # White balance: 0=AUTO (matches X5 for multi-camera consistency)
 white_balance: 0
 # Exposure mode: 0=AUTO (matches X5 for multi-camera consistency)

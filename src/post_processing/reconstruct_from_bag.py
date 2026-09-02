@@ -1149,6 +1149,47 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     print(f"\n  Session duration: {duration:.1f}s  →  {len(centres)} scans "
           f"(camera-driven, min_gap={interval}s, lidar_window={lidar_window}s)")
 
+    # -----------------------------------------------------------------------
+    # Detect SLAM divergence windows from odometry velocity.
+    # When RKO-LIO loses tracking (e.g. scanner bumped), the odometry jumps
+    # at implausible speed. Mark any scan whose capture time falls within
+    # a divergence window with .slam_diverged so merge/ICP skip it.
+    # -----------------------------------------------------------------------
+    _diverged_windows = []  # list of (t_start, t_end) in Livox clock
+    if odom_msgs and len(odom_msgs) > 1:
+        _MAX_PLAUSIBLE_SPEED = 3.0   # m/s — faster than any walking speed
+        _DIVERGE_MARGIN     = 2.0   # seconds of buffer around the bad window
+        _odom_arr = np.array([[ts, om.pose.pose.position.x,
+                                   om.pose.pose.position.y,
+                                   om.pose.pose.position.z]
+                              for ts, om in odom_msgs])
+        _speeds = []
+        for _i in range(1, len(_odom_arr)):
+            _dt = _odom_arr[_i, 0] - _odom_arr[_i-1, 0]
+            _dp = np.linalg.norm(_odom_arr[_i, 1:] - _odom_arr[_i-1, 1:])
+            _speeds.append(_dp / _dt if _dt > 0 else 0.0)
+        _speeds = np.array(_speeds)
+        _bad = np.where(_speeds > _MAX_PLAUSIBLE_SPEED)[0]
+        if len(_bad):
+            # Merge consecutive bad indices into windows
+            _win_start = _odom_arr[_bad[0], 0] - _DIVERGE_MARGIN
+            _win_end   = _odom_arr[_bad[0] + 1, 0] + _DIVERGE_MARGIN
+            for _bi in _bad[1:]:
+                _t = _odom_arr[_bi, 0]
+                if _t - _win_end < 5.0:  # extend existing window
+                    _win_end = _odom_arr[_bi + 1, 0] + _DIVERGE_MARGIN
+                else:  # new window
+                    _diverged_windows.append((_win_start, _win_end))
+                    _win_start = _t - _DIVERGE_MARGIN
+                    _win_end   = _odom_arr[_bi + 1, 0] + _DIVERGE_MARGIN
+            _diverged_windows.append((_win_start, _win_end))
+            for _ws, _we in _diverged_windows:
+                print(f"  ⚠ SLAM divergence detected: t+{_ws-t_start:.1f}s to t+{_we-t_start:.1f}s "
+                      f"(max speed {_speeds[_bad].max():.1f} m/s) — scans in this window will be marked")
+
+    def _is_diverged(t):
+        return any(_ws <= t <= _we for _ws, _we in _diverged_windows)
+
     scan_count = 0
     for idx, (centre, img_idx) in enumerate(centres):
         scan_num = idx + 1
@@ -1390,6 +1431,12 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         motion_warn = f'  ⚠ moved during capture: {_dangle:.0f}deg / {_dpos:.2f}m over {_latency:.1f}s'
         print(f"  ✓ {scan_name}: {len(all_points)} pts  "
               f"img_dt={dt_img:.3f}s  odom_dt={dt_odom:.3f}s{motion_warn}")
+        # Mark scan as SLAM-diverged if its capture time falls in a bad window
+        if _is_diverged(centre):
+            (scan_dir / '.slam_diverged').write_text(
+                f'SLAM divergence at t+{centre-t_start:.1f}s '
+                f'(odometry velocity exceeded 3.0m/s near this scan)')
+            print(f"  26a0 {scan_name}: marked .slam_diverged (unreliable pose 2014 excluded from merge)")
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 

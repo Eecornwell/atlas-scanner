@@ -197,42 +197,52 @@ def create_scan_toggle_viewer(session_dir, use_icp=False):
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
 <style>
-  body {{ margin:0; background:#111; font-family:monospace; color:#eee; display:flex; }}
-  #panel {{ width:320px; min-width:320px; padding:10px; overflow-y:auto; background:#1a1a1a;
-            border-right:1px solid #333; font-size:12px; }}
-  #canvas-container {{ flex:1; position:relative; }}
-  h3 {{ margin:4px 0; color:#adf; font-size:13px; }}
-  .scan-row {{ margin:4px 0; padding:4px 6px; background:#222; border-radius:4px;
-               border-left:3px solid #555; cursor:pointer; }}
-  .scan-row:hover {{ background:#2a2a2a; }}
-  .scan-row label {{ cursor:pointer; display:block; }}
-  .scan-name {{ color:#7cf; font-weight:bold; }}
-  .scan-info {{ color:#888; font-size:10px; margin-top:2px; }}
-  #controls {{ margin-top:10px; padding:6px; background:#222; border-radius:4px; }}
-  button {{ background:#333; color:#eee; border:1px solid #555; padding:4px 8px;
-            border-radius:3px; cursor:pointer; margin:2px; font-size:11px; }}
-  button:hover {{ background:#444; }}
-  #status {{ margin-top:8px; color:#888; font-size:11px; }}
+  * {{ box-sizing:border-box; margin:0; padding:0; }}
+  body {{ background:#111; font-family:monospace; color:#eee; overflow:hidden; }}
+  #canvas-container {{ width:100vw; height:100vh; }}
+  #overlay {{
+    position:fixed; top:8px; left:8px; z-index:10;
+    background:rgba(20,20,20,0.82); border:1px solid #444;
+    border-radius:6px; padding:6px 8px; max-width:calc(100vw - 16px);
+    backdrop-filter:blur(4px);
+  }}
+  #top-bar {{ display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-bottom:5px; }}
+  #top-bar button {{
+    background:#333; color:#eee; border:1px solid #555; padding:3px 7px;
+    border-radius:3px; cursor:pointer; font-size:11px;
+  }}
+  #top-bar button:hover {{ background:#555; }}
+  #size-row {{ display:flex; align-items:center; gap:5px; font-size:11px; color:#aaa; }}
+  #size-row input {{ width:80px; }}
+  #scan-grid {{
+    display:flex; flex-wrap:wrap; gap:3px; max-height:calc(100vh - 80px);
+    overflow-y:auto; padding-right:2px;
+  }}
+  .sb {{
+    width:44px; height:22px; font-size:10px; font-family:monospace;
+    border-radius:3px; border:1px solid #555; cursor:pointer;
+    background:#2a2a2a; color:#7cf; text-align:center; line-height:20px;
+    transition:background 0.1s;
+  }}
+  .sb.off {{ background:#1a1a1a; color:#555; border-color:#333; }}
+  .sb:hover {{ border-color:#aaa; }}
+  #status {{ font-size:10px; color:#666; margin-top:4px; }}
 </style>
 </head>
 <body>
-<div id="panel">
-  <h3>Scan Toggle Viewer</h3>
-  <div style="color:#888;font-size:10px;margin-bottom:8px">{session.name}<br>Trajectory poses only (no ICP)</div>
-  <div id="controls">
-    <button onclick="toggleAll(true)">Show All</button>
-    <button onclick="toggleAll(false)">Hide All</button>
-    <button onclick="showOnly(0)">First Only</button>
-    <div style="margin-top:6px">
-      <label style="font-size:11px">Point size: <span id="size-val">0.04</span></label><br>
-      <input type="range" min="1" max="100" value="40" style="width:100%"
-             oninput="updatePointSize(this.value)">
-    </div>
+<div id="canvas-container"></div>
+<div id="overlay">
+  <div id="top-bar">
+    <b style="font-size:12px;color:#adf">{session.name}</b>
+    <button onclick="toggleAll(true)">All</button>
+    <button onclick="toggleAll(false)">None</button>
+    <button onclick="showOnly(0)">First</button>
+    <div id="size-row">sz:<input type="range" min="1" max="100" value="40"
+      oninput="updatePointSize(this.value)"><span id="size-val">0.04</span></div>
   </div>
-  <div id="scan-list" style="margin-top:8px"></div>
+  <div id="scan-grid"></div>
   <div id="status"></div>
 </div>
-<div id="canvas-container"></div>
 
 <script>
 const scansData = {scans_data_js};
@@ -241,11 +251,10 @@ const scanColors = {{}};
 {scan_arrays_js}
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 500);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 500);
 const renderer = new THREE.WebGLRenderer({{antialias:true}});
-const container = document.getElementById('canvas-container');
-renderer.setSize(container.clientWidth || window.innerWidth - 320, window.innerHeight);
-container.appendChild(renderer.domElement);
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.getElementById('canvas-container').appendChild(renderer.domElement);
 
 const controls = new THREE.OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -260,15 +269,12 @@ function buildScan(name) {{
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   if (col) geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
   const mat = new THREE.PointsMaterial({{
-    size: 0.04,
-    vertexColors: !!col,
-    color: col ? 0xffffff : 0x44aaff,
-    sizeAttenuation: true,
+    size: 0.04, vertexColors: !!col,
+    color: col ? 0xffffff : 0x44aaff, sizeAttenuation: true,
   }});
   return new THREE.Points(geo, mat);
 }}
 
-// Build all scans and add to scene
 let allPts = [];
 scansData.forEach((s, idx) => {{
   const mesh = buildScan(s.name);
@@ -280,7 +286,6 @@ scansData.forEach((s, idx) => {{
     allPts.push(new THREE.Vector3(pos[i], pos[i+1], pos[i+2]));
 }});
 
-// Center camera
 const box = new THREE.Box3().setFromPoints(allPts);
 const center = box.getCenter(new THREE.Vector3());
 const size = box.getSize(new THREE.Vector3());
@@ -288,67 +293,63 @@ const maxDim = Math.max(size.x, size.y, size.z);
 camera.position.set(center.x, center.y + maxDim * 0.3, center.z + maxDim * 1.5);
 controls.target.copy(center);
 
-// Build UI
-const list = document.getElementById('scan-list');
+// Build compact scan grid — one numbered button per scan
+const grid = document.getElementById('scan-grid');
 const hues = scansData.map((_, i) => Math.round(i * 360 / scansData.length));
 scansData.forEach((s, idx) => {{
   const hue = hues[idx];
-  const row = document.createElement('div');
-  row.className = 'scan-row';
-  row.style.borderLeftColor = `hsl(${{hue}},70%,50%)`;
-  row.innerHTML = `
-    <label>
-      <input type="checkbox" checked onchange="setScanVisible('${{s.name}}', this.checked)">
-      <span class="scan-name">${{s.name}}</span>
-      <span style="color:hsl(${{hue}},70%,60%);font-size:10px"> ● ${{s.count}} pts</span>
-      <div class="scan-info">${{s.label.split('|').slice(1).join('|')}}</div>
-    </label>`;
-  row.addEventListener('dblclick', () => showOnly(idx));
-  list.appendChild(row);
-  // Color the mesh by scan index for easy identification when toggling
-  // (keep vertex colors as primary, but allow override)
+  const btn = document.createElement('div');
+  btn.className = 'sb';
+  btn.title = s.label;
+  btn.style.borderColor = `hsl(${{hue}},60%,45%)`;
+  btn.style.color = `hsl(${{hue}},70%,65%)`;
+  btn.textContent = s.name.replace('fusion_scan_', '');
+  btn.addEventListener('click', (e) => {{
+    if (e.shiftKey) {{ showOnly(idx); return; }}
+    const v = !scanVisible[s.name];
+    setScanVisible(s.name, v, btn);
+  }});
+  btn.addEventListener('dblclick', () => showOnly(idx));
+  grid.appendChild(btn);
 }});
 
-function setScanVisible(name, visible) {{
+function setScanVisible(name, visible, btn) {{
   if (scanMeshes[name]) scanMeshes[name].visible = visible;
   scanVisible[name] = visible;
+  if (btn) btn.classList.toggle('off', !visible);
   updateStatus();
 }}
 
 function toggleAll(visible) {{
-  scansData.forEach(s => {{
-    setScanVisible(s.name, visible);
-    const cb = list.querySelectorAll('input[type=checkbox]');
-    cb.forEach(c => c.checked = visible);
+  const btns = grid.querySelectorAll('.sb');
+  scansData.forEach((s, i) => {{
+    setScanVisible(s.name, visible, btns[i]);
   }});
 }}
 
 function showOnly(idx) {{
+  const btns = grid.querySelectorAll('.sb');
   scansData.forEach((s, i) => {{
-    const v = (i === idx);
-    setScanVisible(s.name, v);
+    setScanVisible(s.name, i === idx, btns[i]);
   }});
-  const cbs = list.querySelectorAll('input[type=checkbox]');
-  cbs.forEach((c, i) => c.checked = (i === idx));
 }}
 
 function updateStatus() {{
   const n = Object.values(scanVisible).filter(Boolean).length;
-  document.getElementById('status').textContent = `${{n}}/${{scansData.length}} scans visible`;
+  document.getElementById('status').textContent = n + '/' + scansData.length + ' visible  |  shift+click=isolate  dbl=isolate';
 }}
 
 function updatePointSize(val) {{
-  const size = val / 1000;
-  document.getElementById('size-val').textContent = size.toFixed(3);
-  Object.values(scanMeshes).forEach(m => m.material.size = size);
+  const s = val / 1000;
+  document.getElementById('size-val').textContent = s.toFixed(3);
+  Object.values(scanMeshes).forEach(m => m.material.size = s);
 }}
 updateStatus();
 
 window.addEventListener('resize', () => {{
-  const w = container.clientWidth || window.innerWidth - 320;
-  camera.aspect = w / window.innerHeight;
+  camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(w, window.innerHeight);
+  renderer.setSize(window.innerWidth, window.innerHeight);
 }});
 
 function animate() {{

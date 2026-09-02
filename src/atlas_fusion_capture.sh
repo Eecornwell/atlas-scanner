@@ -89,7 +89,54 @@ else
     _HW_DISPLAY="$CAMERA_HW"
 fi
 export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
-[ -n "$INSTA360_PHOTO_SIZE" ] && export INSTA360_PHOTO_SIZE_DEFAULT="$INSTA360_PHOTO_SIZE"
+# Build per-slot photo sizes and sub-modes from multi_camera.yaml.
+# Always done when multi_camera.yaml exists — the SDK ignores settings
+# for cameras that aren't connected.
+if [ -f "$SCRIPT_DIR/config/multi_camera.yaml" ]; then
+    _cam_photo_sizes=$(ATLAS_SRC="$SCRIPT_DIR" python3 -c "
+import yaml, pathlib, os
+src = os.environ['ATLAS_SRC']
+d = yaml.safe_load(open(src + '/config/multi_camera.yaml'))
+cams = d.get('cameras', {})
+sizes = []; sizes_hdr = []; sub_modes = []; ev_biases_hdr = []
+for i in range(3):
+    c = cams.get(f'cam_{i}', {})
+    hw = c.get('camera_hw', '')
+    if not hw: break
+    hw_yaml = pathlib.Path(src) / 'config' / 'camera_models' / f'{hw}.yaml'
+    ps = -1
+    ps_hdr = -1
+    if hw_yaml.exists():
+        hd = yaml.safe_load(hw_yaml.read_text())
+        v = hd.get('photo_size_enum')
+        if v is not None: ps = int(v)
+        vh = hd.get('photo_size_enum_hdr')
+        if vh is not None: ps_hdr = int(vh)
+        vev = hd.get('ev_bias_hdr')
+        if vev is not None: ev_biases_hdr.append(str(int(vev)))
+        else: ev_biases_hdr.append('0')
+    else:
+        ev_biases_hdr.append('0')
+    sizes.append(str(ps))
+    sizes_hdr.append(str(ps_hdr))
+    sub_modes.append(str(c.get('photo_sub_mode', 0)))
+print(','.join(sizes))
+import sys; print(','.join(sub_modes), file=sys.stderr); print(','.join(sizes_hdr), file=sys.stderr); print(','.join(ev_biases_hdr), file=sys.stderr)
+" 2>/tmp/_atlas_sub_modes_and_hdr)
+    _cam_sub_modes=$(sed -n '1p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
+    _cam_photo_sizes_hdr=$(sed -n '2p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
+    _cam_ev_biases_hdr=$(sed -n '3p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
+    [ -n "$_cam_photo_sizes" ] && export INSTA360_CAMERA_PHOTO_SIZES="$_cam_photo_sizes"
+    [ -n "$_cam_sub_modes" ] && export INSTA360_CAMERA_PHOTO_SUB_MODES="$_cam_sub_modes"
+    [ -n "$_cam_photo_sizes_hdr" ] && export INSTA360_CAMERA_PHOTO_SIZES_HDR="$_cam_photo_sizes_hdr"
+    [ -n "$_cam_ev_biases_hdr" ] && export INSTA360_CAMERA_EV_BIASES_HDR="$_cam_ev_biases_hdr"
+    echo "Camera photo sizes: $_cam_photo_sizes  hdr_sizes: $_cam_photo_sizes_hdr  sub_modes: $_cam_sub_modes  ev_biases_hdr: $_cam_ev_biases_hdr"
+fi
+# Single-camera mode: also set the global photo size default
+_detected_cams_early=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+if [ "${NUM_CAMERAS:-0}" -le 1 ] 2>/dev/null && [ "${_detected_cams_early:-0}" -le 1 ] 2>/dev/null; then
+    [ -n "$INSTA360_PHOTO_SIZE" ] && export INSTA360_PHOTO_SIZE_DEFAULT="$INSTA360_PHOTO_SIZE"
+fi
 [ -n "$INSTA360_WB" ] && export INSTA360_WB
 [ -n "$INSTA360_EXPOSURE_MODE" ] && export INSTA360_EXPOSURE="$INSTA360_EXPOSURE_MODE"
 [ "$USE_AI_STITCH" = "true" ] && export INSTA360_AI_STITCH=1 INSTA360_MODEL_DIR="$SCRIPT_DIR/capture/sdk/models"
@@ -1135,6 +1182,12 @@ for i in range(3):
         fi
         [ -n "$_cam_serials" ] && export INSTA360_CAMERA_SERIALS="$_cam_serials"
     fi
+    # Re-export per-camera settings here in case they were set before SCAN_DIR existed
+    [ -n "$_cam_photo_sizes" ] && export INSTA360_CAMERA_PHOTO_SIZES="$_cam_photo_sizes"
+    [ -n "$_cam_sub_modes" ] && export INSTA360_CAMERA_PHOTO_SUB_MODES="$_cam_sub_modes"
+    [ -n "$_cam_photo_sizes_hdr" ] && export INSTA360_CAMERA_PHOTO_SIZES_HDR="$_cam_photo_sizes_hdr"
+    [ -n "$_cam_ev_biases_hdr" ] && export INSTA360_CAMERA_EV_BIASES_HDR="$_cam_ev_biases_hdr"
+    echo "SDK launch: PHOTO_SIZES=$INSTA360_CAMERA_PHOTO_SIZES SUB_MODES=$INSTA360_CAMERA_PHOTO_SUB_MODES"
     INSTA360_SESSION_DIR="$SCAN_DIR" \
         "$_CAPTURE_BIN" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
     SDK_CAPTURE_PID=$!
@@ -1241,14 +1294,16 @@ print('3')
             > "$SCAN_DIR/oak1_secondary.log" 2>&1 &
         OAK1_SECONDARY_PID=$!
         # Wait for OAK-1 to be ready (max 60s)
-        for _i in $(seq 1 60); do
-            [ -f "$SCAN_DIR/.sdk_ready" ] && break
+        _oak1_wait=0
+        while [ $_oak1_wait -lt 300 ]; do
+            [ -f "$SCAN_DIR/.oak1_ready" ] && break
             if ! kill -0 $OAK1_SECONDARY_PID 2>/dev/null; then
                 echo "✗ oak1_capture.py exited early — check oak1_secondary.log"; exit 1
             fi
-            sleep 1
+            sleep 0.2; _oak1_wait=$((_oak1_wait + 1))
+            [ $((_oak1_wait % 10)) -eq 0 ] && echo "  Waiting for OAK-1... $((_oak1_wait / 5))s"
         done
-        if [ ! -f "$SCAN_DIR/.sdk_ready" ]; then
+        if [ ! -f "$SCAN_DIR/.oak1_ready" ]; then
             echo "✗ OAK-1 secondary timed out waiting for ready"; exit 1
         fi
         echo "✓ Secondary OAK-1 ready"
@@ -1269,6 +1324,7 @@ echo "=========================================="
 
 # ─── Capture loop ─────────────────────────────────────────────────────────────
 if [ "$CAPTURE_MODE" = "continuous" ]; then
+    touch "$SCAN_DIR/.sdk_stitch_continuous"
     echo ""
     echo "=========================================="
     echo "CONTINUOUS MODE: recording session bag"

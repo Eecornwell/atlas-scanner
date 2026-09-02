@@ -1,4 +1,5 @@
 # RKO-LIO Continuous Mode Configuration - Handheld scanner
+# Tuned for both indoor and outdoor use.
 imu_topic: /livox/imu
 lidar_topic: /livox/lidar
 base_frame: base_link
@@ -13,19 +14,23 @@ publish_deskewed_scan: false
 invert_odom_tf: false
 
 deskew: true
-# initialization_phase: true — let scanner settle for 1-2s for gravity estimate
 initialization_phase: true
 extrinsic_imu2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 extrinsic_lidar2base_quat_xyzw_xyz: [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
 
-voxel_size: 0.15             # reduced from 0.2: 20Hz frames have half the points so smaller voxels maintain ICP density
-max_points_per_voxel: 10
-max_range: 20.0
+voxel_size: 0.2              # slightly larger than indoor 0.15: outdoor sparse geometry needs
+                             # denser map representation per voxel for stable ICP matching
+max_points_per_voxel: 20     # doubled: retain more points per voxel for outdoor sparse scenes
+max_range: 40.0              # raised from 20m: outdoor long-range features (building corners,
+                             # tree lines) are the most stable constraints against drift
 min_range: 0.3
-max_correspondance_distance: 0.75  # 5x voxel_size
+max_correspondance_distance: 1.0  # raised from 0.75: outdoor faster walking and open spaces
+                                  # require larger search radius between frames
 convergence_criterion: 0.001
 max_num_threads: 0
-max_expected_jerk: 1.0
-min_beta: 50.0               # strong enough to prevent pitch/roll drift while allowing LiDAR to correct translation/yaw
-double_downsample: false     # use full voxel_size keypoints for ICP
-max_lidar_buffer_size: 10    # doubled from 5: 20Hz means twice as many frames in flight
+max_expected_jerk: 5.0       # allows recovery from accidental bumps without diverging
+min_beta: 100.0              # balanced: trust IMU for short-term stability but allow LiDAR
+                             # geometry to correct IMU drift over long outdoor sessions
+double_downsample: false
+max_lidar_buffer_size: 5     # reduced from 10: smaller buffer drops stale frames faster
+                             # when moving quickly outdoors

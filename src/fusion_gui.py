@@ -1906,8 +1906,8 @@ sys.exit(0 if ok[0] else 4)
         is_continuous_sdk = (any(sess_path.glob('.sdk_shot_*')) or
                              any(sess_path.glob('fusion_scan_*/*.insp')))
         if is_continuous_sdk:
-            cmd += ['--sdk-stitch', '--trim-ends', '0']
-            self._pp_log_write("  Detected continuous SDK-stitch session — adding --sdk-stitch\n")
+            cmd += ['--sdk-stitch', '--trim-ends', '0', '--lidar-window', '0.3']
+            self._pp_log_write("  Detected continuous SDK-stitch session — adding --sdk-stitch --lidar-window 0.3\n")
         self._pp_run("Run Post-Processing", cmd)
 
     def _pp_reprocess(self):

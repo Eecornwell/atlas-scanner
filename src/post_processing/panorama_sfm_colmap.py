@@ -54,15 +54,22 @@ R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 # concentrated in a narrow band and empirically still yield better features
 # than the polar tiles. A dedicated seam mask is applied below to exclude the
 # affected pixel strip.
+# 12 faces: 8 equatorial at 45° yaw steps + 4 elevated at ±30° pitch.
+# Narrower 45° FOV requires more faces for full coverage but gives sharper
+# tiles with less perspective distortion and no upsampling of the ERP.
 FACES = [
-    {'name': 'front',       'pitch':   0, 'yaw':   0},
-    {'name': 'front_left',  'pitch':   0, 'yaw':  45},
-    {'name': 'left',        'pitch':   0, 'yaw':  90},
-    {'name': 'back_left',   'pitch':   0, 'yaw': 135},
-    {'name': 'back',        'pitch':   0, 'yaw': 180},
-    {'name': 'back_right',  'pitch':   0, 'yaw': 225},
-    {'name': 'right',       'pitch':   0, 'yaw': 270},
-    {'name': 'front_right', 'pitch':   0, 'yaw': 315},
+    {'name': 'front',            'pitch':   0, 'yaw':   0},
+    {'name': 'front_left',       'pitch':   0, 'yaw':  45},
+    {'name': 'left',             'pitch':   0, 'yaw':  90},
+    {'name': 'back_left',        'pitch':   0, 'yaw': 135},
+    {'name': 'back',             'pitch':   0, 'yaw': 180},
+    {'name': 'back_right',       'pitch':   0, 'yaw': 225},
+    {'name': 'right',            'pitch':   0, 'yaw': 270},
+    {'name': 'front_right',      'pitch':   0, 'yaw': 315},
+    {'name': 'up_front',         'pitch':  30, 'yaw':   0},
+    {'name': 'up_left',          'pitch':  30, 'yaw':  90},
+    {'name': 'up_back',          'pitch':  30, 'yaw': 180},
+    {'name': 'up_right',         'pitch':  30, 'yaw': 270},
 ]
 FACES_CAM_FROM_PANO = [
     R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
@@ -87,8 +94,15 @@ REF_FACE = 0  # front is ref — must be first in cameras array for rig_configur
 FACES_360 = list(range(NUM_FACES))
 # FACES_180: front hemisphere only (yaw within ±90° of center)
 FACES_180 = [i for i in range(NUM_FACES) if abs(((FACES[i]['yaw'] + 180) % 360) - 180) <= 90]
-FOV_DEG = 65.0
+FOV_DEG = 45.0               # narrower FOV per tile: less perspective distortion at edges,
+                             # better feature quality, avoids upsampling the ERP
+                             # (was 65° — too wide caused blurry/distorted tile edges)
 MIN_BASELINE_M = 0.10
+# Maximum tile size regardless of ERP resolution — caps upsampling artifacts.
+# The Insta360 ERP is stitched/interpolated from fisheye; native detail is
+# limited by the fisheye sensor, not the stitched pixel count.
+# 800px at 45° FOV gives ~17.8px/deg which matches the X5 fisheye resolution.
+MAX_TILE_SIZE = 800
 # Minimum fraction of unmasked pixels for a tile to be included in the COLMAP model.
 # Tiles below this threshold are entirely (or near-entirely) covered by the scanner
 # body mask and contribute no useful features.
@@ -209,33 +223,42 @@ def _load_pose(scan_dir, T_camera_lidar):
 
 
 def _find_erp_image(scan_dir):
-    """Return (path, is_360) — is_360=True for dual fisheye (full sphere)."""
+    """Return (rgb_path, mask_path, is_360).
+    Always use the unmasked JPG for RGB to avoid hard mask edges causing
+    aliasing artifacts when reprojected to perspective tiles. The mask PNG
+    is used separately to filter out scanner-body tiles."""
+    # Prefer unmasked ERP for RGB — no hard black edges from scanner body mask
+    for name in ['equirect_dual_fisheye.jpg']:
+        p = scan_dir / name
+        if p.exists():
+            # Find corresponding mask if available
+            mask_p = scan_dir / 'equirect_dual_fisheye_masked.png'
+            return p, mask_p if mask_p.exists() else None, True
+    # Fallback: masked PNG (older sessions without separate JPG)
     for name in ['equirect_blended_masked.png', 'equirect_dual_fisheye_masked.png',
                  'equirect_dual_fisheye_raw_masked.png']:
         p = scan_dir / name
         if p.exists():
-            return p, True
-    for name in ['equirect_dual_fisheye.jpg']:
-        p = scan_dir / name
-        if p.exists():
-            return p, True
-    # Single fisheye — 180 degree ERP
+            return p, p, True
+    # Single fisheye
     matches = list(scan_dir.glob('equirect_*_masked.png')) + \
               list(scan_dir.glob('equirect_*.jpg')) + \
               list(scan_dir.glob('equirect_*.png'))
     if matches:
-        return matches[0], False
-    return None, False
+        p = matches[0]
+        mask_p = scan_dir / (p.stem + '_masked.png')
+        return p, mask_p if mask_p.exists() else None, False
+    return None, None, False
 
 
 def _tile_size_for_erp(erp_w):
-    """Tile size matched to ERP pixel density at the tile edge latitude.
-    At ±FOV/2 latitude, ERP has cos(FOV/2) fewer px/deg than at equator.
-    Tile px/deg = tile_size / FOV_DEG must not exceed ERP px/deg at the edge
-    to avoid upsampling (which causes grain/blur)."""
+    """Tile size matched to ERP pixel density, capped at MAX_TILE_SIZE to
+    avoid upsampling the stitched/interpolated ERP. The Insta360 fisheye
+    native detail is limited by the sensor, not the stitched pixel count."""
     px_per_deg_equator = erp_w / 360.0
     px_per_deg_edge = px_per_deg_equator * np.cos(np.radians(FOV_DEG / 2))
-    return max(512, int(px_per_deg_edge * FOV_DEG))
+    native = max(512, int(px_per_deg_edge * FOV_DEG))
+    return min(native, MAX_TILE_SIZE)
 
 
 def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LANCZOS4):
@@ -448,11 +471,13 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     )
 
     for scan_dir in scan_dirs:
-        erp_src, is_360 = _find_erp_image(scan_dir)
+        erp_src, erp_mask_src, is_360 = _find_erp_image(scan_dir)
         if erp_src is None:
             continue
         # Skip panoramas where the ERP is almost entirely masked
-        _probe = cv2.imread(str(erp_src), cv2.IMREAD_UNCHANGED)
+        # Use the mask file for visibility check, not the RGB file
+        _probe_path = erp_mask_src if erp_mask_src else erp_src
+        _probe = cv2.imread(str(_probe_path), cv2.IMREAD_UNCHANGED)
         if _probe is not None and _probe.ndim == 3 and _probe.shape[2] == 4:
             _erp_visible = np.count_nonzero(_probe[:, :, 3]) / _probe[:, :, 3].size
             if _erp_visible < MIN_ERP_VISIBLE:
@@ -466,6 +491,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
         panoramas.append({'scan_dir': scan_dir, 'erp_src': erp_src,
+                          'erp_mask_src': erp_mask_src,
                           'center': C_col, 'R_c2w': R_c2w_col, 'R_c2w_ros': R_c2w_ros,
                           'is_360': is_360})
 
@@ -540,9 +566,18 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
               f"f_px={_canonical_f_px:.1f} (using smallest to avoid upsampling)")
 
     for pano_idx, pano in enumerate(panoramas, start=1):
-        erp_img = cv2.imread(str(pano['erp_src']), cv2.IMREAD_UNCHANGED)
+        # Load RGB from unmasked source (JPG) to avoid hard mask edges causing
+        # aliasing/stairstepping when reprojected to perspective tiles.
+        erp_img = cv2.imread(str(pano['erp_src']), cv2.IMREAD_COLOR)
         erp_mask = None
-        if erp_img is not None and erp_img.ndim == 3 and erp_img.shape[2] == 4:
+        # Load mask separately from the masked PNG alpha channel
+        _mask_src = pano.get('erp_mask_src')
+        if _mask_src and _mask_src != pano['erp_src']:
+            _mask_img = cv2.imread(str(_mask_src), cv2.IMREAD_UNCHANGED)
+            if _mask_img is not None and _mask_img.ndim == 3 and _mask_img.shape[2] == 4:
+                erp_mask = _mask_img[:, :, 3]
+        elif erp_img is not None and erp_img.ndim == 3 and erp_img.shape[2] == 4:
+            # Fallback: alpha in the RGB file itself (older masked PNG)
             erp_mask = erp_img[:, :, 3]
             erp_img = erp_img[:, :, :3]
 
@@ -563,6 +598,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
                 erp_mask = np.full(erp_img.shape[:2], 255, dtype=np.uint8)
             erp_mask[:, :_seam_strip] = 0
             erp_mask[:, _erp_w - _seam_strip:] = 0
+            # Mild unsharp mask to recover detail softened by ERP stitching
+            # interpolation. Sigma=1.0, strength=0.4 — enough to sharpen
+            # edges without amplifying compression artifacts.
+            _blur = cv2.GaussianBlur(erp_img, (0, 0), 1.0)
+            erp_img = cv2.addWeighted(erp_img, 1.4, _blur, -0.4, 0)
 
         R_cam_w2c_col = pano['R_c2w'].T
         tiles = []
@@ -1036,6 +1076,16 @@ def _write_oak1_cross_pairs(colmap_dir, erp_panoramas, oak1_panos, session_path,
                 slc = _extract_erp_slice_for_oak1(erp_img, oak1_img.shape, oak1_scan)
                 if slc is None:
                     continue
+                # Downsample slice to ERP native resolution to avoid upsampling
+                # artifacts (stairstepping). The ERP has limited px/deg; rendering
+                # at full OAK-1 size just blows up interpolation artifacts.
+                _erp_native_w = erp_img.shape[1]
+                _fov_px = int(_erp_native_w / 360.0 * 63.6)  # ~OAK-1 HFOV
+                if _fov_px < slc.shape[1]:
+                    _scale = _fov_px / slc.shape[1]
+                    _sw = _fov_px
+                    _sh = max(1, int(slc.shape[0] * _scale))
+                    slc = cv2.resize(slc, (_sw, _sh), interpolation=cv2.INTER_AREA)
                 pano_num = int(erp_p['scan_dir'].name.split('_')[-1])
                 oak1_idx = int(oak1_fname.split('pano_')[1].split('.')[0])
                 slice_fname = f'slice_oak{oak1_idx:03d}_erp{pano_num:03d}.png'

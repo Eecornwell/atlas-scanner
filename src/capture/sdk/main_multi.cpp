@@ -143,7 +143,7 @@ struct CameraSettings {
 };
 static CameraSettings g_settings;
 
-static bool apply_camera_settings(ins_camera::Camera* cam, int cam_idx) {
+static bool apply_camera_settings(ins_camera::Camera* cam, int cam_idx, int per_cam_photo_size = -1, int per_cam_sub_mode = 0, int per_cam_photo_size_hdr = -1, int per_cam_ev_bias_hdr = 0) {
     bool ok = true;
 
     // Exposure
@@ -182,19 +182,63 @@ static bool apply_camera_settings(ins_camera::Camera* cam, int cam_idx) {
         }
     }
 
-    // Photo size
-    if (g_settings.photo_size >= 0) {
+    // Photo size: per-camera override takes priority over global setting.
+    // per_cam_photo_size=-1 means use global; global=-1 means don't set (firmware default).
+    int effective_photo_size = (per_cam_photo_size >= 0) ? per_cam_photo_size : g_settings.photo_size;
+    if (effective_photo_size >= 0) {
         if (!cam->SetPhotoSize(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE,
-                              static_cast<ins_camera::PhotoSize>(g_settings.photo_size))) {
-            LOG_ERR("Camera [" << cam_idx << "] SetPhotoSize failed");
+                              static_cast<ins_camera::PhotoSize>(effective_photo_size))) {
+            LOG_ERR("Camera [" << cam_idx << "] SetPhotoSize(" << effective_photo_size << ") failed");
             ok = false;
+        } else {
+            LOG_OUT("Camera [" << cam_idx << "] photo_size=" << effective_photo_size);
         }
     }
 
-    // Photo sub-mode
-    if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE)) {
-        LOG_ERR("Camera [" << cam_idx << "] SetPhotoSubMode failed");
-        ok = false;
+    // HDR mode: configure settings under FUNCTION_MODE_HDR_IMAGE so the
+    // camera uses HDR when TakePhoto() is called. SetPhotoSubMode alone is
+    // ignored by some firmware versions (e.g. X3).
+    if (per_cam_sub_mode == 1) {
+        // Apply exposure/WB/size settings under HDR function mode
+        if (g_settings.exposure_mode == 0) {
+            // AUTO exposure for HDR
+            auto exp_hdr = std::make_shared<ins_camera::ExposureSettings>();
+            exp_hdr->SetExposureMode(ins_camera::PhotographyOptions_ExposureMode::AUTO);
+            exp_hdr->SetEVBias(per_cam_ev_bias_hdr != 0 ? per_cam_ev_bias_hdr : g_settings.ev_bias);
+            cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_HDR_IMAGE, exp_hdr);
+        }
+        {
+            static const ins_camera::PhotographyOptions_WhiteBalance wb_map[] = {
+                ins_camera::PhotographyOptions_WhiteBalance::WB_AUTO,
+                ins_camera::PhotographyOptions_WhiteBalance::WB_2700K,
+                ins_camera::PhotographyOptions_WhiteBalance::WB_4000K,
+                ins_camera::PhotographyOptions_WhiteBalance::WB_5000K,
+                ins_camera::PhotographyOptions_WhiteBalance::WB_6500K,
+                ins_camera::PhotographyOptions_WhiteBalance::WB_7500K,
+            };
+            auto wb = (g_settings.wb_mode >= 0 && g_settings.wb_mode <= 5)
+                ? wb_map[g_settings.wb_mode]
+                : ins_camera::PhotographyOptions_WhiteBalance::WB_AUTO;
+            auto cap_hdr = std::make_shared<ins_camera::CaptureSettings>();
+            cap_hdr->SetWhiteBalance(wb);
+            cam->SetCaptureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_HDR_IMAGE, cap_hdr);
+        }
+        int effective_photo_size_hdr = (per_cam_photo_size_hdr >= 0) ? per_cam_photo_size_hdr
+                                      : (per_cam_photo_size >= 0)    ? per_cam_photo_size
+                                      : g_settings.photo_size;
+        if (effective_photo_size_hdr >= 0)
+            cam->SetPhotoSize(ins_camera::CameraFunctionMode::FUNCTION_MODE_HDR_IMAGE,
+                              static_cast<ins_camera::PhotoSize>(effective_photo_size_hdr));
+        // Switch active mode to HDR
+        if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_HDR))
+            LOG_ERR("Camera [" << cam_idx << "] SetPhotoSubMode(HDR) failed");
+        else
+            LOG_OUT("Camera [" << cam_idx << "] sub_mode=1 (HDR) configured");
+    } else {
+        if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
+            LOG_ERR("Camera [" << cam_idx << "] SetPhotoSubMode(SINGLE) failed");
+        else
+            LOG_OUT("Camera [" << cam_idx << "] sub_mode=0 (SINGLE)");
     }
 
     // Sync host clock to camera RTC so all cameras share the same time base
@@ -290,6 +334,57 @@ static std::vector<std::string> parse_serial_filter() {
         if (!s.empty()) serials.push_back(s);
     }
     return serials;
+}
+
+// Parse a comma-separated int env var into a vector of size n_cameras.
+static std::vector<int> parse_int_csv_env(const char* env_name, size_t n_cameras) {
+    std::vector<int> sizes(n_cameras, -1);
+    if (auto* v = std::getenv(env_name)) {
+        std::string s(v);
+        size_t idx = 0;
+        size_t pos = 0;
+        while (idx < n_cameras) {
+            pos = s.find(',');
+            std::string tok = (pos != std::string::npos) ? s.substr(0, pos) : s;
+            if (!tok.empty()) {
+                try { sizes[idx] = std::stoi(tok); } catch (...) {}
+            }
+            if (pos == std::string::npos) break;
+            s.erase(0, pos + 1);
+            ++idx;
+        }
+    }
+    return sizes;
+}
+
+static std::vector<int> parse_photo_sizes(size_t n_cameras) {
+    return parse_int_csv_env("INSTA360_CAMERA_PHOTO_SIZES", n_cameras);
+}
+
+static std::vector<int> parse_photo_sizes_hdr(size_t n_cameras) {
+    return parse_int_csv_env("INSTA360_CAMERA_PHOTO_SIZES_HDR", n_cameras);
+}
+
+static std::vector<int> parse_ev_biases_hdr(size_t n_cameras) {
+    return parse_int_csv_env("INSTA360_CAMERA_EV_BIASES_HDR", n_cameras);
+}
+
+// Parse INSTA360_CAMERA_PHOTO_SUB_MODES: comma-separated sub-mode enums.
+// 0=PHOTO_SINGLE, 1=PHOTO_HDR. Default 0.
+static std::vector<int> parse_photo_sub_modes(size_t n_cameras) {
+    std::vector<int> modes(n_cameras, 0);
+    if (auto* v = std::getenv("INSTA360_CAMERA_PHOTO_SUB_MODES")) {
+        std::string s(v);
+        size_t idx = 0;
+        while (idx < n_cameras) {
+            size_t pos = s.find(',');
+            std::string tok = (pos != std::string::npos) ? s.substr(0, pos) : s;
+            if (!tok.empty()) { try { modes[idx] = std::stoi(tok); } catch (...) {} }
+            if (pos == std::string::npos) break;
+            s.erase(0, pos + 1); ++idx;
+        }
+    }
+    return modes;
 }
 
 struct CameraSlot {
@@ -534,11 +629,20 @@ int _main(int argc, char* argv[]) {
 
     // Apply uniform settings to all opened cameras
     g_settings.load_from_env();
+    auto per_cam_sizes = parse_photo_sizes(slots.size());
+    auto per_cam_sizes_hdr = parse_photo_sizes_hdr(slots.size());
+    auto per_cam_sub_modes = parse_photo_sub_modes(slots.size());
+    auto per_cam_ev_biases_hdr = parse_ev_biases_hdr(slots.size());
     LOG_OUT("Settings: exposure=" << g_settings.exposure_mode
             << " wb=" << g_settings.wb_mode
             << " photo_size=" << g_settings.photo_size);
     for (auto& slot : slots) {
-        if (apply_camera_settings(slot.cam, slot.index))
+        int ps     = (slot.index < (int)per_cam_sizes.size())        ? per_cam_sizes[slot.index]        : -1;
+        int ps_hdr = (slot.index < (int)per_cam_sizes_hdr.size())    ? per_cam_sizes_hdr[slot.index]    : -1;
+        int sm     = (slot.index < (int)per_cam_sub_modes.size())    ? per_cam_sub_modes[slot.index]    : 0;
+        int ev_hdr = (slot.index < (int)per_cam_ev_biases_hdr.size()) ? per_cam_ev_biases_hdr[slot.index] : 0;
+        LOG_OUT("Camera [" << slot.index << "] per_cam_sub_mode=" << sm << " ev_bias_hdr=" << ev_hdr);
+        if (apply_camera_settings(slot.cam, slot.index, ps, sm, ps_hdr, ev_hdr))
             LOG_OUT("Camera [" << slot.index << "] " << slot.serial << " configured OK");
         else
             LOG_OUT("Camera [" << slot.index << "] " << slot.serial << " configured with warnings");
@@ -550,11 +654,11 @@ int _main(int argc, char* argv[]) {
                 if (is_capture) {
                     slot.t_shutter_callback->store(now_sec());
                     slot.shutter_fired->store(true);
-                    // Write OAK-1 trigger into a per-shot staging dir.
-                    // reconstruct_from_bag.py promotes these to fusion_scan_*
-                    // dirs after reconstruction, when the total X5 scan count
-                    // is known and there is no risk of colliding with X5 dirs.
-                    if (slot.index == 0) {
+                    // Write OAK-1 trigger into a per-shot staging dir — continuous
+                    // mode only. In stationary mode the shell writes .oak1_trigger
+                    // directly to the correct fusion_scan_NNN dir; firing it here
+                    // too causes a double capture that bloats inter-scan time.
+                    if (slot.index == 0 && fs::exists(session_dir + "/.sdk_stitch_continuous")) {
                         int shot = slot.current_shot->load();
                         char buf[8];
                         std::snprintf(buf, sizeof(buf), "%03d", shot + 1);
