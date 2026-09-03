@@ -41,6 +41,7 @@ def _stitch_scan(scan_dir: Path, camera_mode: str, erp_width: int, erp_height: i
     # Resolve per-slot ERP resolution from multi_camera.yaml so each camera
     # stitches at its own native resolution, not the session primary's.
     slot_w, slot_h = erp_width, erp_height
+    slot_hw = ''
     try:
         import yaml as _y
         ci_file = scan_dir / '.cam_index'
@@ -57,10 +58,11 @@ def _stitch_scan(scan_dir: Path, camera_mode: str, erp_width: int, erp_height: i
                     slot_h = hw_cfg.get('erp_height', erp_height)
     except Exception:
         pass
-    cmd = [str(_STITCH_BIN), str(insp), str(erp),
-           '--width', str(slot_w), '--height', str(slot_h)]
+    cmd = [str(_STITCH_BIN), str(insp), str(erp)]
     if camera_mode == 'single_fisheye':
         cmd.append('--single')
+    if slot_hw == 'x3':
+        cmd.append('--denoise')
     env = os.environ.copy()
     env['INSTA360_ERP_WIDTH']  = str(slot_w)
     env['INSTA360_ERP_HEIGHT'] = str(slot_h)

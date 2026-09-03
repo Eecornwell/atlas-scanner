@@ -1450,10 +1450,6 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
     if _oak1_shots:
         print(f"\n  Promoting {len(_oak1_shots)} OAK-1 shots to fusion_scan_* dirs...")
         for _oak1_dir in _oak1_shots:
-            try:
-                _shot_idx = int(_oak1_dir.name.split('_')[-1])  # 1-based, matches X5 scan
-            except ValueError:
-                continue
             scan_count += 1
             _oak1_scan = session_path / f'fusion_scan_{scan_count:03d}'
             _oak1_scan.mkdir(exist_ok=True)
@@ -1469,16 +1465,52 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             # — OAK-1 scans never have .insp files
             for _insp in list(_oak1_scan.glob('*.insp')) + list(_oak1_scan.glob('*.insp.capture_time')):
                 _insp.unlink(missing_ok=True)
-            _x5_scan = session_path / f'fusion_scan_{_shot_idx:03d}'
-            if _x5_scan.exists():
-                for _ply in list(_x5_scan.glob('sensor_lidar*.ply')) + list(_x5_scan.glob('world_lidar*.ply')):
+            # Read the OAK-1 shutter timestamp from its capture_0.shutter_event
+            # and use it to find the closest X5 scan (by timestamp) for LiDAR
+            # propagation, and to interpolate a fresh trajectory.json.
+            # Never copy trajectory from a scan dir by index — the shot counter
+            # numbering does not map 1:1 to fusion_scan_NNN in multi-camera sessions.
+            _oak1_shutter_t = None
+            _se = _oak1_scan / 'capture_0.shutter_event'
+            if _se.exists():
+                try:
+                    _oak1_shutter_t = float(_se.read_text().strip().split()[0])
+                except Exception:
+                    pass
+            # Find closest X5 scan by shutter timestamp
+            _best_x5 = None
+            _best_dt = float('inf')
+            if _oak1_shutter_t is not None:
+                for _sd in sorted(session_path.glob('fusion_scan_*')):
+                    if _sd == _oak1_scan:
+                        continue
+                    for _ct_f in sorted(_sd.glob('*.insp.capture_time')):
+                        try:
+                            _ct = float(_ct_f.read_text().strip().split()[0])
+                            _dt = abs(_ct - _oak1_shutter_t)
+                            if _dt < _best_dt:
+                                _best_dt, _best_x5 = _dt, _sd
+                        except Exception:
+                            pass
+                        break
+            if _best_x5 is not None and _best_dt < 15.0:
+                for _ply in list(_best_x5.glob('sensor_lidar*.ply')) + list(_best_x5.glob('world_lidar*.ply')):
                     _dst = _oak1_scan / _ply.name
                     if not _dst.exists():
                         _shutil.copy2(str(_ply), str(_dst))
-                _traj = _x5_scan / 'trajectory.json'
+            # Write trajectory.json interpolated at the OAK-1 shutter time
+            if _oak1_shutter_t is not None and odom_msgs and not (_oak1_scan / 'trajectory.json').exists():
+                _oak1_livox_t = _oak1_shutter_t - _host_to_livox_offset
+                _odom_t0 = odom_msgs[0][0]
+                _odom_t1 = odom_msgs[-1][0]
+                if _odom_t0 <= _oak1_livox_t <= _odom_t1:
+                    write_trajectory_json(str(_oak1_scan), _oak1_scan.name,
+                                          _oak1_livox_t, odom_msgs)
+            elif _best_x5 is not None:
+                _traj = _best_x5 / 'trajectory.json'
                 if _traj.exists() and not (_oak1_scan / 'trajectory.json').exists():
                     _shutil.copy2(str(_traj), str(_oak1_scan / 'trajectory.json'))
-            print(f"    {_oak1_dir.name} -> {_oak1_scan.name}")
+            print(f"    {_oak1_dir.name} -> {_oak1_scan.name}  (shutter_dt={_best_dt:.2f}s from {_best_x5.name if _best_x5 else 'none'})")
         print(f"  ✓ OAK-1 shots promoted")
     if sdk_stitch:
         (session_path / '.sdk_stitch_continuous').touch()
@@ -1635,6 +1667,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                             _stitch_env['INSTA360_ERP_HEIGHT'] = str(_prof2.get('erp_height', 2880))
                             print(f"    stitch: cam_{_ci2} ({_slot_hw2}) "
                                   f"{_stitch_env['INSTA360_ERP_WIDTH']}x{_stitch_env['INSTA360_ERP_HEIGHT']}")
+                            if _slot_hw2 == 'x3':
+                                _stitch_cmd.append('--denoise')
                     except Exception as _e:
                         pass  # fall back to inherited env
                     result = subprocess.run(

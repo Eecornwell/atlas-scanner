@@ -309,7 +309,7 @@ scansData.forEach((s, idx) => {{
     const v = !scanVisible[s.name];
     setScanVisible(s.name, v, btn);
   }});
-  btn.addEventListener('dblclick', () => showOnly(idx));
+
   grid.appendChild(btn);
 }});
 
@@ -336,7 +336,7 @@ function showOnly(idx) {{
 
 function updateStatus() {{
   const n = Object.values(scanVisible).filter(Boolean).length;
-  document.getElementById('status').textContent = n + '/' + scansData.length + ' visible  |  shift+click=isolate  dbl=isolate';
+  document.getElementById('status').textContent = n + '/' + scansData.length + ' visible  |  shift+click=isolate';
 }}
 
 function updatePointSize(val) {{
@@ -367,7 +367,7 @@ animate();
 
     print(f'\n✓ Scan toggle viewer: {html_file}')
     print(f'  {len(scans_js)} scans loaded')
-    print(f'  Double-click a scan row to isolate it')
+    print(f'  Shift+click a scan row to isolate it')
 
     # Open in browser
     import subprocess, time

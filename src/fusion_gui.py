@@ -669,7 +669,7 @@ class FusionCaptureGUI:
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
                         variable=self.bag_only_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.outdoor_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(mode_frame, text="Outdoor scene (reduced EV bias)",
+        ttk.Checkbutton(mode_frame, text="Outdoor scene",
                         variable=self.outdoor_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.icp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
@@ -1947,8 +1947,18 @@ sys.exit(0 if ok[0] else 4)
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         _allowed = pathlib.Path(sess).resolve()
-        ply_path = next((p for p in sorted(pathlib.Path(sess).glob('*.ply'), key=lambda p: p.stat().st_mtime, reverse=True)
-                         if _allowed in [p.resolve(), *p.resolve().parents]), None)
+        # Prefer merged_pointcloud*.ply > merged_*.ply (excl trajectory_only) > any *.ply, then by mtime
+        def _ply_priority(p):
+            name = p.name
+            if name.startswith('merged_pointcloud') and 'trajectory' not in name: return 0
+            if name.startswith('merged_') and 'trajectory' not in name: return 1
+            if name.startswith('merged_') and 'trajectory_only' not in name: return 2
+            if name.startswith('merged_'): return 3
+            return 4
+        ply_path = next((p for p in sorted(
+                pathlib.Path(sess).glob('*.ply'),
+                key=lambda p: (_ply_priority(p), -p.stat().st_mtime))
+                if _allowed in [p.resolve(), *p.resolve().parents]), None)
         if not ply_path: self._pp_log_write("\n[!] No .ply file found in session.\n"); return
         self._pp_run("View Point Cloud (Web)", [sys.executable, str(self.script_dir / 'post_processing/web_3d_viewer.py'), str(ply_path.resolve())])
 

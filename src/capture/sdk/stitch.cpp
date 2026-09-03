@@ -25,11 +25,13 @@ int main(int argc, char* argv[]) {
     std::string output_path = argv[2];
     bool single_fisheye = false;
     bool use_ai = false;
+    bool denoise = false;
     std::string model_dir;
     for (int i = 3; i < argc; ++i) {
         std::string a(argv[i]);
-        if (a == "--single")    single_fisheye = true;
-        else if (a == "--ai")   use_ai = true;
+        if (a == "--single")         single_fisheye = true;
+        else if (a == "--ai")        use_ai = true;
+        else if (a == "--denoise")   denoise = true;
         else if (a == "--model-dir" && i + 1 < argc) model_dir = argv[++i];
     }
     // Allow env var overrides
@@ -113,6 +115,32 @@ int main(int argc, char* argv[]) {
     if (!stitcher.Stitch()) {
         std::cerr << "Stitching failed" << std::endl;
         return 1;
+    }
+
+    // The SDK's internal JPEG encoder uses ~q60 which causes visible blocking.
+    // Re-encode the output at q95 to eliminate compression artifacts.
+    // Only applies when the output path is .jpg/.jpeg.
+    std::string ext = output_path.size() >= 4 ? output_path.substr(output_path.rfind('.')) : "";
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    if (ext == ".jpg" || ext == ".jpeg") {
+        cv::Mat img = cv::imread(output_path, cv::IMREAD_COLOR);
+        if (!img.empty()) {
+            cv::Mat processed;
+            if (denoise) {
+                // X3 sensor noise reduction: NL-means denoising removes
+                // high-frequency sensor noise (std ~3x higher than X5).
+                // h=8: filter strength — more aggressive than default h=4.
+                // templateWindowSize=7, searchWindowSize=21: standard values.
+                cv::fastNlMeansDenoisingColored(img, processed, 8.0f, 8.0f, 7, 21);
+            } else {
+                processed = img;
+            }
+            // Mild bilateral filter to smooth residual JPEG DCT block artifacts.
+            cv::Mat deblocked;
+            cv::bilateralFilter(processed, deblocked, 5, 8.0, 5.0);
+            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 95};
+            cv::imwrite(output_path, deblocked, params);
+        }
     }
 
     std::cout << "Done" << std::endl;

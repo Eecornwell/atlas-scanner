@@ -155,7 +155,13 @@ Please review [Running the Software documentation](docs/software-run.md)
 ![Multi-camera Color Normalization](assets/media/color-correction.png "Color Correction")
 
 #### Sample Output
-![Point Cloud Result](assets/media/room-pointcloud.png "Result")
+- Outdoor
+
+    ![Point Cloud Result - Outdoor](assets/media/outdoor-pointcloud.png "Outdoor Result")
+
+- Indoor
+
+    ![Point Cloud Result - Indoor](assets/media/room-pointcloud.png "Indoor Result")
 
 #### Important Notes
 - Two capture modes are supported: stationary (manual trigger per scan) and continuous (full session recorded as a single rosbag, then reconstructed into individual scans at shutdown)

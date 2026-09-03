@@ -465,10 +465,12 @@ def normalize_session(session_dir: str):
         img = None
         if insp_file and stitch_bin.exists():
             clean_erp = scan_dir / '_erp_clean_tmp.jpg'
+            _stitch_cmd = [str(stitch_bin), str(insp_file), str(clean_erp)]
+            _stitch_env = _stitch_env_for_cam(cam_idx)
             result = subprocess.run(
-                [str(stitch_bin), str(insp_file), str(clean_erp)],
+                _stitch_cmd,
                 capture_output=True,
-                env=_stitch_env_for_cam(cam_idx),
+                env=_stitch_env,
             )
             if result.returncode == 0 and clean_erp.exists():
                 img = cv2.imread(str(clean_erp))
@@ -484,6 +486,11 @@ def normalize_session(session_dir: str):
             continue
 
         corrected = apply_color_profile(img, profile)
+        # For noisy sensors (x3), denoise after color correction so the
+        # L-channel gain doesn't re-amplify noise removed before correction.
+        if scan_hw == 'x3':
+            import cv2 as _cv2
+            _cv2.fastNlMeansDenoisingColored(corrected, corrected, 8.0, 8.0, 7, 21)
         cv2.imwrite(str(erp), corrected, [cv2.IMWRITE_JPEG_QUALITY, 95])
         (scan_dir / '.color_normalized').write_text(str(cam_idx))
         normalized += 1

@@ -439,8 +439,9 @@ cleanup() {
                         # so each camera stitches at its own native resolution.
                         _slot_w="$INSTA360_ERP_WIDTH"
                         _slot_h="$INSTA360_ERP_HEIGHT"
+                        _slot_hw=""
                         if [ -f "$scan_dir/.cam_index" ] && [ -f "$_MULTI_CAM_YAML" ]; then
-                            _ci=$(awk '{print $1}' "$scan_dir/.cam_index" 2>/dev/null)
+                            _ci=$(awk '{print $1}' "$scan_dir/.cam_index" 2>/dev/null | tr -d '[:space:]')
                             _slot_hw=$(python3 -c "
 import yaml, sys
 d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
@@ -451,10 +452,14 @@ print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
                                 _slot_h=$(python3 -c "import yaml; d=yaml.safe_load(open('$_CAM_MODEL_DIR/${_slot_hw}.yaml')); print(d.get('erp_height', $_slot_h))" 2>/dev/null || echo "$_slot_h")
                             fi
                         fi
+                        _this_slot_hw="${_slot_hw:-}"
+                        _this_slot_w="$_slot_w"
+                        _this_slot_h="$_slot_h"
                         (
+                            [ "${_this_slot_hw}" = "x3" ] && _denoise_arg="--denoise" || _denoise_arg=""
+                            INSTA360_ERP_WIDTH="$_this_slot_w" INSTA360_ERP_HEIGHT="$_this_slot_h" \
                             "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
-                                --width "$_slot_w" --height "$_slot_h" \
-                                $_stitch_args \
+                                $_stitch_args $_denoise_arg \
                                 || echo "  Warning: SDK stitch failed for $(basename $scan_dir)"
                         ) &
                         _stitch_jobs+=($!)
@@ -1029,7 +1034,21 @@ if [ "$IMU_AVAILABLE" = "true" ]; then
 
     > /tmp/rko_lio.log
     _RKO_CONFIG="rko_lio_config_robust.yaml"
-    [ "$CAPTURE_MODE" = "continuous" ] && _RKO_CONFIG="rko_lio_config_continuous.yaml"
+    if [ "$CAPTURE_MODE" = "continuous" ]; then
+        if [ "${SCENE_MODE:-indoor}" = "outdoor" ]; then
+            _RKO_CONFIG="rko_lio_config_continuous_outdoor.yaml"
+        else
+            _RKO_CONFIG="rko_lio_config_continuous.yaml"
+        fi
+    fi
+    # Verify config file exists — fall back to indoor continuous and warn loudly
+    # rather than launching with a missing file (which silently uses compiled-in
+    # defaults and causes divergence in outdoor environments).
+    if [ ! -f "$ROS_WS_DIR/src/atlas-scanner/src/config/$_RKO_CONFIG" ]; then
+        echo "⚠ RKO-LIO config not found: $_RKO_CONFIG — falling back to rko_lio_config_continuous.yaml"
+        _RKO_CONFIG="rko_lio_config_continuous.yaml"
+    fi
+    echo "RKO-LIO config: $_RKO_CONFIG"
     ros2 launch rko_lio odometry.launch.py \
         config_file:="$ROS_WS_DIR/src/atlas-scanner/src/config/$_RKO_CONFIG" \
         rviz:=false > /tmp/rko_lio.log 2>&1 &

@@ -67,6 +67,7 @@ def create_web_viewer(ply_file):
     <style>
         body {{ margin: 0; background: #000; font-family: Arial; }}
         #info {{ position: absolute; top: 10px; left: 10px; color: white; z-index: 100; }}
+        #ptsize-ctrl {{ position: absolute; bottom: 20px; left: 10px; color: white; z-index: 100; font-family: Arial; font-size: 13px; }}
     </style>
 </head>
 <body>
@@ -75,6 +76,9 @@ def create_web_viewer(ply_file):
         <p>Points: {len(pcd.points)} (showing {len(points)})</p>
         <p>Generated: {timestamp}</p>
         <p>Left-drag: rotate &nbsp;|&nbsp; Right-drag: pan &nbsp;|&nbsp; Scroll: zoom</p>
+    </div>
+    <div id="ptsize-ctrl">
+        Point size: <input id="ptsize" type="range" min="0.005" max="0.2" step="0.005" value="0.02" style="vertical-align:middle;width:120px">
     </div>
     <script>
         const scene = new THREE.Scene();
@@ -101,7 +105,12 @@ def create_web_viewer(ply_file):
         
         const material = new THREE.PointsMaterial({{ 
             {'vertexColors: true,' if colors_js else 'color: 0x00ff00,'}
-            size: 0.02 
+            size: 0.02,
+            sizeAttenuation: true
+        }});
+        document.getElementById('ptsize').addEventListener('input', e => {{
+            material.size = parseFloat(e.target.value);
+            material.needsUpdate = true;
         }});
         const points = new THREE.Points(geometry, material);
         scene.add(points);
