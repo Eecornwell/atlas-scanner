@@ -661,23 +661,32 @@ class FusionCaptureGUI:
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
                      state="readonly", width=14).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
+        ttk.Label(mode_frame, text="Move window:").grid(row=4, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        self.interval_var = tk.StringVar(value="5")
+        _interval_spin = ttk.Spinbox(mode_frame, from_=3, to=60, increment=1,
+                                     textvariable=self.interval_var, width=5)
+        _interval_spin.grid(row=4, column=1, sticky=tk.W, pady=(2, 0))
+        ttk.Label(mode_frame, text="s (continuous)").grid(row=4, column=1, sticky=tk.E, pady=(2, 0))
         self.stationary_wait_var = tk.BooleanVar(value=False)
         self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
                         variable=self.stationary_wait_var)
-        self.stationary_wait_cb.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.stationary_wait_cb.grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.bag_only_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Bag only (post-process later)",
-                        variable=self.bag_only_var).grid(row=5, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.bag_only_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.outdoor_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="Outdoor scene",
-                        variable=self.outdoor_var).grid(row=6, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.outdoor_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.icp_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="ICP alignment (post processing)",
-                        variable=self.icp_var).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.icp_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
         self.colmap_var = tk.BooleanVar(value=False)
         self.colmap_lidar_voxel_size = 0.0
         ttk.Checkbutton(mode_frame, text="Export COLMAP model",
-                        variable=self.colmap_var).grid(row=8, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+                        variable=self.colmap_var).grid(row=9, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        self.colmap_sfm_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="  COLMAP full SfM (slow, poses-only default)",
+                        variable=self.colmap_sfm_var).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -777,12 +786,15 @@ class FusionCaptureGUI:
         _pp_btn(6, 0, "Export COLMAP Model",          self._pp_colmap)
         _pp_btn(6, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
         _pp_btn(7, 0, "Generate Depth Images",        self._pp_colmap_depth)
+        ttk.Checkbutton(btn_frame, text="Full SfM matching (slow — poses-only default)",
+                        variable=self.colmap_sfm_var).grid(
+            row=8, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
         # ── Viewers ───────────────────────────────────────────────────────
-        _pp_sep(8, "Viewers")
-        _pp_btn(10, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
-        _pp_btn(10, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
-        _pp_btn(11, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
-        _pp_btn(11, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
+        _pp_sep(9, "Viewers")
+        _pp_btn(11, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(11, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(12, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(12, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -1109,6 +1121,8 @@ class FusionCaptureGUI:
             'stationary_wait':   self.stationary_wait_var.get(),
             'icp':               self.icp_var.get(),
             'colmap':            self.colmap_var.get(),
+            'colmap_sfm':        self.colmap_sfm_var.get(),
+            'interval':          self.interval_var.get(),
         }
         # Start fusion process in separate thread
         threading.Thread(target=self._run_fusion_process, args=(_launch_params,), daemon=True).start()
@@ -1210,6 +1224,11 @@ class FusionCaptureGUI:
                 cmd.append('--bag-only')
             if capture_val == 'stationary' and params['stationary_wait']:
                 cmd.append('--stationary-wait')
+            try:
+                _interval = max(3, int(params['interval']))
+            except (ValueError, TypeError):
+                _interval = 10
+            cmd += ['--interval', str(_interval)]
             cmd.append('--icp' if params['icp'] else '--no-icp')
             cmd.append('--colmap' if params['colmap'] else '--no-colmap')
             self.fusion_process = subprocess.Popen(
@@ -1936,6 +1955,8 @@ sys.exit(0 if ok[0] else 4)
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         cmd = [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess,
                '--no-bundle-adjustment']
+        if getattr(self, 'colmap_sfm_var', None) and self.colmap_sfm_var.get():
+            cmd.append('--sfm')
         voxel = getattr(self, 'colmap_lidar_voxel_size', 0.0)
         if voxel > 0:
             cmd += ['--lidar-voxel-size', str(voxel)]
@@ -2087,6 +2108,14 @@ sys.exit(0 if ok[0] else 4)
                 ) if k in os.environ
             }
             _safe_env['PYTHONUNBUFFERED'] = '1'
+            # Forward Wayland display vars so Qt-based tools (initial_guess_manual)
+            # can open windows when running under a Wayland compositor.
+            _wayland = os.environ.get('_ATLAS_WAYLAND_DISPLAY') or os.environ.get('WAYLAND_DISPLAY', '')
+            if _wayland:
+                _safe_env['WAYLAND_DISPLAY'] = _wayland
+            # Force xcb (X11) backend for Qt so OpenGL tools work reliably
+            # regardless of whether the session is X11 or Wayland.
+            _safe_env.setdefault('QT_QPA_PLATFORM', 'xcb')
             if env_extra:
                 _safe_env.update(env_extra)
             try:

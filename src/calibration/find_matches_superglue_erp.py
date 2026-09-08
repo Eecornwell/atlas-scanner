@@ -270,13 +270,13 @@ def main():
             # For OAK-1 pinhole images (panorama_size==-1): use native size
             # downscaled to max 640px wide so SuperPoint runs at a sensible res.
             if opt.panorama_size == -1:
-                # OAK-1: use 320x240 — SuperGlue matches better at lower res
-                # where the depth/texture difference is less pronounced
-                max_w = 320
-                scale_x = W / max_w
-                scale_y = H / int(H * max_w / W)
+                # OAK-1: use native image width (already downscaled to 800px by
+                # combine_scans). 320px was too aggressive and lost too much detail.
+                max_w = W  # use full width as provided by combine_scans
+                scale_x = 1.0
+                scale_y = 1.0
                 pano_w = max_w
-                pano_h = int(H * pano_w / W)
+                pano_h = H
             else:
                 pano_w = opt.panorama_size
                 pano_h = pano_w // 2

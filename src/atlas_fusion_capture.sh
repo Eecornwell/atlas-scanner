@@ -132,8 +132,17 @@ import sys; print(','.join(sub_modes), file=sys.stderr); print(','.join(sizes_hd
     [ -n "$_cam_ev_biases_hdr" ] && export INSTA360_CAMERA_EV_BIASES_HDR="$_cam_ev_biases_hdr"
     echo "Camera photo sizes: $_cam_photo_sizes  hdr_sizes: $_cam_photo_sizes_hdr  sub_modes: $_cam_sub_modes  ev_biases_hdr: $_cam_ev_biases_hdr"
 fi
-# Single-camera mode: also set the global photo size default
+# In single-camera mode, disable HDR for X3 — HDR produces a single processed
+# JPEG that the SDK stitcher cannot stitch (ErrorCode:11). HDR is only useful
+# when paired with X5 to compensate for the sensor difference.
 _detected_cams_early=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+if [ "${_detected_cams_early:-1}" -le 1 ] && [ "$CAMERA_HW" = "x3" ]; then
+    # Override the full sub_modes string to all zeros so every slot gets
+    # sub_mode=0 regardless of what multi_camera.yaml says for cam_1.
+    export INSTA360_CAMERA_PHOTO_SUB_MODES="0,0,0"
+    export INSTA360_CAMERA_EV_BIASES_HDR="0,0,0"
+    echo "X3 single-camera mode: HDR disabled (sub_mode forced to 0)"
+fi
 if [ "${NUM_CAMERAS:-0}" -le 1 ] 2>/dev/null && [ "${_detected_cams_early:-0}" -le 1 ] 2>/dev/null; then
     [ -n "$INSTA360_PHOTO_SIZE" ] && export INSTA360_PHOTO_SIZE_DEFAULT="$INSTA360_PHOTO_SIZE"
 fi
@@ -323,9 +332,13 @@ cleanup() {
     # It was deliberately excluded from PIDS so the loop above didn't kill it.
     if [ -n "${SDK_CAPTURE_PID:-}" ] && kill -0 "$SDK_CAPTURE_PID" 2>/dev/null; then
         if [ "${CAMERA_HW:-onex2}" = "oak1" ]; then
-            # OAK-1: signal via trigger file first, then SIGKILL if needed
+            # OAK-1: signal via trigger file first, then wait for current
+            # capture to complete before killing (up to 10s).
             touch "$SCAN_DIR/.oak1_quit_trigger" 2>/dev/null || true
-            sleep 1
+            for _w in $(seq 1 10); do
+                kill -0 "$SDK_CAPTURE_PID" 2>/dev/null || break
+                sleep 1
+            done
             kill -0 "$SDK_CAPTURE_PID" 2>/dev/null && kill -KILL "$SDK_CAPTURE_PID" 2>/dev/null || true
             wait "$SDK_CAPTURE_PID" 2>/dev/null || true
         else
@@ -356,17 +369,31 @@ cleanup() {
     if [ "$CAPTURE_MODE" = "continuous" ]; then
         BAG_DIR=$(ls -d "$SCAN_DIR"/rosbag_* 2>/dev/null | grep -v '_imu$' | head -1)
         if [ -n "$BAG_DIR" ]; then
-            echo "Estimating IMU clock offset..."
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/imu_sync.py" \
-                "$SCAN_DIR" --window 20.0 || echo "  ⚠ IMU sync failed — continuing without offset"
-            echo "Reconstructing scans from bag using header timestamps..."
-            _SDK_STITCH_ARG="--sdk-stitch"
-            _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
-                "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.3 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
-            # reconstruct_from_bag.py handles .insp promotion, stitching, masked image
-            # generation, and coloring internally when called with --sdk-stitch.
-            # Nothing further needed here for continuous mode.
+            if [ "$CAMERA_HW" = "oak1" ]; then
+                # OAK-1 primary continuous mode: images and shutter events are
+                # already in fusion_scan_* dirs. Just reconstruct LiDAR/trajectory
+                # from the bag without wiping existing dirs.
+                echo "Reconstructing LiDAR scans from bag (OAK-1 primary)..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
+                    "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 \
+                    --camera-mode "$CAMERA_MODE" --max-gyro 0.3 --trim-ends 0
+                # Color the OAK-1 scans using exact match fusion
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/color_normalize.py" normalize "$SCAN_DIR"
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/post_process_coloring.py" \
+                    "$SCAN_DIR" --use-exact
+            else
+                echo "Estimating IMU clock offset..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/imu_sync.py" \
+                    "$SCAN_DIR" --window 20.0 || echo "  ⚠ IMU sync failed — continuing without offset"
+                echo "Reconstructing scans from bag using header timestamps..."
+                _SDK_STITCH_ARG="--sdk-stitch"
+                _TRIM_ENDS="0"  # scan centres are at precise shutter times, no SLAM trim needed
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/reconstruct_from_bag.py" \
+                    "$SCAN_DIR" --interval "$CONTINUOUS_INTERVAL" --lidar-window 0.3 --camera-mode "$CAMERA_MODE" --max-gyro 0.3 --trim-ends "$_TRIM_ENDS" $_SDK_STITCH_ARG
+                # reconstruct_from_bag.py handles .insp promotion, stitching, masked image
+                # generation, and coloring internally when called with --sdk-stitch.
+                # Nothing further needed here for continuous mode.
+            fi
         fi
     fi
 
@@ -430,6 +457,7 @@ cleanup() {
                 _stitch_args=""
                 [ "$CAMERA_MODE" = "single_fisheye" ] && _stitch_args="--single"
                 [ "$USE_AI_STITCH" = "true" ] && _stitch_args="$_stitch_args --ai --model-dir $SCRIPT_DIR/capture/sdk/models"
+                [ "$USE_AI_STITCH" = "true" ] && _stitch_args="$_stitch_args --ai --model-dir $SCRIPT_DIR/capture/sdk/models"
                 _stitch_jobs=()
                 for scan_dir in "$SCAN_DIR"/fusion_scan_*; do
                     [ -d "$scan_dir" ] || continue
@@ -447,6 +475,12 @@ import yaml, sys
 d = yaml.safe_load(open('$_MULTI_CAM_YAML'))
 print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
 " "$_ci" 2>/dev/null)
+                            # In single-camera mode the SDK assigns index 0 regardless
+                            # of which physical camera is connected. If multi_camera.yaml
+                            # maps cam_0 to a different hw than CAMERA_HW, use CAMERA_HW.
+                            if [ -n "$_slot_hw" ] && [ "$_slot_hw" != "$CAMERA_HW" ] && [ "$_USE_CAMERAS" -le 1 ] 2>/dev/null; then
+                                _slot_hw="$CAMERA_HW"
+                            fi
                             if [ -n "$_slot_hw" ] && [ -f "$_CAM_MODEL_DIR/${_slot_hw}.yaml" ]; then
                                 _slot_w=$(python3 -c "import yaml; d=yaml.safe_load(open('$_CAM_MODEL_DIR/${_slot_hw}.yaml')); print(d.get('erp_width', $_slot_w))" 2>/dev/null || echo "$_slot_w")
                                 _slot_h=$(python3 -c "import yaml; d=yaml.safe_load(open('$_CAM_MODEL_DIR/${_slot_hw}.yaml')); print(d.get('erp_height', $_slot_h))" 2>/dev/null || echo "$_slot_h")
@@ -460,7 +494,10 @@ print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
                             INSTA360_ERP_WIDTH="$_this_slot_w" INSTA360_ERP_HEIGHT="$_this_slot_h" \
                             "$_SDK_BIN/insta360_stitch" "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
                                 $_stitch_args $_denoise_arg \
-                                || echo "  Warning: SDK stitch failed for $(basename $scan_dir)"
+                            || python3 "$SCRIPT_DIR/capture/fisheye_to_erp.py" \
+                                "$INSP_FILE" "$scan_dir/equirect_dual_fisheye.jpg" \
+                                "$_this_slot_w" "$_this_slot_h" \
+                            || echo "  Warning: SDK stitch failed for $(basename $scan_dir)"
                         ) &
                         _stitch_jobs+=($!)
                         # Limit parallelism to nproc so we don't thrash memory
@@ -1206,6 +1243,11 @@ for i in range(3):
     [ -n "$_cam_sub_modes" ] && export INSTA360_CAMERA_PHOTO_SUB_MODES="$_cam_sub_modes"
     [ -n "$_cam_photo_sizes_hdr" ] && export INSTA360_CAMERA_PHOTO_SIZES_HDR="$_cam_photo_sizes_hdr"
     [ -n "$_cam_ev_biases_hdr" ] && export INSTA360_CAMERA_EV_BIASES_HDR="$_cam_ev_biases_hdr"
+    # Re-apply X3 single-camera HDR disable in case the re-export above overwrote it
+    if [ "${_USE_CAMERAS:-1}" -le 1 ] && [ "$CAMERA_HW" = "x3" ]; then
+        export INSTA360_CAMERA_PHOTO_SUB_MODES="0,0,0"
+        export INSTA360_CAMERA_EV_BIASES_HDR="0,0,0"
+    fi
     echo "SDK launch: PHOTO_SIZES=$INSTA360_CAMERA_PHOTO_SIZES SUB_MODES=$INSTA360_CAMERA_PHOTO_SUB_MODES"
     INSTA360_SESSION_DIR="$SCAN_DIR" \
         "$_CAPTURE_BIN" > "$SCAN_DIR/sdk_capture.log" 2>&1 &
@@ -1418,9 +1460,8 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
             [ "$_input" = "q" ] || [ "$_input" = "quit" ] && break
         fi
     done
+    touch "$SCAN_DIR/.sdk_quit"      # signal SDK daemon to stop
     touch "$SCAN_DIR/.session_done"  # signal watchdog/trigger loop to exit
-
-    # For SDK stitch mode: wait for all background downloads to finish
     # before stopping the bag recorder. The daemon writes .sdk_downloads_pending
     # with the outstanding count; poll until it reaches 0.
     if [ -n "${SDK_CAPTURE_PID:-}" ]; then
@@ -1464,6 +1505,7 @@ else
             while true; do
                 if [ -f "$SCAN_DIR/.quit_trigger" ]; then
                     rm -f "$SCAN_DIR/.quit_trigger"
+                    touch "$SCAN_DIR/.sdk_quit"  # signal SDK daemon to stop
                     break 2
                 fi
                 if [ -f "$SCAN_DIR/.capture_trigger" ]; then
@@ -1725,7 +1767,16 @@ else
 
         if [ $CAPTURE_EXIT_CODE -ne 0 ]; then
             echo "✗ Capture failed"
-            SCAN_COUNT=$((SCAN_COUNT - 1)); continue
+            # If the SDK daemon died, the session is unrecoverable — stop OAK-1
+            # and break out of the capture loop rather than continuing.
+            if ! kill -0 $SDK_CAPTURE_PID 2>/dev/null; then
+                touch "$SCAN_DIR/.oak1_quit_trigger" 2>/dev/null || true
+                SCAN_COUNT=$((SCAN_COUNT - _num_shots))
+                [ -n "${OAK1_SECONDARY_PID:-}" ] && kill -0 "$OAK1_SECONDARY_PID" 2>/dev/null && {
+                    sleep 1; kill -KILL "$OAK1_SECONDARY_PID" 2>/dev/null || true; }
+                break
+            fi
+            SCAN_COUNT=$((SCAN_COUNT - _num_shots)); continue
         fi
 
         # Trajectory trigger — save for all scan dirs at this position

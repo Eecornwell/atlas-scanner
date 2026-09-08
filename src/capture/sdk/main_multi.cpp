@@ -84,7 +84,7 @@ static bool http_download(const std::string& url_base, const std::string& remote
     if (pid < 0) { return false; }
     if (pid == 0) {
         const char* argv[] = {
-            "curl", "-sf", "--max-time", "45", "--retry", "2", "--retry-delay", "1",
+            "curl", "-sf", "--max-time", "30", "--retry", "2", "--retry-delay", "5",
             "-o", local_path.c_str(),
             url.c_str(),
             nullptr
@@ -158,6 +158,17 @@ static bool apply_camera_settings(ins_camera::Camera* cam, int cam_idx, int per_
         if (!cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE, exp)) {
             LOG_ERR("Camera [" << cam_idx << "] SetExposureSettings failed");
             ok = false;
+        }
+    } else if (g_settings.ev_bias != 0) {
+        // AUTO mode with non-zero EV bias (e.g. outdoor scene) — apply bias only
+        auto exp = std::make_shared<ins_camera::ExposureSettings>();
+        exp->SetExposureMode(ins_camera::PhotographyOptions_ExposureMode::AUTO);
+        exp->SetEVBias(g_settings.ev_bias);
+        if (!cam->SetExposureSettings(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE, exp)) {
+            LOG_ERR("Camera [" << cam_idx << "] SetExposureSettings (AUTO+EV) failed");
+            ok = false;
+        } else {
+            LOG_OUT("Camera [" << cam_idx << "] AUTO exposure with EV bias=" << g_settings.ev_bias);
         }
     }
 
@@ -689,7 +700,7 @@ int _main(int argc, char* argv[]) {
     const std::string trigger_path = session_dir + "/.sdk_capture_trigger";
     const std::string done_path    = session_dir + "/.sdk_capture_done";
     const std::string failed_path  = session_dir + "/.sdk_capture_failed";
-    const std::string quit_path    = session_dir + "/.session_done";
+    const std::string quit_path    = session_dir + "/.sdk_quit";
     const std::string pending_path = session_dir + "/.sdk_downloads_pending";
 
     bool   continuous_active = false;
@@ -734,11 +745,15 @@ int _main(int argc, char* argv[]) {
         if (!fs::exists(trigger_path)) {
             // Update pending count for shell to read during download-wait
             static int last_pending = -1;
+            static int poll_count = 0;
             int cur = stat_dl_pending.load();
             if (cur != last_pending) {
                 { std::ofstream pf(pending_path); pf << cur; }
                 last_pending = cur;
             }
+            // Log every ~5s so we can confirm the loop is alive
+            if (++poll_count % 100 == 0)
+                LOG_OUT("[poll] waiting for trigger (" << poll_count / 20 << "s, pending=" << cur << ") path=" << trigger_path);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
@@ -746,8 +761,9 @@ int _main(int argc, char* argv[]) {
         std::string trigger_content;
         { std::ifstream f(trigger_path); if (f) std::getline(f, trigger_content); }
         fs::remove(trigger_path);
+        LOG_OUT("[trigger] read: '" << trigger_content << "'");
 
-        if (trigger_content.empty()) { std::ofstream ff(failed_path); ff << "fail"; continue; }
+        if (trigger_content.empty()) { LOG_OUT("[trigger] empty — writing failed"); std::ofstream ff(failed_path); ff << "fail"; continue; }
         if (trigger_content[0] != '/') trigger_content = fs::current_path().string() + "/" + trigger_content;
 
         if (trigger_content == session_dir) {
@@ -984,7 +1000,17 @@ int _main(int argc, char* argv[]) {
                         cam_dispatches[ci].cv.notify_one();
                     }
 
-                    // Wait for all cameras to finish, then wait the move interval
+                    // Wait for all cameras to finish, then wait the move interval.
+                    // First wait for all workers to set cam_busy=true (they may not
+                    // have been scheduled yet when the dispatcher checks all_done).
+                    for (int ci = 0; ci < num_cameras; ++ci) {
+                        int waited = 0;
+                        while (!cam_busy[ci].load() && waited < 2000 && !timer_stop.load()) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            waited += 10;
+                        }
+                    }
+                    // Now wait for all cameras to finish TakePhoto()
                     bool all_done = false;
                     while (!timer_stop.load() && !all_done) {
                         all_done = true;
@@ -1130,19 +1156,37 @@ int _main(int argc, char* argv[]) {
                     LOG_OUT("[stat] cam[" << ci << "] firing shot " << shot << "...");
                     slots[ci].shutter_fired->store(false);
                     double t_before = now_sec();
-                    auto url = slots[ci].cam->TakePhoto();
+                    // Run TakePhoto() in a thread with a 30s timeout so a hung
+                    // camera (e.g. X3 SD write stall) doesn't block the session.
+                    std::optional<ins_camera::MediaUrl> url_opt;
+                    {
+                        auto prom = std::make_shared<std::promise<ins_camera::MediaUrl>>();
+                        auto fut = prom->get_future();
+                        std::thread th([&slots, ci, prom]() {
+                            prom->set_value(slots[ci].cam->TakePhoto());
+                        });
+                        th.detach();
+                        if (fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready) {
+                            url_opt = fut.get();
+                        } else {
+                            LOG_ERR("[stat] cam[" << ci << "] TakePhoto timed out after 30s");
+                        }
+                    }
                     double t_after = now_sec();
+                    // Treat timeout or failed TakePhoto as empty url
+                    bool url_empty = !url_opt.has_value() || url_opt->Empty() || !url_opt->IsSingleOrigin();
 
-                    if (url.Empty() || !url.IsSingleOrigin()) {
+                    if (url_empty) {
                         LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed — retrying once");
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
                         slots[ci].shutter_fired->store(false);
                         t_before = now_sec();
-                        url = slots[ci].cam->TakePhoto();
+                        url_opt = slots[ci].cam->TakePhoto();
                         t_after = now_sec();
+                        url_empty = !url_opt.has_value() || url_opt->Empty() || !url_opt->IsSingleOrigin();
                     }
 
-                    if (url.Empty() || !url.IsSingleOrigin()) {
+                    if (url_empty) {
                         LOG_ERR("[stat] cam[" << ci << "] TakePhoto failed");
                         results[ci].ok = false;
                         return;
@@ -1162,7 +1206,7 @@ int _main(int argc, char* argv[]) {
                                 << (t_after - t_before) << "s  shutter_est(fallback)=" << std::setprecision(6) << t_shutter_stat);
                     }
                     results[ci].t_shutter = t_shutter_stat;
-                    results[ci].remote_path = url.GetSingleOrigin();
+                    results[ci].remote_path = url_opt->GetSingleOrigin();
                     results[ci].local_path = cam_dir + "/" + fs::path(results[ci].remote_path).filename().string();
 
                     // Write cam_index and capture_time immediately
@@ -1205,9 +1249,14 @@ int _main(int argc, char* argv[]) {
                 stat_dl_pending.fetch_add(1);
             }
             { std::ofstream pf(pending_path); pf << stat_dl_pending.load(); }
-            dl_cv.notify_one();
+            dl_cv.notify_all();
 
             // Signal done
+            // Wait for all CAMERA_NOTIFICATION_STORAGE_UPDATE callbacks to
+            // settle before writing .sdk_capture_done. Without this delay the
+            // SDK's internal notification lock can deadlock the next TakePhoto()
+            // call when the storage callback arrives after the download finishes.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             { std::ofstream df(done_path); df << "ok"; df.flush(); }
             LOG_OUT("[stat] batch capture done: " << num_cameras << " cameras fired in parallel");
             std::this_thread::sleep_for(std::chrono::milliseconds(200));

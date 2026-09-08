@@ -542,6 +542,13 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             intensity_image[_calib_mask < 128] = 0
             indices_image[_calib_mask < 128] = -1
 
+    # For OAK-1: apply CLAHE to boost LiDAR intensity contrast so SuperPoint
+    # can detect keypoints. Raw LiDAR intensities cluster near zero and lack
+    # the edge structure SuperPoint needs.
+    if is_oak1 and intensity_image.max() > 0:
+        _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        intensity_image = _clahe.apply(intensity_image)
+
     cv2.imwrite(str(_safe_output(output_image)), intensity_image)
 
     # The indices image pixel (u,v) must map to the same 3D point as intensity pixel (u,v).

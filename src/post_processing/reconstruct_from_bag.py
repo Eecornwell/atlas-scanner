@@ -1676,6 +1676,20 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         capture_output=True,
                         env=_stitch_env,
                     )
+                    # Fallback: if SDK stitch failed, try Python fisheye-to-ERP
+                    if result.returncode != 0 or not erp_path.exists():
+                        _fisheye_script = Path(__file__).resolve().parents[1] / 'capture' / 'fisheye_to_erp.py'
+                        if _fisheye_script.exists():
+                            _fw = _stitch_env.get('INSTA360_ERP_WIDTH', '7680')
+                            _fh = _stitch_env.get('INSTA360_ERP_HEIGHT', '3840')
+                            _fb = subprocess.run(
+                                [sys.executable, str(_fisheye_script),
+                                 str(best_insp), str(erp_path), _fw, _fh],
+                                capture_output=True, text=True
+                            )
+                            if _fb.returncode == 0:
+                                print(f'  {_fb.stdout.strip()}')
+                                result = type('R', (), {'returncode': 0})()
                     if result.returncode == 0 and erp_path.exists():
                         # Skip legacy WB correction in multi-camera sessions —
                         # color_normalize.py handles cross-camera matching properly.

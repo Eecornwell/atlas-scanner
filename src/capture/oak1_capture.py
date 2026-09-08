@@ -406,11 +406,51 @@ def main():
     (scan_dir / ".oak1_ready").touch()
     print("Waiting for capture trigger...", flush=True)
 
+    # Continuous mode: when .sdk_capture_trigger contains the session dir path,
+    # start a periodic self-trigger loop at INSTA360_INTERVAL_MS cadence.
+    import threading as _threading
+    _continuous_active = False
+    _continuous_shot = [0]
+    _continuous_interval_s = int(os.environ.get('INSTA360_INTERVAL_MS', '5000')) / 1000.0
+
+    def _continuous_loop():
+        import time as _time
+        _time.sleep(_continuous_interval_s)  # initial delay
+        while _continuous_active:
+            _shot_num = _continuous_shot[0]
+            _continuous_shot[0] += 1
+            _buf = f'{_shot_num + 1:03d}'
+            # Write directly to fusion_scan_NNN so the GUI scan counter
+            # updates in real time (dot dirs are invisible to the counter).
+            _oak1_scan = scan_dir / f'fusion_scan_{_buf}'
+            _oak1_scan.mkdir(exist_ok=True)
+            (scan_dir / '.oak1_trigger').write_text(str(_oak1_scan) + '\n')
+            _time.sleep(_continuous_interval_s)
+
     while True:
         if (scan_dir / ".oak1_quit_trigger").exists():
             (scan_dir / ".oak1_quit_trigger").unlink(missing_ok=True)
+            _continuous_active = False
             print("Quit trigger — exiting", flush=True)
             os._exit(0)
+
+        # Handle .sdk_capture_trigger — starts continuous self-trigger loop
+        # only when the trigger content is the session dir itself (continuous mode)
+        # AND this process is running as the primary camera (cam_index == "0").
+        # In secondary mode (alongside X5/X3), main_multi.cpp writes .oak1_trigger
+        # directly on each X5 shutter — the self-trigger loop must not run.
+        sdk_trig = scan_dir / ".sdk_capture_trigger"
+        if sdk_trig.exists() and not _continuous_active:
+            _trig_content = sdk_trig.read_text().strip()
+            if _trig_content == str(scan_dir) and cam_index == "0":
+                sdk_trig.unlink(missing_ok=True)
+                _continuous_active = True
+                _t = _threading.Thread(target=_continuous_loop, daemon=True)
+                _t.start()
+                (scan_dir / ".sdk_capture_done").touch()
+                print(f"Continuous mode started (interval={_continuous_interval_s:.1f}s)", flush=True)
+                # In secondary mode: ignore the continuous trigger entirely —
+                # main_multi.cpp drives the OAK-1 via .oak1_trigger per shutter.
 
         trigger = scan_dir / ".oak1_trigger"
         if trigger.exists():
@@ -440,6 +480,19 @@ def main():
                 while time.time() - t0 < 3.0:
                     f = stream_q.tryGet()
                     if f is not None:
+                        # Frame received — fire shutter sound at the true capture moment
+                        try:
+                            import subprocess as _sp, os as _os
+                            _env = _os.environ.copy()
+                            _uid = _os.getuid()
+                            _env.setdefault('XDG_RUNTIME_DIR', f'/run/user/{_uid}')
+                            _env.setdefault('DBUS_SESSION_BUS_ADDRESS',
+                                            f'unix:path=/run/user/{_uid}/bus')
+                            _sp.Popen(['paplay',
+                                       '/usr/share/sounds/freedesktop/stereo/camera-shutter.oga'],
+                                      stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, env=_env)
+                        except Exception:
+                            pass
                         frame = f.getCvFrame()
                         try:
                             ts = f.getTimestampSystem()

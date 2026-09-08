@@ -100,7 +100,7 @@ static bool http_download(const std::string& remote_path, const std::string& loc
     if (pid == 0) {
         // Child: exec curl directly — no shell, no injection risk.
         const char* argv[] = {
-            "curl", "-sf", "--max-time", "60",
+            "curl", "-sf", "--max-time", "30",
             "-o", local_path.c_str(),
             url.c_str(),
             nullptr
@@ -197,6 +197,18 @@ static bool apply_camera_settings(ins_camera::Camera* cam) {
             return false;
         const char* wb_names[] = {"AUTO", "2700K", "4000K", "5000K", "6500K", "7500K"};
         LOG_OUT("White balance: " << (wb_mode >= 0 && wb_mode <= 5 ? wb_names[wb_mode] : "AUTO"));
+    }
+
+    // Photo size: set from INSTA360_PHOTO_SIZE_DEFAULT env var.
+    if (auto* v = std::getenv("INSTA360_PHOTO_SIZE_DEFAULT")) {
+        int ps = std::atoi(v);
+        if (ps >= 0) {
+            if (!cam->SetPhotoSize(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE,
+                                   static_cast<ins_camera::PhotoSize>(ps)))
+                LOG_ERR("SetPhotoSize(" << ps << ") failed");
+            else
+                LOG_OUT("Photo size set to " << ps);
+        }
     }
 
     return true;
@@ -305,7 +317,7 @@ int main(int argc, char* argv[]) {
     const std::string trigger_path = session_dir + "/.sdk_capture_trigger";
     const std::string done_path    = session_dir + "/.sdk_capture_done";
     const std::string failed_path  = session_dir + "/.sdk_capture_failed";
-    const std::string quit_path    = session_dir + "/.session_done";
+    const std::string quit_path    = session_dir + "/.sdk_quit";
     const std::string pending_path = session_dir + "/.sdk_downloads_pending";
 
     bool   continuous_active = false;
@@ -369,15 +381,6 @@ int main(int argc, char* argv[]) {
             if (!cam->SetPhotoSubMode(ins_camera::SubPhotoMode::PHOTO_SINGLE))
                 LOG_ERR("SetPhotoSubMode failed (continuing)");
 
-            // Apply photo size before first shot
-            if (auto* v = std::getenv("INSTA360_PHOTO_SIZE_DEFAULT")) {
-                int ps = std::atoi(v);
-                if (ps >= 0) {
-                    cam->SetPhotoSize(ins_camera::CameraFunctionMode::FUNCTION_MODE_NORMAL_IMAGE,
-                                     static_cast<ins_camera::PhotoSize>(ps));
-                    LOG_OUT("Photo size set to " << ps);
-                }
-            }
 
             t_start = now_sec();
             continuous_active = true;

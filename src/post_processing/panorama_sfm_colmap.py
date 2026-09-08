@@ -1176,8 +1176,9 @@ def _strip_rig_from_db(db_path):
     conn.close()
 
 
+
 def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
-                 lidar_voxel_size=0.0):
+                 lidar_voxel_size=0.0, poses_only=True):
     try:
         session_path = _safe_data(Path(session_dir).expanduser())
     except ValueError as e:
@@ -1194,223 +1195,276 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         return False
 
     db_path = colmap_dir / 'database.db'
-    if db_path.exists():
-        db_path.unlink()
 
-    # Use the canonical f_px (derived from the smallest ERP width) as the
-    # prior for all cameras. All tiles are the same size so single_camera_per_folder
-    # works correctly — one camera model per face, shared across all panoramas.
-    # canonical f_px and tile_size are stored on every panorama by extract_tiles
+    # Flags used in both modes
+    _oak1_panos = [p for p in panoramas if 'cx' in p]
+    _erp_panos  = [p for p in panoramas if 'cx' not in p]
+    _is_pinhole_session = 'cx' in panoramas[0]
+    _is_mixed = bool(_oak1_panos and _erp_panos)
     f_px = panoramas[0]['f_px']
     c = panoramas[0]['tile_size'] / 2.0
 
-    # OAK-1: use PINHOLE with actual cx/cy; ERP tiles use SIMPLE_PINHOLE
-    _is_pinhole_session = 'cx' in panoramas[0]
-    # Mixed session: some panoramas are ERP, some are OAK-1 pinhole
-    _oak1_panos = [p for p in panoramas if 'cx' in p]
-    _erp_panos  = [p for p in panoramas if 'cx' not in p]
-    _is_mixed = bool(_oak1_panos and _erp_panos)
+    if poses_only:
+        # ── Poses-only mode: build model directly from LiDAR poses + calibration ──
+        # Skips feature extraction, matching, and triangulation entirely.
+        # Points3D will be populated from the LiDAR cloud in the shared section below.
+        print("Mode: poses-only (LiDAR poses + calibration, no SfM matching)")
 
-    if _is_pinhole_session and not _is_mixed:
-        _cx = panoramas[0]['cx']
-        _cy = panoramas[0]['cy']
-        _cam_model = 'PINHOLE'
-        _cam_params = f'{f_px:.4f},{f_px:.4f},{_cx:.4f},{_cy:.4f}'
-        print(f"2. Extracting features (PINHOLE, fx=fy={f_px:.1f} cx={_cx:.1f} cy={_cy:.1f})...")
-    else:
-        _cam_model = 'SIMPLE_PINHOLE'
-        _cam_params = f'{f_px:.4f},{c:.1f},{c:.1f}'
-        if _is_mixed:
-            print(f"2. Extracting features (mixed: SIMPLE_PINHOLE for ERP + PINHOLE for OAK-1)...")
-        else:
-            print("2. Extracting features (SIMPLE_PINHOLE, one camera per face folder)...")
-    mask_dir = colmap_dir / 'masks'
-    # For mixed sessions, first pass only processes ERP faces (not face_oak1)
-    _erp_image_path = colmap_dir / 'images'
-    cmd = [
-        'colmap', 'feature_extractor',
-        '--database_path', str(db_path),
-        '--image_path', str(_erp_image_path),
-        '--ImageReader.camera_model', _cam_model,
-        '--ImageReader.single_camera_per_folder', '1',
-        '--ImageReader.camera_params', _cam_params,
-        '--SiftExtraction.max_num_features', '32768',
-            '--SiftExtraction.estimate_affine_shape', '1',
-    ]
-    if _is_mixed:
-        # Exclude face_oak1 from first pass by listing only ERP face dirs
+        if db_path.exists():
+            db_path.unlink()
+
+        # Poses-only: create a minimal database with cameras + images so
+        # write_init_model_bin can look up IDs without running feature_extractor.
+        import struct as _struct
+        _conn = sqlite3.connect(str(db_path))
+        _conn.execute("""CREATE TABLE cameras (
+            camera_id INTEGER PRIMARY KEY, model INTEGER NOT NULL,
+            width INTEGER NOT NULL, height INTEGER NOT NULL,
+            params BLOB, prior_focal_length INTEGER NOT NULL)""")
+        _conn.execute("""CREATE TABLE images (
+            image_id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+            camera_id INTEGER NOT NULL,
+            prior_qw REAL, prior_qx REAL, prior_qy REAL, prior_qz REAL,
+            prior_tx REAL, prior_ty REAL, prior_tz REAL)""")
+        _face_cam_ids = {}
+        _oak1_cam_id  = None
+        _cam_id = 1
+        _img_id = 1
+        _f_px_po = panoramas[0]['f_px']
+        _tile_size_po = panoramas[0]['tile_size']
+        _c_po = _tile_size_po / 2.0
+        for _fi in range(NUM_FACES):
+            _params = _struct.pack('ddd', _f_px_po, _c_po, _c_po)
+            _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
+                          (_cam_id, 0, _tile_size_po, _tile_size_po, _params, 1))
+            _face_cam_ids[_fi] = _cam_id
+            _cam_id += 1
+        if _oak1_panos:
+            _op = _oak1_panos[0]
+            _oak1_params = _struct.pack('dddd', _op['f_px'], _op['f_px'],
+                                        _op['cx'], _op['cy'])
+            _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
+                          (_cam_id, 1, int(_op.get('width', _tile_size_po)),
+                           int(_op.get('height', _tile_size_po)), _oak1_params, 1))
+            _oak1_cam_id = _cam_id
+            _cam_id += 1
+        for _pano in panoramas:
+            for _tile in _pano['tiles']:
+                _is_oak1 = 'face_oak1' in _tile['rel_path']
+                _cid = _oak1_cam_id if _is_oak1 else _face_cam_ids.get(_tile['face'], 1)
+                _conn.execute('INSERT OR IGNORE INTO images VALUES (?,?,?,?,?,?,?,?,?,?)',
+                              (_img_id, _tile['rel_path'], _cid,
+                               None, None, None, None, None, None, None))
+                _img_id += 1
+        _conn.commit()
+        _conn.close()
+
+        print("2. Writing binary init model with known poses...")
+        init_sparse = write_init_model_bin(colmap_dir, panoramas)
+
+        output_dir = colmap_dir / 'sparse' / '0'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in ('rigs.bin', 'frames.bin'):
+            _p = output_dir / _stale
+            if _p.exists():
+                _p.unlink()
+
         import shutil as _shutil
-        _oak1_tmp = colmap_dir / '_face_oak1_tmp'
-        _oak1_src = colmap_dir / 'images' / 'face_oak1'
-        if _oak1_tmp.exists():
-            _shutil.rmtree(str(_oak1_tmp))
-        if _oak1_src.exists():
-            _oak1_src.rename(_oak1_tmp)
-    if any(mask_dir.rglob('*.png')):
-        cmd += ['--ImageReader.mask_path', str(mask_dir)]
-    subprocess.run(cmd, check=True)
-    if _is_mixed and _oak1_tmp.exists():
-        _oak1_tmp.rename(_oak1_src)
+        for _f in ('cameras.bin', 'images.bin', 'points3D.bin'):
+            _src = init_sparse / _f
+            _dst = output_dir / _f
+            if _src.exists():
+                _shutil.copy2(str(_src), str(_dst))
 
-    # Mixed session: run a second feature extraction pass for OAK-1 face_oak1/
-    # with PINHOLE model and actual intrinsics — no mask needed for OAK-1
-    if _is_mixed and _oak1_panos:
-        _oak1_cx = _oak1_panos[0]['cx']
-        _oak1_cy = _oak1_panos[0]['cy']
-        _oak1_fpx = _oak1_panos[0]['f_px']
-        _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
-        print(f"   OAK-1 pass: PINHOLE fx=fy={_oak1_fpx:.1f} cx={_oak1_cx:.1f} cy={_oak1_cy:.1f}")
-        cmd_oak1 = [
+        if _oak1_panos:
+            _inject_known_pose_images(output_dir, init_sparse, _oak1_panos)
+            print(f"  Injected {len(_oak1_panos)} OAK-1 images with known poses")
+
+        print(f"\n✓ Poses-only model written: {output_dir}")
+
+    else:
+        # ── Full SfM mode: feature extraction + matching + triangulation ──────────
+        print("Mode: full SfM (feature extraction + matching + triangulation)")
+
+        if db_path.exists():
+            db_path.unlink()
+
+        if _is_pinhole_session and not _is_mixed:
+            _cx = panoramas[0]['cx']
+            _cy = panoramas[0]['cy']
+            _cam_model = 'PINHOLE'
+            _cam_params = f'{f_px:.4f},{f_px:.4f},{_cx:.4f},{_cy:.4f}'
+            print(f"2. Extracting features (PINHOLE, fx=fy={f_px:.1f} cx={_cx:.1f} cy={_cy:.1f})...")
+        else:
+            _cam_model = 'SIMPLE_PINHOLE'
+            _cam_params = f'{f_px:.4f},{c:.1f},{c:.1f}'
+            if _is_mixed:
+                print("2. Extracting features (mixed: SIMPLE_PINHOLE for ERP + PINHOLE for OAK-1)...")
+            else:
+                print("2. Extracting features (SIMPLE_PINHOLE, one camera per face folder)...")
+
+        mask_dir = colmap_dir / 'masks'
+        _erp_image_path = colmap_dir / 'images'
+        cmd = [
             'colmap', 'feature_extractor',
             '--database_path', str(db_path),
-            '--image_path', str(colmap_dir / 'images'),
-            '--image_list_path', str(_write_oak1_list(colmap_dir)),
-            '--ImageReader.camera_model', 'PINHOLE',
+            '--image_path', str(_erp_image_path),
+            '--ImageReader.camera_model', _cam_model,
             '--ImageReader.single_camera_per_folder', '1',
-            '--ImageReader.camera_params', _oak1_params,
+            '--ImageReader.camera_params', _cam_params,
             '--SiftExtraction.max_num_features', '32768',
-                '--SiftExtraction.estimate_affine_shape', '1',
+            '--SiftExtraction.estimate_affine_shape', '1',
         ]
-        subprocess.run(cmd_oak1, check=True)
+        if _is_mixed:
+            import shutil as _shutil
+            _oak1_tmp = colmap_dir / '_face_oak1_tmp'
+            _oak1_src = colmap_dir / 'images' / 'face_oak1'
+            if _oak1_tmp.exists():
+                _shutil.rmtree(str(_oak1_tmp))
+            if _oak1_src.exists():
+                _oak1_src.rename(_oak1_tmp)
+        if any(mask_dir.rglob('*.png')):
+            cmd += ['--ImageReader.mask_path', str(mask_dir)]
+        subprocess.run(cmd, check=True)
+        if _is_mixed and _oak1_tmp.exists():
+            _oak1_tmp.rename(_oak1_src)
 
-    print("3. Configuring rig...")
-    rig_config_path = write_rig_config(colmap_dir, panoramas)
-    subprocess.run([
-        'colmap', 'rig_configurator',
-        '--database_path', str(db_path),
-        '--rig_config_path', str(rig_config_path),
-    ], check=True)
-
-    print("4. Matching features...")
-    if exhaustive:
-        matcher = 'exhaustive_matcher'
-        matcher_args = []
-    else:
-        matcher = 'sequential_matcher'
-        # 360° cameras see all directions simultaneously, so even scans several
-        # positions apart share content. overlap=10 ensures each panorama is
-        # matched against its 10 nearest spatial neighbours (in both directions)
-        # after the nearest-neighbour sort above.
-        # quadratic_overlap=1 also matches i with i+2, i+4... for robustness
-        # on non-uniform scan spacing.
-        n_panos = len(panoramas)
-        is_360 = panoramas[0].get('is_360', True) if panoramas else True
-        overlap = min(10 if is_360 else 5, max(1, n_panos - 1))
-        matcher_args = [
-            '--SequentialMatching.overlap', str(overlap),
-            '--SequentialMatching.quadratic_overlap', '1',
-        ]
-        print(f"  Sequential matching: overlap={overlap}, quadratic_overlap=1 "
-              f"({'360°' if is_360 else '180°'}, {n_panos} panoramas)")
-    subprocess.run([
-        'colmap', matcher,
-        '--database_path', str(db_path),
-        '--FeatureMatching.rig_verification', '1',
-        '--FeatureMatching.skip_image_pairs_in_same_frame', '1',
-        '--FeatureMatching.max_num_matches', '32768',
-        '--FeatureMatching.gpu_index', '-1',
-    ] + matcher_args, check=True)
-
-    # Cross-match OAK-1 images against ERP tiles from spatially nearest panoramas.
-    # Sequential matching only pairs OAK-1 against OAK-1 (separate rig/sequence);
-    # explicit pairs ensure OAK-1 features are matched against overlapping ERP content.
-    _erp_panos = [p for p in panoramas if 'cx' not in p]
-    _oak1_panos_match = [p for p in panoramas if 'cx' in p]
-    if _oak1_panos_match and _erp_panos:
-        _result = _write_oak1_cross_pairs(colmap_dir, _erp_panos, _oak1_panos_match, session_path)
-        if _result:
-            _cross_pairs, _slice_list, _slice_images = _result
-            # Extract features from ERP slices using same PINHOLE intrinsics as OAK-1
-            _oak1_fpx = _oak1_panos_match[0]['f_px']
-            _oak1_cx  = _oak1_panos_match[0]['cx']
-            _oak1_cy  = _oak1_panos_match[0]['cy']
+        if _is_mixed and _oak1_panos:
+            _oak1_cx = _oak1_panos[0]['cx']
+            _oak1_cy = _oak1_panos[0]['cy']
+            _oak1_fpx = _oak1_panos[0]['f_px']
             _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
-            print(f"  Extracting features from {len(_slice_images)} ERP slices...")
+            print(f"   OAK-1 pass: PINHOLE fx=fy={_oak1_fpx:.1f} cx={_oak1_cx:.1f} cy={_oak1_cy:.1f}")
             subprocess.run([
                 'colmap', 'feature_extractor',
                 '--database_path', str(db_path),
                 '--image_path', str(colmap_dir / 'images'),
-                '--image_list_path', str(_slice_list),
+                '--image_list_path', str(_write_oak1_list(colmap_dir)),
                 '--ImageReader.camera_model', 'PINHOLE',
                 '--ImageReader.single_camera_per_folder', '1',
                 '--ImageReader.camera_params', _oak1_params,
                 '--SiftExtraction.max_num_features', '32768',
                 '--SiftExtraction.estimate_affine_shape', '1',
             ], check=True)
-            print(f"  Cross-matching {len(_oak1_panos_match)} OAK-1 images against ERP slices...")
-            subprocess.run([
-                'colmap', 'matches_importer',
-                '--database_path', str(db_path),
-                '--match_list_path', str(_cross_pairs),
-                '--match_type', 'pairs',
-                '--FeatureMatching.max_num_matches', '32768',
-                '--FeatureMatching.gpu_index', '-1',
-            ], check=True)
 
-    print("5. Writing binary init model with known poses...")
-    init_sparse = write_init_model_bin(colmap_dir, panoramas)
-
-    # Strip rig from DB before triangulation — point_triangulator crashes when
-    # a triangulated point references an image whose rig frame is incomplete.
-    # The rig was only needed for rig_verification during matching.
-    _strip_rig_from_db(colmap_dir / 'database.db')
-
-    output_dir = colmap_dir / 'sparse' / '0'
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # Remove stale rig binaries from any previous BA run — point_triangulator
-    # must not see rigs.bin/frames.bin or it crashes on dangling image IDs.
-    for _stale in ('rigs.bin', 'frames.bin'):
-        _p = output_dir / _stale
-        if _p.exists():
-            _p.unlink()
-
-    print("6. Triangulating points with known poses...")
-    subprocess.run([
-        'colmap', 'point_triangulator',
-        '--database_path', str(db_path),
-        '--image_path', str(colmap_dir / 'images'),
-        '--input_path', str(init_sparse),
-        '--output_path', str(output_dir),
-        '--clear_points', '1',
-        '--Mapper.tri_min_angle', '1.0',
-        '--Mapper.tri_merge_max_reproj_error', '16.0',
-        '--Mapper.tri_complete_max_reproj_error', '16.0',
-        '--Mapper.tri_re_max_angle_error', '8.0',
-    ], check=True)
-
-    # Inject OAK-1 images with known poses into sparse/0/images.bin.
-    # point_triangulator drops images with no triangulated points, but OAK-1
-    # images have pose priors and don't need triangulated points to be useful.
-    _oak1_panos = [p for p in panoramas if 'cx' in p]
-    if _oak1_panos:
-        _inject_known_pose_images(output_dir, init_sparse, _oak1_panos)
-        print(f"  Injected {len(_oak1_panos)} OAK-1 images with known poses")
-
-    if bundle_adjustment:
-        print("7. Restoring rig for bundle adjustment...")
+        print("3. Configuring rig...")
+        rig_config_path = write_rig_config(colmap_dir, panoramas)
         subprocess.run([
             'colmap', 'rig_configurator',
             '--database_path', str(db_path),
             '--rig_config_path', str(rig_config_path),
         ], check=True)
 
-        print("8. Writing rig into sparse model...")
-        write_rig_bin(output_dir, db_path, panoramas)
-
-        print("9. Running rig-aware bundle adjustment...")
+        print("4. Matching features...")
+        if exhaustive:
+            matcher = 'exhaustive_matcher'
+            matcher_args = []
+        else:
+            matcher = 'sequential_matcher'
+            n_panos = len(panoramas)
+            is_360 = panoramas[0].get('is_360', True) if panoramas else True
+            overlap = min(10 if is_360 else 5, max(1, n_panos - 1))
+            matcher_args = [
+                '--SequentialMatching.overlap', str(overlap),
+                '--SequentialMatching.quadratic_overlap', '1',
+            ]
+            print(f"  Sequential matching: overlap={overlap}, quadratic_overlap=1 "
+                  f"({'360°' if is_360 else '180°'}, {n_panos} panoramas)")
         subprocess.run([
-            'colmap', 'bundle_adjuster',
-            '--input_path', str(output_dir),
+            'colmap', matcher,
+            '--database_path', str(db_path),
+            '--FeatureMatching.rig_verification', '1',
+            '--FeatureMatching.skip_image_pairs_in_same_frame', '1',
+            '--FeatureMatching.max_num_matches', '32768',
+            '--FeatureMatching.gpu_index', '-1',
+        ] + matcher_args, check=True)
+
+        _oak1_panos_match = [p for p in panoramas if 'cx' in p]
+        _erp_panos_match  = [p for p in panoramas if 'cx' not in p]
+        if _oak1_panos_match and _erp_panos_match:
+            _result = _write_oak1_cross_pairs(colmap_dir, _erp_panos_match, _oak1_panos_match, session_path)
+            if _result:
+                _cross_pairs, _slice_list, _slice_images = _result
+                _oak1_fpx = _oak1_panos_match[0]['f_px']
+                _oak1_cx  = _oak1_panos_match[0]['cx']
+                _oak1_cy  = _oak1_panos_match[0]['cy']
+                _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
+                print(f"  Extracting features from {len(_slice_images)} ERP slices...")
+                subprocess.run([
+                    'colmap', 'feature_extractor',
+                    '--database_path', str(db_path),
+                    '--image_path', str(colmap_dir / 'images'),
+                    '--image_list_path', str(_slice_list),
+                    '--ImageReader.camera_model', 'PINHOLE',
+                    '--ImageReader.single_camera_per_folder', '1',
+                    '--ImageReader.camera_params', _oak1_params,
+                    '--SiftExtraction.max_num_features', '32768',
+                    '--SiftExtraction.estimate_affine_shape', '1',
+                ], check=True)
+                print(f"  Cross-matching {len(_oak1_panos_match)} OAK-1 images against ERP slices...")
+                subprocess.run([
+                    'colmap', 'matches_importer',
+                    '--database_path', str(db_path),
+                    '--match_list_path', str(_cross_pairs),
+                    '--match_type', 'pairs',
+                    '--FeatureMatching.max_num_matches', '32768',
+                    '--FeatureMatching.gpu_index', '-1',
+                ], check=True)
+
+        print("5. Writing binary init model with known poses...")
+        init_sparse = write_init_model_bin(colmap_dir, panoramas)
+        _strip_rig_from_db(colmap_dir / 'database.db')
+
+        output_dir = colmap_dir / 'sparse' / '0'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for _stale in ('rigs.bin', 'frames.bin'):
+            _p = output_dir / _stale
+            if _p.exists():
+                _p.unlink()
+
+        print("6. Triangulating points with known poses...")
+        subprocess.run([
+            'colmap', 'point_triangulator',
+            '--database_path', str(db_path),
+            '--image_path', str(colmap_dir / 'images'),
+            '--input_path', str(init_sparse),
             '--output_path', str(output_dir),
-            '--BundleAdjustment.refine_focal_length', '0',
-            '--BundleAdjustment.refine_principal_point', '0',
-            '--BundleAdjustment.refine_extra_params', '0',
-            '--BundleAdjustment.refine_sensor_from_rig', '0',
-            '--BundleAdjustment.refine_rig_from_world', '1',
-            '--BundleAdjustmentCeres.max_num_iterations', '500',
+            '--clear_points', '1',
+            '--Mapper.tri_min_angle', '1.0',
+            '--Mapper.tri_merge_max_reproj_error', '16.0',
+            '--Mapper.tri_complete_max_reproj_error', '16.0',
+            '--Mapper.tri_re_max_angle_error', '8.0',
         ], check=True)
 
-    print(f"\n✓ Reconstruction complete: {output_dir}")
+        if _oak1_panos:
+            _inject_known_pose_images(output_dir, init_sparse, _oak1_panos)
+            print(f"  Injected {len(_oak1_panos)} OAK-1 images with known poses")
+
+        if bundle_adjustment:
+            print("7. Restoring rig for bundle adjustment...")
+            subprocess.run([
+                'colmap', 'rig_configurator',
+                '--database_path', str(db_path),
+                '--rig_config_path', str(rig_config_path),
+            ], check=True)
+            print("8. Writing rig into sparse model...")
+            write_rig_bin(output_dir, db_path, panoramas)
+            print("9. Running rig-aware bundle adjustment...")
+            subprocess.run([
+                'colmap', 'bundle_adjuster',
+                '--input_path', str(output_dir),
+                '--output_path', str(output_dir),
+                '--BundleAdjustment.refine_focal_length', '0',
+                '--BundleAdjustment.refine_principal_point', '0',
+                '--BundleAdjustment.refine_extra_params', '0',
+                '--BundleAdjustment.refine_sensor_from_rig', '0',
+                '--BundleAdjustment.refine_rig_from_world', '1',
+                '--BundleAdjustmentCeres.max_num_iterations', '500',
+            ], check=True)
+
+        print(f"\n✓ Reconstruction complete: {output_dir}")
+
+    # ── Shared: PLY export + LiDAR merge + depth images + zip ────────────────
     ply_out = colmap_dir / 'sparse' / 'reconstructed.ply'
     subprocess.run([
         'colmap', 'model_converter',
@@ -1421,10 +1475,6 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     if ply_out.exists():
         print(f"✓ Exported PLY: {ply_out}")
 
-    # Merge LiDAR point cloud with COLMAP reconstruction.
-    # Positions from sensor_lidar.ply (200k pts, same as depth images).
-    # Colors from sensor_colored_exact.ply via nearest-neighbour transfer.
-    # This guarantees points3D.bin is consistent with depth images.
     print("  Building per-scan LiDAR cloud for points3D...")
     import open3d as o3d
     all_lidar_pts  = []
@@ -1457,21 +1507,15 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         pts_ros = (_Rl @ pts_s.T).T + _pos
         pts_col = (R_ROS2COLMAP @ pts_ros.T).T
 
-        # Transfer colors from sensor_colored_exact.ply using nearest-neighbour
         if ply_color.exists():
             pcd_c = o3d.io.read_point_cloud(str(ply_color))
             if pcd_c.has_colors() and len(pcd_c.points) > 0:
                 from scipy.spatial import cKDTree as _KDT
                 _tree = _KDT(np.asarray(pcd_c.points))
                 _dists, _idx = _tree.query(pts_s, k=1, workers=-1)
-                # Only transfer color when the nearest colored point is close enough.
-                # sensor_colored_exact.ply is a filtered subset of sensor_lidar.ply
-                # (distance-clipped, masked), so uncolored points have no valid match.
-                # A threshold of 0.05m (~2x voxel size) rejects spurious far matches.
                 _valid = _dists < 0.05
                 cols = np.zeros((len(pts_s), 3), int)
                 cols[_valid] = (np.asarray(pcd_c.colors)[_idx[_valid]] * 255).astype(int)
-                # Drop points with no valid color transfer
                 pts_col = pts_col[_valid]
                 cols    = cols[_valid]
             else:
@@ -1485,25 +1529,29 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     if all_lidar_pts and ply_out.exists():
         merged_lidar_pts  = np.vstack(all_lidar_pts)
         merged_lidar_cols = np.vstack(all_lidar_cols)
-        # Also merge in the SfM points
-        colmap_pcd  = o3d.io.read_point_cloud(str(ply_out))
-        colmap_pts  = np.asarray(colmap_pcd.points)
-        colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) \
-                      if colmap_pcd.has_colors() else np.zeros((len(colmap_pts), 3), int)
-        sfm_mask = _filter_sfm_to_lidar_extents(colmap_pts, merged_lidar_pts)
-        colmap_pts  = colmap_pts[sfm_mask]
-        colmap_cols = colmap_cols[sfm_mask]
-        print(f'  SfM outlier filter: {sfm_mask.sum()}/{len(sfm_mask)} points kept')
-        iso_mask = _filter_sfm_by_lidar_proximity(colmap_pts, merged_lidar_pts)
-        colmap_pts  = colmap_pts[iso_mask]
-        colmap_cols = colmap_cols[iso_mask]
-        print(f'  SfM proximity filter: {iso_mask.sum()}/{len(iso_mask)} points kept')
+        if not poses_only:
+            colmap_pcd  = o3d.io.read_point_cloud(str(ply_out))
+            colmap_pts  = np.asarray(colmap_pcd.points)
+            colmap_cols = (np.asarray(colmap_pcd.colors) * 255).astype(int) \
+                          if colmap_pcd.has_colors() else np.zeros((len(colmap_pts), 3), int)
+            sfm_mask = _filter_sfm_to_lidar_extents(colmap_pts, merged_lidar_pts)
+            colmap_pts  = colmap_pts[sfm_mask]
+            colmap_cols = colmap_cols[sfm_mask]
+            print(f'  SfM outlier filter: {sfm_mask.sum()}/{len(sfm_mask)} points kept')
+            iso_mask = _filter_sfm_by_lidar_proximity(colmap_pts, merged_lidar_pts)
+            colmap_pts  = colmap_pts[iso_mask]
+            colmap_cols = colmap_cols[iso_mask]
+            print(f'  SfM proximity filter: {iso_mask.sum()}/{len(iso_mask)} points kept')
         lidar_iso_mask = _filter_sfm_isolated(merged_lidar_pts, radius=0.3, min_neighbors=5)
         merged_lidar_pts  = merged_lidar_pts[lidar_iso_mask]
         merged_lidar_cols = merged_lidar_cols[lidar_iso_mask]
         print(f'  LiDAR isolated filter: {lidar_iso_mask.sum()}/{len(lidar_iso_mask)} points kept')
-        all_pts  = np.vstack([merged_lidar_pts,  colmap_pts])
-        all_cols = np.vstack([merged_lidar_cols, colmap_cols])
+        if poses_only:
+            all_pts  = merged_lidar_pts
+            all_cols = merged_lidar_cols
+        else:
+            all_pts  = np.vstack([merged_lidar_pts,  colmap_pts])
+            all_cols = np.vstack([merged_lidar_cols, colmap_cols])
         merged_ply = colmap_dir / 'sparse' / 'merged.ply'
         with open(merged_ply, 'w') as _mf:
             _mf.write('ply\nformat ascii 1.0\n')
@@ -1512,10 +1560,10 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _mf.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
             for _p, _c in zip(all_pts, all_cols):
                 _mf.write(f'{_p[0]:.6f} {_p[1]:.6f} {_p[2]:.6f} {int(_c[0])} {int(_c[1])} {int(_c[2])}\n')
-        print(f'  LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts)} -> {merged_ply}')
+        src_label = 'LiDAR' if poses_only else f'LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts) if not poses_only else 0}'
+        print(f'  {src_label} -> {merged_ply}')
         _write_merged_to_points3d(output_dir, merged_lidar_pts, merged_lidar_cols)
     elif ply_out.exists():
-        # Fallback: use session merged cloud if no per-scan PLYs available
         session_aligned = session_path / 'merged_aligned_colored.ply'
         session_merged  = session_path / 'merged_pointcloud.ply'
         lidar_ply = session_aligned if session_aligned.exists() else \
@@ -1526,13 +1574,12 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _fb_lidar_pcd = _o3d.io.read_point_cloud(str(lidar_ply))
             _fb_lidar_pts = (R_ROS2COLMAP @ np.asarray(_fb_lidar_pcd.points).T).T
             _merge_point_clouds(lidar_ply, ply_out, merged_ply, transform_lidar=True,
-                                lidar_voxel_size=lidar_voxel_size, filter_sfm=True)
+                                lidar_voxel_size=lidar_voxel_size, filter_sfm=not poses_only)
             _write_merged_to_points3d(output_dir, _fb_lidar_pts,
                                       (np.asarray(_fb_lidar_pcd.colors) * 255).astype(int)
                                       if _fb_lidar_pcd.has_colors()
                                       else np.zeros((len(_fb_lidar_pts), 3), int))
 
-    # Generate depth images using non-downsampled per-scan point clouds
     print("\n10. Generating depth images...")
     import importlib.util as _ilu
     _dep_spec = _ilu.spec_from_file_location(
@@ -1561,19 +1608,18 @@ if __name__ == '__main__':
         description='Panorama SfM: perspective tiles + rig + triangulation (panorama_sfm.py style)'
     )
     parser.add_argument('session_directory')
+    parser.add_argument('--sfm', dest='poses_only', action='store_false',
+                        help='Run full SfM pipeline (feature extraction + matching + triangulation)')
     parser.add_argument('--sequential', dest='exhaustive', action='store_false',
-                        help='Use sequential matcher (default — images are spatially '
-                             'sorted so overlap=10 covers nearby 360° panoramas)')
+                        help='Use sequential matcher (default for SfM mode)')
     parser.add_argument('--exhaustive', dest='exhaustive', action='store_true',
-                        help='Use exhaustive matcher (matches all pairs — slow, '
-                             'best for very small sessions)')
+                        help='Use exhaustive matcher (slow, best for small sessions)')
     parser.add_argument('--lidar-voxel-size', type=float, default=0.0,
-                        help='Voxel downsample size for LiDAR cloud before merging '
-                             'with COLMAP points (metres, 0 = no downsampling)')
-    parser.set_defaults(exhaustive=False)
+                        help='Voxel downsample size for LiDAR cloud (metres, 0 = no downsampling)')
+    parser.set_defaults(exhaustive=False, poses_only=True)
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
-                        help='Skip rig-aware bundle adjustment')
+                        help='Skip rig-aware bundle adjustment (SfM mode only)')
     parser.set_defaults(bundle_adjustment=False)
     args = parser.parse_args()
 
@@ -1585,4 +1631,5 @@ if __name__ == '__main__':
     run_pipeline(args.session_directory,
                  exhaustive=args.exhaustive,
                  bundle_adjustment=args.bundle_adjustment,
-                 lidar_voxel_size=args.lidar_voxel_size)
+                 lidar_voxel_size=args.lidar_voxel_size,
+                 poses_only=args.poses_only)

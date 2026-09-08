@@ -13,6 +13,8 @@ import sys
 import os
 import glob
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'capture'))
 from fisheye_to_erp import fisheye_jpg_to_erp
 from exact_match_fusion import exact_match_calibration_tool
 

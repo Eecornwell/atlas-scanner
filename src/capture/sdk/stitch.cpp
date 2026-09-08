@@ -1,7 +1,9 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <algorithm>
 #include <cstdlib>
+#include <unistd.h>
 #include <filesystem>
 #include <ins_stitcher.h>
 #include <ins_common.h>
@@ -109,12 +111,75 @@ int main(int argc, char* argv[]) {
     stitcher.EnableCuda(false);
     stitcher.SetImageProcessingAccelType(ins::ImageProcessingAccel::kCPU);
 
+    // Pre-read input file bytes for fallback use — must happen before Stitch()
+    // since the SDK may modify internal state that interferes with cv::imdecode.
+    std::vector<uchar> input_buf;
+    {
+        std::ifstream ifs(input_path, std::ios::binary);
+        input_buf.assign((std::istreambuf_iterator<char>(ifs)),
+                          std::istreambuf_iterator<char>());
+    }
+
     std::cout << "Stitching " << sanitise(input_path) << " -> " << sanitise(output_path)
               << " (" << erp_w << "x" << erp_h << ")" << std::endl;
 
     if (!stitcher.Stitch()) {
-        std::cerr << "Stitching failed" << std::endl;
-        return 1;
+        // SDK stitch failed — attempt OpenCV fisheye-to-ERP fallback.
+        // This handles HDR single-fisheye .insp files (square aspect ratio)
+        // which the SDK rejects with ErrorCode:11.
+        // cv::imread uses file extension to select codec; .insp is not
+        // recognised so use imdecode with raw bytes instead.
+        std::ifstream ifs(input_path, std::ios::binary);
+        std::vector<uchar> buf((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+        cv::Mat fisheye = cv::imdecode(input_buf, cv::IMREAD_COLOR);
+        if (fisheye.empty()) {
+            std::cerr << "Stitching failed (fallback: could not decode image, buf=" << input_buf.size() << ")" << std::endl;
+            return 1;
+        }
+        int fw = fisheye.cols, fh = fisheye.rows;
+        std::cout << "Fallback: decoded " << fw << "x" << fh << " from " << input_buf.size() << " bytes" << std::endl;
+        // Only attempt fallback for square (single-fisheye) images
+        if (std::abs(fw - fh) > fw / 10) {
+            std::cerr << "Stitching failed (fallback: not square: " << fw << "x" << fh << ")" << std::endl;
+            return 1;
+        }
+        std::cout << "SDK stitch failed — using OpenCV fisheye-to-ERP fallback ("
+                  << fw << "x" << fh << ")" << std::endl;
+        // Equidistant fisheye projection: r = f * theta
+        double cx = fw / 2.0, cy = fh / 2.0;
+        double f  = fw / M_PI;  // FOV ~180deg: at edge r=fw/2, theta=pi/2 -> f=fw/pi
+        cv::Mat map_x(erp_h, erp_w, CV_32F);
+        cv::Mat map_y(erp_h, erp_w, CV_32F);
+        for (int ey = 0; ey < erp_h; ++ey) {
+            double lat = (0.5 - (ey + 0.5) / erp_h) * M_PI;
+            for (int ex = 0; ex < erp_w; ++ex) {
+                double lon = ((ex + 0.5) / erp_w - 0.5) * 2.0 * M_PI;
+                double X = std::cos(lat) * std::sin(lon);
+                double Y = std::sin(lat);
+                double Z = std::cos(lat) * std::cos(lon);
+                double theta = std::acos(std::max(-1.0, std::min(1.0, Z)));
+                double phi   = std::atan2(Y, X);
+                double r     = f * theta;
+                float sx = static_cast<float>(cx + r * std::cos(phi));
+                float sy = static_cast<float>(cy + r * std::sin(phi));
+                // Only map front hemisphere (theta < pi/2)
+                if (theta < M_PI / 2.0 && sx >= 0 && sx < fw && sy >= 0 && sy < fh) {
+                    map_x.at<float>(ey, ex) = sx;
+                    map_y.at<float>(ey, ex) = sy;
+                } else {
+                    map_x.at<float>(ey, ex) = -1;
+                    map_y.at<float>(ey, ex) = -1;
+                }
+            }
+        }
+        cv::Mat erp;
+        cv::remap(fisheye, erp, map_x, map_y, cv::INTER_LINEAR,
+                  cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 95};
+        cv::imwrite(output_path, erp, params);
+        std::cout << "Done (fisheye fallback)" << std::endl;
+        return 0;
     }
 
     // The SDK's internal JPEG encoder uses ~q60 which causes visible blocking.
@@ -127,22 +192,18 @@ int main(int argc, char* argv[]) {
         if (!img.empty()) {
             cv::Mat processed;
             if (denoise) {
-                // X3 sensor noise reduction: NL-means denoising removes
-                // high-frequency sensor noise (std ~3x higher than X5).
-                // h=8: filter strength — more aggressive than default h=4.
-                // templateWindowSize=7, searchWindowSize=21: standard values.
-                cv::fastNlMeansDenoisingColored(img, processed, 8.0f, 8.0f, 7, 21);
+                cv::fastNlMeansDenoisingColored(img, processed, 4.0f, 4.0f, 7, 21);
             } else {
                 processed = img;
             }
-            // Mild bilateral filter to smooth residual JPEG DCT block artifacts.
-            cv::Mat deblocked;
-            cv::bilateralFilter(processed, deblocked, 5, 8.0, 5.0);
             std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 95};
-            cv::imwrite(output_path, deblocked, params);
+            cv::imwrite(output_path, processed, params);
         }
     }
 
     std::cout << "Done" << std::endl;
-    return 0;
+    // Use _exit() to skip the SDK's OpenGL offscreen context destructor which
+    // takes ~500ms per instance on Intel GPU (no CUDA/Vulkan). With many scans
+    // running in parallel this is the dominant source of post-processing latency.
+    _exit(0);
 }

@@ -58,6 +58,12 @@ def load_color_profile(camera_hw: str, cam_index: int) -> dict | None:
     """
     profile_path = _CALIB_DIR / camera_hw / f'cam_{cam_index}' / 'color_profile.npz'
     if not profile_path.exists():
+        # Fallback: use any available profile for this camera_hw.
+        # Handles OAK-1 primary mode where cam_index=0 but the profile
+        # was calibrated as cam_3 in a multi-camera session.
+        for _p in sorted((_CALIB_DIR / camera_hw).glob('cam_*/color_profile.npz')):
+            data = np.load(str(_p), allow_pickle=True)
+            return {k: data[k] for k in data.files}
         return None
     data = np.load(str(profile_path), allow_pickle=True)
     return {k: data[k] for k in data.files}
@@ -413,11 +419,13 @@ def normalize_session(session_dir: str):
     stitch_bin = Path(__file__).resolve().parents[1] / 'capture' / 'sdk' / 'build' / 'insta360_stitch'
 
     normalized = 0
-    for scan_dir in sorted(session_path.glob('fusion_scan_*')):
-        if not scan_dir.is_dir():
-            continue
-        if (scan_dir / '.blur_skip').exists() or (scan_dir / '.corrupt_bag').exists():
-            continue
+    scan_dirs = sorted(d for d in session_path.glob('fusion_scan_*') if d.is_dir())
+    eligible = [
+        d for d in scan_dirs
+        if not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()
+    ]
+    print(f"Normalizing {len(eligible)} scans...", flush=True)
+    for i, scan_dir in enumerate(eligible, 1):
         ci_file = scan_dir / '.cam_index'
         cam_idx = int(ci_file.read_text().strip().split()[0]) if ci_file.exists() else 0
 
@@ -437,6 +445,8 @@ def normalize_session(session_dir: str):
         profile = load_color_profile(scan_hw, cam_idx)
         if profile is None:
             continue  # no profile = reference camera, leave untouched
+
+        print(f"  [{i}/{len(eligible)}] {scan_dir.name} (cam_{cam_idx} {scan_hw})", flush=True)
 
         if is_oak1:
             # OAK-1: apply profile to both raw and undistorted PNG
@@ -486,11 +496,6 @@ def normalize_session(session_dir: str):
             continue
 
         corrected = apply_color_profile(img, profile)
-        # For noisy sensors (x3), denoise after color correction so the
-        # L-channel gain doesn't re-amplify noise removed before correction.
-        if scan_hw == 'x3':
-            import cv2 as _cv2
-            _cv2.fastNlMeansDenoisingColored(corrected, corrected, 8.0, 8.0, 7, 21)
         cv2.imwrite(str(erp), corrected, [cv2.IMWRITE_JPEG_QUALITY, 95])
         (scan_dir / '.color_normalized').write_text(str(cam_idx))
         normalized += 1

@@ -88,7 +88,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
         # Dual-fisheye fallback: synthesise ERP from dual_fisheye.jpg
         if not equirect_files:
             import sys as _sys
-            _sys.path.insert(0, str(Path(__file__).parent.parent / 'post_processing'))
+            _sys.path.insert(0, str(Path(__file__).parent.parent / 'capture'))
             from fisheye_to_erp import fisheye_jpg_to_erp
             dual_src = fusion_dir / 'dual_fisheye.jpg'
             single_files = list(fusion_dir.glob('fisheye_*.jpg'))
@@ -136,8 +136,18 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                 # and the images/ copy (initial_guess_manual display).
                 # The full-res original stays in the session dir; no need to
                 # duplicate it here.
-                MATCHER_MAX_W = 800
+                # Use higher resolution for high-res sensors so SuperGlue has
+                # enough texture detail to find reliable matches.
                 src_h, src_w = img.shape[:2]
+                _hw_for_res = ''
+                try:
+                    import json as _j
+                    _sc = src_img.parent.parent / 'session_config.json'
+                    if _sc.exists():
+                        _hw_for_res = _j.loads(_sc.read_text()).get('camera_hw', '')
+                except Exception:
+                    pass
+                MATCHER_MAX_W = 1600 if _hw_for_res in ('x5',) else 1024 if _hw_for_res in ('x3',) else 800
                 scale = MATCHER_MAX_W / src_w
                 MATCHER_W = MATCHER_MAX_W
                 MATCHER_H = round(src_h * scale)
