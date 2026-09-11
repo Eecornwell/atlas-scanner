@@ -10,6 +10,8 @@
 
 ## Technical Approach
 
+![ATLAS Scanner](assets/media/splat-handheld-scanner.gif "ATLAS Mobile Scanner")
+
 ![ATLAS Scanner](assets/media/atlas-splat.gif "ATLAS Scanner")
 
 ![ATLAS Supported Cameras](assets/media/atlas_cameras_v1.jpeg "ATLAS Supported Cameras")
