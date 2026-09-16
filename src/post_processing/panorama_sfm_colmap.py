@@ -54,22 +54,21 @@ R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 # concentrated in a narrow band and empirically still yield better features
 # than the polar tiles. A dedicated seam mask is applied below to exclude the
 # affected pixel strip.
-# 12 faces: 8 equatorial at 45° yaw steps + 4 elevated at ±30° pitch.
-# Narrower 45° FOV requires more faces for full coverage but gives sharper
-# tiles with less perspective distortion and no upsampling of the ERP.
+# 8 faces at 60° FOV: 4 equatorial (front/right/back/left) + 4 diagonal elevated.
+# 60° FOV gives f = tile_size / (2*tan(30°)) = tile_size * 0.866 — a moderate
+# focal length that Gaussian Splatting handles well (similar to a 35mm lens).
+# Adjacent faces overlap by 30° on each edge, giving good multi-view coverage.
+# Elevated faces at pitch=±45° cover ceiling/floor without the extreme
+# distortion of a pure up/down 90° face.
 FACES = [
-    {'name': 'front',            'pitch':   0, 'yaw':   0},
-    {'name': 'front_left',       'pitch':   0, 'yaw':  45},
-    {'name': 'left',             'pitch':   0, 'yaw':  90},
-    {'name': 'back_left',        'pitch':   0, 'yaw': 135},
-    {'name': 'back',             'pitch':   0, 'yaw': 180},
-    {'name': 'back_right',       'pitch':   0, 'yaw': 225},
-    {'name': 'right',            'pitch':   0, 'yaw': 270},
-    {'name': 'front_right',      'pitch':   0, 'yaw': 315},
-    {'name': 'up_front',         'pitch':  30, 'yaw':   0},
-    {'name': 'up_left',          'pitch':  30, 'yaw':  90},
-    {'name': 'up_back',          'pitch':  30, 'yaw': 180},
-    {'name': 'up_right',         'pitch':  30, 'yaw': 270},
+    {'name': 'front',       'pitch':   0, 'yaw':   0},
+    {'name': 'right',       'pitch':   0, 'yaw':  90},
+    {'name': 'back',        'pitch':   0, 'yaw': 180},
+    {'name': 'left',        'pitch':   0, 'yaw': 270},
+    {'name': 'up_front',    'pitch':  45, 'yaw':   0},
+    {'name': 'up_back',     'pitch':  45, 'yaw': 180},
+    {'name': 'down_front',  'pitch': -45, 'yaw':   0},
+    {'name': 'down_back',   'pitch': -45, 'yaw': 180},
 ]
 FACES_CAM_FROM_PANO = [
     R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
@@ -90,19 +89,14 @@ NUM_FACES = len(FACES)
 REF_FACE = 0  # front is ref — must be first in cameras array for rig_configurator
 
 # Face indices for each camera mode.
-# For 180° single fisheye, only render faces in the front hemisphere (look dir Z > 0 in pano frame).
+# For 180° single fisheye, exclude back-facing faces.
 FACES_360 = list(range(NUM_FACES))
-# FACES_180: front hemisphere only (yaw within ±90° of center)
-FACES_180 = [i for i in range(NUM_FACES) if abs(((FACES[i]['yaw'] + 180) % 360) - 180) <= 90]
-FOV_DEG = 45.0               # narrower FOV per tile: less perspective distortion at edges,
-                             # better feature quality, avoids upsampling the ERP
-                             # (was 65° — too wide caused blurry/distorted tile edges)
+FACES_180 = [i for i in range(NUM_FACES) if 'back' not in FACES[i]['name']]
+FOV_DEG = 60.0               # 60° FOV: f = tile_size*0.866, moderate focal length
+                             # that Gaussian Splatting handles well. 30° overlap
+                             # between adjacent faces gives good multi-view coverage.
 MIN_BASELINE_M = 0.10
-# Maximum tile size regardless of ERP resolution — caps upsampling artifacts.
-# The Insta360 ERP is stitched/interpolated from fisheye; native detail is
-# limited by the fisheye sensor, not the stitched pixel count.
-# 800px at 45° FOV gives ~17.8px/deg which matches the X5 fisheye resolution.
-MAX_TILE_SIZE = 800
+MAX_TILE_SIZE = 1024
 # Minimum fraction of unmasked pixels for a tile to be included in the COLMAP model.
 # Tiles below this threshold are entirely (or near-entirely) covered by the scanner
 # body mask and contribute no useful features.
@@ -278,11 +272,13 @@ def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.I
     return cv2.remap(erp_img, u, v, interpolation, borderMode=cv2.BORDER_WRAP)
 
 
-def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs):
+def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size):
     """Add OAK-1 pinhole images from a mixed session into face_oak1/.
     Called after ERP tiling so both camera types end up in COLMAP."""
     images_dir = colmap_dir / 'images' / 'face_oak1'
     images_dir.mkdir(parents=True, exist_ok=True)
+    mask_dir = colmap_dir / 'masks' / 'face_oak1'
+    mask_dir.mkdir(parents=True, exist_ok=True)
 
     panoramas = []
     for scan_dir in scan_dirs:
@@ -306,7 +302,6 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs):
         fy = ci['fy'] * sy
         cx_k = ci['cx'] * sx
         cy_k = ci['cy'] * sy
-        f_px = (fx + fy) / 2.0
 
         T_scan = _load_calibration_for_scan(scan_dir, session_path)
         pose = _load_pose(scan_dir, T_scan)
@@ -314,10 +309,35 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs):
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
 
+        # Reproject OAK-1 image into the canonical tile format (same FOV and
+        # resolution as ERP tiles) so all cameras are identical to Gaussian
+        # Splatting. Mixed camera models/resolutions degrade GS quality.
+        # We render a central perspective crop at FOV_DEG using the OAK-1
+        # intrinsics, then resize to tile_size x tile_size.
+        _tile = tile_size  # canonical tile size from ERP pipeline
+        _f_tile = _tile / (2 * np.tan(np.radians(FOV_DEG / 2)))
+        _c_tile = _tile / 2.0
+        # Build pixel ray grid for the output tile
+        _x, _y = np.meshgrid(np.arange(_tile) + 0.5, np.arange(_tile) + 0.5)
+        _rays = np.stack([(_x - _c_tile) / _f_tile,
+                          (_y - _c_tile) / _f_tile,
+                          np.ones((_tile, _tile))], axis=-1)
+        # Project rays into OAK-1 pixel coords using its intrinsics
+        _u = (_rays[:,:,0] * fx + cx_k).astype(np.float32)
+        _v = (_rays[:,:,1] * fy + cy_k).astype(np.float32)
+        # Only keep rays that land within the OAK-1 image
+        _valid = (_u >= 0) & (_u < iw) & (_v >= 0) & (_v < ih)
+        _u = np.clip(_u, 0, iw - 1)
+        _v = np.clip(_v, 0, ih - 1)
+        tile_img = cv2.remap(img, _u, _v, cv2.INTER_LANCZOS4,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # Write mask: white where OAK-1 FOV covers the tile, black where it doesn't
+        tile_mask = (_valid.astype(np.uint8) * 255)
+
         fname = f"pano_{len(panoramas):03d}.png"
         dst = images_dir / fname
-        import shutil as _shutil
-        _shutil.copy2(str(img_src), str(dst))
+        cv2.imwrite(str(dst), tile_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        cv2.imwrite(str(mask_dir / f'{fname}.png'), tile_mask)
 
         R_w2c = R_c2w_col.T
         T_tile = -R_w2c @ C_col
@@ -331,10 +351,10 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs):
             'center': C_col,
             'R_c2w': R_c2w_col,
             'R_c2w_ros': R_c2w_ros,
-            'f_px': f_px,
-            'tile_size': iw,
-            'cx': cx_k, 'cy': cy_k,
-            'img_w': iw, 'img_h': ih,
+            'f_px': _f_tile,          # canonical focal length, same as ERP tiles
+            'tile_size': _tile,
+            'img_w': _tile, 'img_h': _tile,
+            # No cx/cy key: treated as SIMPLE_PINHOLE like ERP tiles
             'active_faces': [0],
             'tiles': [{
                 'face': 0,
@@ -356,7 +376,8 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
 
     scan_dirs = sorted(d for d in session_path.iterdir()
                        if d.is_dir() and d.name.startswith('fusion_scan_')
-                       and not (d / '.blur_skip').exists())
+                       and not (d / '.blur_skip').exists()
+                       and not (d / '.corrupt_bag').exists())
 
     panoramas = []
     for scan_dir in scan_dirs:
@@ -644,7 +665,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     # Mixed session: also add OAK-1 pinhole images into face_oak1/
     if _has_oak1_scans:
         oak1_panos = _prepare_images_pinhole_extra(
-            session_path, colmap_dir, scan_dirs)
+            session_path, colmap_dir, scan_dirs, _canonical_tile_size)
         if oak1_panos:
             panoramas.extend(oak1_panos)
             print(f"  Added {len(oak1_panos)} OAK-1 pinhole images (face_oak1/)")
@@ -981,13 +1002,20 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
     all_pts  = np.vstack([lidar_pts,  colmap_pts])
     all_cols = np.vstack([lidar_cols, colmap_cols])
 
-    with open(output_ply, 'w') as f:
-        f.write('ply\nformat ascii 1.0\n')
-        f.write(f'element vertex {len(all_pts)}\n')
-        f.write('property float x\nproperty float y\nproperty float z\n')
-        f.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
-        for p, c in zip(all_pts, all_cols):
-            f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n')
+    with open(output_ply, 'wb') as f:
+        _hdr = (
+            'ply\nformat binary_little_endian 1.0\n'
+            f'element vertex {len(all_pts)}\n'
+            'property float x\nproperty float y\nproperty float z\n'
+            'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n'
+        )
+        f.write(_hdr.encode('ascii'))
+        _dt = np.dtype([('x','<f4'),('y','<f4'),('z','<f4'),('r','u1'),('g','u1'),('b','u1')])
+        _rec = np.empty(len(all_pts), dtype=_dt)
+        _rec['x'] = all_pts[:,0]; _rec['y'] = all_pts[:,1]; _rec['z'] = all_pts[:,2]
+        _rgb = np.clip(all_cols, 0, 255).astype(np.uint8)
+        _rec['r'] = _rgb[:,0]; _rec['g'] = _rgb[:,1]; _rec['b'] = _rgb[:,2]
+        f.write(_rec.tobytes())
 
     print(f'✓ Merged {len(lidar_pts)} lidar + {len(colmap_pts)} COLMAP points -> {output_ply}')
     return all_pts, all_cols
@@ -1231,7 +1259,9 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         _cam_id = 1
         _img_id = 1
         _f_px_po = panoramas[0]['f_px']
-        _tile_size_po = panoramas[0]['tile_size']
+        # Use the first ERP panorama for tile_size (not OAK-1 which may be non-square)
+        _erp_pano_0 = next((p for p in panoramas if 'cx' not in p), panoramas[0])
+        _tile_size_po = _erp_pano_0['tile_size']
         _c_po = _tile_size_po / 2.0
         for _fi in range(NUM_FACES):
             _params = _struct.pack('ddd', _f_px_po, _c_po, _c_po)
@@ -1244,8 +1274,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _oak1_params = _struct.pack('dddd', _op['f_px'], _op['f_px'],
                                         _op['cx'], _op['cy'])
             _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
-                          (_cam_id, 1, int(_op.get('width', _tile_size_po)),
-                           int(_op.get('height', _tile_size_po)), _oak1_params, 1))
+                          (_cam_id, 1, int(_op.get('img_w', _op.get('tile_size', _tile_size_po))),
+                           int(_op.get('img_h', _op.get('tile_size', _tile_size_po))), _oak1_params, 1))
             _oak1_cam_id = _cam_id
             _cam_id += 1
         for _pano in panoramas:
@@ -1483,10 +1513,18 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
                       for d in sorted(session_path.glob('fusion_scan_*'))
                       if d.is_dir() and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()}
     for pi, scan_dir in sorted(scan_dirs_map.items()):
-        ply_dense  = scan_dir / 'sensor_lidar.ply'
         ply_color  = scan_dir / 'sensor_colored_exact.ply'
-        if not ply_dense.exists():
+        ply_dense  = scan_dir / 'sensor_lidar.ply'
+
+        # Use sensor_colored_exact.ply exclusively — it has colors and only
+        # contains points that projected onto the ERP image. Scans without a
+        # colored PLY (propagated LiDAR-only slots with no camera image) are
+        # skipped entirely: their LiDAR is already covered by co-located colored
+        # scans and including them would add black/uncolored point clusters.
+        if not ply_color.exists():
             continue
+        ply_src = ply_color
+
         traj_f = scan_dir / 'trajectory_icp_refined.json'
         if not traj_f.exists():
             traj_f = scan_dir / 'trajectory.json'
@@ -1500,26 +1538,15 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
                          _lp['orientation']['z'], _lp['orientation']['w']])
         _Rl  = R.from_quat(_q).as_matrix()
 
-        pcd_dense = o3d.io.read_point_cloud(str(ply_dense))
+        pcd_src = o3d.io.read_point_cloud(str(ply_src))
         if lidar_voxel_size > 0:
-            pcd_dense = pcd_dense.voxel_down_sample(lidar_voxel_size)
-        pts_s   = np.asarray(pcd_dense.points)
+            pcd_src = pcd_src.voxel_down_sample(lidar_voxel_size)
+        pts_s   = np.asarray(pcd_src.points)
         pts_ros = (_Rl @ pts_s.T).T + _pos
         pts_col = (R_ROS2COLMAP @ pts_ros.T).T
 
-        if ply_color.exists():
-            pcd_c = o3d.io.read_point_cloud(str(ply_color))
-            if pcd_c.has_colors() and len(pcd_c.points) > 0:
-                from scipy.spatial import cKDTree as _KDT
-                _tree = _KDT(np.asarray(pcd_c.points))
-                _dists, _idx = _tree.query(pts_s, k=1, workers=-1)
-                _valid = _dists < 0.05
-                cols = np.zeros((len(pts_s), 3), int)
-                cols[_valid] = (np.asarray(pcd_c.colors)[_idx[_valid]] * 255).astype(int)
-                pts_col = pts_col[_valid]
-                cols    = cols[_valid]
-            else:
-                cols = np.zeros((len(pts_s), 3), int)
+        if pcd_src.has_colors() and len(pcd_src.colors) > 0:
+            cols = (np.asarray(pcd_src.colors) * 255).astype(int)
         else:
             cols = np.zeros((len(pts_s), 3), int)
 
@@ -1529,6 +1556,32 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     if all_lidar_pts and ply_out.exists():
         merged_lidar_pts  = np.vstack(all_lidar_pts)
         merged_lidar_cols = np.vstack(all_lidar_cols)
+
+        # ── Statistical outlier removal on the merged LiDAR cloud ───────────────
+        # Removes isolated noise points that cause depth inconsistency.
+        # Uses scipy KDTree (fast, no open3d overhead) to find points with
+        # fewer than min_neighbors within radius, then removes them.
+        # This is the key fix for spotchy/inconsistent depth images.
+        print(f'  Statistical outlier removal ({len(merged_lidar_pts)} pts)...')
+        from scipy.spatial import cKDTree as _KDT
+        _tree = _KDT(merged_lidar_pts)
+        # Count neighbours within 0.15m for each point
+        _counts = _tree.query_ball_point(merged_lidar_pts, r=0.15, return_length=True, workers=-1)
+        _sor_mask = _counts >= 6  # keep points with at least 6 neighbours
+        merged_lidar_pts  = merged_lidar_pts[_sor_mask]
+        merged_lidar_cols = merged_lidar_cols[_sor_mask]
+        print(f'  SOR: {_sor_mask.sum()}/{len(_sor_mask)} points kept')
+
+        # ── Voxel downsample for uniform density ──────────────────────────────
+        # Only apply if per-scan voxel downsampling wasn't already done,
+        # to avoid double-downsampling when --lidar-voxel-size is set.
+        if lidar_voxel_size <= 0:
+            _vox = 0.05
+            _vox_idx = np.floor(merged_lidar_pts / _vox).astype(np.int32)
+            _, _unique_idx = np.unique(_vox_idx, axis=0, return_index=True)
+            merged_lidar_pts  = merged_lidar_pts[_unique_idx]
+            merged_lidar_cols = merged_lidar_cols[_unique_idx]
+            print(f'  Voxel {_vox}m: {len(merged_lidar_pts)} points')
         if not poses_only:
             colmap_pcd  = o3d.io.read_point_cloud(str(ply_out))
             colmap_pts  = np.asarray(colmap_pcd.points)
@@ -1542,10 +1595,14 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             colmap_pts  = colmap_pts[iso_mask]
             colmap_cols = colmap_cols[iso_mask]
             print(f'  SfM proximity filter: {iso_mask.sum()}/{len(iso_mask)} points kept')
-        lidar_iso_mask = _filter_sfm_isolated(merged_lidar_pts, radius=0.3, min_neighbors=5)
-        merged_lidar_pts  = merged_lidar_pts[lidar_iso_mask]
-        merged_lidar_cols = merged_lidar_cols[lidar_iso_mask]
-        print(f'  LiDAR isolated filter: {lidar_iso_mask.sum()}/{len(lidar_iso_mask)} points kept')
+        # Skip isolated-point filter in poses-only mode — LiDAR clouds are
+        # dense and the open3d radius outlier removal is O(N log N) on 3M+
+        # points which takes 30+ minutes. Only needed for sparse SfM points.
+        if not poses_only:
+            lidar_iso_mask = _filter_sfm_isolated(merged_lidar_pts, radius=0.3, min_neighbors=5)
+            merged_lidar_pts  = merged_lidar_pts[lidar_iso_mask]
+            merged_lidar_cols = merged_lidar_cols[lidar_iso_mask]
+            print(f'  LiDAR isolated filter: {lidar_iso_mask.sum()}/{len(lidar_iso_mask)} points kept')
         if poses_only:
             all_pts  = merged_lidar_pts
             all_cols = merged_lidar_cols
@@ -1553,13 +1610,22 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             all_pts  = np.vstack([merged_lidar_pts,  colmap_pts])
             all_cols = np.vstack([merged_lidar_cols, colmap_cols])
         merged_ply = colmap_dir / 'sparse' / 'merged.ply'
-        with open(merged_ply, 'w') as _mf:
-            _mf.write('ply\nformat ascii 1.0\n')
-            _mf.write(f'element vertex {len(all_pts)}\n')
-            _mf.write('property float x\nproperty float y\nproperty float z\n')
-            _mf.write('property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n')
-            for _p, _c in zip(all_pts, all_cols):
-                _mf.write(f'{_p[0]:.6f} {_p[1]:.6f} {_p[2]:.6f} {int(_c[0])} {int(_c[1])} {int(_c[2])}\n')
+        with open(merged_ply, 'wb') as _mf:
+            _header = (
+                'ply\nformat binary_little_endian 1.0\n'
+                f'element vertex {len(all_pts)}\n'
+                'property float x\nproperty float y\nproperty float z\n'
+                'property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n'
+            )
+            _mf.write(_header.encode('ascii'))
+            # Pack as interleaved float32 xyz + uint8 rgb
+            _xyz = all_pts.astype(np.float32)
+            _rgb = np.clip(all_cols, 0, 255).astype(np.uint8)
+            _buf = np.zeros(len(all_pts), dtype=[('x','f4'),('y','f4'),('z','f4'),
+                                                  ('r','u1'),('g','u1'),('b','u1')])
+            _buf['x'], _buf['y'], _buf['z'] = _xyz[:,0], _xyz[:,1], _xyz[:,2]
+            _buf['r'], _buf['g'], _buf['b'] = _rgb[:,0], _rgb[:,1], _rgb[:,2]
+            _mf.write(_buf.tobytes())
         src_label = 'LiDAR' if poses_only else f'LiDAR {len(merged_lidar_pts)} + SfM {len(colmap_pts) if not poses_only else 0}'
         print(f'  {src_label} -> {merged_ply}')
         _write_merged_to_points3d(output_dir, merged_lidar_pts, merged_lidar_cols)

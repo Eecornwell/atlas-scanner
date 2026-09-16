@@ -165,7 +165,7 @@ def reprocess_session(session_dir, skip_coloring=False, skip_colmap=False):
         )
         _sfm = _ilu.module_from_spec(_sfm_spec)
         _sfm_spec.loader.exec_module(_sfm)
-        _sfm.run_pipeline(str(session_path), exhaustive=True, bundle_adjustment=False)
+        _sfm.run_pipeline(str(session_path), poses_only=True)
 
     print("\n✓ Reprocessing complete.")
     return True

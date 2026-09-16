@@ -377,7 +377,18 @@ def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1)
     # In multi-camera mode cam0/cam1/cam2 are co-located by design — they carry
     # different images and must all be kept. Only true duplicates (same camera,
     # same position) are dropped.
-    MIN_BASELINE_M = 0.10
+    #
+    # Stationary mode: operator deliberately places scanner at each position,
+    # so use a very tight threshold (2cm) to only drop true duplicates.
+    # Continuous mode: scanner moves continuously, 10cm filters redundant frames.
+    _sess_cfg = session_path / 'session_config.json'
+    _capture_mode = 'continuous'
+    try:
+        import json as _jcfg
+        _capture_mode = _jcfg.loads(_sess_cfg.read_text()).get('capture_mode', 'continuous') if _sess_cfg.exists() else 'continuous'
+    except Exception:
+        pass
+    MIN_BASELINE_M = 0.02 if _capture_mode == 'stationary' else 0.10
 
     def _cam_index(sd):
         ci_path = sd / '.cam_index'

@@ -55,19 +55,25 @@ def save_ply(path, points):
     """Save XYZ or XYZ+RGB point array to PLY. RGB expected as floats 0-1."""
     safe = _safe_data(path)
     has_rgb = points.shape[1] == 6
-    with open(safe, 'w') as f:
-        f.write('ply\nformat ascii 1.0\n')
-        f.write(f'element vertex {len(points)}\n')
-        f.write('property float x\nproperty float y\nproperty float z\n')
+    n = len(points)
+    fields = 'property float x\nproperty float y\nproperty float z\n'
+    if has_rgb:
+        fields += 'property uchar red\nproperty uchar green\nproperty uchar blue\n'
+    header = f'ply\nformat binary_little_endian 1.0\nelement vertex {n}\n{fields}end_header\n'
+    import numpy as _np
+    with open(safe, 'wb') as f:
+        f.write(header.encode('ascii'))
         if has_rgb:
-            f.write('property uchar red\nproperty uchar green\nproperty uchar blue\n')
-        f.write('end_header\n')
-        for p in points:
-            if has_rgb:
-                r, g, b = int(p[3] * 255), int(p[4] * 255), int(p[5] * 255)
-                f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {r} {g} {b}\n')
-            else:
-                f.write(f'{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}\n')
+            dt = _np.dtype([('x','<f4'),('y','<f4'),('z','<f4'),('r','u1'),('g','u1'),('b','u1')])
+            rec = _np.empty(n, dtype=dt)
+            rec['x'] = points[:,0]; rec['y'] = points[:,1]; rec['z'] = points[:,2]
+            rgb = (points[:,3:6] * 255).clip(0,255).astype(_np.uint8)
+            rec['r'] = rgb[:,0]; rec['g'] = rgb[:,1]; rec['b'] = rgb[:,2]
+        else:
+            dt = _np.dtype([('x','<f4'),('y','<f4'),('z','<f4')])
+            rec = _np.empty(n, dtype=dt)
+            rec['x'] = points[:,0]; rec['y'] = points[:,1]; rec['z'] = points[:,2]
+        f.write(rec.tobytes())
 
 
 def merge_trajectory_only(session_dir):

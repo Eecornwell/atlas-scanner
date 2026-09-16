@@ -661,12 +661,11 @@ class FusionCaptureGUI:
         ttk.Combobox(mode_frame, textvariable=self.capture_mode_var,
                      values=["continuous", "stationary"],
                      state="readonly", width=14).grid(row=3, column=1, sticky=(tk.W, tk.E), pady=(2, 0))
-        ttk.Label(mode_frame, text="Move window:").grid(row=4, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
+        ttk.Label(mode_frame, text="Interval (s):").grid(row=4, column=0, sticky=tk.W, padx=(0, 4), pady=(2, 0))
         self.interval_var = tk.StringVar(value="5")
         _interval_spin = ttk.Spinbox(mode_frame, from_=3, to=60, increment=1,
                                      textvariable=self.interval_var, width=5)
         _interval_spin.grid(row=4, column=1, sticky=tk.W, pady=(2, 0))
-        ttk.Label(mode_frame, text="s (continuous)").grid(row=4, column=1, sticky=tk.E, pady=(2, 0))
         self.stationary_wait_var = tk.BooleanVar(value=False)
         self.stationary_wait_cb = ttk.Checkbutton(mode_frame, text="Wait 3s before recording (stationary)",
                         variable=self.stationary_wait_var)
@@ -778,23 +777,24 @@ class FusionCaptureGUI:
         _pp_btn(0, 1, "Recolor with New Calibration", self._pp_reprocess)
         _pp_btn(1, 0, "ICP Alignment",                self._pp_icp)
         _pp_btn(1, 1, "Filter Blurry Frames",         self._pp_filter_blurry)
-        _pp_btn(2, 0, "Merge (Trajectory Only)",      self._pp_merge_traj)
-        _pp_btn(2, 1, "Run Sync Benchmark",           self._pp_sync_benchmark)
-        _pp_btn(3, 0, "SDK Sync Validator",            self._pp_sdk_sync_validator)
+        _pp_btn(2, 0, "Omit Scans…",                  self._pp_omit_scans)
+        _pp_btn(3, 0, "Merge (Trajectory Only)",      self._pp_merge_traj)
+        _pp_btn(3, 1, "Run Sync Benchmark",           self._pp_sync_benchmark)
+        _pp_btn(4, 0, "SDK Sync Validator",            self._pp_sdk_sync_validator)
         # ── COLMAP ────────────────────────────────────────────────────────
-        _pp_sep(4, "COLMAP")
-        _pp_btn(6, 0, "Export COLMAP Model",          self._pp_colmap)
-        _pp_btn(6, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
-        _pp_btn(7, 0, "Generate Depth Images",        self._pp_colmap_depth)
+        _pp_sep(5, "COLMAP")
+        _pp_btn(7, 0, "Export COLMAP Model",          self._pp_colmap)
+        _pp_btn(7, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
+        _pp_btn(8, 0, "Generate Depth Images",        self._pp_colmap_depth)
         ttk.Checkbutton(btn_frame, text="Full SfM matching (slow — poses-only default)",
                         variable=self.colmap_sfm_var).grid(
-            row=8, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
+            row=9, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
         # ── Viewers ───────────────────────────────────────────────────────
-        _pp_sep(9, "Viewers")
-        _pp_btn(11, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
-        _pp_btn(11, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
-        _pp_btn(12, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
-        _pp_btn(12, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
+        _pp_sep(10, "Viewers")
+        _pp_btn(12, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(12, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(13, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(13, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -1281,6 +1281,15 @@ class FusionCaptureGUI:
                         self.root.after(0, self._system_ready)
                     elif line.startswith("✓ Scan") and "completed:" in line:
                         self.root.after(0, self._scan_completed)
+                        # Check for LIO divergence sentinel after each scan
+                        if hasattr(self, 'scan_dir') and self.scan_dir:
+                            _div = pathlib.Path(self.scan_dir) / '.lio_diverged'
+                            if _div.exists():
+                                _info = _div.read_text().strip()
+                                self.root.after(0, lambda i=_info: (
+                                    self.log_message(f'⚠ LIO DIVERGENCE DETECTED: {i}'),
+                                    self.update_status('⚠ LIO diverged — poses unreliable, stop and restart', 'red')
+                                ))
                     elif "✓ Scan saved to:" in line:
                         self.root.after(0, self._scan_completed)
                     elif "_viewer.html" in line or ("3D viewer" in line and ".html" in line):
@@ -1908,12 +1917,91 @@ sys.exit(0 if ok[0] else 4)
                 self.root.after(0, self._pp_log_write, f"Error: permission denied: {e}\n")
         threading.Thread(target=_run, daemon=True).start()
 
+    def _pp_omit_scans(self):
+        """Show a dialog to flag/unflag scans by number with a .blur_skip sentinel."""
+        sess = self._pp_session()
+        if not sess:
+            self._pp_log_write('\n[!] No session selected.\n')
+            return
+
+        import pathlib as _pl
+        sess_path = _pl.Path(sess)
+
+        # Build current state: scan_num -> is_omitted
+        all_scans = sorted(sess_path.glob('fusion_scan_*'),
+                           key=lambda p: int(p.name.split('_')[-1]))
+        if not all_scans:
+            self._pp_log_write('\n[!] No fusion_scan_* directories found.\n')
+            return
+
+        # ── Dialog ────────────────────────────────────────────────────────────
+        dlg = tk.Toplevel(self.root)
+        dlg.title('Omit Scans')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text='Check scans to omit from processing (writes .blur_skip):',
+                  font=('Arial', 9)).pack(anchor=tk.W, padx=10, pady=(10, 4))
+
+        # Scrollable list of checkboxes
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+        canvas = tk.Canvas(list_frame, width=340, height=min(400, len(all_scans) * 22 + 10),
+                           highlightthickness=0)
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        inner = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        check_vars = {}
+        for scan_dir in all_scans:
+            num = int(scan_dir.name.split('_')[-1])
+            skip_file = scan_dir / '.blur_skip'
+            var = tk.BooleanVar(value=skip_file.exists())
+            check_vars[num] = (var, scan_dir)
+            # Show cam_index if available
+            ci_path = scan_dir / '.cam_index'
+            ci = ci_path.read_text().strip().split()[0] if ci_path.exists() else ''
+            label = f'scan {num:03d}' + (f'  [cam {ci}]' if ci else '')
+            if skip_file.exists():
+                label += '  ✗ omitted'
+            ttk.Checkbutton(inner, text=label, variable=var).pack(anchor=tk.W, pady=1)
+
+        # ── Buttons ───────────────────────────────────────────────────────────
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(fill=tk.X, padx=10, pady=(6, 10))
+
+        def _apply():
+            changed = []
+            for num, (var, scan_dir) in check_vars.items():
+                skip_file = scan_dir / '.blur_skip'
+                if var.get() and not skip_file.exists():
+                    skip_file.write_text('')   # empty = manually placed, survives filter_blurry_scans
+                    changed.append(f'  omitted  scan_{num:03d}')
+                elif not var.get() and skip_file.exists():
+                    skip_file.unlink()
+                    changed.append(f'  restored scan_{num:03d}')
+            dlg.destroy()
+            if changed:
+                self._pp_log_write('\nOmit Scans:\n' + '\n'.join(changed) + '\n')
+            else:
+                self._pp_log_write('\nOmit Scans: no changes.\n')
+
+        ttk.Button(btn_row, text='Apply', command=_apply).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(btn_row, text='Cancel', command=dlg.destroy).pack(side=tk.RIGHT)
+
     def _pp_run_reconstruct(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
         sess_path = pathlib.Path(sess)
-        has_rosbag = any(p.is_dir() and not str(p).endswith('_imu')
-                         for p in sess_path.glob('rosbag_*'))
+        # Check for rosbag at session root (continuous mode) OR inside scan dirs (stationary)
+        has_rosbag = (any(p.is_dir() and not str(p).endswith('_imu')
+                          for p in sess_path.glob('rosbag_*')) or
+                      any(p.is_dir() for sd in sess_path.glob('fusion_scan_*')
+                          for p in sd.glob('rosbag_*') if not str(p).endswith('_imu')))
         if not has_rosbag:
             self._pp_log_write("\n[!] No rosbag found in session.\n")
             self._pp_log_write("    The bag may have been deleted after processing.\n")
@@ -2833,6 +2921,7 @@ def main():
     default_icp, default_colmap, default_colmap_lidar_voxel = False, False, 0.0
     default_camera_hw = 'onex2'
     default_outdoor = False
+    default_interval = 5
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -2850,6 +2939,9 @@ def main():
                 default_camera_hw = line.split('=', 1)[1].split('#')[0].strip('"\' ')
             elif line.startswith('SCENE_MODE=') and '#' not in line.split('SCENE_MODE=')[0]:
                 default_outdoor = line.split('=', 1)[1].split('#')[0].strip('"\' ') == 'outdoor'
+            elif line.startswith('CONTINUOUS_INTERVAL=') and '#' not in line.split('CONTINUOUS_INTERVAL=')[0]:
+                try: default_interval = int(line.split('=', 1)[1].split('#')[0].strip('"\' '))
+                except ValueError: pass
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
                 try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
                 except ValueError: pass
@@ -2880,6 +2972,7 @@ def main():
     app.camera_hw_var.set(default_camera_hw)
     app.outdoor_var.set(default_outdoor)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
+    app.interval_var.set(str(default_interval))
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     

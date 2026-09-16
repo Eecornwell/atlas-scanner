@@ -133,18 +133,16 @@ def unpack_lidar(msg):
 
 
 def save_ply(path, points, has_intensity=True):
-    with open(path, "w") as f:
-        f.write("ply\nformat ascii 1.0\n")
-        f.write(f"element vertex {len(points)}\n")
-        f.write("property float x\nproperty float y\nproperty float z\n")
-        if has_intensity:
-            f.write("property float intensity\n")
-        f.write("end_header\n")
-        for p in points:
-            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f}")
-            if has_intensity:
-                f.write(f" {p[3]:.6f}")
-            f.write("\n")
+    import numpy as _np
+    pts = _np.array(points, dtype=_np.float32)
+    n = len(pts)
+    fields = 'property float x\nproperty float y\nproperty float z\n'
+    if has_intensity:
+        fields += 'property float intensity\n'
+    header = f'ply\nformat binary_little_endian 1.0\nelement vertex {n}\n{fields}end_header\n'
+    with open(path, 'wb') as f:
+        f.write(header.encode('ascii'))
+        f.write(pts.tobytes())
 
 
 # ---------------------------------------------------------------------------
@@ -354,28 +352,81 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
     scan_count = sum(1 for ok in results if ok)
     print(f"\n\u2713 Processed {scan_count} scans")
 
-    # Colorization (dual_fisheye only — single_fisheye is handled per-bag)
+    # Colorization — stitch .insp files and run exact-match coloring
     pp = Path(__file__).resolve().parent
-    if camera_mode == "dual_fisheye":
-        _camera_hw = os.environ.get("CAMERA_HW", "")
-        if not _camera_hw:
-            _sess_cfg = session_path / "session_config.json"
-            if _sess_cfg.exists():
-                try:
-                    import json as _j2
-                    _camera_hw = _j2.loads(_sess_cfg.read_text()).get("camera_hw", "x5")
-                except Exception:
-                    _camera_hw = "x5"
-            else:
-                _camera_hw = "x5"
+    sdk_stitch_bin = Path(__file__).resolve().parents[1] / 'capture' / 'sdk' / 'build' / 'insta360_stitch'
+    _sess_cfg = session_path / 'session_config.json'
+    _camera_hw = 'x5'
+    try:
+        import json as _j2
+        _camera_hw = _j2.loads(_sess_cfg.read_text()).get('camera_hw', 'x5') if _sess_cfg.exists() else 'x5'
+    except Exception:
+        pass
+
+    if camera_mode == 'dual_fisheye':
         subprocess.run(
-            [sys.executable, str(pp / "regenerate_masked_images.py"), str(session_path),
-             "--camera-mode", camera_mode, "--sdk-stitch",
-             "--camera-hw", _camera_hw],
+            [sys.executable, str(pp / 'regenerate_masked_images.py'), str(session_path),
+             '--camera-mode', camera_mode, '--sdk-stitch', '--camera-hw', _camera_hw],
             check=False,
         )
         subprocess.run(
-            [sys.executable, str(pp / "post_process_coloring.py"), str(session_path), "--use-exact"],
+            [sys.executable, str(pp / 'post_process_coloring.py'), str(session_path), '--use-exact'],
+            check=False,
+        )
+    else:
+        # single_fisheye: stitch each .insp to ERP then run exact-match coloring
+        if sdk_stitch_bin.exists():
+            print('\nStitching .insp files to ERP...')
+            import concurrent.futures as _cf2
+            import os as _os2
+            _stitch_env = os.environ.copy()
+
+            def _stitch_one(scan_dir):
+                insp = next(scan_dir.glob('*.insp'), None)
+                if insp is None:
+                    return
+                erp = scan_dir / 'equirect_dual_fisheye.jpg'
+                if erp.exists():
+                    return
+                # Load per-slot ERP dimensions
+                try:
+                    import yaml as _y, pathlib as _pl
+                    _src = _pl.Path(__file__).resolve().parents[1]
+                    _mc = _y.safe_load((_src / 'config' / 'multi_camera.yaml').read_text())
+                    _ci_file = scan_dir / '.cam_index'
+                    _ci = int(_ci_file.read_text().strip().split()[0]) if _ci_file.exists() else 0
+                    _slot = _mc.get('cameras', {}).get(f'cam_{_ci}', {})
+                    _hw = _slot.get('camera_hw', _camera_hw)
+                    _hw_yaml = _src / 'config' / 'camera_models' / f'{_hw}.yaml'
+                    _hw_cfg = _y.safe_load(_hw_yaml.read_text()) if _hw_yaml.exists() else {}
+                    _erp_w = str(_hw_cfg.get('erp_width', 11520))
+                    _erp_h = str(_hw_cfg.get('erp_height', 5760))
+                except Exception:
+                    _erp_w, _erp_h = '11520', '5760'
+                _env = _stitch_env.copy()
+                _env['INSTA360_ERP_WIDTH'] = _erp_w
+                _env['INSTA360_ERP_HEIGHT'] = _erp_h
+                _denoise = ['--denoise'] if _camera_hw == 'x3' else []
+                subprocess.run(
+                    [str(sdk_stitch_bin), str(insp), str(erp), '--single'] + _denoise,
+                    env=_env, capture_output=True,
+                )
+
+            scan_dirs_with_insp = [sd for sd in sorted(session_path.glob('fusion_scan_*'))
+                                   if sd.is_dir() and next(sd.glob('*.insp'), None)]
+            n_w = min(len(scan_dirs_with_insp), _os2.cpu_count() or 4)
+            with _cf2.ThreadPoolExecutor(max_workers=n_w) as pool:
+                list(pool.map(_stitch_one, scan_dirs_with_insp))
+            print(f'  Stitched {len(scan_dirs_with_insp)} scans')
+
+        # Generate masked images and run exact-match coloring
+        subprocess.run(
+            [sys.executable, str(pp / 'regenerate_masked_images.py'), str(session_path),
+             '--camera-mode', camera_mode, '--sdk-stitch', '--camera-hw', _camera_hw],
+            check=False,
+        )
+        subprocess.run(
+            [sys.executable, str(pp / 'post_process_coloring.py'), str(session_path), '--use-exact'],
             check=False,
         )
     return scan_count
@@ -1440,6 +1491,40 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
 
     print(f"\n✓ Reconstructed {scan_count} scans from bag")
 
+    # Auto-mark scans with LIO divergence as corrupt.
+    # The trajectory recorder writes lio_diverged=True into trajectory.json
+    # when it detects a velocity jump > 30 m/s or Z jump > 2 m.
+    # Also detect position jumps > 50 m between consecutive scans as a
+    # fallback for sessions recorded before divergence detection was added.
+    import math as _math
+    _prev_pos = None
+    _prev_name = None
+    for _sd in sorted(session_path.glob('fusion_scan_*')):
+        if not _sd.is_dir(): continue
+        if (_sd / '.corrupt_bag').exists(): continue
+        _tj = _sd / 'trajectory.json'
+        if not _tj.exists(): continue
+        try:
+            _td = json.loads(_tj.read_text())
+            if _td.get('scan_info', {}).get('lio_diverged', False):
+                (_sd / '.corrupt_bag').write_text('lio_diverged')
+                print(f"  ✗ {_sd.name}: marked corrupt (LIO divergence flag)")
+                _prev_pos = None
+                continue
+            _p = _td['current_pose']['position']
+            _cur = (_p['x'], _p['y'], _p['z'])
+            if _prev_pos is not None:
+                _dist = _math.sqrt(sum((_cur[i]-_prev_pos[i])**2 for i in range(3)))
+                if _dist > 50.0:
+                    (_sd / '.corrupt_bag').write_text(f'position_jump_{_dist:.0f}m_from_{_prev_name}')
+                    print(f"  ✗ {_sd.name}: marked corrupt (position jump {_dist:.0f}m from {_prev_name})")
+                    _prev_pos = None
+                    continue
+            _prev_pos = _cur
+            _prev_name = _sd.name
+        except Exception:
+            pass
+
     # --- Promote OAK-1 continuous shots to fusion_scan_* dirs ---
     # In continuous mode with a secondary OAK-1, main_multi.cpp writes each
     # OAK-1 capture to .oak1_shot_NNN/ in sync with the X5 shot.
@@ -1498,6 +1583,13 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _dst = _oak1_scan / _ply.name
                     if not _dst.exists():
                         _shutil.copy2(str(_ply), str(_dst))
+            else:
+                # No match yet — X5 scans may not exist yet if this is a
+                # re-run where OAK-1 shots were promoted before bag reconstruction.
+                # Record for a deferred retry after all X5 scans are built.
+                if not hasattr(reconstruct, '_oak1_lidar_deferred'):
+                    reconstruct._oak1_lidar_deferred = []
+                reconstruct._oak1_lidar_deferred.append((_oak1_scan, _oak1_shutter_t))
             # Write trajectory.json interpolated at the OAK-1 shutter time
             if _oak1_shutter_t is not None and odom_msgs and not (_oak1_scan / 'trajectory.json').exists():
                 _oak1_livox_t = _oak1_shutter_t - _host_to_livox_offset
@@ -1778,6 +1870,36 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 [sys.executable, str(pp / "color_with_fisheye.py"), str(scan_dir)],
                 check=False,
             )
+
+    # Deferred LiDAR copy for OAK-1 scans that had no X5 match during promotion
+    # (happens when OAK-1 shots were promoted before X5 scans were reconstructed).
+    _deferred = getattr(reconstruct, '_oak1_lidar_deferred', [])
+    if _deferred:
+        import shutil as _shutil2
+        print(f"  Retrying LiDAR copy for {len(_deferred)} deferred OAK-1 scans...")
+        for _oak1_scan, _oak1_shutter_t in _deferred:
+            _best_x5, _best_dt = None, float('inf')
+            for _sd in sorted(session_path.glob('fusion_scan_*')):
+                if _sd == _oak1_scan:
+                    continue
+                for _ct_f in sorted(_sd.glob('*.insp.capture_time')):
+                    try:
+                        _ct = float(_ct_f.read_text().strip().split()[0])
+                        _dt = abs(_ct - _oak1_shutter_t)
+                        if _dt < _best_dt:
+                            _best_dt, _best_x5 = _dt, _sd
+                    except Exception:
+                        pass
+                    break
+            if _best_x5 is not None and _best_dt < 15.0:
+                for _ply in list(_best_x5.glob('sensor_lidar*.ply')) + list(_best_x5.glob('world_lidar*.ply')):
+                    _dst = _oak1_scan / _ply.name
+                    if not _dst.exists():
+                        _shutil2.copy2(str(_ply), str(_dst))
+                print(f"    {_oak1_scan.name}: copied LiDAR from {_best_x5.name} (dt={_best_dt:.2f}s)")
+            else:
+                print(f"    {_oak1_scan.name}: no X5 match found (best_dt={_best_dt:.1f}s)")
+        reconstruct._oak1_lidar_deferred = []
 
     return scan_count
 

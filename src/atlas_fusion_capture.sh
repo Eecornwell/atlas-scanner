@@ -16,7 +16,7 @@ ROS_WS_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 # ─── User Configuration ────────────────────────────────────────────────────────
 CAMERA_MODE="single_fisheye"        # dual_fisheye | single_fisheye
 CAPTURE_MODE="stationary"         # stationary | continuous
-CONTINUOUS_INTERVAL=5             # seconds to move between batch captures (continuous mode)
+CONTINUOUS_INTERVAL=3             # seconds to move between batch captures (continuous mode)
                                   # All cameras fire simultaneously, then you have this many
                                   # seconds to move before the next batch fires.
                                   # Capture time per batch: ~9s (slowest camera = OneX2 ~8-9s)
@@ -943,6 +943,47 @@ except Exception as e:
 elif [ "${CAMERA_HW:-onex2}" = "x5" ] || [ "${_DETECTED_CAMERAS:-0}" -gt 1 ]; then
     if [ -f /tmp/.insta360_session_ran ]; then
         _usb_force_reset_camera
+    elif [ "${_DETECTED_CAMERAS:-0}" -lt 2 ] && [ -f "$_MULTI_CAM_YAML" ]; then
+        # Expected multi-camera session but only 1 camera detected — the second
+        # camera may still be booting or in a non-Android USB mode. Run the
+        # full serial-based multi-camera reset to give it time to enumerate.
+        echo "  ⚠ Only $_DETECTED_CAMERAS camera(s) detected, expected 2+ — forcing multi-camera USB reset"
+        _USE_CAMERAS=2  # force multi-camera reset path
+        # Fall through to the multi-camera reset block above by re-running it inline
+        echo "Resetting all Insta360 USB devices for multi-camera mode..."
+        _reset_count=0
+        for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+            _devnode="/dev/insta_${_serial}"
+            [ -e "$_devnode" ] || continue
+            sudo python3 -c "
+import fcntl, sys
+USBDEVFS_RESET = 0x5514
+try:
+    with open('$_devnode', 'wb') as f:
+        fcntl.ioctl(f, USBDEVFS_RESET, 0)
+    print('  Reset: $_devnode')
+except Exception as e:
+    print(f'  Reset failed: $_devnode: {e}', file=sys.stderr)
+" 2>/dev/null && _reset_count=$((_reset_count + 1)) || true
+        done
+        echo "Waiting for cameras to re-enumerate..."
+        for _serial in IAHEA26019RESN IAQEB26048TER3 IXSE46EN77TP9E; do
+            _devnode="/dev/insta_${_serial}"
+            [ -e "$_devnode" ] || continue
+            _w=0
+            while [ $_w -lt 30 ]; do
+                _busdev=$(udevadm info --query=path --name="$(readlink -f "$_devnode" 2>/dev/null)" 2>/dev/null | grep -oP '[0-9]+-[0-9.]+$')
+                _cfg=$(cat "/sys/bus/usb/devices/${_busdev}/bConfigurationValue" 2>/dev/null | tr -d '[:space:]')
+                [ -n "$_cfg" ] && [ "$_cfg" != "0" ] && break
+                sleep 1; _w=$((_w + 1))
+            done
+            echo "  ✓ $_serial ready (${_w}s)"
+        done
+        sleep 3
+        # Re-detect after reset
+        _DETECTED_CAMERAS=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
+        _USE_CAMERAS=$_DETECTED_CAMERAS
+        echo "✓ USB reset complete ($_reset_count cameras, now seeing $_DETECTED_CAMERAS)"
     else
         echo "✓ Camera already connected, skipping USB reset (no prior session)"
     fi
@@ -1641,7 +1682,10 @@ else
         if [ "$CAMERA_HW" = "oak1" ]; then
             echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.oak1_trigger"
         else
-            echo "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.sdk_capture_trigger"
+            # Write trigger atomically via temp file + rename to prevent the
+            # SDK daemon reading an empty file during the create/write race.
+            printf '%s' "$SCAN_DIR/fusion_scan_$(printf "%03d" $_first_scan)" > "$SCAN_DIR/.sdk_capture_trigger.tmp"
+            mv -f "$SCAN_DIR/.sdk_capture_trigger.tmp" "$SCAN_DIR/.sdk_capture_trigger"
             # Trigger secondary OAK-1 into its own dedicated scan dir
             if [ -n "$_oak1_scan_dir" ]; then
                 echo "$_oak1_scan_dir" > "$SCAN_DIR/.oak1_trigger"

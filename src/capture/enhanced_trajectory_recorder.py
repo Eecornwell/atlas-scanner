@@ -60,6 +60,9 @@ class EnhancedTrajectoryRecorder(Node):
         self.start_time = None
         self.first_pose = None  # Store first pose as reference origin
         self.recording_started = True
+        self._last_pose_t = None   # for velocity divergence detection
+        self._last_pose_xyz = None
+        self._diverged = False     # set True once divergence detected, stays True
         
         # Load camera-lidar transform from calibration file
         try:
@@ -130,6 +133,35 @@ class EnhancedTrajectoryRecorder(Node):
             'position': {'x': pos.x, 'y': pos.y, 'z': pos.z},
             'orientation': {'x': ori.x, 'y': ori.y, 'z': ori.z, 'w': ori.w}
         }
+
+        # Velocity-based divergence detection.
+        # RKO-LIO publishes at ~20 Hz. A jump > 1.5 m between consecutive
+        # messages (= 30 m/s) is physically impossible and indicates divergence.
+        # Z jumps > 2 m/step are also a strong divergence signal outdoors.
+        _now_t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        _xyz = (pos.x, pos.y, pos.z)
+        if self._last_pose_xyz is not None and self._last_pose_t is not None:
+            _dt = _now_t - self._last_pose_t
+            if 0 < _dt < 1.0:  # only check consecutive messages
+                import math
+                _dx = pos.x - self._last_pose_xyz[0]
+                _dy = pos.y - self._last_pose_xyz[1]
+                _dz = pos.z - self._last_pose_xyz[2]
+                _dist = math.sqrt(_dx*_dx + _dy*_dy + _dz*_dz)
+                _vel = _dist / _dt
+                if (_vel > 30.0 or abs(_dz) > 2.0) and not self._diverged:
+                    self._diverged = True
+                    self.get_logger().error(
+                        f'LIO DIVERGENCE DETECTED: vel={_vel:.1f} m/s dz={_dz:.2f} m '
+                        f'at t={_now_t:.1f}s — writing .lio_diverged sentinel')
+                    try:
+                        sentinel = os.path.join(self.output_dir, '.lio_diverged')
+                        with open(sentinel, 'w') as _f:
+                            _f.write(f'{_now_t:.3f} vel={_vel:.1f} dz={_dz:.2f}')
+                    except OSError:
+                        pass
+        self._last_pose_t = _now_t
+        self._last_pose_xyz = _xyz
         
         # Calculate camera pose
         camera_pose = self.calculate_camera_pose(lidar_pose)
@@ -292,7 +324,8 @@ class EnhancedTrajectoryRecorder(Node):
                 'timestamp': scan_timestamp,
                 'capture_time': capture_time,
                 'scan_request_time': scan_request_time,
-                'scan_pose_time': pose_snapshot['timestamp']
+                'scan_pose_time': pose_snapshot['timestamp'],
+                'lio_diverged': self._diverged,
             },
             'coordinate_system': {
                 'standard': 'ROS_REP_103',

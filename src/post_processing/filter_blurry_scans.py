@@ -87,11 +87,15 @@ def filter_blurry_scans(session_dir, percentile=20, min_blur=None, max_motion=0.
         print("No fusion_scan_* directories found")
         return [], []
 
-    # Remove any existing sentinels first (re-running is safe)
+    # Remove any existing sentinels that were written by a previous blur filter
+    # run. Manually placed sentinels (empty file or content not starting with
+    # 'blur_score=') are preserved so hand-flagged scans stay excluded.
     for sd in scan_dirs:
         skip = sd / '.blur_skip'
         if skip.exists():
-            skip.unlink()
+            content = skip.read_text().strip()
+            if content.startswith('blur_score='):
+                skip.unlink()
 
     scores = []
     for sd in scan_dirs:

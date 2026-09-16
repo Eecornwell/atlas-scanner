@@ -763,7 +763,19 @@ int _main(int argc, char* argv[]) {
         fs::remove(trigger_path);
         LOG_OUT("[trigger] read: '" << trigger_content << "'");
 
-        if (trigger_content.empty()) { LOG_OUT("[trigger] empty — writing failed"); std::ofstream ff(failed_path); ff << "fail"; continue; }
+        if (trigger_content.empty()) {
+            // Empty trigger = file was created but content not yet written (write race).
+            // Wait briefly and re-read before giving up.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            { std::ifstream f2(trigger_path); if (f2) std::getline(f2, trigger_content); }
+            fs::remove(trigger_path);
+            if (trigger_content.empty()) {
+                LOG_OUT("[trigger] empty after retry — writing failed");
+                std::ofstream ff(failed_path); ff << "fail";
+                continue;
+            }
+            LOG_OUT("[trigger] read after retry: '" << trigger_content << "'");
+        }
         if (trigger_content[0] != '/') trigger_content = fs::current_path().string() + "/" + trigger_content;
 
         if (trigger_content == session_dir) {
