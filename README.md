@@ -143,6 +143,29 @@ Please review [Hardware Build documentation](docs/atlas-hw-build-v1.pdf)
 ### Calibration
 Please review [Calibration documentation](docs/calibration.md)
 
+### Offline Depth Enhancement (Windows GPU Tool)
+
+The ATLAS scanner produces sparse LiDAR depth maps that can appear blocky when used for Gaussian Splatting training. A standalone Windows tool is provided to replace the sparse depth images with dense, continuous depth maps using [PromptDA](https://github.com/DepthAnything/PromptDA) — a model purpose-built for LiDAR-anchored depth completion.
+
+**What it does:** Takes the sparse LiDAR splats in `colmap/depth_images/` and produces smooth, planar depth surfaces with sharp edges aligned to RGB object boundaries. The output is a drop-in replacement `colmap_enhanced.zip` with identical structure to the original, ready for the cloud Gaussian Splatting pipeline.
+
+**Input:** `colmap.zip` — the file already produced by the ATLAS pipeline. No additional data needed. The zip contains both the RGB tiles (`colmap/images/`) and sparse depth maps (`colmap/depth_images/`) that PromptDA needs.
+
+**Setup (Windows, one time):**
+```
+cd tools/depth_enhance
+install.bat
+```
+Requires Python 3.10+, Git, and an NVIDIA GPU with CUDA 12.x drivers. Model weights (~2 GB) are downloaded from HuggingFace on first run.
+
+**Usage:**
+```
+python enhance_depth.py colmap.zip
+```
+Outputs `colmap_enhanced.zip` in the same directory. Upload this to the cloud GS pipeline instead of the original `colmap.zip`.
+
+See [`tools/depth_enhance/`](tools/depth_enhance/) for the tool source.
+
 ### Testing and Capturing
 Please review [Running the Software documentation](docs/software-run.md)
 

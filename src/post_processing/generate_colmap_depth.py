@@ -126,18 +126,105 @@ def _read_ply_points(path):
 # Depth rendering
 # ---------------------------------------------------------------------------
 
+def _guided_depth_completion(sparse_depth_u16, rgb_guide):
+    """
+    Convert a sparse splatted depth map into a dense continuous depth surface.
+
+    Uses PromptDA (depth-anything/promptda_vitl) when available — a model
+    purpose-built for LiDAR-anchored dense depth completion that produces
+    smooth planar surfaces with sharp RGB-aligned edges.
+
+    Falls back to iterative guided image filtering (cv2.ximgproc) when
+    PromptDA is not installed, which is faster but produces blockier output.
+    """
+    if rgb_guide is None:
+        return sparse_depth_u16
+
+    # ── Try PromptDA first ────────────────────────────────────────────────────────────────
+    try:
+        import torch
+        from promptda.promptda import PromptDA
+        from PIL import Image as _PILImage
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Cache model across calls to avoid reloading per tile
+        if not hasattr(_guided_depth_completion, '_promptda_model'):
+            print('  Loading PromptDA model (first tile)...')
+            _guided_depth_completion._promptda_model = (
+                PromptDA.from_pretrained('depth-anything/promptda_vitl')
+                .to(device).eval()
+            )
+        model = _guided_depth_completion._promptda_model
+
+        # PromptDA expects:
+        #   image: PIL RGB image
+        #   prompt_depth: (1,1,H,W) float32 tensor in metres
+        rgb_pil = _PILImage.fromarray(cv2.cvtColor(rgb_guide, cv2.COLOR_BGR2RGB))
+        sparse_m = sparse_depth_u16.astype(np.float32) / 1000.0  # mm -> metres
+        prompt = torch.from_numpy(sparse_m).unsqueeze(0).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            depth_pred = model.predict(image=rgb_pil, prompt_depth=prompt)
+
+        depth_m = depth_pred.squeeze().cpu().numpy()  # (H, W) float32, metres
+        return np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+
+    except (ImportError, Exception):
+        pass  # PromptDA not installed or failed — fall through to guided filter
+
+    # ── Guided filter fallback ────────────────────────────────────────────────────────────────
+    depth = sparse_depth_u16.astype(np.float32)
+    valid = (depth > 0).astype(np.float32)
+    guide = cv2.cvtColor(rgb_guide, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+    try:
+        for radius, eps in [(64, 0.01), (32, 0.005), (16, 0.002), (8, 0.001)]:
+            d_filt = cv2.ximgproc.guidedFilter(
+                guide=guide, src=depth * valid,
+                radius=radius, eps=eps * (depth.max() ** 2 + 1e-6)
+            )
+            c_filt = cv2.ximgproc.guidedFilter(
+                guide=guide, src=valid, radius=radius, eps=eps
+            )
+            propagated = np.where(c_filt > 0.01, d_filt / np.maximum(c_filt, 0.01), 0.0)
+            depth = np.where(valid > 0.5, depth, propagated)
+            valid = (depth > 0).astype(np.float32)
+        if depth.max() > 0:
+            d_norm = np.clip(depth / depth.max() * 255, 0, 255).astype(np.uint8)
+            d_sharp = cv2.ximgproc.jointBilateralFilter(
+                joint=rgb_guide, src=d_norm, d=9, sigmaColor=25, sigmaSpace=5)
+            depth = d_sharp.astype(np.float32) / 255.0 * depth.max()
+    except (cv2.error, AttributeError):
+        # ximgproc not available — fall back to TELEA inpainting
+        hole_mask = (sparse_depth_u16 == 0).astype(np.uint8)
+        if hole_mask.any():
+            d_max = depth.max()
+            if d_max > 0:
+                d_norm = np.clip(depth / d_max * 255, 0, 255).astype(np.uint8)
+                d_inp  = cv2.inpaint(d_norm, hole_mask, inpaintRadius=5,
+                                     flags=cv2.INPAINT_TELEA)
+                depth  = np.where(sparse_depth_u16 > 0, depth,
+                                  d_inp.astype(np.float32) / 255.0 * d_max)
+
+    # Final NN fill for any remaining zeros
+    still_zero = depth == 0
+    if still_zero.any():
+        from scipy.ndimage import distance_transform_edt
+        _, idx = distance_transform_edt(still_zero, return_indices=True)
+        depth[still_zero] = depth[idx[0][still_zero], idx[1][still_zero]]
+
+    return np.clip(depth, 0, 65535).astype(np.uint16)
+
+
 def _joint_bilateral_fill(depth_u16, rgb_guide, window=15,
                           sigma_space=7.0, sigma_color=20.0):
     """
     Fill holes in depth_u16 guided by the RGB image.
-    Two-pass strategy:
-      Pass 1 (coarse): discontinuity-aware nearest-neighbour fill.
-                       Each hole pixel inherits the nearest valid depth only
-                       if the RGB colour difference is below a hard threshold,
-                       preventing background depth from bleeding across edges.
-      Pass 2 (fine):   bilateral fill restricted to same-layer neighbours
-                       (|depth_neighbour - depth_hole| < 20% of hole depth)
-                       to snap residual holes to the correct depth layer.
+    Uses OpenCV TELEA inpainting on the hole mask to propagate depth along
+    RGB isophotes (follows object edges) rather than Euclidean nearest-neighbour
+    (which produces Voronoi staircase boundaries). A bilateral pass then
+    corrects any remaining depth-layer mixing at silhouette edges.
     """
     from scipy.ndimage import distance_transform_edt
 
@@ -145,31 +232,31 @@ def _joint_bilateral_fill(depth_u16, rgb_guide, window=15,
     valid_mask = depth > 0
 
     if not valid_mask.all():
-        # ── Pass 1: colour-gated nearest-neighbour propagation ──────────────
-        # Find the spatially nearest valid pixel for every hole pixel.
-        _, nearest_idx = distance_transform_edt(~valid_mask, return_indices=True)
-        depth_nn = depth[nearest_idx[0], nearest_idx[1]]
+        hole_mask = (~valid_mask).astype(np.uint8)
 
         if rgb_guide is not None:
-            # Gate propagation on RGB similarity: only accept the nearest-neighbour
-            # depth if the colour difference is small (same surface), otherwise
-            # leave the hole for the bilateral pass to handle.
-            gray = cv2.cvtColor(rgb_guide, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            hole_y, hole_x = np.where(~valid_mask)
-            nn_y, nn_x = nearest_idx[0][~valid_mask], nearest_idx[1][~valid_mask]
-            color_diff = np.abs(gray[hole_y, hole_x] - gray[nn_y, nn_x])
-            # Accept propagation only where colour is similar (same surface)
-            accept = color_diff < 15.0
-            depth[hole_y[accept], hole_x[accept]] = depth_nn[~valid_mask][accept]
+            # Normalise depth to uint8 range for inpainting, then scale back.
+            # TELEA inpainting fills holes by propagating values inward along
+            # RGB isophotes, so boundaries follow the colour edges in the guide
+            # image rather than forming Voronoi staircases.
+            d_max = depth.max()
+            if d_max > 0:
+                d_norm = np.clip(depth / d_max * 255, 0, 255).astype(np.uint8)
+                d_inpainted = cv2.inpaint(d_norm, hole_mask, inpaintRadius=5,
+                                          flags=cv2.INPAINT_TELEA)
+                depth_filled = d_inpainted.astype(np.float32) / 255.0 * d_max
+                depth = np.where(valid_mask, depth, depth_filled)
+            else:
+                depth = np.zeros_like(depth)
         else:
-            depth = np.where(valid_mask, depth, depth_nn)
+            _, nearest_idx = distance_transform_edt(~valid_mask, return_indices=True)
+            depth = np.where(valid_mask, depth,
+                             depth[nearest_idx[0], nearest_idx[1]])
 
-    # ── Pass 2: depth-layer-aware bilateral fill ─────────────────────────────
-    # Re-compute hole mask after pass 1 (some holes may still be unfilled).
-    # For each remaining hole, accumulate weighted depth from neighbours that
-    # are in the same depth layer (within 20% relative depth), preventing
-    # foreground/background mixing at silhouette edges.
-    still_holes = depth == 0
+    # Bilateral pass: correct depth-layer mixing at silhouette edges.
+    # Only runs on pixels that were originally holes and are adjacent to a
+    # depth discontinuity in the filled result.
+    still_holes = depth_u16 == 0
     if still_holes.any() and rgb_guide is not None:
         gray = cv2.cvtColor(rgb_guide, cv2.COLOR_BGR2GRAY).astype(np.float32)
         half = window // 2
@@ -178,7 +265,6 @@ def _joint_bilateral_fill(depth_u16, rgb_guide, window=15,
               np.mgrid[-half:half+1, -half:half+1][1] ** 2)
             / (2 * sigma_space ** 2)
         ).astype(np.float32)
-
         depth_pad = np.pad(depth, half, mode='edge')
         gray_pad  = np.pad(gray,  half, mode='edge')
         vy, vx = np.where(still_holes)
@@ -190,8 +276,6 @@ def _joint_bilateral_fill(depth_u16, rgb_guide, window=15,
                 ny, nx = vy + dy + half, vx + dx + half
                 d_nb = depth_pad[ny, nx]
                 g_nb = gray_pad[ny, nx]
-                # Depth-layer gate: reject neighbours from a different depth layer.
-                # Use a relative threshold so the gate scales with scene depth.
                 depth_ref = np.maximum(acc_d / np.maximum(acc_w, 1e-6), 100.0)
                 same_layer = (d_nb == 0) | (np.abs(d_nb - depth_ref) < 0.20 * depth_ref)
                 color_w = np.exp(-(g_nb - gc) ** 2 / (2 * sigma_color ** 2))
@@ -201,7 +285,7 @@ def _joint_bilateral_fill(depth_u16, rgb_guide, window=15,
         filled = acc_w > 1e-6
         depth[vy[filled], vx[filled]] = acc_d[filled] / acc_w[filled]
 
-    # Any pixels still zero after both passes: fall back to unconditional NN
+    # Final fallback: any remaining zeros get unconditional NN fill
     still_zero = depth == 0
     if still_zero.any():
         _, nearest_idx = distance_transform_edt(~(depth > 0), return_indices=True)
@@ -222,10 +306,12 @@ _SPLAT_RADIUS_MAX = 12                       # cap to avoid blurring thin struct
 def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
                   rgb_guide=None):
     """
-    Project pts_world (N,3) into the camera, splat each point as a
-    depth-adaptive disc whose radius scales with f_px/z so the splat
-    exactly covers the angular gap between LiDAR scan lines at any range.
-    Returns uint16 depth map in mm.
+    Project pts_world (N,3) into the camera using sub-pixel splatting.
+    Each point is projected to its exact floating-point (u,v) coordinate
+    and distributed across its 2x2 pixel neighbourhood with bilinear weights,
+    eliminating the staircase jagging caused by hard integer rounding.
+    A depth-adaptive Gaussian disc then fills the scan-line gap around each
+    sub-pixel centre. Returns uint16 depth map in mm.
     """
     pts_cam = (R_w2c @ pts_world.T).T + t_w2c
 
@@ -235,47 +321,74 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
         return np.zeros((h, w), dtype=np.uint16)
 
     z  = pts_cam[:, 2]
-    ui = np.round(pts_cam[:, 0] / z * f_px + cx).astype(np.int32)
-    vi = np.round(pts_cam[:, 1] / z * f_px + cy).astype(np.int32)
+    # Exact sub-pixel projection — do NOT round yet
+    uf = pts_cam[:, 0] / z * f_px + cx
+    vf = pts_cam[:, 1] / z * f_px + cy
 
-    in_bounds = (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
-    ui, vi, z = ui[in_bounds], vi[in_bounds], z[in_bounds]
+    in_bounds = (uf >= 0) & (uf < w) & (vf >= 0) & (vf < h)
+    uf, vf, z = uf[in_bounds], vf[in_bounds], z[in_bounds]
 
-    # Depth-adaptive splat radius: r = clamp(f_px * gap_rad / z, min, max)
-    # Splat far-to-near so close points overwrite background depth correctly.
     splat_r = np.clip(
         np.round(f_px * _LIDAR_ANGULAR_GAP_RAD / z).astype(np.int32),
         _SPLAT_RADIUS_MIN, _SPLAT_RADIUS_MAX
     )
 
-    depth_f = np.full((h, w), np.inf, dtype=np.float32)
-    order = np.argsort(z)[::-1]   # far → near
-    ui, vi, z, splat_r = ui[order], vi[order], z[order].astype(np.float32), splat_r[order]
+    # Float accumulators: weighted depth sum and total weight per pixel.
+    # Bilinear sub-pixel weights spread each point across its 2x2 neighbourhood
+    # so depth boundaries land at the true projection position rather than a
+    # rounded integer, eliminating staircase edges at object silhouettes.
+    depth_acc  = np.zeros((h, w), dtype=np.float64)
+    weight_acc = np.zeros((h, w), dtype=np.float64)
 
-    # Group by radius to batch the disc-splatting loop (avoids per-point Python overhead).
-    # Discontinuity guard: a disc pixel is only written if the centre point is
-    # closer than the current pixel OR the current pixel is still unset (inf).
-    # This prevents background splat halos bleeding over foreground silhouettes —
-    # the far-to-near order ensures foreground points always win at their centre,
-    # and the guard stops background discs from overwriting already-set closer pixels.
+    order = np.argsort(z)[::-1]   # far -> near
+    uf, vf, z, splat_r = uf[order], vf[order], z[order], splat_r[order]
+
+    u0 = np.floor(uf).astype(np.int32)
+    v0 = np.floor(vf).astype(np.int32)
+    du = (uf - u0).astype(np.float32)
+    dv = (vf - v0).astype(np.float32)
+
     for r in np.unique(splat_r):
         mask = splat_r == r
-        ui_r, vi_r, z_r = ui[mask], vi[mask], z[mask]
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dx * dx + dy * dy > r * r:
+        u0_r, v0_r, z_r = u0[mask], v0[mask], z[mask]
+        bw00 = ((1 - du) * (1 - dv))[mask]
+        bw10 = (     du  * (1 - dv))[mask]
+        bw01 = ((1 - du) *      dv )[mask]
+        bw11 = (     du  *      dv )[mask]
+        bilinear_r = [(0, 0, bw00), (1, 0, bw10), (0, 1, bw01), (1, 1, bw11)]
+        # Sigma covers the full splat radius so the Gaussian decays to ~1%
+        # at the edge. No hard disc cutoff — the weight tapers smoothly to
+        # zero, eliminating the jagged circle boundary entirely.
+        sigma = max(r / 2.0, 0.5)
+        extent = r + 1  # one extra pixel so the tail blends into neighbours
+
+        for dy in range(-extent, extent + 1):
+            for dx in range(-extent, extent + 1):
+                # Pure Gaussian — no hard disc boundary check
+                gauss_w = float(np.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma)))
+                if gauss_w < 0.01:   # skip negligible contributions
                     continue
-                vj = np.clip(vi_r + dy, 0, h - 1)
-                uj = np.clip(ui_r + dx, 0, w - 1)
-                closer = z_r < depth_f[vj, uj]
-                depth_f[vj[closer], uj[closer]] = z_r[closer]
 
-    depth_mm = np.clip(depth_f * 1000.0, 0, 65535)
-    depth_mm[depth_f == np.inf] = 0
-    depth_u16 = depth_mm.astype(np.uint16)
+                for bdu, bdv, bw in bilinear_r:
+                    vj = np.clip(v0_r + dy + bdv, 0, h - 1)
+                    uj = np.clip(u0_r + dx + bdu, 0, w - 1)
+                    tw = gauss_w * bw
 
-    depth_u16 = _joint_bilateral_fill(depth_u16, rgb_guide)
-    return depth_u16
+                    existing = np.where(
+                        weight_acc[vj, uj] > 0,
+                        depth_acc[vj, uj] / weight_acc[vj, uj],
+                        np.inf
+                    )
+                    write = z_r < existing
+                    depth_acc[vj[write], uj[write]]  = tw[write] * z_r[write]
+                    weight_acc[vj[write], uj[write]] = tw[write]
+
+    valid_w  = weight_acc > 0
+    depth_f  = np.where(valid_w, depth_acc / np.maximum(weight_acc, 1e-9), 0.0)
+    depth_mm = np.clip(depth_f * 1000.0, 0, 65535).astype(np.uint16)
+
+    depth_mm = _guided_depth_completion(depth_mm, rgb_guide)
+    return depth_mm
 
 
 # ---------------------------------------------------------------------------
