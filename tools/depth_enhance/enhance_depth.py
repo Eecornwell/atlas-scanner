@@ -20,31 +20,57 @@
 #   python enhance_depth.py colmap.zip --batch-size 4   # tiles per GPU batch
 
 import argparse
-import io
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
 
-import cv2
-import numpy as np
-import torch
-from PIL import Image
-from promptda.promptda import PromptDA
-from tqdm import tqdm
+
+def _check_deps():
+    """Verify required packages are importable and give a clear error if not."""
+    missing = []
+    for pkg, import_name in [
+        ('opencv-python', 'cv2'),
+        ('numpy',         'numpy'),
+        ('torch',         'torch'),
+        ('Pillow',        'PIL'),
+        ('tqdm',          'tqdm'),
+    ]:
+        try:
+            __import__(import_name)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print('ERROR: Missing packages:', ', '.join(missing))
+        print()
+        print('Run install.bat to set up the environment, then use run.bat')
+        print('to launch this script with the correct Python.')
+        print()
+        print(f'Current Python: {sys.executable} ({sys.version.split()[0]})')
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
 # Model loading (cached singleton)
 # ---------------------------------------------------------------------------
 
-_MODEL: PromptDA | None = None
-_DEVICE: str = ''
+_MODEL = None
+_DEVICE = ''
 
 
-def _get_model() -> tuple[PromptDA, str]:
+def _get_model():
     global _MODEL, _DEVICE
+    import torch
+    from promptda.promptda import PromptDA
     if _MODEL is None:
         _DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Verify CUDA actually works on this GPU (older cards like Pascal
+        # may be detected but not supported by the installed PyTorch wheel)
+        if _DEVICE == 'cuda':
+            try:
+                torch.zeros(1).cuda()
+            except Exception as e:
+                print(f'WARNING: CUDA unavailable ({e}), falling back to CPU.')
+                _DEVICE = 'cpu'
         if _DEVICE == 'cpu':
             print('WARNING: No CUDA GPU detected — running on CPU (slow).')
         print(f'Loading PromptDA (depth-anything/promptda_vitl) on {_DEVICE}...')
@@ -57,39 +83,50 @@ def _get_model() -> tuple[PromptDA, str]:
 # Per-tile enhancement
 # ---------------------------------------------------------------------------
 
-def enhance_tile(
-    rgb_png: bytes,
-    depth_png: bytes,
-    model: PromptDA,
-    device: str,
-) -> bytes:
-    """
-    Run PromptDA on one (rgb, sparse_depth) tile pair.
+def enhance_tile(rgb_png: bytes, depth_png: bytes, model, device: str) -> bytes:
+    import cv2
+    import numpy as np
+    import torch
 
-    rgb_png:   PNG bytes of the RGB tile (uint8, 1024x1024x3)
-    depth_png: PNG bytes of the sparse depth tile (uint16, mm)
-
-    Returns PNG bytes of the dense depth tile (uint16, mm), same resolution.
-    """
-    # Decode RGB
+    # ── Decode RGB ────────────────────────────────────────────────────────────
     rgb_arr = cv2.imdecode(np.frombuffer(rgb_png, np.uint8), cv2.IMREAD_COLOR)
-    rgb_pil = Image.fromarray(cv2.cvtColor(rgb_arr, cv2.COLOR_BGR2RGB))
+    rgb_arr = cv2.cvtColor(rgb_arr, cv2.COLOR_BGR2RGB)
+    orig_h, orig_w = rgb_arr.shape[:2]
 
-    # Decode sparse depth (uint16 mm → float32 metres)
+    # PromptDA requires image dimensions to be multiples of 14 (DINOv2 patch size)
+    def to_mult14(v):
+        return int(v // 14 * 14)
+    proc_h, proc_w = to_mult14(orig_h), to_mult14(orig_w)
+    if proc_h != orig_h or proc_w != orig_w:
+        rgb_arr = cv2.resize(rgb_arr, (proc_w, proc_h), interpolation=cv2.INTER_AREA)
+
+    # Image tensor: (1, 3, H, W) float32 in [0, 1] on model device
+    img_t = torch.from_numpy(rgb_arr.astype(np.float32) / 255.0)                  .permute(2, 0, 1).unsqueeze(0).to(device)
+
+    # ── Decode sparse depth ───────────────────────────────────────────────────
     depth_arr = cv2.imdecode(np.frombuffer(depth_png, np.uint8), cv2.IMREAD_UNCHANGED)
-    sparse_m = depth_arr.astype(np.float32) / 1000.0
+    sparse_m = depth_arr.astype(np.float32) / 1000.0  # mm -> metres
 
-    # PromptDA: prompt_depth must be (1, 1, H, W) float32 tensor in metres
-    prompt = torch.from_numpy(sparse_m).unsqueeze(0).unsqueeze(0).to(device)
+    # Resize sparse depth to match processed image size
+    if proc_h != orig_h or proc_w != orig_w:
+        sparse_m = cv2.resize(sparse_m, (proc_w, proc_h), interpolation=cv2.INTER_NEAREST)
 
+    # prompt_depth: (1, 1, H, W) float32 on model device
+    prompt = torch.from_numpy(np.ascontiguousarray(sparse_m))                   .unsqueeze(0).unsqueeze(0).float().to(device)
+
+    # ── Run PromptDA ──────────────────────────────────────────────────────────
     with torch.no_grad():
-        depth_pred = model.predict(image=rgb_pil, prompt_depth=prompt)
+        depth_pred = model.predict(image=img_t, prompt_depth=prompt)
 
-    # Output: (H, W) float32 metres → uint16 mm
-    depth_m = depth_pred.squeeze().cpu().numpy()
+    # ── Decode output ─────────────────────────────────────────────────────────
+    depth_m = depth_pred.squeeze().cpu().numpy()  # (H, W) float32 metres
+
+    # Resize back to original tile size if we had to crop
+    if proc_h != orig_h or proc_w != orig_w:
+        depth_m = cv2.resize(depth_m, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
     depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
 
-    # Encode back to PNG
     ok, buf = cv2.imencode('.png', depth_mm)
     if not ok:
         raise RuntimeError('Failed to encode enhanced depth tile')
@@ -101,6 +138,7 @@ def enhance_tile(
 # ---------------------------------------------------------------------------
 
 def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
+    from tqdm import tqdm
     model, device = _get_model()
 
     with zipfile.ZipFile(input_zip, 'r') as zin:
@@ -172,6 +210,7 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    _check_deps()
     parser = argparse.ArgumentParser(
         description='Enhance ATLAS colmap.zip depth images using PromptDA.'
     )
