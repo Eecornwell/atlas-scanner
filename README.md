@@ -151,7 +151,7 @@ The ATLAS scanner produces sparse LiDAR depth maps that can appear blocky when u
 
 **Input:** `colmap.zip` — the file already produced by the ATLAS pipeline. No additional data needed. The zip contains both the RGB tiles (`colmap/images/`) and sparse depth maps (`colmap/depth_images/`) that PromptDA needs.
 
-**Setup (Windows, one time):**
+**Usage:**
 ```
 cd tools/depth_enhance
 install.bat
@@ -160,9 +160,16 @@ Requires Python 3.10+, Git, and an NVIDIA GPU with CUDA 12.x drivers. Model weig
 
 **Usage:**
 ```
-python enhance_depth.py colmap.zip
+run.bat colmap.zip
 ```
 Outputs `colmap_enhanced.zip` in the same directory. Upload this to the cloud GS pipeline instead of the original `colmap.zip`.
+
+**Verify results before uploading:**
+```
+verify.bat colmap_enhanced.zip                    # RGB vs enhanced depth
+verify.bat colmap.zip colmap_enhanced.zip         # A/B compare original vs enhanced
+```
+Opens a self-contained HTML viewer in your browser. Side-by-side panels with a synchronised crosshair and per-pixel depth readout in mm. A/B mode shows original and enhanced depth side by side so you can confirm the improvement before uploading.
 
 See [`tools/depth_enhance/`](tools/depth_enhance/) for the tool source.
 

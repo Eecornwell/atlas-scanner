@@ -79,6 +79,10 @@ T = np.eye(4)
 T[:3, :3] = R.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
 T[:3, 3]  = [cfg['x_offset'], cfg['y_offset'], cfg['z_offset']]
 
+# DVL's calib.json T_lidar_camera convention: coordinate_transform.py
+# inverts whatever is stored here to produce T_camera_lidar for the YAML.
+# So we must store the inverse of T_camera_lidar (i.e. T_lidar_camera)
+# so that after inversion we get T_camera_lidar back.
 Ti = np.linalg.inv(T)
 q  = R.from_matrix(Ti[:3, :3]).as_quat()  # xyzw
 vec = [float(v) for v in list(Ti[:3, 3]) + list(q)]

@@ -250,9 +250,16 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         origin, R_world_lidar = _load_trajectory_pose(_safe_scan_dir)
 
         if is_oak1:
-            # OAK-1 pinhole projection — must come before ERP paths
+            # OAK-1 pinhole projection — use undistorted intrinsics so the
+            # LiDAR projection aligns with the undistorted camera image.
+            # camera_info.yaml has distorted intrinsics; the undistorted sidecar
+            # YAML has the correct post-undistortion intrinsics.
             import yaml as _yaml
-            _ci = _yaml.safe_load((_safe_scan_dir / 'camera_info.yaml').read_text())
+            _undist_yaml = next(_safe_scan_dir.glob('oak1_*_undistorted.yaml'), None)
+            if _undist_yaml:
+                _ci = _yaml.safe_load(_undist_yaml.read_text())
+            else:
+                _ci = _yaml.safe_load((_safe_scan_dir / 'camera_info.yaml').read_text())
             _sx = out_w / _ci['width']
             _sy = out_h / _ci['height']
             _fx = _ci['fx'] * _sx
@@ -451,7 +458,11 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             scan_path = _safe_scan_dir
             candidates = sorted(scan_path.glob('equirect_*_masked.png')) or \
                          [f for f in sorted(scan_path.glob('equirect_*.jpg')) if '_masked' not in f.name]
-            # OAK-1 fallback
+            # OAK-1 fallback: prefer undistorted image since LiDAR is
+            # projected using undistorted intrinsics — using the raw
+            # distorted image causes pixel misalignment and zero SuperGlue matches.
+            if not candidates:
+                candidates = sorted(scan_path.glob('oak1_*_undistorted.png'))
             if not candidates:
                 candidates = [f for f in sorted(scan_path.glob('oak1_*.png'))
                               if '_undistorted' not in f.name]

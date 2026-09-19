@@ -87,26 +87,25 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
 
         # Dual-fisheye fallback: synthesise ERP from dual_fisheye.jpg
         if not equirect_files:
-            import sys as _sys
-            _sys.path.insert(0, str(Path(__file__).parent.parent / 'capture'))
-            from fisheye_to_erp import fisheye_jpg_to_erp
             dual_src = fusion_dir / 'dual_fisheye.jpg'
             single_files = list(fusion_dir.glob('fisheye_*.jpg'))
-            if dual_src.exists():
-                erp_cfg = os.path.expanduser('~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
-                dst = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
-                if not dst.exists():
-                    fisheye_jpg_to_erp(str(dual_src), erp_cfg, str(dst), dual=True)
-                equirect_files = [dst]
-                print(f"  Synthesised ERP from dual fisheye for {fusion_dir.name}")
-            elif single_files:
-                erp_cfg = os.path.expanduser('~/atlas_ws/src/insta360_ros_driver/config/equirectangular.yaml')
-                src = single_files[0]
-                dst = fusion_dir / f'equirect_{src.stem}.jpg'
-                if not dst.exists():
-                    fisheye_jpg_to_erp(str(src), erp_cfg, str(dst))
-                equirect_files = [dst]
-                print(f"  Synthesised ERP from single fisheye for {fusion_dir.name}")
+            if dual_src.exists() or single_files:
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent.parent / 'capture'))
+                from fisheye_to_erp import fisheye_jpg_to_erp
+                if dual_src.exists():
+                    dst = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
+                    if not dst.exists():
+                        fisheye_jpg_to_erp(str(dual_src), str(dst))
+                    equirect_files = [dst]
+                    print(f"  Synthesised ERP from dual fisheye for {fusion_dir.name}")
+                elif single_files:
+                    src = single_files[0]
+                    dst = fusion_dir / f'equirect_{src.stem}.jpg'
+                    if not dst.exists():
+                        fisheye_jpg_to_erp(str(src), str(dst))
+                    equirect_files = [dst]
+                    print(f"  Synthesised ERP from single fisheye for {fusion_dir.name}")
 
         # OAK-1 fallback: use undistorted PNG directly (already in pinhole space)
         if not equirect_files:
