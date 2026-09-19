@@ -83,7 +83,7 @@ def _get_model():
 # Per-tile enhancement
 # ---------------------------------------------------------------------------
 
-def enhance_tile(rgb_png: bytes, depth_png: bytes, model, device: str) -> bytes:
+def enhance_tile(rgb_png: bytes, depth_png: bytes, mask_png, model, device: str) -> bytes:
     import cv2
     import numpy as np
     import torch
@@ -92,6 +92,17 @@ def enhance_tile(rgb_png: bytes, depth_png: bytes, model, device: str) -> bytes:
     rgb_arr = cv2.imdecode(np.frombuffer(rgb_png, np.uint8), cv2.IMREAD_COLOR)
     rgb_arr = cv2.cvtColor(rgb_arr, cv2.COLOR_BGR2RGB)
     orig_h, orig_w = rgb_arr.shape[:2]
+
+    # Decode mask: white=valid, black=masked (scanner body / nadir)
+    valid_mask = None
+    if mask_png is not None:
+        import cv2 as _cv2
+        m = _cv2.imdecode(np.frombuffer(mask_png, np.uint8), _cv2.IMREAD_GRAYSCALE)
+        if m is not None:
+            if m.shape != (orig_h, orig_w):
+                m = _cv2.resize(m, (orig_w, orig_h), interpolation=_cv2.INTER_NEAREST)
+            valid_mask = m > 128
+
 
     # PromptDA requires image dimensions to be multiples of 14 (DINOv2 patch size)
     def to_mult14(v):
@@ -106,6 +117,10 @@ def enhance_tile(rgb_png: bytes, depth_png: bytes, model, device: str) -> bytes:
     # ── Decode sparse depth ───────────────────────────────────────────────────
     depth_arr = cv2.imdecode(np.frombuffer(depth_png, np.uint8), cv2.IMREAD_UNCHANGED)
     sparse_m = depth_arr.astype(np.float32) / 1000.0  # mm -> metres
+    # Zero masked regions so PromptDA does not use them as metric anchors
+    if valid_mask is not None:
+        sparse_m[~valid_mask] = 0.0
+
 
     # Resize sparse depth to match processed image size
     if proc_h != orig_h or proc_w != orig_w:
@@ -126,6 +141,9 @@ def enhance_tile(rgb_png: bytes, depth_png: bytes, model, device: str) -> bytes:
         depth_m = cv2.resize(depth_m, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
     depth_mm = np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
+    # Zero masked regions in output so GS does not receive hallucinated depth
+    if valid_mask is not None:
+        depth_mm[~valid_mask] = 0
 
     ok, buf = cv2.imencode('.png', depth_mm)
     if not ok:
@@ -142,9 +160,9 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
     model, device = _get_model()
 
     with zipfile.ZipFile(input_zip, 'r') as zin:
-        all_names = zin.namelist()
+        all_names = set(zin.namelist())
 
-        # Index depth tiles and their matching RGB tiles
+        # Index depth tiles and their matching RGB and mask tiles
         depth_names = [
             n for n in all_names
             if 'depth_images' in n and n.endswith('.png')
@@ -153,15 +171,20 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
             print('ERROR: No depth_images/*.png found in zip.')
             sys.exit(1)
 
-        # Build depth → rgb path mapping
-        # depth: colmap/depth_images/face_XX/pano_NNN.png
-        # rgb:   colmap/images/face_XX/pano_NNN.png
         def depth_to_rgb(depth_path: str) -> str:
             p = PurePosixPath(depth_path)
-            # Replace 'depth_images' component with 'images'
             parts = list(p.parts)
-            di = parts.index('depth_images')
-            parts[di] = 'images'
+            parts[parts.index('depth_images')] = 'images'
+            return str(PurePosixPath(*parts))
+
+        def depth_to_mask(depth_path: str) -> str:
+            # colmap/depth_images/face_XX/pano_NNN.png
+            # -> colmap/masks/face_XX/pano_NNN.png.png  (COLMAP mask convention)
+            p = PurePosixPath(depth_path)
+            parts = list(p.parts)
+            parts[parts.index('depth_images')] = 'masks'
+            # COLMAP mask filenames have an extra .png suffix
+            parts[-1] = parts[-1] + '.png'
             return str(PurePosixPath(*parts))
 
         pairs = []
@@ -178,23 +201,27 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
 
         print(f'Enhancing {len(pairs)} depth tiles...')
 
-        # Build set of depth paths that will be replaced
         enhanced_depth: dict[str, bytes] = {}
 
         for depth_name, rgb_name in tqdm(pairs, unit='tile'):
             rgb_bytes   = zin.read(rgb_name)
             depth_bytes = zin.read(depth_name)
+
+            # Load mask if available — used to zero out scanner body / nadir
+            # regions after PromptDA so it doesn't hallucinate depth there.
+            mask_name = depth_to_mask(depth_name)
+            mask_bytes = zin.read(mask_name) if mask_name in all_names else None
+
             try:
-                enhanced = enhance_tile(rgb_bytes, depth_bytes, model, device)
+                enhanced = enhance_tile(rgb_bytes, depth_bytes, mask_bytes, model, device)
                 enhanced_depth[depth_name] = enhanced
             except Exception as e:
                 print(f'\nWARNING: Failed to enhance {depth_name}: {e} — copying original.')
                 enhanced_depth[depth_name] = depth_bytes
 
-        # Write output zip: copy everything, replacing depth tiles
         print(f'Writing {output_zip.name}...')
         with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for name in tqdm(all_names, unit='file', desc='Packing'):
+            for name in tqdm(sorted(all_names), unit='file', desc='Packing'):
                 if name in enhanced_depth:
                     zout.writestr(name, enhanced_depth[name])
                 else:
