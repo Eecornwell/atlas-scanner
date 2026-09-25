@@ -1,4 +1,5 @@
 import Foundation
+import CoreImage
 import CoreVideo
 import simd
 

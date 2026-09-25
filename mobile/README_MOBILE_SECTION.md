@@ -209,23 +209,44 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
 > (`calibrate_extrinsic.py`) remains available as a higher-accuracy alternative using
 > SuperGlue feature matching when a GPU workstation is available.
 
-#### Phase 6: Polish
-- [ ] Capture guidance UI (coverage indicator, scan quality, pose tracking status)
-- [ ] Session management (list, resume, review, delete, storage usage)
-- [ ] WiFi reconnection handling (Insta360 drop recovery)
-- [ ] Thermal management (throttle capture rate, warn user)
-- [ ] Battery usage optimization
-- [ ] Session transfer to workstation (AirDrop, USB via Finder, WiFi)
+#### Phase 6: Live Capture UI
+- [ ] **AR camera preview** — replace the blank capture screen with an `ARView` (RealityKit) or `ARSCNView` (SceneKit) showing the live iPhone camera feed during sessions
+- [ ] **Tracking state indicator** — display ARKit tracking quality (normal / limited / not available) with a colored badge or banner; show the reason when limited (insufficient features, excessive motion, initializing)
+- [ ] **Scan counter overlay** — show scan count on top of the camera preview instead of in a separate status bar
+- [ ] **Capture flash feedback** — brief screen flash or border animation on "Capture Scan" so the user knows it fired
+- [ ] **Last-capture thumbnail** — after each scan, show a small thumbnail of the captured RGB frame in a corner of the preview
+- [ ] **LiDAR depth overlay** — optional toggle to render the live depth map as a colored overlay on the camera feed (confidence-weighted coloring)
+- [ ] **Point cloud visualization** — render accumulated LiDAR points as a 3D point cloud in the AR view, giving the user real-time spatial feedback
+- [ ] **Mesh visualization** — optionally render `ARMeshAnchor` geometry (available on LiDAR devices) as a wireframe overlay
+
+#### Phase 7: Insta360 Connection UI
+- [ ] **Connection status screen** — show camera discovery and connection progress when starting a session (connecting, connected, failed per camera)
+- [ ] **Camera status badge** — persistent indicator showing connected camera count and names during an active session
+- [ ] **Manual retry** — button to retry connection if a camera fails to connect
+- [ ] **Disconnection alert** — notify the user if an Insta360 camera drops mid-session (heartbeat failure)
+- [ ] **WiFi reconnection handling** — automatic reconnect attempt when Insta360 WiFi drops, with user notification
+- [ ] **Preview from Insta360** — show the most recent Insta360 capture thumbnail after each scan (downloaded at capture time, not deferred to end-session)
+
+#### Phase 8: Session Management & Polish
+- [ ] **Session browser improvements** — add delete, rename, and storage usage display to `SessionListView`
+- [ ] **Session resume** — allow resuming a previously ended session (re-open the same directory, continue scan numbering)
+- [ ] **Capture guidance** — coverage indicator showing which directions have been scanned, suggesting where to scan next
+- [ ] **Thermal management** — monitor `ProcessInfo.thermalState`, throttle capture rate or warn user when thermal pressure is high
+- [ ] **Battery usage optimization** — reduce ARKit frame rate when idle (between captures), disable unnecessary sensors
+- [ ] **Session transfer** — streamlined export to workstation via AirDrop, USB (Finder), or WiFi direct
+- [ ] **3D session viewer** — after ending a session, show captured point cloud and camera positions in a 3D viewer for quality review
 
 ### Local Development Setup
 
 #### iOS App (requires macOS)
 
 1. **Prerequisites**
-    - macOS 13+ with Xcode 15+
+    - macOS 13+ with Xcode 15+ (16.2+ recommended)
     - iPhone 14 Pro or later (LiDAR required, simulator not supported)
     - Apple Developer account (for device deployment)
     - Insta360 X5 (or supported model) for integration testing
+    - Insta360 iOS SDK zip (`iOS-SDK-1.10.4.zip`) from the [Insta360 Developer Portal](https://www.insta360.com/developer) or `s3://gaussian-splatting-20240613/code/iOS-SDK-1.10.4.zip`
+    - OpenCV iOS framework from [GitHub releases](https://github.com/opencv/opencv/releases)
 
 2. **Clone and checkout**
     ```bash
@@ -235,35 +256,394 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
     cd mobile/AtlasMobile
     ```
 
-3. **Create Xcode project**
-    - Open Xcode → File → New → Project → iOS → App
-    - Product Name: `AtlasMobile`
-    - Interface: SwiftUI
-    - Language: Swift
-    - Save into `mobile/AtlasMobile/`
-    - Add all `.swift` files from the skeleton to the Xcode project
-    - Add `Info.plist` to the target
+3. **Install frameworks**
 
-4. **Add Insta360 SDK**
-    - Download from [Insta360 Developer Portal](https://www.insta360.com/developer)
-    - Add framework to project (CocoaPods or manual embed)
-    - Ensure `NSLocalNetworkUsageDescription` and `NSBonjourServices` are in Info.plist
+    Extract the Insta360 SDK and OpenCV framework, then copy into the project:
+    ```bash
+    mkdir -p Frameworks
 
-5. **Configure signing**
+    # Insta360 SDK
+    unzip ~/Downloads/iOS-SDK-1.10.4.zip -d /tmp/iOS-SDK-1.10.4/
+    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCameraSDK.xcframework Frameworks/
+    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCameraServiceSDK.xcframework Frameworks/
+    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCoreMedia.xcframework Frameworks/
+    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/SSZipArchive.xcframework Frameworks/
+
+    # OpenCV
+    curl -L -o /tmp/opencv-ios.zip https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-ios-framework.zip
+    unzip /tmp/opencv-ios.zip -d /tmp/opencv/
+    cp -R /tmp/opencv/opencv2.framework Frameworks/
+    ```
+
+4. **Create the Xcode project**
+
+    The `AtlasMobile/` directory contains Swift source files but no `.xcodeproj`. There are two options:
+
+    **Option A: Headless build with XcodeGen (CI / EC2 Mac instances)**
+
+    Install XcodeGen:
+    ```bash
+    curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+    cd /tmp && unzip xcodegen.zip
+    ```
+
+    Create `project.yml` in `mobile/AtlasMobile/`:
+    ```yaml
+    name: AtlasMobile
+    options:
+      bundleIdPrefix: com.atlas
+      deploymentTarget:
+        iOS: "17.0"
+      xcodeVersion: "16.2"
+
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        CLANG_CXX_LIBRARY: libc++
+        FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/Frameworks
+        SWIFT_OBJC_BRIDGING_HEADER: AtlasMobile/AtlasMobile-Bridging-Header.h
+
+    targets:
+      AtlasMobile:
+        type: application
+        platform: iOS
+        sources:
+          - path: AtlasMobile
+            excludes:
+              - "**/*.xcodeproj"
+        info:
+          path: AtlasMobile/Info.plist
+          properties:
+            NSCameraUsageDescription: "Atlas Mobile uses the camera and LiDAR sensor for 3D scene capture."
+            NSLocalNetworkUsageDescription: "Atlas Mobile connects to Insta360 cameras over the local network."
+            NSBonjourServices:
+              - "_insta360._tcp"
+            UIRequiredDeviceCapabilities:
+              - arkit
+              - lidar
+            UILaunchScreen: {}
+        settings:
+          base:
+            PRODUCT_BUNDLE_IDENTIFIER: com.cornwell.atlas.AtlasMobile
+            CODE_SIGN_IDENTITY: ""
+            CODE_SIGNING_REQUIRED: "NO"
+            CODE_SIGNING_ALLOWED: "NO"
+            DEVELOPMENT_TEAM: ""
+        dependencies:
+          - framework: Frameworks/INSCameraSDK.xcframework
+            embed: true
+          - framework: Frameworks/INSCameraServiceSDK.xcframework
+            embed: true
+          - framework: Frameworks/INSCoreMedia.xcframework
+            embed: true
+          - framework: Frameworks/SSZipArchive.xcframework
+            embed: true
+          - framework: Frameworks/opencv2.framework
+            embed: false
+          - sdk: ARKit.framework
+          - sdk: CoreML.framework
+          - sdk: CoreVideo.framework
+          - sdk: CoreImage.framework
+          - sdk: Accelerate.framework
+    ```
+
+    > **Important:** `opencv2.framework` must use `embed: false`. OpenCV is a static library — its code is linked into the main binary at build time. Embedding the framework bundle causes iOS to reject the app with `MissingBundleExecutable` because the `.framework` wrapper has no valid executable.
+
+    Create the bridging header at `AtlasMobile/AtlasMobile-Bridging-Header.h`:
+    ```objc
+    #import "FeatureMatcher.h"
+    ```
+
+    Generate and build:
+    ```bash
+    /tmp/xcodegen/bin/xcodegen generate --spec project.yml
+    xcodebuild -project AtlasMobile.xcodeproj \
+      -scheme AtlasMobile \
+      -sdk iphoneos \
+      -configuration Release \
+      CODE_SIGN_IDENTITY="" \
+      CODE_SIGNING_REQUIRED=NO \
+      CODE_SIGNING_ALLOWED=NO
+    ```
+
+    **Option B: Interactive Xcode GUI (local Mac)**
+
+    See [docs/setup-and-testing.md](docs/setup-and-testing.md) for step-by-step Xcode GUI instructions including manual framework embedding, bridging header setup, and build settings.
+
+5. **Configure signing** (required for device deployment)
     - Select your team in Xcode → Target → Signing & Capabilities
-    - Enable Camera capability
+    - Or pass `CODE_SIGN_IDENTITY` and `DEVELOPMENT_TEAM` to `xcodebuild`
 
 6. **Build and run**
     ```bash
-    # Build from command line (optional, Xcode GUI preferred)
+    # Command line
     xcodebuild -scheme AtlasMobile -destination 'platform=iOS,name=<your-device>'
     ```
-    - Or press Cmd+R in Xcode with your iPhone connected
+    Or press Cmd+R in Xcode with your iPhone connected.
 
 7. **Test ARKit capture (Phase 1)**
     - Launch app on device
     - Tap "Start Session" → "Capture Scan" → "End Session"
     - Verify output in Files app → AtlasMobile → atlas_sessions/
+
+#### EC2 Mac Build (no local Mac)
+
+If you don't have a Mac, you can build on an EC2 Mac Dedicated Host. **Expect ~$26/day** (mac1.metal on-demand) with a **24-hour minimum allocation**.
+
+> **Known restriction:** `mac2.metal` (Apple Silicon) may be blocked by your AWS organization's Service Control Policies. If you get `UnsupportedHostConfiguration`, fall back to `mac1.metal` (Intel). Both work for iOS cross-compilation.
+
+1. **Allocate a Dedicated Host** (24-hour minimum billing applies)
+    ```bash
+    aws ec2 allocate-hosts \
+      --instance-type mac1.metal \
+      --availability-zone us-east-1a \
+      --quantity 1
+    ```
+    Save the `HostId` from the response — you'll need it for the next step.
+
+2. **Launch an instance** using a macOS AMI
+
+    Find the latest macOS AMI. The architecture filter must be `x86_64_mac` (not `x86_64`):
+    ```bash
+    aws ec2 describe-images --owners amazon \
+      --filters "Name=name,Values=amzn-ec2-macos-15*" \
+                "Name=architecture,Values=x86_64_mac" \
+      --query "Images | sort_by(@, &CreationDate) | [-1].[ImageId,Name]" \
+      --output table
+    ```
+
+    Create `bdm.json` for the 200 GB root volume:
+    ```json
+    [{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":200,"VolumeType":"gp3"}}]
+    ```
+
+    Launch the instance (use `--placement` not `--host-id`):
+    ```bash
+    aws ec2 run-instances \
+      --instance-type mac1.metal \
+      --placement "HostId=<host-id>" \
+      --image-id <ami-id> \
+      --key-name <key-name> \
+      --security-group-ids <sg-id> \
+      --block-device-mappings file://bdm.json
+    ```
+
+    > **PowerShell note:** JSON with quotes in `--block-device-mappings` breaks in PowerShell. Always use `file://bdm.json` instead of inline JSON.
+
+3. **Connect via SSM** (no SSH key required — avoids key pair issues)
+    ```bash
+    aws ssm start-session --target <instance-id>
+    ```
+
+    The SSM session starts as `ssm-user` with a minimal environment. Fix it immediately:
+    ```bash
+    export HOME=/Users/ec2-user
+    export USER=ec2-user
+    cd /Users/ec2-user
+    ```
+
+4. **Install Xcode** on the instance
+
+    Homebrew is unsupported on Intel EC2 Macs. Download the `xcodes` binary directly:
+    ```bash
+    curl -fsSL -o /tmp/xcodes.zip \
+      https://github.com/XcodesOrg/xcodes/releases/latest/download/xcodes.zip
+    cd /tmp && unzip xcodes.zip && chmod +x xcodes
+
+    # Install Xcode (prompts for Apple ID)
+    ./xcodes install 16.2
+    ```
+
+    If `xcodes` hangs during xip extraction (common under SSM), extract manually:
+    ```bash
+    # Find the downloaded xip
+    ls /Users/ec2-user/Library/Caches/com.robotsandpencils.xcodes/*.xip
+
+    # Extract with sudo (TMPDIR must be writable)
+    cd /Applications
+    sudo xip -x "/Users/ec2-user/Library/Caches/com.robotsandpencils.xcodes/Xcode_16.2.xip"
+    sudo mv Xcode.app /Applications/Xcode-16.2.0.app
+    ```
+
+    Configure Xcode and install the iOS platform:
+    ```bash
+    sudo xcode-select -s /Applications/Xcode-16.2.0.app/Contents/Developer
+    sudo xcodebuild -runFirstLaunch
+    sudo xcodebuild -license accept
+    sudo xcodebuild -downloadPlatform iOS
+    ```
+
+    > **Important:** The iOS platform download (`-downloadPlatform iOS`) is required even though `xcodebuild -showsdks` may list `iphoneos18.2`. Without it, builds fail with "Found no destinations" or "iOS 18.2 is not installed."
+
+5. **Install XcodeGen**
+
+    XcodeGen generates the `.xcodeproj` from `project.yml`:
+    ```bash
+    curl -fsSL -o /tmp/xcodegen.zip \
+      https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+    unzip -o /tmp/xcodegen.zip -d /Users/ec2-user/
+    ```
+    The binary is at `/Users/ec2-user/xcodegen/bin/xcodegen`.
+
+6. **Clone the repo and install frameworks**
+    ```bash
+    cd /Users/ec2-user
+    git clone https://github.com/Eecornwell/atlas-scanner.git
+    cd atlas-scanner && git checkout mobile
+    cd mobile/AtlasMobile
+    mkdir -p Frameworks
+    ```
+
+    Copy the Insta360 SDK frameworks. Upload the SDK zip to S3 or transfer via SCP:
+    ```bash
+    # Download SDK from S3
+    aws s3 cp s3://gaussian-splatting-20240613/code/iOS-SDK-1.10.4.zip /tmp/
+    cd /tmp && unzip iOS-SDK-1.10.4.zip -d iOS-SDK-1.10.4/
+
+    SDK_FW=/tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks
+    cp -R $SDK_FW/INSCameraSDK.xcframework Frameworks/
+    cp -R $SDK_FW/INSCameraServiceSDK.xcframework Frameworks/
+    cp -R $SDK_FW/INSCoreMedia.xcframework Frameworks/
+    cp -R $SDK_FW/SSZipArchive.xcframework Frameworks/
+
+    # OpenCV
+    curl -L -o /tmp/opencv-ios.zip \
+      https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-ios-framework.zip
+    unzip /tmp/opencv-ios.zip -d /tmp/opencv/
+    cp -R /tmp/opencv/opencv2.framework Frameworks/
+    ```
+
+    Verify all five frameworks are present:
+    ```bash
+    ls -d Frameworks/*.xcframework Frameworks/*.framework
+    # Expected:
+    # Frameworks/INSCameraSDK.xcframework
+    # Frameworks/INSCameraServiceSDK.xcframework
+    # Frameworks/INSCoreMedia.xcframework
+    # Frameworks/SSZipArchive.xcframework
+    # Frameworks/opencv2.framework
+    ```
+
+    > **Warning:** If you re-extract the project zip later, the Frameworks/ directory will be overwritten. Re-copy from `/tmp` after any re-extraction.
+
+7. **Generate and build**
+    ```bash
+    export HOME=/Users/ec2-user
+    export USER=ec2-user
+    cd /Users/ec2-user/atlas-scanner/mobile/AtlasMobile
+
+    /Users/ec2-user/xcodegen/bin/xcodegen generate --spec project.yml
+
+    xcodebuild -project AtlasMobile.xcodeproj \
+      -scheme AtlasMobile \
+      -sdk iphoneos \
+      -destination 'generic/platform=iOS' \
+      -configuration Release \
+      CODE_SIGN_IDENTITY="" \
+      CODE_SIGNING_REQUIRED=NO \
+      CODE_SIGNING_ALLOWED=NO
+    ```
+
+    > **Troubleshooting:**
+    > - `"Couldn't find current username"` from XcodeGen → set `HOME` and `USER` env vars
+    > - `"Found no destinations"` → run `sudo xcodebuild -downloadPlatform iOS`
+    > - `"overlapping accesses"` in HostUploader.swift → capture `.count` to a local variable before `withUnsafeMutableBytes`/`withUnsafeBytes` closures
+    > - FeatureMatcher.mm compile errors → ensure `AtlasMobile-Bridging-Header.h` exists with `#import "FeatureMatcher.h"`
+
+8. **Archive and export a signed IPA** (for device deployment)
+
+    To deploy to a physical device, you need a signed IPA. This requires an Apple Developer account with a provisioning profile that includes the target device's UDID.
+
+    Create `ExportOptionsAdHoc.plist`:
+    ```xml
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+      "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>method</key>
+      <string>ad-hoc</string>
+      <key>teamID</key>
+      <string>YOUR_TEAM_ID</string>
+      <key>signingStyle</key>
+      <string>manual</string>
+      <key>signingCertificate</key>
+      <string>Apple Distribution</string>
+      <key>provisioningProfiles</key>
+      <dict>
+        <key>com.cornwell.atlas.AtlasMobile</key>
+        <string>YOUR_PROFILE_NAME</string>
+      </dict>
+    </dict>
+    </plist>
+    ```
+
+    Copy the provisioning profile to the build user's directory. SSM `send-command` runs as root, interactive SSM runs as `ssm-user`:
+    ```bash
+    # For interactive SSM sessions (ssm-user)
+    mkdir -p /Users/ssm-user/Library/MobileDevice/Provisioning\ Profiles/
+    cp /Users/ec2-user/YourProfile.mobileprovision \
+       /Users/ssm-user/Library/MobileDevice/Provisioning\ Profiles/
+
+    # For SSM send-command (runs as root)
+    sudo mkdir -p /var/root/Library/MobileDevice/Provisioning\ Profiles/
+    sudo cp /Users/ec2-user/YourProfile.mobileprovision \
+       /var/root/Library/MobileDevice/Provisioning\ Profiles/
+    ```
+
+    Archive and export:
+    ```bash
+    xcodebuild archive \
+      -project AtlasMobile.xcodeproj \
+      -scheme AtlasMobile \
+      -archivePath ~/AtlasMobile.xcarchive \
+      -destination "generic/platform=iOS" \
+      CODE_SIGN_STYLE=Manual \
+      CODE_SIGN_IDENTITY="Apple Distribution" \
+      PROVISIONING_PROFILE_SPECIFIER="YOUR_PROFILE_NAME" \
+      DEVELOPMENT_TEAM="YOUR_TEAM_ID"
+
+    xcodebuild -exportArchive \
+      -archivePath ~/AtlasMobile.xcarchive \
+      -exportPath ~/AtlasMobile_export \
+      -exportOptionsPlist ~/ExportOptionsAdHoc.plist
+    ```
+
+    The IPA is at `~/AtlasMobile_export/AtlasMobile.ipa`.
+
+    > **Important:** After running XcodeGen, verify that the `Embed Frameworks` build phase in the generated `.xcodeproj` does NOT include `opencv2.framework`. If it does, remove it:
+    > ```bash
+    > sed -i.bak '/opencv2.framework in Embed Frameworks/d' \
+    >   AtlasMobile.xcodeproj/project.pbxproj
+    > ```
+
+9. **Install the IPA on a device** (no Mac required)
+
+    Transfer the IPA to any machine (Windows/Mac/Linux) with USB access to the iPhone:
+    ```bash
+    # Install pymobiledevice3 (requires Python 3.10+)
+    pip install pymobiledevice3
+
+    # Connect iPhone via USB, then:
+    pymobiledevice3 apps install AtlasMobile.ipa
+    ```
+
+    Or host the IPA for OTA installation via HTTPS (requires valid TLS certificate):
+    - Upload the IPA and a manifest plist to an HTTPS server
+    - Open `itms-services://?action=download-manifest&url=<manifest-url>` on the device
+
+10. **Release the host** after 24 hours to stop billing
+    ```bash
+    aws ec2 terminate-instances --instance-ids <instance-id>
+    # Wait for instance to terminate, then:
+    aws ec2 release-hosts --host-ids <host-id>
+    ```
+    The host cannot be released until 24 hours after allocation. Check with:
+    ```bash
+    aws ec2 describe-hosts --host-ids <host-id> \
+      --query "Hosts[0].AllocationTime"
+    ```
 
 #### Offline Pipeline (macOS/Linux/Windows)
 

@@ -28,24 +28,29 @@ struct ExtrinsicCalibration {
         let insta360World = insta360Pose(from: iphonePose)
         let insta360W2C = insta360World.inverse
 
-        // Apply face rotation
-        var tileW2C = simd_float4x4(1.0)
-        let faceRot4 = simd_float4x4(simd_float3x3(
-            faceRotation.columns.0,
-            faceRotation.columns.1,
-            faceRotation.columns.2
-        ))
-        tileW2C = faceRot4 * insta360W2C
+        let faceRot4 = simd_float4x4(
+            SIMD4(faceRotation.columns.0, 0),
+            SIMD4(faceRotation.columns.1, 0),
+            SIMD4(faceRotation.columns.2, 0),
+            SIMD4(0, 0, 0, 1)
+        )
+        var tileW2C = faceRot4 * insta360W2C
 
-        // Apply ARKit → COLMAP coordinate transform
-        tileW2C = COLMAPExporter.arkitToCOLMAP * tileW2C
+        let coordTransform = simd_float4x4(
+            SIMD4(COLMAPExporter.arkitToColmap.columns.0, 0),
+            SIMD4(COLMAPExporter.arkitToColmap.columns.1, 0),
+            SIMD4(COLMAPExporter.arkitToColmap.columns.2, 0),
+            SIMD4(0, 0, 0, 1)
+        )
+        tileW2C = coordTransform * tileW2C
 
         let rotation = simd_float3x3(
             SIMD3(tileW2C.columns.0.x, tileW2C.columns.0.y, tileW2C.columns.0.z),
             SIMD3(tileW2C.columns.1.x, tileW2C.columns.1.y, tileW2C.columns.1.z),
             SIMD3(tileW2C.columns.2.x, tileW2C.columns.2.y, tileW2C.columns.2.z)
         )
-        let quat = COLMAPExporter.rotationToQuaternion(rotation)
+        let quatArray = COLMAPExporter.rotationToQuatWXYZ(rotation)
+        let quat = SIMD4<Float>(quatArray[0], quatArray[1], quatArray[2], quatArray[3])
         let translation = SIMD3(tileW2C.columns.3.x, tileW2C.columns.3.y, tileW2C.columns.3.z)
 
         return (quat, translation)

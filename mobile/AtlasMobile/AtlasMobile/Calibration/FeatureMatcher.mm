@@ -1,6 +1,6 @@
 #import "FeatureMatcher.h"
 #import <opencv2/opencv.hpp>
-#import <opencv2/features2d.hpp>
+#import <opencv2/features.hpp>
 
 // Lowe's ratio test threshold — matches flutter-pixelmatching Constants.h
 static const float kRatioThreshold = 0.75f;
@@ -39,7 +39,7 @@ static cv::Mat uiImageToGrayMat(UIImage *image, int maxWidth) {
 }
 
 @implementation FeatureMatcher {
-    cv::Ptr<cv::KAZE>              _detector;
+    cv::Ptr<cv::SIFT>              _detector;
     cv::Ptr<cv::DescriptorMatcher> _matcher;
     std::vector<cv::KeyPoint>      _refKeypoints;
     cv::Mat                        _refDescriptors;
@@ -53,7 +53,7 @@ static cv::Mat uiImageToGrayMat(UIImage *image, int maxWidth) {
     if (self) {
         // KAZE: good for ERP images — handles the smooth gradients and
         // non-planar distortion better than SIFT on equirectangular content.
-        _detector = cv::KAZE::create();
+        _detector = cv::SIFT::create();
         _matcher  = cv::DescriptorMatcher::create(
             cv::DescriptorMatcher::MatcherType::FLANNBASED
         );
@@ -65,14 +65,14 @@ static cv::Mat uiImageToGrayMat(UIImage *image, int maxWidth) {
 - (BOOL)setReference:(UIImage *)lidarERP {
     _refOrig = cv::Size((int)lidarERP.size.width, (int)lidarERP.size.height);
     cv::Mat gray = uiImageToGrayMat(lidarERP, kMaxERPWidth);
-    if (gray.empty()) return NO;
+    if (gray.empty()) return false;
     _refSize = gray.size();
 
     _refKeypoints.clear();
     _refDescriptors.release();
     _detector->detectAndCompute(gray, cv::noArray(), _refKeypoints, _refDescriptors);
 
-    if (_refDescriptors.empty() || _refDescriptors.rows < kKNN) return NO;
+    if (_refDescriptors.empty() || _refDescriptors.rows < kKNN) return false;
 
     _matcher->clear();
     _matcher->add(_refDescriptors);

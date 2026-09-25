@@ -31,7 +31,9 @@ final class TrajectoryRecorder {
             poses: poses.map { entry in
                 PoseEntry(
                     timestamp: entry.timestamp,
-                    transform: entry.pose.columns.map { [$0.x, $0.y, $0.z, $0.w] }
+                    transform: [entry.pose.columns.0, entry.pose.columns.1,
+                                entry.pose.columns.2, entry.pose.columns.3]
+                        .map { [$0.x, $0.y, $0.z, $0.w] }
                 )
             }
         )

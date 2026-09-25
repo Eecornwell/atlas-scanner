@@ -62,16 +62,19 @@ final class PostProcessingManager: ObservableObject {
     // MARK: - Model loading
 
     func loadModels() async {
-        await Task.detached(priority: .userInitiated) {
-            // PromptDA
+        let (pda, sn) = await Task.detached(priority: .userInitiated) {
+            var p: MLModel?
+            var s: MLModel?
             if let url = Bundle.main.url(forResource: "PromptDA", withExtension: "mlpackage") {
-                self.promptDAModel = try? MLModel(contentsOf: url)
+                p = try? MLModel(contentsOf: url)
             }
-            // StableNormal
             if let url = Bundle.main.url(forResource: "StableNormal", withExtension: "mlpackage") {
-                self.stableNormalModel = try? MLModel(contentsOf: url)
+                s = try? MLModel(contentsOf: url)
             }
+            return (p, s)
         }.value
+        self.promptDAModel = pda
+        self.stableNormalModel = sn
     }
 
     var promptDAAvailable: Bool { promptDAModel != nil }
@@ -127,19 +130,18 @@ final class PostProcessingManager: ObservableObject {
 
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
+        let capturedModel = model
         await Task.detached(priority: .userInitiated) {
             guard let rgb = UIImage(contentsOfFile: rgbURL.path),
                   let rgbCG = rgb.cgImage else { return }
 
-            // Load sparse depth (256×192 Float32)
             guard let depthData = try? Data(contentsOf: depthURL) else { return }
             let depthFloats = depthData.withUnsafeBytes {
                 Array($0.bindMemory(to: Float.self).prefix(256 * 192))
             }
 
-            // Build CoreML input
-            guard let rgbBuffer = Self.cgImageToMLMultiArray(rgbCG, targetW: 518, targetH: 518),
-                  let depthBuffer = Self.depthToMLMultiArray(depthFloats, w: 256, h: 192,
+            guard let rgbBuffer = PostProcessingManager.cgImageToMLMultiArray(rgbCG, targetW: 518, targetH: 518),
+                  let depthBuffer = PostProcessingManager.depthToMLMultiArray(depthFloats, w: 256, h: 192,
                                                               targetW: 518, targetH: 518)
             else { return }
 
@@ -147,9 +149,8 @@ final class PostProcessingManager: ObservableObject {
                 "image": MLFeatureValue(multiArray: rgbBuffer),
                 "prompt_depth": MLFeatureValue(multiArray: depthBuffer),
             ])
-            guard let input, let output = try? model.prediction(from: input) else { return }
+            guard let input, let output = try? capturedModel.prediction(from: input) else { return }
 
-            // Extract depth output and save as uint16 PNG (mm)
             guard let depthOut = output.featureValue(for: "depth")?.multiArrayValue else { return }
             let outH = Int(rgb.size.height), outW = Int(rgb.size.width)
             var depthMM = [UInt16](repeating: 0, count: outW * outH)
@@ -158,7 +159,7 @@ final class PostProcessingManager: ObservableObject {
                 let metres = Float(truncating: depthOut[i])
                 depthMM[i] = UInt16(clamping: Int(metres * 1000))
             }
-            Self.saveUInt16PNG(pixels: depthMM, width: outW, height: outH, to: outURL)
+            PostProcessingManager.saveUInt16PNG(pixels: depthMM, width: outW, height: outH, to: outURL)
         }.value
     }
 
@@ -175,20 +176,20 @@ final class PostProcessingManager: ObservableObject {
 
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
+        let capturedModel = model
         await Task.detached(priority: .userInitiated) {
             guard let rgb = UIImage(contentsOfFile: rgbURL.path),
                   let rgbCG = rgb.cgImage else { return }
 
-            guard let rgbBuffer = Self.cgImageToMLMultiArray(rgbCG, targetW: 768, targetH: 768)
+            guard let rgbBuffer = PostProcessingManager.cgImageToMLMultiArray(rgbCG, targetW: 768, targetH: 768)
             else { return }
 
             let input = try? MLDictionaryFeatureProvider(dictionary: [
                 "image": MLFeatureValue(multiArray: rgbBuffer),
             ])
-            guard let input, let output = try? model.prediction(from: input) else { return }
+            guard let input, let output = try? capturedModel.prediction(from: input) else { return }
             guard let normalOut = output.featureValue(for: "normal")?.multiArrayValue else { return }
 
-            // normal is (3, H, W) float32 in [-1, 1] → encode to RGB uint8
             let outH = Int(rgb.size.height), outW = Int(rgb.size.width)
             var rgba = [UInt8](repeating: 255, count: outW * outH * 4)
             let n = outW * outH
@@ -200,13 +201,13 @@ final class PostProcessingManager: ObservableObject {
                 rgba[i*4+1] = UInt8(clamping: Int((g * 0.5 + 0.5) * 255))
                 rgba[i*4+2] = UInt8(clamping: Int((b * 0.5 + 0.5) * 255))
             }
-            Self.saveRGBAPNG(pixels: rgba, width: outW, height: outH, to: outURL)
+            PostProcessingManager.saveRGBAPNG(pixels: rgba, width: outW, height: outH, to: outURL)
         }.value
     }
 
     // MARK: - CoreML buffer helpers
 
-    private static func cgImageToMLMultiArray(
+    nonisolated private static func cgImageToMLMultiArray(
         _ cgImage: CGImage, targetW: Int, targetH: Int
     ) -> MLMultiArray? {
         guard let ctx = CGContext(
@@ -230,7 +231,7 @@ final class PostProcessingManager: ObservableObject {
         return arr
     }
 
-    private static func depthToMLMultiArray(
+    nonisolated private static func depthToMLMultiArray(
         _ depth: [Float], w: Int, h: Int, targetW: Int, targetH: Int
     ) -> MLMultiArray? {
         guard let arr = try? MLMultiArray(shape: [1, 1, targetH as NSNumber, targetW as NSNumber],
@@ -246,7 +247,7 @@ final class PostProcessingManager: ObservableObject {
         return arr
     }
 
-    private static func saveUInt16PNG(pixels: [UInt16], width: Int, height: Int, to url: URL) {
+    nonisolated private static func saveUInt16PNG(pixels: [UInt16], width: Int, height: Int, to url: URL) {
         var data = pixels
         let provider = CGDataProvider(data: Data(bytes: &data,
                                                   count: width * height * 2) as CFData)!
@@ -264,7 +265,7 @@ final class PostProcessingManager: ObservableObject {
         }
     }
 
-    private static func saveRGBAPNG(pixels: [UInt8], width: Int, height: Int, to url: URL) {
+    nonisolated private static func saveRGBAPNG(pixels: [UInt8], width: Int, height: Int, to url: URL) {
         var data = pixels
         let provider = CGDataProvider(data: Data(bytes: &data,
                                                   count: width * height * 4) as CFData)!

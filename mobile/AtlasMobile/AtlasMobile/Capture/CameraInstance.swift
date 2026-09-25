@@ -1,13 +1,11 @@
 import Foundation
 import INSCameraSDK
 
-/// Camera WiFi Direct defaults — Insta360 AP mode address.
 private let kCameraHost = "192.168.42.1"
 private let kCameraPort: UInt16 = 6666
 private let kHeartbeatInterval: TimeInterval = 0.5
-private let kClockSyncSamples = 10
+private let kClockSyncSamples: UInt = 10
 
-/// Represents a single connected Insta360 camera with its calibration and state.
 final class CameraInstance: NSObject, Identifiable {
     let id: String
     let model: String
@@ -18,7 +16,6 @@ final class CameraInstance: NSObject, Identifiable {
     private(set) var clockOffset: ClockOffset?
     private(set) var isConnected = false
 
-    /// Pending media URIs queued for download (populated by capture()).
     private var pendingURIs: [(scanIndex: Int, uri: String)] = []
     private var heartbeatTimer: Timer?
     private var kvoToken: NSKeyValueObservation?
@@ -34,16 +31,12 @@ final class CameraInstance: NSObject, Identifiable {
     // MARK: - Connection
 
     func connect() async -> Bool {
-        let device = INSSocketDevice(host: kCameraHost, port: kCameraPort)
-        INSCameraManager.socket().currentCamera = device as? (any INSCameraDevice)
-
         return await withCheckedContinuation { continuation in
             kvoToken = INSCameraManager.socket().observe(
                 \.cameraState,
                 options: [.new]
             ) { [weak self] manager, change in
-                guard let self, let rawValue = change.newValue else { return }
-                let state = INSCameraState(rawValue: rawValue.uintValue) ?? .noConnection
+                guard let self, let state = change.newValue else { return }
                 switch state {
                 case .connected:
                     self.kvoToken = nil
@@ -70,7 +63,6 @@ final class CameraInstance: NSObject, Identifiable {
 
     // MARK: - Clock offset
 
-    /// Estimates clock offset using the SDK's built-in sync (median of N samples).
     func calibrateClockOffset() async -> ClockOffset {
         return await withCheckedContinuation { continuation in
             INSCameraManager.socket().commandsImpl.syncTimeMsToCamera(
@@ -79,7 +71,7 @@ final class CameraInstance: NSObject, Identifiable {
             ) { [weak self] dTimeMs, error in
                 let offset = ClockOffset(
                     offsetMs: error == nil ? Double(dTimeMs) : 0.0,
-                    sampleCount: error == nil ? kClockSyncSamples : 0,
+                    sampleCount: error == nil ? Int(kClockSyncSamples) : 0,
                     stdDevMs: 0.0
                 )
                 self?.clockOffset = offset
@@ -147,10 +139,10 @@ final class CameraInstance: NSObject, Identifiable {
         )
 
         return await withCheckedContinuation { continuation in
-            INSCameraManager.socket().commandsImpl.fetchResource(
+            INSCameraHTTPManager.socket().fetchResource(
                 withURI: uri,
                 toLocalFile: destURL,
-                progress: nil
+                progress: { _ in }
             ) { error in
                 if error != nil {
                     continuation.resume(returning: nil)

@@ -350,11 +350,13 @@ private enum ZipReader {
         // Prepend zlib header (0x78 0x9C) that Compression framework expects
         var zlib = Data([0x78, 0x9C]) + input
         var output = Data(count: max(expectedSize, 1))
+        let outputCount = output.count
+        let zlibCount = zlib.count
         let written = zlib.withUnsafeBytes { src in
             output.withUnsafeMutableBytes { dst in
                 compression_decode_buffer(
-                    dst.baseAddress!.assumingMemoryBound(to: UInt8.self), output.count,
-                    src.baseAddress!.assumingMemoryBound(to: UInt8.self), zlib.count,
+                    dst.baseAddress!.assumingMemoryBound(to: UInt8.self), outputCount,
+                    src.baseAddress!.assumingMemoryBound(to: UInt8.self), zlibCount,
                     nil, COMPRESSION_ZLIB
                 )
             }
