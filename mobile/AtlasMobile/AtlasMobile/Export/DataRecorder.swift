@@ -117,6 +117,7 @@ final class DataRecorder {
                 }
             }
 
+            let smoothedURL = scanDir.appendingPathComponent("depth_smoothed.bin")
             return ScanExportData(
                 scanName: scanDir.lastPathComponent,
                 arkitPose: arkitPose,
@@ -124,6 +125,7 @@ final class DataRecorder {
                 imageWidth: pose.imageWidth,
                 imageHeight: pose.imageHeight,
                 depthBinURL: scanDir.appendingPathComponent("depth.bin"),
+                smoothedDepthBinURL: FileManager.default.fileExists(atPath: smoothedURL.path) ? smoothedURL : nil,
                 iphoneImageURL: scanDir.appendingPathComponent("rgb.jpg"),
                 insta360ImageURLs: insta360URLs
             )

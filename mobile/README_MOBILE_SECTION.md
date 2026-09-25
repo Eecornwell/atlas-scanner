@@ -245,7 +245,7 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
     - iPhone 14 Pro or later (LiDAR required, simulator not supported)
     - Apple Developer account (for device deployment)
     - Insta360 X5 (or supported model) for integration testing
-    - Insta360 iOS SDK zip (`iOS-SDK-1.10.4.zip`) from the [Insta360 Developer Portal](https://www.insta360.com/developer) or `s3://gaussian-splatting-20240613/code/iOS-SDK-1.10.4.zip`
+    - Insta360 iOS SDK zip (`iOS-SDK-1.10.4.zip`) from the [Insta360 Developer Portal](https://www.insta360.com/developer) or `s3://<BUCKET>/code/iOS-SDK-1.10.4.zip`
     - OpenCV iOS framework from [GitHub releases](https://github.com/opencv/opencv/releases)
 
 2. **Clone and checkout**
@@ -315,8 +315,8 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
         info:
           path: AtlasMobile/Info.plist
           properties:
-            NSCameraUsageDescription: "Atlas Mobile uses the camera and LiDAR sensor for 3D scene capture."
-            NSLocalNetworkUsageDescription: "Atlas Mobile connects to Insta360 cameras over the local network."
+            NSCameraUsageDescription: "ATLAS Mobile uses the camera and LiDAR sensor for 3D scene capture."
+            NSLocalNetworkUsageDescription: "ATLAS Mobile connects to Insta360 cameras over the local network."
             NSBonjourServices:
               - "_insta360._tcp"
             UIRequiredDeviceCapabilities:
@@ -498,7 +498,7 @@ If you don't have a Mac, you can build on an EC2 Mac Dedicated Host. **Expect ~$
     Copy the Insta360 SDK frameworks. Upload the SDK zip to S3 or transfer via SCP:
     ```bash
     # Download SDK from S3
-    aws s3 cp s3://gaussian-splatting-20240613/code/iOS-SDK-1.10.4.zip /tmp/
+    aws s3 cp s3://<BUCKET>/iOS-SDK-1.10.4.zip /tmp/
     cd /tmp && unzip iOS-SDK-1.10.4.zip -d iOS-SDK-1.10.4/
 
     SDK_FW=/tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks

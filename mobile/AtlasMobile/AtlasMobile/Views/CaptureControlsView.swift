@@ -7,39 +7,25 @@ struct CaptureControlsView: View {
 
     var body: some View {
         VStack(spacing: 16) {
-            if !sessionManager.isSessionActive {
-                Button("Start Session") {
-                    Task { await sessionManager.startSession() }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-
-                if let dir = sessionManager.sessionDirectory {
-                    Button("Share Last Session") { isSharing = true }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
-                        .sheet(isPresented: $isSharing) {
-                            ShareSheet(url: dir)
-                        }
-                }
-            } else {
-                Button("Capture Scan") {
-                    Task { await sessionManager.captureScan() }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(!sessionManager.isReadyToCapture)
-
-                Button("End Session") {
-                    Task { await sessionManager.endSession() }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
+            Button("Start Session") {
+                Task { await sessionManager.startSession() }
             }
-        }
-        .sheet(isPresented: $sessionManager.showExportSheet) {
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
             if let dir = sessionManager.sessionDirectory {
-                SessionExportView(sessionDirectory: dir)
+                Button("Share Last Session") { isSharing = true }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .sheet(isPresented: $isSharing) {
+                        ShareSheet(url: dir)
+                    }
+            }
+
+            if let error = sessionManager.exportError {
+                Label(error, systemImage: "exclamationmark.triangle")
+                    .foregroundColor(.red)
+                    .font(.caption)
             }
         }
     }

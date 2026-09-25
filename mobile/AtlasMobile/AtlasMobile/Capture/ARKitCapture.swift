@@ -3,7 +3,7 @@ import Combine
 
 /// Manages the ARKit session for LiDAR depth, RGB frames, and 6DoF pose tracking.
 final class ARKitCapture: NSObject, ObservableObject {
-    private var session: ARSession?
+    private(set) var session: ARSession?
     private var configuration: ARWorldTrackingConfiguration?
 
     @Published var isRunning = false

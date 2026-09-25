@@ -9,6 +9,7 @@ struct SessionExportView: View {
 
     @State private var selectedMode: ExportMode = .colmapOnly
     @State private var isRunning = false
+    @State private var isComplete = false
     @State private var isSharing = false
     @Environment(\.dismiss) private var dismiss
 
@@ -58,7 +59,7 @@ struct SessionExportView: View {
                 }
 
                 // Progress
-                if isRunning {
+                if isRunning || isComplete {
                     Section("Progress") {
                         progressSection
                     }
@@ -91,7 +92,7 @@ struct SessionExportView: View {
                     Button(isRunning ? "Running…" : "Export") {
                         Task { await runExport() }
                     }
-                    .disabled(isRunning)
+                    .disabled(isRunning || isComplete)
                 }
             }
             .task { await postProcessor.loadModels() }
@@ -136,14 +137,25 @@ struct SessionExportView: View {
 
     private func runExport() async {
         isRunning = true
-        defer { isRunning = false }
 
         switch selectedMode {
         case .colmapOnly:
-            // Already done in endSession() — just mark complete
-            postProcessor.progress = ExportProgress(
-                stage: "COLMAP model ready", current: 1, total: 1, isComplete: true
-            )
+            let sparseDir = sessionDirectory
+                .appendingPathComponent("colmap/sparse/0")
+            let camerasExist = FileManager.default
+                .fileExists(atPath: sparseDir.appendingPathComponent("cameras.bin").path)
+
+            if camerasExist {
+                postProcessor.progress = ExportProgress(
+                    stage: "COLMAP model ready",
+                    current: 1, total: 1, isComplete: true
+                )
+            } else {
+                postProcessor.progress = ExportProgress(
+                    stage: "COLMAP export failed — no output files found",
+                    error: "Check that the session has at least one scan with valid pose data."
+                )
+            }
 
         case .fullOnDevice:
             await postProcessor.runFullPipeline(sessionDirectory: sessionDirectory)
@@ -151,6 +163,9 @@ struct SessionExportView: View {
         case .hostProcessing:
             await uploader.upload(sessionDirectory: sessionDirectory, hostURL: hostURL)
         }
+
+        isRunning = false
+        isComplete = true
     }
 }
 

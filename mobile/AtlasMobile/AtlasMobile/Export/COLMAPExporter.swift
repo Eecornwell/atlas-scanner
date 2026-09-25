@@ -23,11 +23,17 @@ final class COLMAPExporter {
 
     private let sessionDirectory: URL
     private let sparseDir: URL
+    private let imagesDir: URL
+    private let depthsDir: URL
 
     init(sessionDirectory: URL) {
         self.sessionDirectory = sessionDirectory
         self.sparseDir = sessionDirectory
             .appendingPathComponent("colmap/sparse/0")
+        self.imagesDir = sessionDirectory
+            .appendingPathComponent("colmap/images")
+        self.depthsDir = sessionDirectory
+            .appendingPathComponent("colmap/depths")
     }
 
     // MARK: - Public
@@ -84,6 +90,7 @@ final class COLMAPExporter {
         try writeFramesBin(scans: scans, imageEntries: imageEntries,
                            cameraConfig: cameraConfig, iphoneCameraId: iphoneCameraId,
                            tileCameraIds: tileCameraIds)
+        try copyImagesAndDepths(scans: scans)
     }
 
     // MARK: - cameras.bin
@@ -395,6 +402,26 @@ final class COLMAPExporter {
         try data.write(to: sparseDir.appendingPathComponent("frames.bin"))
     }
 
+    // MARK: - Copy images & depths
+
+    private func copyImagesAndDepths(scans: [ScanExportData]) throws {
+        let fm = FileManager.default
+        let iphoneFaceDir = imagesDir.appendingPathComponent("face_iphone")
+        try fm.createDirectory(at: iphoneFaceDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: depthsDir, withIntermediateDirectories: true)
+
+        for scan in scans {
+            if let src = scan.iphoneImageURL, fm.fileExists(atPath: src.path) {
+                let dst = iphoneFaceDir.appendingPathComponent("\(scan.scanName).jpg")
+                try? fm.copyItem(at: src, to: dst)
+            }
+            if let src = scan.smoothedDepthBinURL, fm.fileExists(atPath: src.path) {
+                let dst = depthsDir.appendingPathComponent("\(scan.scanName)_depth_smoothed.bin")
+                try? fm.copyItem(at: src, to: dst)
+            }
+        }
+    }
+
     // MARK: - Coordinate math
 
     /// ARKit camera-to-world 4x4 → COLMAP world-to-camera (R_w2c 3x3, t as 4x4 col)
@@ -441,6 +468,7 @@ struct ScanExportData {
     let imageWidth: Int
     let imageHeight: Int
     let depthBinURL: URL?
+    let smoothedDepthBinURL: URL?
     let iphoneImageURL: URL?
     let insta360ImageURLs: [String: URL]  // cameraId → ERP path
 }

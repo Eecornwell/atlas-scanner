@@ -1,0 +1,57 @@
+name: AtlasMobile
+options:
+  bundleIdPrefix: com.cornwell.atlas
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.2"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CLANG_CXX_LANGUAGE_STANDARD: c++20
+    CLANG_CXX_LIBRARY: libc++
+    FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/Frameworks
+    SWIFT_OBJC_BRIDGING_HEADER: AtlasMobile/AtlasMobile-Bridging-Header.h
+
+targets:
+  AtlasMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: AtlasMobile
+        excludes:
+          - "**/*.xcodeproj"
+    info:
+      path: AtlasMobile/Info.plist
+      properties:
+        NSCameraUsageDescription: "ATLAS Mobile uses the camera and LiDAR sensor for 3D scene capture."
+        NSLocalNetworkUsageDescription: "ATLAS Mobile connects to Insta360 cameras over the local network."
+        NSBonjourServices:
+          - "_insta360._tcp"
+        UIRequiredDeviceCapabilities:
+          - arkit
+          - lidar
+        UILaunchScreen: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cornwell.atlas.AtlasMobile
+        CODE_SIGN_IDENTITY: ""
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        DEVELOPMENT_TEAM: ""
+    dependencies:
+      - framework: Frameworks/INSCameraSDK.xcframework
+        embed: true
+      - framework: Frameworks/INSCameraServiceSDK.xcframework
+        embed: true
+      - framework: Frameworks/INSCoreMedia.xcframework
+        embed: true
+      - framework: Frameworks/SSZipArchive.xcframework
+        embed: true
+      - framework: Frameworks/opencv2.framework
+        embed: false
+      - sdk: ARKit.framework
+      - sdk: CoreML.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreImage.framework
+      - sdk: Accelerate.framework

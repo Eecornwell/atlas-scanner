@@ -5,25 +5,46 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 20) {
-                SessionStatusView()
+            ZStack {
+                if sessionManager.isSessionActive,
+                   let session = sessionManager.arkitCapture.session {
+                    ARCameraView(session: session)
+                        .ignoresSafeArea()
 
-                Spacer()
-
-                CaptureControlsView()
-
-                Spacer()
-
-                NavigationLink("Sessions") {
-                    SessionListView()
-                }
-
-                NavigationLink("Calibration") {
-                    CalibrationView()
+                    CaptureOverlayView()
+                } else {
+                    homeView
                 }
             }
-            .padding()
-            .navigationTitle("Atlas Mobile")
+            .navigationTitle(sessionManager.isSessionActive ? "" : "ATLAS Mobile")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar(sessionManager.isSessionActive ? .hidden : .visible, for: .navigationBar)
+            .sheet(isPresented: $sessionManager.showExportSheet) {
+                if let dir = sessionManager.sessionDirectory {
+                    SessionExportView(sessionDirectory: dir)
+                }
+            }
         }
+    }
+
+    private var homeView: some View {
+        VStack(spacing: 20) {
+            SessionStatusView()
+
+            Spacer()
+
+            CaptureControlsView()
+
+            Spacer()
+
+            NavigationLink("Sessions") {
+                SessionListView()
+            }
+
+            NavigationLink("Calibration") {
+                CalibrationView()
+            }
+        }
+        .padding()
     }
 }
