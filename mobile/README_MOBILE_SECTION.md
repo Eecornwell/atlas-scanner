@@ -209,23 +209,24 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
 > (`calibrate_extrinsic.py`) remains available as a higher-accuracy alternative using
 > SuperGlue feature matching when a GPU workstation is available.
 
-#### Phase 6: Live Capture UI
-- [ ] **AR camera preview** — replace the blank capture screen with an `ARView` (RealityKit) or `ARSCNView` (SceneKit) showing the live iPhone camera feed during sessions
-- [ ] **Tracking state indicator** — display ARKit tracking quality (normal / limited / not available) with a colored badge or banner; show the reason when limited (insufficient features, excessive motion, initializing)
-- [ ] **Scan counter overlay** — show scan count on top of the camera preview instead of in a separate status bar
-- [ ] **Capture flash feedback** — brief screen flash or border animation on "Capture Scan" so the user knows it fired
-- [ ] **Last-capture thumbnail** — after each scan, show a small thumbnail of the captured RGB frame in a corner of the preview
-- [ ] **LiDAR depth overlay** — optional toggle to render the live depth map as a colored overlay on the camera feed (confidence-weighted coloring)
-- [ ] **Point cloud visualization** — render accumulated LiDAR points as a 3D point cloud in the AR view, giving the user real-time spatial feedback
-- [ ] **Mesh visualization** — optionally render `ARMeshAnchor` geometry (available on LiDAR devices) as a wireframe overlay
+#### Phase 6: Live Capture UI ✅
+- [x] AR camera preview — `ARCameraView` (`ARSCNView`) shows live camera feed during sessions
+- [x] Tracking state indicator — `TrackingStateBadge` with colored dot and reason text, forwarded via Combine `assign(to:)`
+- [x] Scan counter overlay — "Scans: N" badge on top of camera preview in `CaptureOverlayView`
+- [x] Capture flash feedback — brief white screen flash + shutter sound (1108) + haptic vibration on capture
+- [x] Last-capture thumbnail — 60×60 thumbnail of captured RGB frame shown in bottom-left corner
+- [x] LiDAR depth overlay — jet-colorized depth map overlay (~10fps), toggled via camera.filters button in overlay
+- [x] Point cloud visualization — ARKit feature points rendered via `ARSCNView.debugOptions`, toggled via circle.dotted button
+- [x] Mesh visualization — `ARMeshAnchor` wireframe via `ARSCNViewDelegate`, cyan wireframe, toggled via 3D layers button; enables `sceneReconstruction = .mesh` on demand
 
-#### Phase 7: Insta360 Connection UI
-- [ ] **Connection status screen** — show camera discovery and connection progress when starting a session (connecting, connected, failed per camera)
-- [ ] **Camera status badge** — persistent indicator showing connected camera count and names during an active session
-- [ ] **Manual retry** — button to retry connection if a camera fails to connect
-- [ ] **Disconnection alert** — notify the user if an Insta360 camera drops mid-session (heartbeat failure)
-- [ ] **WiFi reconnection handling** — automatic reconnect attempt when Insta360 WiFi drops, with user notification
-- [ ] **Preview from Insta360** — show the most recent Insta360 capture thumbnail after each scan (downloaded at capture time, not deferred to end-session)
+#### Phase 7: Insta360 Connection UI ✅
+- [x] Connection status screen — `cameraStatus` shows "Connecting N cameras…" → result; camera connection runs in background Task so session starts immediately
+- [x] Camera status badge — persistent badge in `CaptureOverlayView` (own row) + configured camera count on home screen
+- [x] Camera settings UI — `CameraSettingsView`: add/edit/delete cameras, test connection, ± button for negative mount values
+- [x] Manual retry — "Retry" button appears in overlay when cameras fail to connect or disconnect; calls `retryConnection()` on `Insta360CaptureManager`
+- [x] Disconnection alert — `CameraInstance` monitors `cameraState` KVO after connection; on unexpected disconnect, fires `onDisconnect` callback → manager removes camera → status updates to "Camera disconnected" (red)
+- [x] WiFi reconnection handling — `CameraInstance.reconnect(maxRetries:)` with 2s backoff between attempts; `Insta360CaptureManager.retryConnection()` reconnects only missing cameras
+- [x] Preview from Insta360 — `lastInstaERP` shown as "360" thumbnail in overlay alongside iPhone thumbnail after each capture
 
 #### Phase 8: Session Management & Polish
 - [ ] **Session browser improvements** — add delete, rename, and storage usage display to `SessionListView`

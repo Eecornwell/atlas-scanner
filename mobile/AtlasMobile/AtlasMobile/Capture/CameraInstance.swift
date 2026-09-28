@@ -1,8 +1,6 @@
 import Foundation
 import INSCameraSDK
 
-private let kCameraHost = "192.168.42.1"
-private let kCameraPort: UInt16 = 6666
 private let kHeartbeatInterval: TimeInterval = 0.5
 private let kClockSyncSamples: UInt = 10
 
@@ -16,9 +14,13 @@ final class CameraInstance: NSObject, Identifiable {
     private(set) var clockOffset: ClockOffset?
     private(set) var isConnected = false
 
+    var onDisconnect: (() -> Void)?
+    var onStatusUpdate: ((String) -> Void)?
+
     private var pendingURIs: [(scanIndex: Int, uri: String)] = []
     private var heartbeatTimer: Timer?
     private var kvoToken: NSKeyValueObservation?
+    private var disconnectToken: NSKeyValueObservation?
 
     init(config: CameraConfig) {
         self.id = config.id
@@ -31,41 +33,104 @@ final class CameraInstance: NSObject, Identifiable {
     // MARK: - Connection
 
     func connect() async -> Bool {
+        onStatusUpdate?("[\(id)] Waiting for SDK connection...")
+
+        var didResume = false
         return await withCheckedContinuation { continuation in
-            kvoToken = INSCameraManager.socket().observe(
-                \.cameraState,
-                options: [.new]
-            ) { [weak self] manager, change in
-                guard let self, let state = change.newValue else { return }
-                switch state {
-                case .connected:
-                    self.kvoToken = nil
+            func finish(_ result: Bool) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: result)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { finish(false); return }
+
+                let socket = INSCameraManager.socket()
+                let currentState = socket.cameraState
+                self.onStatusUpdate?("[\(self.id)] state=\(Self.stateName(currentState))")
+
+                if currentState == .connected {
+                    self.onStatusUpdate?("[\(self.id)] Already connected!")
                     self.isConnected = true
                     self.startHeartbeat()
-                    continuation.resume(returning: true)
-                case .connectFailed:
+                    self.monitorConnection()
+                    finish(true)
+                    return
+                }
+
+                if currentState == .connectFailed {
+                    self.onStatusUpdate?("[\(self.id)] SDK in ConnectFailed state")
+                    finish(false)
+                    return
+                }
+
+                self.kvoToken = socket.observe(
+                    \.cameraState,
+                    options: [.new]
+                ) { [weak self] _, change in
+                    guard let self, let state = change.newValue else { return }
+                    self.onStatusUpdate?("[\(self.id)] State → \(Self.stateName(state))")
+                    if state == .connected {
+                        self.kvoToken = nil
+                        self.isConnected = true
+                        self.startHeartbeat()
+                        self.monitorConnection()
+                        self.onStatusUpdate?("[\(self.id)] Connected!")
+                        finish(true)
+                    } else if state == .connectFailed {
+                        self.kvoToken = nil
+                        finish(false)
+                    }
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+                    guard let self, !didResume else { return }
                     self.kvoToken = nil
-                    continuation.resume(returning: false)
-                default:
-                    break
+                    self.onStatusUpdate?("[\(self.id)] Timeout waiting for connection")
+                    finish(false)
                 }
             }
-            INSCameraManager.socket().setup()
+        }
+    }
+
+    private static func stateName(_ state: INSCameraState) -> String {
+        switch state {
+        case .found: return "Found"
+        case .synchronized: return "Synchronized"
+        case .connected: return "Connected"
+        case .connectFailed: return "ConnectFailed"
+        case .noConnection: return "NoConnection"
+        @unknown default: return "unknown(\(state.rawValue))"
         }
     }
 
     func disconnect() async {
         stopHeartbeat()
         kvoToken = nil
-        INSCameraManager.socket().shutdown()
+        disconnectToken = nil
         isConnected = false
+    }
+
+    func reconnect(maxRetries: Int = 3) async -> Bool {
+        await disconnect()
+        for attempt in 1...maxRetries {
+            if await connect() {
+                _ = await calibrateClockOffset()
+                return true
+            }
+            if attempt < maxRetries {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        return false
     }
 
     // MARK: - Clock offset
 
     func calibrateClockOffset() async -> ClockOffset {
         return await withCheckedContinuation { continuation in
-            INSCameraManager.socket().commandsImpl.syncTimeMsToCamera(
+            INSCameraManager.shared().commandManager.syncTimeMsToCamera(
                 withTryCount: kClockSyncSamples,
                 dTimeMsMax: 200
             ) { [weak self] dTimeMs, error in
@@ -85,24 +150,29 @@ final class CameraInstance: NSObject, Identifiable {
     func capture(arkitTimestamp: Double, scanIndex: Int) async -> Insta360CaptureResult? {
         guard isConnected else { return nil }
 
-        return await withCheckedContinuation { continuation in
-            let options = INSTakePictureOptions()
-            INSCameraManager.socket().commandsImpl.takePicture(with: options) { [weak self] error, photoInfo in
-                guard let self, error == nil, let uri = photoInfo?.uri else {
-                    continuation.resume(returning: nil)
-                    return
+        let insta360Ts = Date().timeIntervalSince1970
+        let options = INSTakePictureOptions()
+
+        let uri: String? = await withCheckedContinuation { continuation in
+            INSCameraManager.shared().commandManager.takePicture(with: options) { error, photoInfo in
+                if let error {
+                    print("[Insta360] capture error: \(error)")
                 }
-                let insta360Ts = Date().timeIntervalSince1970
-                self.pendingURIs.append((scanIndex: scanIndex, uri: uri))
-                continuation.resume(returning: Insta360CaptureResult(
-                    cameraId: self.id,
-                    scanIndex: scanIndex,
-                    arkitTimestamp: arkitTimestamp,
-                    insta360Timestamp: insta360Ts,
-                    mediaIdentifier: uri
-                ))
+                continuation.resume(returning: photoInfo?.uri)
             }
         }
+
+        if let uri {
+            pendingURIs.append((scanIndex: scanIndex, uri: uri))
+        }
+
+        return Insta360CaptureResult(
+            cameraId: id,
+            scanIndex: scanIndex,
+            arkitTimestamp: arkitTimestamp,
+            insta360Timestamp: insta360Ts,
+            mediaIdentifier: uri ?? ""
+        )
     }
 
     // MARK: - Download
@@ -160,12 +230,26 @@ final class CameraInstance: NSObject, Identifiable {
 
     private func startHeartbeat() {
         heartbeatTimer = Timer.scheduledTimer(withTimeInterval: kHeartbeatInterval, repeats: true) { _ in
-            INSCameraManager.socket().commandsImpl.sendHeartbeats(with: nil)
+            INSCameraManager.shared().commandManager.sendHeartbeats(with: nil)
         }
     }
 
     private func stopHeartbeat() {
         heartbeatTimer?.invalidate()
         heartbeatTimer = nil
+    }
+
+    private func monitorConnection() {
+        disconnectToken = INSCameraManager.socket().observe(
+            \.cameraState, options: [.new]
+        ) { [weak self] _, change in
+            guard let self, let state = change.newValue else { return }
+            if state != .connected && self.isConnected {
+                self.isConnected = false
+                self.stopHeartbeat()
+                self.disconnectToken = nil
+                self.onDisconnect?()
+            }
+        }
     }
 }

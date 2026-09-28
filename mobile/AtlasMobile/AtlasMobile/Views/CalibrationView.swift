@@ -180,7 +180,10 @@ struct CalibrationView: View {
 
     private var statusText: String {
         switch calibManager.state {
-        case .idle:                    return "No frames — start a session and capture"
+        case .idle:
+            return sessionManager.isSessionActive
+                ? "Press Capture Frame to begin"
+                : "Start a session first, then return here"
         case .framesCollected(let n):  return "\(n) frame\(n == 1 ? "" : "s") captured"
         case .optimizing:              return "Optimising…"
         case .done:                    return "Optimisation complete — review overlay"

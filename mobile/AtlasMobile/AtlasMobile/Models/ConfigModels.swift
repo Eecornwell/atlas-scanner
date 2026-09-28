@@ -69,15 +69,21 @@ struct MultiCameraConfig: Codable {
         return try parseYAML(text)
     }
 
-    /// Saves the config as YAML to Documents/atlas_sessions/multi_camera.yaml.
+    /// Saves the config as JSON to Documents/atlas_sessions/multi_camera.json.
     func saveToDocuments() throws {
         guard let documentsDir = FileManager.default.urls(
             for: .documentDirectory, in: .userDomainMask
-        ).first else { return }
+        ).first else {
+            throw NSError(domain: "MultiCameraConfig", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Documents directory not found"])
+        }
         let dir = documentsDir.appendingPathComponent("atlas_sessions")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("multi_camera.yaml")
-        try toYAML().write(to: url, atomically: true, encoding: .utf8)
+        let url = dir.appendingPathComponent("multi_camera.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(self)
+        try data.write(to: url, options: .atomic)
     }
 
     private func toYAML() -> String {
@@ -85,7 +91,8 @@ struct MultiCameraConfig: Codable {
         for cam in cameras {
             let e = cam.extrinsic
             lines += [
-                "  - id: \(cam.id)",
+                "  -",
+                "    id: \(cam.id)",
                 "    model: \(cam.model)",
                 "    serial: \"\(cam.serial)\"",
                 "    extrinsic:",
@@ -104,21 +111,26 @@ struct MultiCameraConfig: Codable {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// Loads config from Documents/atlas_sessions/multi_camera.yaml (user-placed
-    /// calibrated file) falling back to the app bundle's multi_camera.yaml.
+    /// Loads config: JSON from Documents first, then YAML from Documents (legacy),
+    /// then YAML from app bundle, then default.
     static func loadFromDeviceOrBundle() -> MultiCameraConfig {
-        // 1. User-placed calibrated file in Documents (survives app updates)
         if let documentsDir = FileManager.default.urls(
             for: .documentDirectory, in: .userDomainMask
         ).first {
-            let url = documentsDir
-                .appendingPathComponent("atlas_sessions")
-                .appendingPathComponent("multi_camera.yaml")
-            if let config = try? load(from: url) {
+            let sessionsDir = documentsDir.appendingPathComponent("atlas_sessions")
+            // 1. JSON (current format)
+            let jsonURL = sessionsDir.appendingPathComponent("multi_camera.json")
+            if let data = try? Data(contentsOf: jsonURL),
+               let config = try? JSONDecoder().decode(MultiCameraConfig.self, from: data) {
+                return config
+            }
+            // 2. YAML from Documents (legacy)
+            let yamlURL = sessionsDir.appendingPathComponent("multi_camera.yaml")
+            if let config = try? load(from: yamlURL) {
                 return config
             }
         }
-        // 2. App bundle (baked in at build time)
+        // 3. App bundle YAML
         if let bundleURL = Bundle.main.url(forResource: "multi_camera", withExtension: "yaml"),
            let config = try? load(from: bundleURL) {
             return config

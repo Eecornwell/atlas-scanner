@@ -2,6 +2,8 @@ import Foundation
 import Combine
 import ARKit
 import CoreImage
+import AudioToolbox
+import UIKit
 
 /// Orchestrates the full capture session: ARKit tracking, Insta360 cameras, and data recording.
 @MainActor
@@ -14,10 +16,15 @@ final class CaptureSessionManager: ObservableObject {
     @Published var showExportSheet = false
     @Published var exportError: String?
     @Published var cameraStatus: String?
+    @Published var trackingState: ARCamera.TrackingState = .notAvailable
+    @Published var showDepthOverlay = false
+    @Published var showMesh = false
+    @Published var showPointCloud = false
+    @Published var depthOverlayImage: UIImage?
 
     /// ARKit capture — exposed for CalibrationView.
     let arkitCapture = ARKitCapture()
-    private let insta360Manager = Insta360CaptureManager()
+    private var insta360Manager = Insta360CaptureManager()
     private let maskManager = MaskManager()
     private var dataRecorder: DataRecorder?
     private var trajectoryRecorder: TrajectoryRecorder?
@@ -28,11 +35,30 @@ final class CaptureSessionManager: ObservableObject {
     @Published var lastCapturedThumbnail: UIImage?
     /// Triggers a brief flash animation on capture.
     @Published var captureFlash = false
+    /// Live connection diagnostic log for Insta360 cameras.
+    @Published var connectionLog: [String] = []
+
+    init() {
+        arkitCapture.$trackingState
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$trackingState)
+        arkitCapture.$depthOverlayImage
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$depthOverlayImage)
+    }
 
     func startSession() async {
         showExportSheet = false
         exportError = nil
         lastCapturedThumbnail = nil
+
+        insta360Manager = Insta360CaptureManager()
+        connectionLog = []
+        insta360Manager.onLogMessage = { [weak self] msg in
+            Task { @MainActor in
+                self?.connectionLog.append(msg)
+            }
+        }
 
         let sessionDir = SessionDirectory.create()
         dataRecorder = DataRecorder(sessionDirectory: sessionDir)
@@ -45,28 +71,36 @@ final class CaptureSessionManager: ObservableObject {
         let configuredCount = insta360Manager.cameraConfig.cameras.count
         if configuredCount > 0 {
             cameraStatus = "Connecting \(configuredCount) camera\(configuredCount == 1 ? "" : "s")…"
-        }
-
-        await insta360Manager.discoverAndConnect()
-        connectedCameraCount = insta360Manager.connectedCameras.count
-
-        if configuredCount > 0 {
-            if connectedCameraCount == configuredCount {
-                cameraStatus = "\(connectedCameraCount) camera\(connectedCameraCount == 1 ? "" : "s") connected"
-            } else if connectedCameraCount > 0 {
-                cameraStatus = "\(connectedCameraCount)/\(configuredCount) cameras connected"
-            } else {
-                cameraStatus = "No cameras connected"
-            }
         } else {
             cameraStatus = "iPhone only"
         }
 
-        maskManager.loadMasks(for: insta360Manager.connectedCameras, sessionDirectory: sessionDir)
-
         isSessionActive = true
         isReadyToCapture = true
         scanCount = 0
+
+        setupDisconnectHandler()
+
+        if configuredCount > 0 {
+            Task { [insta360Manager, maskManager] in
+                await insta360Manager.discoverAndConnect()
+                let count = insta360Manager.connectedCameras.count
+                await MainActor.run {
+                    self.connectedCameraCount = count
+                    if count == configuredCount {
+                        self.cameraStatus = "\(count) camera\(count == 1 ? "" : "s") connected"
+                    } else if count > 0 {
+                        self.cameraStatus = "\(count)/\(configuredCount) cameras connected"
+                    } else {
+                        self.cameraStatus = "No cameras found"
+                    }
+                }
+                maskManager.loadMasks(
+                    for: insta360Manager.connectedCameras,
+                    sessionDirectory: sessionDir
+                )
+            }
+        }
     }
 
     func captureScan() async {
@@ -75,37 +109,48 @@ final class CaptureSessionManager: ObservableObject {
         defer { isReadyToCapture = true }
 
         guard let arkitFrame = arkitCapture.captureCurrentFrame() else { return }
+        let currentScan = scanCount
+        scanCount += 1
+
+        // UI feedback immediately
+        captureFlash = true
+        AudioServicesPlaySystemSound(1108)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        lastCapturedThumbnail = thumbnailFromPixelBuffer(arkitFrame.capturedImage)
 
         trajectoryRecorder?.recordPose(
             timestamp: arkitFrame.timestamp,
             pose: arkitFrame.pose
         )
 
+        // Await Insta360 capture — blocks until camera confirms the shot
         let insta360Results = await insta360Manager.captureAll(
             arkitTimestamp: arkitFrame.timestamp,
-            scanIndex: scanCount
+            scanIndex: currentScan
         )
 
-        await dataRecorder?.saveScan(
-            scanIndex: scanCount,
-            arkitFrame: arkitFrame,
-            insta360Results: insta360Results
-        )
-
-        // Generate thumbnail from the iPhone RGB frame
-        lastCapturedThumbnail = thumbnailFromPixelBuffer(arkitFrame.capturedImage)
-
-        captureFlash = true
-
-        // Keep the most recent Insta360 ERP available for calibration
-        if let firstResult = insta360Results.first,
-           let erpURL = dataRecorder?.erpURL(cameraId: firstResult.cameraId, scanIndex: scanCount),
-           let data = try? Data(contentsOf: erpURL),
-           let img = UIImage(data: data) {
-            lastInstaERP = img
+        // Save iPhone data in background
+        let recorder = dataRecorder
+        Task {
+            await recorder?.saveScan(
+                scanIndex: currentScan,
+                arkitFrame: arkitFrame,
+                insta360Results: insta360Results
+            )
         }
 
-        scanCount += 1
+        // Download 360 image after capture completes
+        if !insta360Results.isEmpty, let dir = sessionDirectory {
+            let mgr = insta360Manager
+            Task {
+                let downloads = await mgr.downloadAllPending(into: dir)
+                if let first = downloads.first,
+                   let data = try? Data(contentsOf: first.localURL),
+                   let img = UIImage(data: data) {
+                    self.lastInstaERP = img
+                }
+            }
+        }
     }
 
     func endSession() async {
@@ -138,9 +183,66 @@ final class CaptureSessionManager: ObservableObject {
         showExportSheet = true
     }
 
+    // MARK: - Visualization toggles
+
+    func toggleDepthOverlay() {
+        showDepthOverlay.toggle()
+        arkitCapture.showDepthOverlay = showDepthOverlay
+    }
+
+    func toggleMesh() {
+        showMesh.toggle()
+        arkitCapture.showMesh = showMesh
+    }
+
+    func togglePointCloud() {
+        showPointCloud.toggle()
+    }
+
+    // MARK: - Insta360 retry
+
+    func retryInsta360Connection() {
+        let configuredCount = insta360Manager.cameraConfig.cameras.count
+        guard configuredCount > 0 else { return }
+        cameraStatus = "Retrying \(configuredCount) camera\(configuredCount == 1 ? "" : "s")…"
+        connectionLog.append("--- Retry started ---")
+
+        Task {
+            await insta360Manager.retryConnection()
+            let count = insta360Manager.connectedCameras.count
+            let total = configuredCount
+            await MainActor.run {
+                self.connectedCameraCount = count
+                if count == total {
+                    self.cameraStatus = "\(count) camera\(count == 1 ? "" : "s") connected"
+                } else if count > 0 {
+                    self.cameraStatus = "\(count)/\(total) cameras connected"
+                } else {
+                    self.cameraStatus = "No cameras found"
+                }
+            }
+        }
+    }
+
+    private func setupDisconnectHandler() {
+        insta360Manager.onCameraDisconnected = { [weak self] cameraId in
+            guard let self else { return }
+            let count = self.insta360Manager.connectedCameras.count
+            let total = self.insta360Manager.cameraConfig.cameras.count
+            self.connectedCameraCount = count
+            if count == 0 {
+                self.cameraStatus = "Camera disconnected"
+            } else {
+                self.cameraStatus = "\(count)/\(total) cameras"
+            }
+        }
+    }
+
+    private let ciContext = CIContext()
+
     private func thumbnailFromPixelBuffer(_ buffer: CVPixelBuffer) -> UIImage? {
         let ciImage = CIImage(cvPixelBuffer: buffer)
-        let context = CIContext()
+        let context = ciContext
         let scale = 120.0 / ciImage.extent.height
         let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else {

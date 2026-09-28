@@ -6,6 +6,9 @@ final class Insta360CaptureManager: ObservableObject {
     @Published var connectedCameras: [CameraInstance] = []
     @Published var isConnecting = false
 
+    var onCameraDisconnected: ((String) -> Void)?
+    var onLogMessage: ((String) -> Void)?
+
     let cameraConfig: MultiCameraConfig
 
     init(config: MultiCameraConfig) {
@@ -24,6 +27,11 @@ final class Insta360CaptureManager: ObservableObject {
 
         // Attempt to connect all configured cameras in parallel.
         let instances = cameraConfig.cameras.map { CameraInstance(config: $0) }
+        for instance in instances {
+            instance.onStatusUpdate = { [weak self] msg in
+                self?.onLogMessage?(msg)
+            }
+        }
 
         let connected: [CameraInstance] = await withTaskGroup(of: CameraInstance?.self) { group in
             for instance in instances {
@@ -46,7 +54,54 @@ final class Insta360CaptureManager: ObservableObject {
             }
         }
 
+        for cam in connected {
+            cam.onDisconnect = { [weak self] in
+                self?.handleDisconnect(cameraId: cam.id)
+            }
+        }
+
         await MainActor.run { connectedCameras = connected }
+    }
+
+    func retryConnection() async {
+        await MainActor.run { isConnecting = true }
+        defer { Task { @MainActor in self.isConnecting = false } }
+
+        let connectedIds = Set(await MainActor.run { connectedCameras.map(\.id) })
+        let missing = cameraConfig.cameras.filter { !connectedIds.contains($0.id) }
+        guard !missing.isEmpty else { return }
+
+        let reconnected: [CameraInstance] = await withTaskGroup(of: CameraInstance?.self) { group in
+            for config in missing {
+                group.addTask { [weak self] in
+                    let instance = CameraInstance(config: config)
+                    instance.onStatusUpdate = { msg in
+                        self?.onLogMessage?(msg)
+                    }
+                    return await instance.reconnect() ? instance : nil
+                }
+            }
+            var result: [CameraInstance] = []
+            for await cam in group {
+                if let cam { result.append(cam) }
+            }
+            return result
+        }
+
+        for cam in reconnected {
+            cam.onDisconnect = { [weak self] in
+                self?.handleDisconnect(cameraId: cam.id)
+            }
+        }
+
+        await MainActor.run { connectedCameras.append(contentsOf: reconnected) }
+    }
+
+    private func handleDisconnect(cameraId: String) {
+        DispatchQueue.main.async {
+            self.connectedCameras.removeAll { $0.id == cameraId }
+            self.onCameraDisconnected?(cameraId)
+        }
     }
 
     func disconnect() async {
@@ -60,17 +115,19 @@ final class Insta360CaptureManager: ObservableObject {
 
     // MARK: - Capture
 
-    /// Triggers capture on all connected cameras simultaneously.
     func captureAll(arkitTimestamp: Double, scanIndex: Int) async -> [Insta360CaptureResult] {
         await withTaskGroup(of: Insta360CaptureResult?.self) { group in
             for camera in connectedCameras {
                 group.addTask {
-                    await camera.capture(arkitTimestamp: arkitTimestamp, scanIndex: scanIndex)
+                    await camera.capture(
+                        arkitTimestamp: arkitTimestamp,
+                        scanIndex: scanIndex
+                    )
                 }
             }
             var results: [Insta360CaptureResult] = []
             for await result in group {
-                if let result { results.append(result) }
+                if let r = result { results.append(r) }
             }
             return results
         }
