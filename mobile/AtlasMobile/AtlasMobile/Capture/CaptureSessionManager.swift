@@ -10,6 +10,7 @@ import UIKit
 final class CaptureSessionManager: ObservableObject {
     @Published var isSessionActive = false
     @Published var isReadyToCapture = false
+    @Published var isAutoCapturing = false
     @Published var scanCount = 0
     @Published var connectedCameraCount = 0
     @Published var sessionDirectory: URL?
@@ -112,24 +113,27 @@ final class CaptureSessionManager: ObservableObject {
         let currentScan = scanCount
         scanCount += 1
 
-        // UI feedback immediately
-        captureFlash = true
+        let fast = isAutoCapturing
+
+        if !fast {
+            captureFlash = true
+            lastCapturedThumbnail = thumbnailFromPixelBuffer(
+                arkitFrame.capturedImage
+            )
+        }
         AudioServicesPlaySystemSound(1108)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-        lastCapturedThumbnail = thumbnailFromPixelBuffer(arkitFrame.capturedImage)
 
         trajectoryRecorder?.recordPose(
             timestamp: arkitFrame.timestamp,
             pose: arkitFrame.pose
         )
 
-        // Await Insta360 capture — blocks until camera confirms the shot
         let insta360Results = await insta360Manager.captureAll(
             arkitTimestamp: arkitFrame.timestamp,
             scanIndex: currentScan
         )
 
-        // Save iPhone data in background
         let recorder = dataRecorder
         Task {
             await recorder?.saveScan(
@@ -139,8 +143,7 @@ final class CaptureSessionManager: ObservableObject {
             )
         }
 
-        // Download 360 image after capture completes
-        if !insta360Results.isEmpty, let dir = sessionDirectory {
+        if !fast, !insta360Results.isEmpty, let dir = sessionDirectory {
             let mgr = insta360Manager
             Task {
                 let downloads = await mgr.downloadAllPending(into: dir)
@@ -153,7 +156,27 @@ final class CaptureSessionManager: ObservableObject {
         }
     }
 
+    private var autoCaptureTask: Task<Void, Never>?
+
+    func startAutoCapture() {
+        guard isSessionActive, !isAutoCapturing else { return }
+        isAutoCapturing = true
+        autoCaptureTask = Task {
+            while isAutoCapturing && isSessionActive {
+                await captureScan()
+            }
+            isAutoCapturing = false
+        }
+    }
+
+    func stopAutoCapture() {
+        isAutoCapturing = false
+        autoCaptureTask?.cancel()
+        autoCaptureTask = nil
+    }
+
     func endSession() async {
+        stopAutoCapture()
         isReadyToCapture = false
 
         if let dir = sessionDirectory {

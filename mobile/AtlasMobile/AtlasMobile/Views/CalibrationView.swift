@@ -245,11 +245,23 @@ private struct SeedField: View {
                 .frame(width: 110, alignment: .leading)
                 .font(.caption)
             Spacer()
-            TextField("0.0", value: $value, format: .number)
-                .keyboardType(.decimalPad)
-                .multilineTextAlignment(.trailing)
-                .frame(width: 80)
-                .textFieldStyle(.roundedBorder)
+            HStack(spacing: 4) {
+                Button {
+                    value = -value
+                } label: {
+                    Text("±")
+                        .font(.body.weight(.semibold))
+                        .frame(width: 30, height: 30)
+                        .background(Color(.systemGray5))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                TextField("0.0", value: $value, format: .number)
+                    .keyboardType(.decimalPad)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 80)
+                    .textFieldStyle(.roundedBorder)
+            }
         }
     }
 }

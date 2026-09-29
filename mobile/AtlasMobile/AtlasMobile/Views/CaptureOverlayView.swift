@@ -165,24 +165,59 @@ struct CaptureOverlayView: View {
                     Spacer()
 
                     // Capture button
-                    Button {
-                        Task { await sessionManager.captureScan() }
-                    } label: {
-                        ZStack {
-                            Circle()
-                                .fill(.white)
-                                .frame(width: 72, height: 72)
-                            Circle()
-                                .stroke(.white, lineWidth: 4)
-                                .frame(width: 82, height: 82)
+                    if sessionManager.isAutoCapturing {
+                        Button {
+                            sessionManager.stopAutoCapture()
+                        } label: {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(.red)
+                                    .frame(width: 40, height: 40)
+                                Circle()
+                                    .stroke(.white, lineWidth: 4)
+                                    .frame(width: 82, height: 82)
+                            }
                         }
+                    } else {
+                        Button {
+                            Task { await sessionManager.captureScan() }
+                        } label: {
+                            ZStack {
+                                Circle()
+                                    .fill(.white)
+                                    .frame(width: 72, height: 72)
+                                Circle()
+                                    .stroke(.white, lineWidth: 4)
+                                    .frame(width: 82, height: 82)
+                            }
+                        }
+                        .disabled(!sessionManager.isReadyToCapture)
+                        .opacity(sessionManager.isReadyToCapture ? 1.0 : 0.5)
                     }
-                    .disabled(!sessionManager.isReadyToCapture)
-                    .opacity(sessionManager.isReadyToCapture ? 1.0 : 0.5)
 
                     Spacer()
 
                     VStack(spacing: 8) {
+                        // Auto/Manual capture toggle
+                        Button {
+                            if sessionManager.isAutoCapturing {
+                                sessionManager.stopAutoCapture()
+                            } else {
+                                sessionManager.startAutoCapture()
+                            }
+                        } label: {
+                            Text(sessionManager.isAutoCapturing ? "AUTO" : "MAN")
+                                .font(.caption2.weight(.bold))
+                                .foregroundColor(sessionManager.isAutoCapturing ? .black : .white)
+                                .frame(width: 44, height: 44)
+                                .background(
+                                    sessionManager.isAutoCapturing
+                                        ? AnyShapeStyle(.green)
+                                        : AnyShapeStyle(.ultraThinMaterial)
+                                )
+                                .clipShape(Circle())
+                        }
+
                         // Visualization toggles
                         VisToggle(icon: "square.3.layers.3d", active: sessionManager.showMesh) {
                             sessionManager.toggleMesh()
