@@ -374,7 +374,10 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     if int_vals.max() > int_vals.min():
         lo, hi = np.percentile(int_vals, 5), np.percentile(int_vals, 95)
         int_vals = np.clip((int_vals.astype(np.float32) - lo) / max(hi - lo, 1e-6) * 200, 0, 255).astype(np.uint8)
-    blended_vals = ((0.5 * range_norm + 0.5 * int_vals)).astype(np.uint8)
+    # OAK-1: use intensity-only rendering. Range is anti-correlated with camera
+    # brightness (close objects are bright in range but may be dark in camera),
+    # so blending range in destroys the structural similarity SuperGlue needs.
+    blended_vals = (int_vals if is_oak1 else (0.5 * range_norm + 0.5 * int_vals)).astype(np.uint8)
 
     blended = np.zeros((out_h, out_w), dtype=np.uint8)
     blended[v2, u2] = blended_vals
@@ -405,22 +408,48 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     hole_mask = (blended_thick == 0).astype(np.uint8)
     if suppress_middle:
         hole_mask[:, mid_start_inpaint:mid_end_inpaint] = 0
-    # OAK-1: restrict inpainting to the bounding box of projected points
-    # so the empty region outside the camera FOV is not filled
+    # OAK-1: restrict inpainting to a convex hull of the projected point density.
+    # A bounding box fails because the 360° lidar scan scatters points across the
+    # entire projected image, making the bbox cover the whole frame and allowing
+    # inpainting to flood regions with no real lidar data.
+    oak1_fov_mask = None
     if is_oak1 and len(u2) > 0:
-        fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
-        u_min, u_max = max(0, u2.min() - 20), min(out_w, u2.max() + 20)
-        v_min, v_max = max(0, v2.min() - 20), min(out_h, v2.max() + 20)
-        fov_mask[v_min:v_max, u_min:u_max] = 1
-        hole_mask = hole_mask * fov_mask
+        # Build a density grid: divide image into cells and keep only cells that
+        # have at least one real projected point. Then take the convex hull of
+        # those occupied cells to define the valid inpainting region.
+        cell = 20  # px per cell
+        density = np.zeros((out_h // cell + 1, out_w // cell + 1), dtype=np.uint8)
+        density[v2 // cell, u2 // cell] = 1
+        # Require a minimum density: cells with fewer than N points are noise
+        cell_counts = np.zeros_like(density, dtype=np.int32)
+        np.add.at(cell_counts, (v2 // cell, u2 // cell), 1)
+        density = (cell_counts >= 2).astype(np.uint8)
+        # Expand occupied cells back to pixel coords and compute convex hull
+        occ_rows, occ_cols = np.where(density)
+        if len(occ_rows) >= 3:
+            pts_hull = np.column_stack([
+                (occ_cols * cell + cell // 2).clip(0, out_w - 1),
+                (occ_rows * cell + cell // 2).clip(0, out_h - 1),
+            ]).astype(np.float32)
+            hull = cv2.convexHull(pts_hull)
+            oak1_fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+            cv2.fillConvexPoly(oak1_fov_mask, hull.astype(np.int32), 1)
+            # Erode slightly so inpainting doesn't bleed past the hull boundary
+            oak1_fov_mask = cv2.erode(oak1_fov_mask,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cell, cell)))
+        else:
+            # Fallback to bbox if too few occupied cells for a hull
+            oak1_fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
+            u_min, u_max = max(0, u2.min() - 20), min(out_w, u2.max() + 20)
+            v_min, v_max = max(0, v2.min() - 20), min(out_h, v2.max() + 20)
+            oak1_fov_mask[v_min:v_max, u_min:u_max] = 1
+        hole_mask = hole_mask * oak1_fov_mask
     filled = cv2.inpaint(blended_thick, hole_mask, inpaintRadius=12, flags=cv2.INPAINT_TELEA)
     if suppress_middle:
         filled[:, mid_start_inpaint:mid_end_inpaint] = 0
-    # OAK-1: zero everything outside the FOV bounding box after inpainting
-    if is_oak1 and len(u2) > 0:
-        outside = np.ones((out_h, out_w), dtype=np.uint8)
-        outside[v_min:v_max, u_min:u_max] = 0
-        filled[outside > 0] = 0
+    # OAK-1: zero everything outside the convex hull after inpainting
+    if is_oak1 and oak1_fov_mask is not None:
+        filled[oak1_fov_mask == 0] = 0
 
     # 3. Erode slightly to pull back over-dilated edges
     filled = cv2.erode(filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
@@ -510,6 +539,10 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             cam_gray[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = 0
             if feather is not None:
                 cam_gray = (cam_gray.astype(np.float32) * feather).clip(0, 255).astype(np.uint8)
+            # OAK-1: mask camera image to the lidar convex hull so SuperGlue
+            # only finds keypoints where both modalities have real data.
+            if is_oak1 and oak1_fov_mask is not None:
+                cam_gray[oak1_fov_mask == 0] = 0
             # Write processed camera gray to a sidecar — never overwrite the source RGB
             try:
                 cam_gray_path = str(_safe_output(
@@ -529,6 +562,13 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                 except ValueError:
                     pass
             elif feather is not None:
+                try:
+                    cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
+                except ValueError:
+                    pass
+            elif is_oak1 and oak1_fov_mask is not None:
+                # OAK-1: overwrite root PNG with hull-masked camera gray so
+                # SuperGlue sees the same spatial region in both modalities.
                 try:
                     cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
                 except ValueError:
@@ -559,6 +599,11 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     if is_oak1 and intensity_image.max() > 0:
         _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         intensity_image = _clahe.apply(intensity_image)
+    # OAK-1: zero the lidar intensity image outside the convex hull so SuperGlue
+    # only sees pixels where real lidar data exists.
+    if is_oak1 and oak1_fov_mask is not None:
+        intensity_image[oak1_fov_mask == 0] = 0
+        indices_image[oak1_fov_mask == 0] = -1
 
     cv2.imwrite(str(_safe_output(output_image)), intensity_image)
 

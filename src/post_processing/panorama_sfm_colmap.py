@@ -54,21 +54,17 @@ R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 # concentrated in a narrow band and empirically still yield better features
 # than the polar tiles. A dedicated seam mask is applied below to exclude the
 # affected pixel strip.
-# 8 faces at 60° FOV: 4 equatorial (front/right/back/left) + 4 diagonal elevated.
-# 60° FOV gives f = tile_size / (2*tan(30°)) = tile_size * 0.866 — a moderate
-# focal length that Gaussian Splatting handles well (similar to a 35mm lens).
-# Adjacent faces overlap by 30° on each edge, giving good multi-view coverage.
-# Elevated faces at pitch=±45° cover ceiling/floor without the extreme
-# distortion of a pure up/down 90° face.
+# 6-face cubemap at 90° FOV matching the reference panorama_sfm.py.
+# 90° FOV maximises overlap between adjacent faces (each face shares a full
+# 90° edge with its neighbour), giving SIFT more co-visible area to match.
+# Standard cubemap faces: 4 equatorial + top + bottom.
 FACES = [
-    {'name': 'front',       'pitch':   0, 'yaw':   0},
-    {'name': 'right',       'pitch':   0, 'yaw':  90},
-    {'name': 'back',        'pitch':   0, 'yaw': 180},
-    {'name': 'left',        'pitch':   0, 'yaw': 270},
-    {'name': 'up_front',    'pitch':  45, 'yaw':   0},
-    {'name': 'up_back',     'pitch':  45, 'yaw': 180},
-    {'name': 'down_front',  'pitch': -45, 'yaw':   0},
-    {'name': 'down_back',   'pitch': -45, 'yaw': 180},
+    {'name': 'front',   'pitch':   0, 'yaw':   0},
+    {'name': 'right',   'pitch':   0, 'yaw':  90},
+    {'name': 'back',    'pitch':   0, 'yaw': 180},
+    {'name': 'left',    'pitch':   0, 'yaw': 270},
+    {'name': 'top',     'pitch':  90, 'yaw':   0},
+    {'name': 'bottom',  'pitch': -90, 'yaw':   0},
 ]
 FACES_CAM_FROM_PANO = [
     R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
@@ -92,15 +88,16 @@ REF_FACE = 0  # front is ref — must be first in cameras array for rig_configur
 # For 180° single fisheye, exclude back-facing faces.
 FACES_360 = list(range(NUM_FACES))
 FACES_180 = [i for i in range(NUM_FACES) if 'back' not in FACES[i]['name']]
-FOV_DEG = 60.0               # 60° FOV: f = tile_size*0.866, moderate focal length
-                             # that Gaussian Splatting handles well. 30° overlap
-                             # between adjacent faces gives good multi-view coverage.
+FOV_DEG = 90.0               # 90° FOV: matches reference panorama_sfm.py.
+                             # Maximises tile overlap for better SIFT matching.
 MIN_BASELINE_M = 0.10
-MAX_TILE_SIZE = 1024
+MAX_TILE_SIZE = 1536  # X5 at 11520px ERP has ~22px/deg optical resolution;
+                      # 1536px tile at 90° FOV gives 17px/deg, well within
+                      # optical limit. X3 at 7680px naturally caps at ~1024px.
 # Minimum fraction of unmasked pixels for a tile to be included in the COLMAP model.
 # Tiles below this threshold are entirely (or near-entirely) covered by the scanner
 # body mask and contribute no useful features.
-MIN_TILE_VISIBLE = 0.20  # 20% of tile pixels must be unmasked
+MIN_TILE_VISIBLE = 0.30  # 30% of tile pixels must be unmasked
 # Minimum fraction of unmasked pixels across the whole ERP for a panorama to be
 # included at all. An ERP below this is fully occluded (e.g. cap/floor shot).
 MIN_ERP_VISIBLE  = 0.10  # 10% of ERP pixels must be unmasked
@@ -140,17 +137,19 @@ def _load_calibration_for_scan(scan_dir, session_path):
     except OSError:
         pass
 
-    if ci_has_serial:
-        mc_path = Path(__file__).resolve().parent.parent / 'config' / 'multi_camera.yaml'
-        if mc_path.exists():
-            try:
-                mc = yaml.safe_load(mc_path.read_text()) or {}
-                slot_hw = mc.get('cameras', {}).get(
-                    f'cam_{cam_idx}', {}).get('camera_hw', '')
-                if slot_hw:
-                    hw = slot_hw
-            except Exception:
-                pass
+    # Always resolve hw from multi_camera.yaml by cam_idx — the serial is only
+    # needed for cam_index_for_scan (already resolved above). Even without a
+    # serial, the slot index uniquely identifies the camera in a fixed rig.
+    mc_path = Path(__file__).resolve().parent.parent / 'config' / 'multi_camera.yaml'
+    if mc_path.exists():
+        try:
+            mc = yaml.safe_load(mc_path.read_text()) or {}
+            slot_hw = mc.get('cameras', {}).get(
+                f'cam_{cam_idx}', {}).get('camera_hw', '')
+            if slot_hw:
+                hw = slot_hw
+        except Exception:
+            pass
 
     calib_path = calibration_path(hw, cam_idx)
     with open(calib_path) as f:
@@ -220,20 +219,34 @@ def _find_erp_image(scan_dir):
     """Return (rgb_path, mask_path, is_360).
     Always use the unmasked JPG for RGB to avoid hard mask edges causing
     aliasing artifacts when reprojected to perspective tiles. The mask PNG
-    is used separately to filter out scanner-body tiles."""
+    is used separately to filter out scanner-body tiles.
+    is_360 is True for dual-fisheye sessions, False for single-fisheye.
+    Derived from session_config.json camera_mode rather than filename so
+    single-fisheye sessions that produce equirect_dual_fisheye.jpg are
+    correctly identified."""
+    # Determine is_360 from session_config.json (authoritative)
+    import json as _json
+    _sess_cfg = scan_dir.parent / 'session_config.json'
+    _is_360 = True  # default: dual fisheye
+    if _sess_cfg.exists():
+        try:
+            _mode = _json.loads(_sess_cfg.read_text()).get('camera_mode', 'dual_fisheye')
+            _is_360 = (_mode != 'single_fisheye')
+        except Exception:
+            pass
+
     # Prefer unmasked ERP for RGB — no hard black edges from scanner body mask
     for name in ['equirect_dual_fisheye.jpg']:
         p = scan_dir / name
         if p.exists():
-            # Find corresponding mask if available
             mask_p = scan_dir / 'equirect_dual_fisheye_masked.png'
-            return p, mask_p if mask_p.exists() else None, True
+            return p, mask_p if mask_p.exists() else None, _is_360
     # Fallback: masked PNG (older sessions without separate JPG)
     for name in ['equirect_blended_masked.png', 'equirect_dual_fisheye_masked.png',
                  'equirect_dual_fisheye_raw_masked.png']:
         p = scan_dir / name
         if p.exists():
-            return p, p, True
+            return p, p, _is_360
     # Single fisheye
     matches = list(scan_dir.glob('equirect_*_masked.png')) + \
               list(scan_dir.glob('equirect_*.jpg')) + \
@@ -255,7 +268,17 @@ def _tile_size_for_erp(erp_w):
     return min(native, MAX_TILE_SIZE)
 
 
-def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.INTER_LANCZOS4):
+# Camera center directions in panorama frame for each face (used for feathered masks).
+# Each face's camera looks along +Z in its own frame; in pano frame that's
+# cam_from_pano.T @ [0,0,1] = the third column of cam_from_pano.T.
+_FACE_CENTERS_IN_PANO = np.array(
+    [r.T[:, 2] for r in FACES_CAM_FROM_PANO], dtype=np.float64
+)  # shape (NUM_FACES, 3)
+
+
+def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size,
+                        interpolation=cv2.INTER_LANCZOS4,
+                        face_idx=None):
     """Sample a perspective tile from an ERP image using Lanczos for sharper output."""
     pano_h, pano_w = erp_img.shape[:2]
     f = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
@@ -269,7 +292,24 @@ def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size, interpolation=cv2.I
     pitch = -np.arctan2(r[1], np.linalg.norm(r[[0, 2]], axis=0))
     u = ((1 + yaw / np.pi) / 2 * pano_w - 0.5).astype(np.float32).reshape(tile_size, tile_size)
     v = ((1 - pitch * 2 / np.pi) / 2 * pano_h - 0.5).astype(np.float32).reshape(tile_size, tile_size)
-    return cv2.remap(erp_img, u, v, interpolation, borderMode=cv2.BORDER_WRAP)
+    tile = cv2.remap(erp_img, u, v, interpolation, borderMode=cv2.BORDER_WRAP)
+
+    # Feathered overlap mask matching reference panorama_sfm.py:
+    # pixels within `margin` cosine-distance of the best face are included,
+    # then Gaussian-blurred to avoid hard seam boundaries that create banding
+    # artifacts in SIFT matching and Gaussian Splatting.
+    feather_mask = None
+    if face_idx is not None:
+        similarities = rays_pano @ _FACE_CENTERS_IN_PANO.T  # (H*W, NUM_FACES)
+        best_score = similarities.max(axis=-1)
+        cam_score  = similarities[:, face_idx]
+        margin = 0.02  # ~8° angular margin at boundary
+        mask_flat = ((best_score - cam_score) <= margin).astype(np.uint8) * 255
+        mask = mask_flat.reshape(tile_size, tile_size)
+        blur_size = max(7, int(tile_size * 0.01) | 1)
+        feather_mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+
+    return tile, feather_mask
 
 
 def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size):
@@ -331,6 +371,9 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
         _v = np.clip(_v, 0, ih - 1)
         tile_img = cv2.remap(img, _u, _v, cv2.INTER_LANCZOS4,
                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        # Zero out pixels outside the OAK-1 FOV — np.clip above prevents
+        # BORDER_CONSTANT from zeroing them, causing edge smearing instead.
+        tile_img[~_valid] = 0
         # Write mask: white where OAK-1 FOV covers the tile, black where it doesn't
         tile_mask = (_valid.astype(np.uint8) * 255)
 
@@ -354,7 +397,9 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             'f_px': _f_tile,          # canonical focal length, same as ERP tiles
             'tile_size': _tile,
             'img_w': _tile, 'img_h': _tile,
-            # No cx/cy key: treated as SIMPLE_PINHOLE like ERP tiles
+            # cx/cy mark this as an OAK-1 panorama so run_pipeline creates a
+            # PINHOLE camera entry in the DB with the correct intrinsics.
+            'cx': _tile / 2.0, 'cy': _tile / 2.0,
             'active_faces': [0],
             'tiles': [{
                 'face': 0,
@@ -523,10 +568,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     print(f"  Camera mode: {'360° dual fisheye' if session_is_360 else '180° single fisheye'} "
           f"({len(active_faces)} faces)")
 
-    # Create per-face subdirectories only for active faces
-    for face_idx in active_faces:
-        (images_dir / f'face_{face_idx:02d}').mkdir(parents=True)
-        (mask_dir / f'face_{face_idx:02d}').mkdir(parents=True)
+    # Create per-face subdirectories only for active faces.
+    # In multi-camera sessions each face gets one subfolder per camera so
+    # single_camera_per_folder=1 is satisfied (e.g. face_00_cam0/, face_00_cam1/).
+    # NOTE: _tile_size_by_cam is not yet built here — directory creation is
+    # deferred to after the tile-size map is computed (see below).
 
     kept, positions = [], []
     for p in panoramas:
@@ -563,28 +609,46 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         panoramas = [panoramas[i] for i in order]
         print(f"  Sorted {len(panoramas)} panoramas by spatial proximity (nearest-neighbour)")
 
+    # Per-camera tile sizes: each camera uses its own native tile size derived
+    # from its ERP width. This lets X5 tiles be 1754px while X3 tiles are 1169px.
+    # single_camera_per_folder remains valid because alternating capture means
+    # each face folder contains tiles from one camera only.
+    _erp_width_by_cam: dict[int, int] = {}
+    for p in panoramas:
+        ci_path = p['scan_dir'] / '.cam_index'
+        _cam_idx = 0
+        if ci_path.exists():
+            try:
+                _cam_idx = int(ci_path.read_text().strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        img_probe = cv2.imread(str(p['erp_src']), cv2.IMREAD_UNCHANGED)
+        if img_probe is not None and _cam_idx not in _erp_width_by_cam:
+            _erp_width_by_cam[_cam_idx] = img_probe.shape[1]
+
+    _tile_size_by_cam: dict[int, int] = {
+        k: _tile_size_for_erp(w) for k, w in _erp_width_by_cam.items()
+    }
+    # Fallback tile size if no cam_index files exist
     _probe_img = cv2.imread(str(panoramas[0]['erp_src']), cv2.IMREAD_UNCHANGED)
     _default_tile_size = _tile_size_for_erp(_probe_img.shape[1]) if _probe_img is not None else 1024
-    _default_f_px = _default_tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
-    print(f"  ERP width: {_probe_img.shape[1] if _probe_img is not None else '?'}px "
-          f"-> tile_size: {_default_tile_size}px  f_px: {_default_f_px:.1f}")
-
-    # Canonical tile size per face: the smallest native tile size among all
-    # panoramas. This avoids upsampling lower-res cameras (X3) to match
-    # higher-res ones (X5), while keeping single_camera_per_folder valid
-    # (all tiles in a face folder must be the same dimensions).
-    # Downsampling X5 tiles to X3 size is lossless in information terms.
-    from collections import Counter
-    _all_erp_widths = []
-    for p in panoramas:
-        img_probe = cv2.imread(str(p['erp_src']), cv2.IMREAD_UNCHANGED)
-        if img_probe is not None:
-            _all_erp_widths.append(img_probe.shape[1])
-    _canonical_tile_size = _tile_size_for_erp(min(_all_erp_widths)) if _all_erp_widths else _default_tile_size
+    # Canonical tile size = primary camera (cam_0) for rig_config reference
+    _canonical_tile_size = _tile_size_by_cam.get(0, _default_tile_size)
     _canonical_f_px = _canonical_tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
-    if _canonical_tile_size != _default_tile_size:
-        print(f"  Mixed ERP widths detected: canonical tile_size={_canonical_tile_size}px "
-              f"f_px={_canonical_f_px:.1f} (using smallest to avoid upsampling)")
+
+    if len(_tile_size_by_cam) > 1:
+        print(f"  Per-camera tile sizes: " +
+              ", ".join(f"cam_{k}={v}px" for k, v in sorted(_tile_size_by_cam.items())))
+    else:
+        print(f"  Tile size: {_canonical_tile_size}px  f_px: {_canonical_f_px:.1f}")
+
+    # Create per-face subdirectories now that _tile_size_by_cam is available.
+    _multi_cam = len(_tile_size_by_cam) > 1
+    for face_idx in active_faces:
+        for cam_k in sorted(_tile_size_by_cam.keys()):
+            _subfolder = f'face_{face_idx:02d}_cam{cam_k}' if _multi_cam else f'face_{face_idx:02d}'
+            (images_dir / _subfolder).mkdir(parents=True, exist_ok=True)
+            (mask_dir / _subfolder).mkdir(parents=True, exist_ok=True)
 
     for pano_idx, pano in enumerate(panoramas, start=1):
         # Load RGB from unmasked source (JPG) to avoid hard mask edges causing
@@ -602,11 +666,19 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             erp_mask = erp_img[:, :, 3]
             erp_img = erp_img[:, :, :3]
 
-        # All tiles use the canonical size so single_camera_per_folder is valid.
-        # X5 tiles are downsampled to canonical (no information loss).
-        # X3 tiles are already at or below canonical (no upsampling).
-        tile_size = _canonical_tile_size
-        f_px = _canonical_f_px
+        # Use per-camera tile size based on this panorama's camera index.
+        _ci_path = pano['scan_dir'] / '.cam_index'
+        _pano_cam_idx = 0
+        if _ci_path.exists():
+            try:
+                _pano_cam_idx = int(_ci_path.read_text().strip().split()[0])
+            except (ValueError, IndexError):
+                pass
+        tile_size = _tile_size_by_cam.get(_pano_cam_idx, _canonical_tile_size)
+        f_px = tile_size / (2 * np.tan(np.radians(FOV_DEG) / 2))
+        # Subfolder name: include cam index when multiple cameras are present
+        # so each folder contains only one tile size (single_camera_per_folder).
+        _face_subfolder_suffix = f'_cam{_pano_cam_idx}' if _multi_cam else ''
 
         # Apply a seam exclusion strip to the mask. The dual-fisheye stitch seam
         # runs vertically at the left/right ERP edges (u=0 and u=W, which wrap).
@@ -614,11 +686,21 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         # each side. Mask these out so SIFT doesn't match warped features.
         if erp_img is not None:
             _erp_w = erp_img.shape[1]
+            _erp_h = erp_img.shape[0]
             _seam_strip = int(_erp_w * 0.04)  # 4% on each side of the wrap seam
             if erp_mask is None:
                 erp_mask = np.full(erp_img.shape[:2], 255, dtype=np.uint8)
             erp_mask[:, :_seam_strip] = 0
             erp_mask[:, _erp_w - _seam_strip:] = 0
+            # Single fisheye: mask the ERP poles where the Insta360 SDK stitches
+            # the back fisheye into the top/bottom of the ERP. The stitch seam
+            # at the poles creates a horizontal band of distortion/blending
+            # artifacts that degrade SIFT feature quality.
+            # 10% of ERP height (~18° from each pole) covers the worst artifacts.
+            if not pano.get('is_360', True):
+                _pole_strip = int(_erp_h * 0.10)
+                erp_mask[:_pole_strip, :] = 0
+                erp_mask[-_pole_strip:, :] = 0
             # Mild unsharp mask to recover detail softened by ERP stitching
             # interpolation. Sigma=1.0, strength=0.4 — enough to sharpen
             # edges without amplifying compression artifacts.
@@ -629,19 +711,57 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         tiles = []
         for face_idx in active_faces:
             cam_from_pano_r = FACES_CAM_FROM_PANO[face_idx]
-            tile = _erp_to_perspective(erp_img, cam_from_pano_r, tile_size)
+            tile, feather_mask = _erp_to_perspective(erp_img, cam_from_pano_r, tile_size,
+                                                     face_idx=face_idx)
 
             tile_mask = None
             if erp_mask is not None:
-                tile_mask = _erp_to_perspective(erp_mask, cam_from_pano_r, tile_size,
-                                                interpolation=cv2.INTER_NEAREST)
-                if np.count_nonzero(tile_mask) / tile_mask.size < MIN_TILE_VISIBLE:
+                scanner_mask, _ = _erp_to_perspective(erp_mask, cam_from_pano_r, tile_size,
+                                                      interpolation=cv2.INTER_NEAREST)
+                if np.count_nonzero(scanner_mask) / scanner_mask.size < MIN_TILE_VISIBLE:
                     continue
+                # Combine scanner body mask with feathered overlap mask:
+                # a pixel must be both unmasked by the scanner body AND within
+                # this face's overlap region.
+                if feather_mask is not None:
+                    tile_mask = cv2.bitwise_and(scanner_mask, feather_mask)
+                else:
+                    tile_mask = scanner_mask
+            elif feather_mask is not None:
+                tile_mask = feather_mask
 
             fname = f"pano_{pano_idx:03d}.png"
-            cv2.imwrite(str(images_dir / f'face_{face_idx:02d}' / fname), tile)
-            if tile_mask is not None:
-                cv2.imwrite(str(mask_dir / f'face_{face_idx:02d}' / f'{fname}.png'), tile_mask)
+            _subfolder = f'face_{face_idx:02d}{_face_subfolder_suffix}'
+
+            # Pad smaller tiles to the canonical size so all images in the
+            # dataset are the same dimensions. Center the content and fill
+            # the border with black. The mask is extended to cover the padded
+            # border (marking it invalid) so the trainer ignores those pixels.
+            _out_tile = tile
+            _out_mask = tile_mask
+            _pad_x, _pad_y = 0, 0
+            if _multi_cam and tile_size < _canonical_tile_size:
+                _pad_total = _canonical_tile_size - tile_size
+                _pad_y = _pad_total // 2
+                _pad_x = _pad_total // 2
+                _pad_y2 = _pad_total - _pad_y
+                _pad_x2 = _pad_total - _pad_x
+                _out_tile = cv2.copyMakeBorder(
+                    tile, _pad_y, _pad_y2, _pad_x, _pad_x2,
+                    cv2.BORDER_CONSTANT, value=0)
+                if _out_mask is not None:
+                    _out_mask = cv2.copyMakeBorder(
+                        _out_mask, _pad_y, _pad_y2, _pad_x, _pad_x2,
+                        cv2.BORDER_CONSTANT, value=0)
+                else:
+                    # No mask yet — create one that marks only the padded
+                    # border as invalid and the content area as valid.
+                    _out_mask = np.zeros((_canonical_tile_size, _canonical_tile_size), dtype=np.uint8)
+                    _out_mask[_pad_y:_pad_y + tile_size, _pad_x:_pad_x + tile_size] = 255
+
+            cv2.imwrite(str(images_dir / _subfolder / fname), _out_tile)
+            if _out_mask is not None:
+                cv2.imwrite(str(mask_dir / _subfolder / f'{fname}.png'), _out_mask)
 
             # Tile w2c in COLMAP world = cam_from_pano @ pano_w2c_colmap
             # pano_w2c_colmap = R_cam_w2c_col (the panorama camera w2c)
@@ -651,7 +771,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             if q[3] < 0:
                 q = -q
             tiles.append({'face': face_idx,
-                          'rel_path': f'face_{face_idx:02d}/{fname}',
+                          'cam_idx': _pano_cam_idx,
+                          'tile_size': _canonical_tile_size if (_multi_cam and tile_size < _canonical_tile_size) else tile_size,
+                          'pad_x': _pad_x,
+                          'pad_y': _pad_y,
+                          'rel_path': f'{_subfolder}/{fname}',
                           'quat_wxyz': [q[3], q[0], q[1], q[2]],
                           'trans': T_tile.tolist()})
 
@@ -675,36 +799,77 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
 
 def write_rig_config(colmap_dir, panoramas):
     """Write rig_config.json for rig_configurator CLI."""
-    # All tiles use the canonical size so f_px and c are uniform across faces.
-    f_px = panoramas[0]['f_px']
-    c = panoramas[0]['tile_size'] / 2.0
+    # Build per-subfolder tile size and pad offsets from actual panorama data.
+    _subfolder_tile_size: dict[str, int] = {}
+    _subfolder_f_px: dict[str, float] = {}
+    _subfolder_cx: dict[str, float] = {}
+    _subfolder_cy: dict[str, float] = {}
+    for _p in panoramas:
+        if 'cx' in _p:
+            continue
+        for _t in _p.get('tiles', []):
+            _sf = _t['rel_path'].split('/')[0]
+            if _sf not in _subfolder_tile_size:
+                _ts = _t.get('tile_size', _p['tile_size'])
+                _px = _t.get('pad_x', 0)
+                _py = _t.get('pad_y', 0)
+                _native_half = (_ts - 2 * _px) / 2.0
+                _subfolder_tile_size[_sf] = _ts
+                _subfolder_f_px[_sf] = _p['f_px']
+                _subfolder_cx[_sf] = _native_half + _px
+                _subfolder_cy[_sf] = _native_half + _py
+    # Canonical fallback
+    _erp_pano_0 = next((p for p in panoramas if 'cx' not in p), panoramas[0])
+    f_px = _erp_pano_0['f_px']
+    c = _erp_pano_0['tile_size'] / 2.0
 
-    # Only include faces that have images in the DB
+    # Only include faces that have images in the DB.
+    # In multi-cam sessions subfolders are face_00_cam0/, face_00_cam1/, etc.
+    # Query distinct folder prefixes rather than assuming face_{idx:02d}/.
     db_path = colmap_dir / 'database.db'
     conn = sqlite3.connect(str(db_path))
-    present_faces = set()
-    for face_idx in range(NUM_FACES):
-        row = conn.execute(
-            'SELECT 1 FROM images WHERE name LIKE ? LIMIT 1',
-            (f'face_{face_idx:02d}/%',)
-        ).fetchone()
-        if row:
-            present_faces.add(face_idx)
+    present_subfolders = set()
+    for (name,) in conn.execute("SELECT name FROM images WHERE name NOT LIKE 'face_oak1/%'"):
+        folder = name.split('/')[0]
+        present_subfolders.add(folder)
+    # Map subfolder -> face_idx (parse from folder name prefix)
+    def _folder_face_idx(folder):
+        try:
+            return int(folder.split('_')[1])
+        except (IndexError, ValueError):
+            return -1
+    present_faces = set(_folder_face_idx(f) for f in present_subfolders if _folder_face_idx(f) >= 0)
     conn.close()
 
     # Ref face must be present; fall back to first present face
     ref_face = REF_FACE if REF_FACE in present_faces else min(present_faces)
     R_ref_from_pano = FACES_CAM_FROM_PANO[ref_face]
+    # Pick the ref subfolder: prefer the canonical cam_0 subfolder for ref_face
+    def _ref_subfolder_for_face(face_idx, subfolders):
+        candidates = sorted(s for s in subfolders if _folder_face_idx(s) == face_idx)
+        # prefer _cam0 or bare face_XX/
+        for s in candidates:
+            if s.endswith('_cam0') or '_cam' not in s:
+                return s
+        return candidates[0] if candidates else f'face_{face_idx:02d}'
+    ref_subfolder = _ref_subfolder_for_face(ref_face, present_subfolders)
 
     cameras = []
-    # ref sensor must be first
-    for face_idx in sorted(present_faces, key=lambda f: (f != ref_face, f)):
+    # ref sensor must be first; then remaining subfolders sorted by name
+    sorted_subfolders = sorted(present_subfolders,
+                               key=lambda s: (s != ref_subfolder, s))
+    for subfolder in sorted_subfolders:
+        face_idx = _folder_face_idx(subfolder)
+        _ts = _subfolder_tile_size.get(subfolder, int(c * 2))
+        _fp = _subfolder_f_px.get(subfolder, f_px)
+        _cx = _subfolder_cx.get(subfolder, _ts / 2.0)
+        _cy = _subfolder_cy.get(subfolder, _ts / 2.0)
         entry = {
-            "image_prefix": f"face_{face_idx:02d}/",
-            "camera_model_name": "SIMPLE_PINHOLE",
-            "camera_params": [f_px, c, c],
+            "image_prefix": f"{subfolder}/",
+            "camera_model_name": "PINHOLE",
+            "camera_params": [_fp, _fp, _cx, _cy],
         }
-        if face_idx == ref_face:
+        if subfolder == ref_subfolder:
             entry["ref_sensor"] = True
         else:
             R_cam_from_rig = FACES_CAM_FROM_PANO[face_idx] @ R_ref_from_pano.T
@@ -772,7 +937,7 @@ def write_init_model_bin(colmap_dir, panoramas):
     for face_idx in range(NUM_FACES):
         row = conn.execute(
             'SELECT camera_id FROM images WHERE name LIKE ? LIMIT 1',
-            (f'face_{face_idx:02d}/%',)
+            (f'face_{face_idx:02d}%/%',)
         ).fetchone()
         if row:
             face_camera_ids[face_idx] = row[0]
@@ -786,6 +951,16 @@ def write_init_model_bin(colmap_dir, panoramas):
     db_cameras = conn.execute(
         'SELECT camera_id, model, width, height, params FROM cameras ORDER BY camera_id'
     ).fetchall()
+    # Build subfolder -> camera_id map before closing the connection
+    subfolder_cam_ids = {}
+    for name, img_id in db_images.items():
+        subfolder = name.split('/')[0]
+        if subfolder not in subfolder_cam_ids:
+            row3 = conn.execute(
+                'SELECT camera_id FROM images WHERE name=? LIMIT 1', (name,)
+            ).fetchone()
+            if row3:
+                subfolder_cam_ids[subfolder] = row3[0]
     conn.close()
 
     # cameras.bin
@@ -803,12 +978,15 @@ def write_init_model_bin(colmap_dir, panoramas):
     for pano in panoramas:
         for tile in pano['tiles']:
             img_id = db_images.get(tile['rel_path'])
-            # Use OAK-1 camera ID for face_oak1 tiles, numeric face ID for ERP
+            # Use OAK-1 camera ID for face_oak1 tiles; for ERP tiles look up
+            # by subfolder name so multi-cam folders (face_00_cam0/, face_00_cam1/)
+            # resolve to the correct per-camera entry.
             if 'face_oak1' in tile['rel_path']:
                 cam_id = oak1_camera_id
                 _oak1_count += 1
             else:
-                cam_id = face_camera_ids.get(tile['face'])
+                subfolder = tile['rel_path'].split('/')[0]
+                cam_id = subfolder_cam_ids.get(subfolder, face_camera_ids.get(tile['face']))
             if img_id is not None and cam_id is not None:
                 # Verify the image file actually exists (not skipped as blank)
                 img_file = colmap_dir / 'images' / tile['rel_path']
@@ -1258,17 +1436,50 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         _oak1_cam_id  = None
         _cam_id = 1
         _img_id = 1
-        _f_px_po = panoramas[0]['f_px']
-        # Use the first ERP panorama for tile_size (not OAK-1 which may be non-square)
+        # Use the first ERP panorama for the canonical tile size (not OAK-1)
         _erp_pano_0 = next((p for p in panoramas if 'cx' not in p), panoramas[0])
         _tile_size_po = _erp_pano_0['tile_size']
         _c_po = _tile_size_po / 2.0
-        for _fi in range(NUM_FACES):
-            _params = _struct.pack('ddd', _f_px_po, _c_po, _c_po)
-            _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
-                          (_cam_id, 0, _tile_size_po, _tile_size_po, _params, 1))
-            _face_cam_ids[_fi] = _cam_id
-            _cam_id += 1
+        _f_px_po = _erp_pano_0['f_px']
+        # In multi-camera sessions each face folder may contain tiles from a
+        # different camera at a different tile size (e.g. X5=1536, X3=1357).
+        # In multi-cam sessions the same face index appears in multiple subfolders
+        # (face_00_cam0=1536, face_00_cam1=1357 padded to 1536).
+        # Key by (face, cam_idx) to get per-subfolder tile size and pad offsets.
+        _face_tile_size: dict[tuple, int] = {}
+        _face_f_px: dict[tuple, float] = {}
+        _face_pad: dict[tuple, tuple] = {}  # (pad_x, pad_y)
+        for _p in panoramas:
+            if 'cx' in _p:
+                continue  # OAK-1 handled separately
+            for _t in _p.get('tiles', []):
+                _key = (_t['face'], _t.get('cam_idx', 0))
+                if _key not in _face_tile_size:
+                    _face_tile_size[_key] = _t.get('tile_size', _p['tile_size'])
+                    _face_f_px[_key] = _p['f_px']
+                    _face_pad[_key] = (_t.get('pad_x', 0), _t.get('pad_y', 0))
+        # Create one SIMPLE_PINHOLE camera per unique (tile_size, pad) combination.
+        # Padded tiles share the canonical tile_size but have shifted cx/cy.
+        _cam_key_to_cam_id: dict[tuple, int] = {}  # (tile_size, pad_x, pad_y) -> cam_id
+        _subfolder_cam_id: dict[str, int] = {}
+        for (_fi, _ci), _ts in _face_tile_size.items():
+            _fp = _face_f_px[(_fi, _ci)]
+            _px, _py = _face_pad.get((_fi, _ci), (0, 0))
+            # cx/cy = native half-size + pad offset (centering shifts principal point)
+            _native_half = (_ts - 2 * _px) / 2.0  # original tile half-size
+            _cx = _native_half + _px
+            _cy = _native_half + _py
+            _cam_key = (_ts, _px, _py)
+            if _cam_key not in _cam_key_to_cam_id:
+                _params = _struct.pack('ddd', _fp, _cx, _cy)
+                _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
+                              (_cam_id, 0, _ts, _ts, _params, 1))
+                _cam_key_to_cam_id[_cam_key] = _cam_id
+                _cam_id += 1
+            _multi = len({c for (f, c) in _face_tile_size}) > 1
+            _subfolder = f'face_{_fi:02d}_cam{_ci}' if _multi else f'face_{_fi:02d}'
+            _subfolder_cam_id[_subfolder] = _cam_key_to_cam_id[_cam_key]
+            _face_cam_ids[_fi] = _cam_key_to_cam_id[_cam_key]  # fallback
         if _oak1_panos:
             _op = _oak1_panos[0]
             _oak1_params = _struct.pack('dddd', _op['f_px'], _op['f_px'],
@@ -1281,7 +1492,15 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         for _pano in panoramas:
             for _tile in _pano['tiles']:
                 _is_oak1 = 'face_oak1' in _tile['rel_path']
-                _cid = _oak1_cam_id if _is_oak1 else _face_cam_ids.get(_tile['face'], 1)
+                if _is_oak1:
+                    _cid = _oak1_cam_id
+                else:
+                    _tile_subfolder = _tile['rel_path'].split('/')[0]
+                    _px = _tile.get('pad_x', 0)
+                    _py = _tile.get('pad_y', 0)
+                    _ts = _tile.get('tile_size', _tile_size_po)
+                    _cid = _subfolder_cam_id.get(_tile_subfolder,
+                           _cam_key_to_cam_id.get((_ts, _px, _py), 1))
                 _conn.execute('INSERT OR IGNORE INTO images VALUES (?,?,?,?,?,?,?,?,?,?)',
                               (_img_id, _tile['rel_path'], _cid,
                                None, None, None, None, None, None, None))

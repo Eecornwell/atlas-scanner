@@ -2378,7 +2378,10 @@ sys.exit(0 if ok[0] else 4)
                 ("2. Generate Intensity Images", [sys.executable,
                     str(self.script_dir / 'calibration' / 'generate_intensity_images.py'), output]),
                 (f"3. Match Features (SuperGlue {scene}, {sg_mode})", [sys.executable, str(erp_matcher),
-                    output, '--superglue', scene, '--mode', sg_mode, '--max_keypoints', '4096', '--match_threshold', '0.2', '--crop_size', '640']),
+                    output, '--superglue', scene, '--mode', sg_mode, '--max_keypoints', '4096',
+                    '--match_threshold', '0.01' if hw == 'oak1' else '0.2',
+                    '--keypoint_threshold', '0.05' if hw == 'oak1' else '0.005',
+                    '--crop_size', '640']),
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
@@ -2386,36 +2389,18 @@ sys.exit(0 if ok[0] else 4)
             # 1. SuperGlue cross-modal matching (LiDAR IR vs RGB) produces 0 matches
             # 2. initial_guess_manual renders image on ERP sphere (radius=W/2pi=127m)
             #    which dwarfs the LiDAR point cloud and makes point selection impossible
-            # 3. The existing calibration from fusion_calibration.yaml already has
-            #    sub-pixel reprojection error (confirmed by sensor_colored_exact.ply)
-            # For OAK-1, skip DVL entirely and just verify/apply the existing calibration.
-            _skip_dvl = (hw == 'oak1')
-            if _skip_dvl:
-                self.root.after(0, self._cal_log_write,
-                                '  NOTE: OAK-1 — skipping DVL calibration pipeline.\n'
-                                '  The existing fusion_calibration.yaml already has good\n'
-                                '  reprojection quality. Use 3D Colorize to verify visually,\n'
-                                '  or use the Tune sweep tools for fine adjustment.\n')
-                # Still run Combine + Intensity so the output/ dataset exists
-                # for the Tune tools, but skip SuperGlue, initial_guess, calibrate.
-                steps = [
-                    s for s in steps
-                    if any(x in ' '.join(str(a) for a in s[1])
-                       for x in ('combine_scans', 'generate_intensity_images', 'seed_calib'))
-                ]
-                steps.append(("Apply Calibration (existing)", [
-                    sys.executable,
-                    str(self.script_dir / 'calibration' / 'coordinate_transform.py'),
-                    src, '--camera-hw', hw
-                ]))
+            # OAK-1 uses panorama mode in find_matches_superglue_erp.py (direct pinhole
+            # image matching, no ERP reprojection) and initial_guess_auto (not manual).
+            _skip_dvl = False
+            _oak1_force_auto = (hw == 'oak1')
 
             if not _skip_dvl:
-                if guess == 'manual':
-                    steps.append(("5. Initial Guess (Manual — adjust pose then close window)", [
-                        str(dvl / 'initial_guess_manual'), '--data_path', output]))
-                else:
+                if _oak1_force_auto or guess != 'manual':
                     steps.append(("5. Initial Guess (Auto)", [
                         str(dvl / 'initial_guess_auto'), '--data_path', output]))
+                else:
+                    steps.append(("5. Initial Guess (Manual — adjust pose then close window)", [
+                        str(dvl / 'initial_guess_manual'), '--data_path', output]))
                 steps += [
                     ("6. Run Calibration", [str(dvl / 'calibrate'), '--data_path', output,
                         '--nid_bins', '32', '--nelder_mead_convergence_criteria', '1e-10']),
@@ -2445,7 +2430,7 @@ sys.exit(0 if ok[0] else 4)
                     return
                 # Manual initial guess: stop here so the user can inspect the
                 # pose in the interactive window before running calibration.
-                if not _skip_dvl and guess == 'manual' and 'initial_guess_manual' in safe_cmd:
+                if not _oak1_force_auto and guess == 'manual' and 'initial_guess_manual' in safe_cmd:
                     self.root.after(0, self._cal_log_write,
                                     '\n⚠ Pipeline paused after manual initial guess.\n'
                                     '  Adjust the pose in the viewer window, then close it.\n'

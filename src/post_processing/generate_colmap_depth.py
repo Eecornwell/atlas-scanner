@@ -444,6 +444,8 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
     cameras = _read_cameras(sparse_dir / 'cameras.bin')
     images  = _read_images(sparse_dir  / 'images.bin')
 
+    canonical_size = max(c['w'] for c in cameras.values())
+
     T_camera_lidar = _load_T_camera_lidar(session)
     T_lidar_camera = np.linalg.inv(T_camera_lidar)
 
@@ -533,6 +535,13 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
 
             depth_img = _render_depth(pts_colmap, R_w2c, t_w2c, f_px, cx, cy, w, h,
                                       radius=radius, rgb_guide=rgb_guide)
+            if w < canonical_size:
+                pad_x = (canonical_size - w) // 2
+                pad_y = (canonical_size - h) // 2
+                depth_img = cv2.copyMakeBorder(
+                    depth_img, pad_y, canonical_size - h - pad_y,
+                    pad_x, canonical_size - w - pad_x,
+                    cv2.BORDER_CONSTANT, value=0)
             out   = depth_root / rel
             out.parent.mkdir(parents=True, exist_ok=True)
             try:

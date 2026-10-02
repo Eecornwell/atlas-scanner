@@ -332,7 +332,11 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
     import os as _os
 
     script = str(Path(__file__).resolve())
-    n_workers = min(len(per_scan_bags), _os.cpu_count() or 4)
+    # Cap parallelism to avoid OOM when sessions have many bags.
+    # Each worker decompresses a rosbag (~200-400MB) and runs reconstruction,
+    # so uncapped parallelism on large sessions (25+ bags) can exhaust RAM.
+    # Use at most 4 workers, or fewer if the CPU count is low.
+    n_workers = min(len(per_scan_bags), 4, _os.cpu_count() or 4)
 
     def _run_one(bag_dir):
         cmd = [
@@ -414,7 +418,7 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
 
             scan_dirs_with_insp = [sd for sd in sorted(session_path.glob('fusion_scan_*'))
                                    if sd.is_dir() and next(sd.glob('*.insp'), None)]
-            n_w = min(len(scan_dirs_with_insp), _os2.cpu_count() or 4)
+            n_w = min(len(scan_dirs_with_insp), 4, _os2.cpu_count() or 4)
             with _cf2.ThreadPoolExecutor(max_workers=n_w) as pool:
                 list(pool.map(_stitch_one, scan_dirs_with_insp))
             print(f'  Stitched {len(scan_dirs_with_insp)} scans')

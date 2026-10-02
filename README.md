@@ -187,8 +187,6 @@ Please review [Running the Software documentation](docs/software-run.md)
 #### Sample Output
 - Outdoor
 
-    ![Point Cloud Result - Outdoor](assets/media/atlas-outdoor-scan.gif "Outdoor Result")
-  
     ![Point Cloud Result - Outdoor](assets/media/outdoor-pointcloud.png "Outdoor Result")
 
 - Indoor
