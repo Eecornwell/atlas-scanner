@@ -200,6 +200,9 @@ private struct CameraFormView: View {
     @State private var rollDeg: Double
     @State private var pitchDeg: Double
     @State private var yawDeg: Double
+    @State private var useMetric = true
+
+    private let inchesToM = 0.0254
 
     init(title: String, buttonLabel: String, existing: CameraConfig? = nil,
          onSave: @escaping (CameraConfig) -> Void) {
@@ -217,6 +220,15 @@ private struct CameraFormView: View {
         _yawDeg = State(initialValue: existing?.extrinsic.yaw ?? 0.0)
     }
 
+    private func unitBinding(_ source: Binding<Double>) -> Binding<Double> {
+        Binding(
+            get: { useMetric ? source.wrappedValue : source.wrappedValue / inchesToM },
+            set: { source.wrappedValue = useMetric ? $0 : $0 * inchesToM }
+        )
+    }
+
+    private var unitLabel: String { useMetric ? "meters" : "inches" }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -226,10 +238,15 @@ private struct CameraFormView: View {
                     TextField("Serial Number", text: $serial)
                 }
 
-                Section("Mount Position (meters)") {
-                    NumberField("Forward", value: $forwardM)
-                    NumberField("Left", value: $leftM)
-                    NumberField("Up", value: $upM)
+                Section("Mount Position (\(unitLabel))") {
+                    Picker("Units", selection: $useMetric) {
+                        Text("Metric (m)").tag(true)
+                        Text("Imperial (in)").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    NumberField("Forward", value: unitBinding($forwardM))
+                    NumberField("Left", value: unitBinding($leftM))
+                    NumberField("Up", value: unitBinding($upM))
                 }
 
                 Section("Mount Rotation (degrees)") {

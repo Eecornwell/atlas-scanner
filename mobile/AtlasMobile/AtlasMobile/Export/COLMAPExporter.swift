@@ -1,6 +1,7 @@
 import Foundation
 import simd
 import ARKit
+import UIKit
 
 /// Exports a captured session to COLMAP binary format on-device.
 /// Mirrors assemble_colmap.py — produces cameras.bin, images.bin, points3D.bin.
@@ -20,6 +21,40 @@ final class COLMAPExporter {
         SIMD3(0, -1,  0),
         SIMD3(0,  0, -1),
     ])
+
+    // Landscape COLMAP camera frame → portrait COLMAP camera frame.
+    // Applied because the saved iPhone JPEG is rotated 90° CW from
+    // the landscape sensor buffer.
+    static let portraitRotation = simd_float3x3(rows: [
+        SIMD3( 0, -1, 0),
+        SIMD3( 1,  0, 0),
+        SIMD3( 0,  0, 1),
+    ])
+
+    // Optimizer Camera frame (X=up,Y=right,Z=forward) from
+    // ARKit camera frame (X=right,Y=up,Z=backward).
+    private static let cameraFromARKit = simd_float3x3(rows: [
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(1, 0, 0),
+        SIMD3<Float>(0, 0, -1),
+    ])
+
+    /// Seed extrinsic → ERP-from-ARKit 4x4 for composing with T_wc.inverse.
+    static func erpFromARKit(_ ext: RigidTransform) -> simd_float4x4 {
+        let T = ExtrinsicOptimizer.seedToCameraMatrix(ext)
+        let R = simd_float3x3(
+            SIMD3(T.columns.0.x, T.columns.0.y, T.columns.0.z),
+            SIMD3(T.columns.1.x, T.columns.1.y, T.columns.1.z),
+            SIMD3(T.columns.2.x, T.columns.2.y, T.columns.2.z)
+        )
+        let Rc = R * cameraFromARKit
+        var M = simd_float4x4(1)
+        M.columns.0 = SIMD4(Rc.columns.0, 0)
+        M.columns.1 = SIMD4(Rc.columns.1, 0)
+        M.columns.2 = SIMD4(Rc.columns.2, 0)
+        M.columns.3 = T.columns.3
+        return M
+    }
 
     private let sessionDirectory: URL
     private let sparseDir: URL
@@ -58,17 +93,26 @@ final class COLMAPExporter {
             uniqueKeysWithValues: (0..<faceCount).map { ($0, UInt32($0 + 2)) }
         )
 
-        let imgW = first.imageWidth
-        let imgH = first.imageHeight
-        let fx = first.intrinsics[0][0]
-        let fy = first.intrinsics[1][1]
-        let cx = first.intrinsics[0][2]
-        let cy = first.intrinsics[1][2]
+        // Landscape values from pose.json (sensor native frame).
+        let imgW_l = first.imageWidth
+        let imgH_l = first.imageHeight
+        let fx_l = first.intrinsics[0][0]
+        let fy_l = first.intrinsics[1][1]
+        let cx_l = first.intrinsics[0][2]
+        let cy_l = first.intrinsics[1][2]
+
+        // Portrait values for cameras.bin — saved JPEG is rotated 90° CW.
+        let imgW_p = imgH_l
+        let imgH_p = imgW_l
+        let fx_p = fy_l
+        let fy_p = fx_l
+        let cx_p = Float(imgH_l - 1) - cy_l
+        let cy_p = cx_l
 
         try writeCamerasBin(
             iphoneCameraId: iphoneCameraId,
-            imgW: imgW, imgH: imgH,
-            fx: fx, fy: fy, cx: cx, cy: cy,
+            imgW: imgW_p, imgH: imgH_p,
+            fx: fx_p, fy: fy_p, cx: cx_p, cy: cy_p,
             tileCameraIds: tileCameraIds,
             tileSize: tileSize,
             f_tile: f_tile, c_tile: c_tile
@@ -79,8 +123,8 @@ final class COLMAPExporter {
             cameraConfig: cameraConfig,
             iphoneCameraId: iphoneCameraId,
             tileCameraIds: tileCameraIds,
-            imgW: imgW, imgH: imgH,
-            fx: fx, fy: fy, cx: cx, cy: cy
+            imgW: imgW_l, imgH: imgH_l,
+            fx: fx_l, fy: fy_l, cx: cx_l, cy: cy_l
         )
 
         try writeImagesBin(entries: imageEntries)
@@ -144,13 +188,21 @@ final class COLMAPExporter {
 
         for scan in scans {
             let T_wc = scan.arkitPose  // ARKit camera-to-world (4x4)
-            let (R_w2c, t_w2c) = Self.arkitToColmapW2C(T_wc)
+            let (R_w2c_landscape, t_w2c_mat) = Self.arkitToColmapW2C(T_wc)
+            let t_w2c_landscape = SIMD3(
+                t_w2c_mat.columns.3.x,
+                t_w2c_mat.columns.3.y,
+                t_w2c_mat.columns.3.z
+            )
 
-            // iPhone image entry
+            // iPhone image entry — portrait rotation (saved JPEG is 90° CW)
+            let R_w2c_portrait = Self.portraitRotation * R_w2c_landscape
+            let t_w2c_portrait = Self.portraitRotation * t_w2c_landscape
+
             entries.append(ImageEntry(
                 imageId: imageId,
-                quatWXYZ: Self.rotationToQuatWXYZ(R_w2c),
-                tvec: SIMD3(t_w2c.columns.3.x, t_w2c.columns.3.y, t_w2c.columns.3.z),
+                quatWXYZ: Self.rotationToQuatWXYZ(R_w2c_portrait),
+                tvec: t_w2c_portrait,
                 cameraId: iphoneCameraId,
                 name: "face_iphone/\(scan.scanName).jpg"
             ))
@@ -158,10 +210,9 @@ final class COLMAPExporter {
 
             // Insta360 face tile entries
             for camCfg in cameraConfig.cameras {
-                let T_insta_iphone = camCfg.extrinsic.toMatrix()
-                // T_iphone_world = inv(T_wc) = world-to-iphone
+                let T_insta_arkit = Self.erpFromARKit(camCfg.extrinsic)
                 let T_iphone_world = T_wc.inverse
-                let T_insta_world = T_insta_iphone * T_iphone_world  // insta360 w2c
+                let T_insta_world = T_insta_arkit * T_iphone_world
 
                 let R_insta_w2c = simd_float3x3(
                     SIMD3(T_insta_world.columns.0.x, T_insta_world.columns.0.y, T_insta_world.columns.0.z),
@@ -173,7 +224,7 @@ final class COLMAPExporter {
                                     T_insta_world.columns.3.z)
                 let C_insta = -R_insta_w2c.transpose * t_insta
                 let C_insta_col = Self.arkitToColmap * C_insta
-                let R_insta_col = Self.arkitToColmap * R_insta_w2c
+                let R_insta_col = R_insta_w2c * Self.arkitToColmap
 
                 for (faceIdx, camFromPano) in faceRotations.enumerated() {
                     guard let camId = tileCameraIds[faceIdx] else { continue }
@@ -308,29 +359,29 @@ final class COLMAPExporter {
         data.appendLE(sensorTypeCamera)
         data.appendLE(iphoneCameraId)
 
-        // Non-ref sensors: each Insta360 face tile
+        // Non-ref sensors: each Insta360 face tile.
+        // sensor_from_rig = cam_from_pano * erp_from_arkit * portraitRot^T
+        let rRotT = Self.portraitRotation.transpose
         for camCfg in cameraConfig.cameras {
-            let T_insta_iphone = camCfg.extrinsic.toMatrix()
+            let T_erp = Self.erpFromARKit(camCfg.extrinsic)
             let R_insta = simd_float3x3(
-                SIMD3(T_insta_iphone.columns.0.x, T_insta_iphone.columns.0.y, T_insta_iphone.columns.0.z),
-                SIMD3(T_insta_iphone.columns.1.x, T_insta_iphone.columns.1.y, T_insta_iphone.columns.1.z),
-                SIMD3(T_insta_iphone.columns.2.x, T_insta_iphone.columns.2.y, T_insta_iphone.columns.2.z)
+                SIMD3(T_erp.columns.0.x, T_erp.columns.0.y, T_erp.columns.0.z),
+                SIMD3(T_erp.columns.1.x, T_erp.columns.1.y, T_erp.columns.1.z),
+                SIMD3(T_erp.columns.2.x, T_erp.columns.2.y, T_erp.columns.2.z)
             )
-            let t_insta = SIMD3(T_insta_iphone.columns.3.x,
-                                T_insta_iphone.columns.3.y,
-                                T_insta_iphone.columns.3.z)
+            let t_insta = SIMD3(T_erp.columns.3.x,
+                                T_erp.columns.3.y,
+                                T_erp.columns.3.z)
 
             for (faceIdx, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {
                 let camFromPano = faceRotations[faceIdx]
-                // T_tile_from_iphone = R_tile @ T_insta_iphone
-                let R_tile = camFromPano * R_insta
+                let R_tile = camFromPano * R_insta * rRotT
                 let t_tile = camFromPano * t_insta
-                let q = Self.rotationToQuatWXYZ(R_tile)  // wxyz
+                let q = Self.rotationToQuatWXYZ(R_tile)
 
                 data.appendLE(sensorTypeCamera)
                 data.appendLE(camId)
                 data.appendLE(UInt8(1))   // has_pose = true
-                // sensor_from_rig: qw, qx, qy, qz, tx, ty, tz (7 x float64)
                 for v in q { data.appendLE(Double(v)) }
                 data.appendLE(Double(t_tile.x))
                 data.appendLE(Double(t_tile.y))
@@ -364,11 +415,13 @@ final class COLMAPExporter {
             let baseImageId = UInt32(scanIdx * imagesPerScan + 1)
             let iphoneImageId = baseImageId
 
-            // Frame pose = iPhone w2c
-            let (R_w2c, t_w2c_mat) = Self.arkitToColmapW2C(scan.arkitPose)
-            let t_w2c = SIMD3(t_w2c_mat.columns.3.x,
-                               t_w2c_mat.columns.3.y,
-                               t_w2c_mat.columns.3.z)
+            // Frame pose = iPhone w2c in portrait camera frame
+            let (R_w2c_l, t_w2c_mat) = Self.arkitToColmapW2C(scan.arkitPose)
+            let t_w2c_l = SIMD3(t_w2c_mat.columns.3.x,
+                                t_w2c_mat.columns.3.y,
+                                t_w2c_mat.columns.3.z)
+            let R_w2c = Self.portraitRotation * R_w2c_l
+            let t_w2c = Self.portraitRotation * t_w2c_l
             let q = Self.rotationToQuatWXYZ(R_w2c)
 
             data.appendLE(UInt32(scanIdx + 1))  // frame_id
@@ -410,14 +463,46 @@ final class COLMAPExporter {
         try fm.createDirectory(at: iphoneFaceDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: depthsDir, withIntermediateDirectories: true)
 
+        let slicer = ERPTileSlicer()
+
         for scan in scans {
+            // iPhone RGB
             if let src = scan.iphoneImageURL, fm.fileExists(atPath: src.path) {
                 let dst = iphoneFaceDir.appendingPathComponent("\(scan.scanName).jpg")
                 try? fm.copyItem(at: src, to: dst)
             }
+
+            // Smoothed depth
             if let src = scan.smoothedDepthBinURL, fm.fileExists(atPath: src.path) {
-                let dst = depthsDir.appendingPathComponent("\(scan.scanName)_depth_smoothed.bin")
+                let dst = depthsDir.appendingPathComponent(
+                    "\(scan.scanName)_depth_smoothed.bin"
+                )
                 try? fm.copyItem(at: src, to: dst)
+            }
+
+            // Insta360 ERP → perspective face tiles
+            for (_, erpURL) in scan.insta360ImageURLs {
+                guard let erpData = try? Data(contentsOf: erpURL),
+                      let erpImage = UIImage(data: erpData)
+                else { continue }
+
+                let tiles = slicer.sliceTiles(from: erpImage)
+                for (faceIdx, tileImage) in tiles {
+                    let faceDir = imagesDir.appendingPathComponent(
+                        String(format: "face_%02d", faceIdx)
+                    )
+                    try? fm.createDirectory(
+                        at: faceDir, withIntermediateDirectories: true
+                    )
+                    let dst = faceDir.appendingPathComponent(
+                        "\(scan.scanName).jpg"
+                    )
+                    if let jpegData = tileImage.jpegData(
+                        compressionQuality: 0.92
+                    ) {
+                        try? jpegData.write(to: dst)
+                    }
+                }
             }
         }
     }

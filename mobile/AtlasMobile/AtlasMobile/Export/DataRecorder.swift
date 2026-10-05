@@ -181,9 +181,14 @@ final class DataRecorder {
     }
 
     private func savePixelBufferAsJPEG(_ pixelBuffer: CVPixelBuffer, to url: URL) async {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        // ARKit's capturedImage is always landscape (native sensor).
+        // Rotate 90° CW so the saved JPEG matches portrait phone orientation.
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
         let context = CIContext()
-        guard let data = context.jpegRepresentation(of: ciImage, colorSpace: CGColorSpaceCreateDeviceRGB()) else { return }
+        guard let data = context.jpegRepresentation(
+            of: ciImage,
+            colorSpace: CGColorSpaceCreateDeviceRGB()
+        ) else { return }
         try? data.write(to: url)
     }
 

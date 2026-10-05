@@ -11,6 +11,8 @@ struct SessionExportView: View {
     @State private var isRunning = false
     @State private var isComplete = false
     @State private var isSharing = false
+    @State private var isZipping = false
+    @State private var shareZipURL: URL?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -116,11 +118,16 @@ struct SessionExportView: View {
             if p.isComplete {
                 Label("Done", systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
-                Button("Share Session") { isSharing = true }
-                    .buttonStyle(.bordered)
-                    .sheet(isPresented: $isSharing) {
-                        ShareSheet(url: sessionDirectory)
+                Button(isZipping ? "Zipping…" : "Share Session") {
+                    Task { await zipAndShare() }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isZipping)
+                .sheet(isPresented: $isSharing) {
+                    if let zipURL = shareZipURL {
+                        ShareSheet(url: zipURL)
                     }
+                }
             }
         }
     }
@@ -134,6 +141,21 @@ struct SessionExportView: View {
     }
 
     // MARK: - Run
+
+    private func zipAndShare() async {
+        isZipping = true
+        let dir = sessionDirectory
+        let url = await Task.detached(priority: .userInitiated) {
+            let zipURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(dir.lastPathComponent).zip")
+            try? FileManager.default.removeItem(at: zipURL)
+            return ZipWriter.write(sourceDir: dir, to: zipURL) ? zipURL : nil
+        }.value
+        isZipping = false
+        guard let url else { return }
+        shareZipURL = url
+        isSharing = true
+    }
 
     private func runExport() async {
         isRunning = true

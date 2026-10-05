@@ -4,6 +4,8 @@ import UIKit
 struct CaptureControlsView: View {
     @EnvironmentObject var sessionManager: CaptureSessionManager
     @State private var isSharing = false
+    @State private var isZipping = false
+    @State private var shareZipURL: URL?
 
     var body: some View {
         VStack(spacing: 16) {
@@ -14,12 +16,17 @@ struct CaptureControlsView: View {
             .controlSize(.large)
 
             if let dir = sessionManager.sessionDirectory {
-                Button("Share Last Session") { isSharing = true }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .sheet(isPresented: $isSharing) {
-                        ShareSheet(url: dir)
+                Button(isZipping ? "Zipping…" : "Share Last Session") {
+                    Task { await zipAndShare(dir) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(isZipping)
+                .sheet(isPresented: $isSharing) {
+                    if let zipURL = shareZipURL {
+                        ShareSheet(url: zipURL)
                     }
+                }
             }
 
             if let error = sessionManager.exportError {
@@ -29,12 +36,33 @@ struct CaptureControlsView: View {
             }
         }
     }
+
+    private func zipAndShare(_ dir: URL) async {
+        isZipping = true
+        let url = await Task.detached(priority: .userInitiated) {
+            let zipURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(dir.lastPathComponent).zip")
+            try? FileManager.default.removeItem(at: zipURL)
+            return ZipWriter.write(sourceDir: dir, to: zipURL)
+                ? zipURL : nil
+        }.value
+        isZipping = false
+        guard let url else { return }
+        shareZipURL = url
+        isSharing = true
+    }
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {
     let url: URL
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        UIActivityViewController(
+            activityItems: [url],
+            applicationActivities: nil
+        )
     }
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+    func updateUIViewController(
+        _ uiViewController: UIActivityViewController,
+        context: Context
+    ) {}
 }

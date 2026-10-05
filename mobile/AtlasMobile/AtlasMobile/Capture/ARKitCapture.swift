@@ -95,17 +95,19 @@ extension ARKitCapture: ARSessionDelegate {
             pose: frame.camera.transform
         )
 
-        if showDepthOverlay, frame.timestamp - lastDepthUpdate > 0.1 {
+        let wantsOverlay = showDepthOverlay
+        if wantsOverlay, frame.timestamp - lastDepthUpdate > 0.1 {
             lastDepthUpdate = frame.timestamp
             if let depth = frame.sceneDepth?.depthMap {
-                let orientation = UIApplication.shared.connectedScenes
-                    .compactMap { $0 as? UIWindowScene }.first?
-                    .interfaceOrientation ?? .portrait
-                let image = colorizeDepthMap(depth, orientation: orientation)
+                let image = colorizeDepthMap(depth, orientation: .portrait)
                 DispatchQueue.main.async { self.depthOverlayImage = image }
             }
-        } else if !showDepthOverlay && depthOverlayImage != nil {
-            DispatchQueue.main.async { self.depthOverlayImage = nil }
+        } else if !wantsOverlay {
+            DispatchQueue.main.async {
+                if self.depthOverlayImage != nil {
+                    self.depthOverlayImage = nil
+                }
+            }
         }
     }
 

@@ -152,13 +152,15 @@ struct CaptureOverlayView: View {
                     VStack(spacing: 6) {
                         if let thumb = sessionManager.lastCapturedThumbnail {
                             ThumbnailView(image: thumb, label: "iPhone")
+                                .id("iphone-\(sessionManager.thumbnailVersion)")
                         }
                         if let erp = sessionManager.lastInstaERP {
                             ThumbnailView(image: erp, label: "360")
+                                .id("insta-\(sessionManager.thumbnailVersion)")
                         }
                         if sessionManager.lastCapturedThumbnail == nil
                             && sessionManager.lastInstaERP == nil {
-                            Color.clear.frame(width: 60, height: 60)
+                            Color.clear.frame(width: 80, height: 80)
                         }
                     }
 
@@ -308,7 +310,7 @@ private struct ThumbnailView: View {
             Image(uiImage: image)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
-                .frame(width: 60, height: 60)
+                .frame(width: 80, height: 80)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)

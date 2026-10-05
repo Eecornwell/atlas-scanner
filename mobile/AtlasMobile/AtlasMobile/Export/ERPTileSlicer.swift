@@ -106,15 +106,16 @@ final class ERPTileSlicer {
         var maps: [(u: [Float], v: [Float])] = []
 
         for R in faceRotations {
-            // Rotate ray directions: r_pano = R * ray_cam
-            // R is column-major simd_float3x3
+            // R is cam_from_pano; transpose to get pano_from_cam.
+            // Matches Python: rays_pano = rays @ cam_from_pano (= cam_from_pano^T * ray)
+            let Rt = R.transpose
             var rx = [Float](repeating: 0, count: n)
             var ry = [Float](repeating: 0, count: n)
             var rz = [Float](repeating: 0, count: n)
 
             for i in 0..<n {
                 let ray = SIMD3<Float>(px[i], py[i], pz[i])
-                let rot = R * ray
+                let rot = Rt * ray
                 rx[i] = rot.x
                 ry[i] = rot.y
                 rz[i] = rot.z

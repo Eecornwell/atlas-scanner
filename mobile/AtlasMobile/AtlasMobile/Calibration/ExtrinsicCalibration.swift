@@ -10,7 +10,7 @@ struct ExtrinsicCalibration {
     init(cameraId: String, transform: RigidTransform) {
         self.cameraId = cameraId
         self.transform = transform
-        self.matrix = transform.toMatrix()
+        self.matrix = COLMAPExporter.erpFromARKit(transform)
     }
 
     /// Computes the Insta360 camera world pose from the iPhone ARKit pose.

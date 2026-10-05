@@ -128,7 +128,7 @@ final class HostUploader: NSObject, ObservableObject {
 /// Writes a ZIP archive from a directory tree.
 /// Uses DEFLATE compression via Apple's Compression framework (built-in, iOS 13+).
 /// Produces a standard ZIP file compatible with all unzip tools.
-private enum ZipWriter {
+enum ZipWriter {
 
     static func write(sourceDir: URL, to destURL: URL) -> Bool {
         var entries: [(localPath: URL, zipPath: String)] = []
@@ -138,12 +138,16 @@ private enum ZipWriter {
             options: [.skipsHiddenFiles]
         ) else { return false }
 
-        let base = sourceDir.lastPathComponent
+        let srcPath = sourceDir.standardizedFileURL.path
+        let sessionName = sourceDir.lastPathComponent
         for case let fileURL as URL in enumerator {
             guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
             else { continue }
-            let rel = fileURL.path.dropFirst(sourceDir.deletingLastPathComponent().path.count + 1)
-            entries.append((fileURL, String(rel)))
+            let filePath = fileURL.standardizedFileURL.path
+            let relToSession = String(filePath.dropFirst(srcPath.count))
+                .drop(while: { $0 == "/" })
+            let zipPath = sessionName + "/" + relToSession
+            entries.append((fileURL, zipPath))
         }
 
         var archive = Data()
@@ -197,7 +201,6 @@ private enum ZipWriter {
     // MARK: - Deflate
 
     private static func deflate(_ input: Data) -> Data {
-        // Raw deflate (no zlib header) — ZIP uses method 8 = raw deflate
         let bufSize = input.count + 1024
         var output = Data(count: bufSize)
         let written = input.withUnsafeBytes { src in
@@ -209,9 +212,8 @@ private enum ZipWriter {
                 )
             }
         }
-        // Strip the 2-byte zlib header and 4-byte adler32 trailer
-        guard written > 6 else { return input }
-        return output.subdata(in: 2..<(written - 4))
+        guard written > 0 else { return input }
+        return output.prefix(written)
     }
 
     // MARK: - CRC-32
@@ -347,16 +349,13 @@ private enum ZipReader {
     }
 
     private static func inflate(_ input: Data, expectedSize: Int) -> Data? {
-        // Prepend zlib header (0x78 0x9C) that Compression framework expects
-        var zlib = Data([0x78, 0x9C]) + input
         var output = Data(count: max(expectedSize, 1))
         let outputCount = output.count
-        let zlibCount = zlib.count
-        let written = zlib.withUnsafeBytes { src in
+        let written = input.withUnsafeBytes { src in
             output.withUnsafeMutableBytes { dst in
                 compression_decode_buffer(
                     dst.baseAddress!.assumingMemoryBound(to: UInt8.self), outputCount,
-                    src.baseAddress!.assumingMemoryBound(to: UInt8.self), zlibCount,
+                    src.baseAddress!.assumingMemoryBound(to: UInt8.self), input.count,
                     nil, COMPRESSION_ZLIB
                 )
             }

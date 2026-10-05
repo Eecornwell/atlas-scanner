@@ -207,6 +207,8 @@ final class CameraInstance: NSObject, Identifiable {
             at: destURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        // Remove stale file so fetchResource can write a fresh one.
+        try? FileManager.default.removeItem(at: destURL)
 
         return await withCheckedContinuation { continuation in
             INSCameraHTTPManager.socket().fetchResource(
@@ -214,7 +216,8 @@ final class CameraInstance: NSObject, Identifiable {
                 toLocalFile: destURL,
                 progress: { _ in }
             ) { error in
-                if error != nil {
+                if let error {
+                    print("[Insta360] download failed: \(error)")
                     continuation.resume(returning: nil)
                     return
                 }
