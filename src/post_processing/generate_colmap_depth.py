@@ -376,7 +376,7 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
 
                     existing = np.where(
                         weight_acc[vj, uj] > 0,
-                        depth_acc[vj, uj] / weight_acc[vj, uj],
+                        depth_acc[vj, uj] / np.maximum(weight_acc[vj, uj], 1e-9),
                         np.inf
                     )
                     write = z_r < existing

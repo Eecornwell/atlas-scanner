@@ -137,17 +137,35 @@ def _load_calibration_for_scan(scan_dir, session_path):
     except OSError:
         pass
 
-    # Always resolve hw from multi_camera.yaml by cam_idx — the serial is only
-    # needed for cam_index_for_scan (already resolved above). Even without a
-    # serial, the slot index uniquely identifies the camera in a fixed rig.
+    # In a multi-camera session, resolve hw from multi_camera.yaml by cam_idx
+    # so each camera slot gets its own calibration. In a single-camera session
+    # (e.g. OAK-1 only) the SDK always assigns cam_idx=0 regardless of physical
+    # slot, so the slot lookup would wrongly return cam_0 (X5). Skip the lookup
+    # when session_hw already identifies a specific single-camera hw.
     mc_path = Path(__file__).resolve().parent.parent / 'config' / 'multi_camera.yaml'
     if mc_path.exists():
         try:
             mc = yaml.safe_load(mc_path.read_text()) or {}
-            slot_hw = mc.get('cameras', {}).get(
-                f'cam_{cam_idx}', {}).get('camera_hw', '')
-            if slot_hw:
-                hw = slot_hw
+            cameras_mc = mc.get('cameras', {})
+            # Only use slot lookup when the session is genuinely multi-camera:
+            # check if any sibling scan dirs have a different cam_idx, meaning
+            # multiple cameras were active. In a single-camera session the SDK
+            # always assigns cam_idx=0 regardless of physical slot.
+            sibling_indices = set()
+            try:
+                for _sd in Path(scan_dir).parent.glob('fusion_scan_*'):
+                    _ci = (_sd / '.cam_index')
+                    if _ci.exists():
+                        _parts = _ci.read_text().strip().split()
+                        if _parts:
+                            sibling_indices.add(int(_parts[0]))
+            except Exception:
+                pass
+            is_multi_cam_session = len(sibling_indices) > 1
+            if is_multi_cam_session:
+                slot_hw = cameras_mc.get(f'cam_{cam_idx}', {}).get('camera_hw', '')
+                if slot_hw:
+                    hw = slot_hw
         except Exception:
             pass
 
@@ -314,6 +332,7 @@ def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size,
 
 def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size):
     """Add OAK-1 pinhole images from a mixed session into face_oak1/.
+    Copies undistorted PNGs directly with native intrinsics — no reprojection.
     Called after ERP tiling so both camera types end up in COLMAP."""
     images_dir = colmap_dir / 'images' / 'face_oak1'
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -326,10 +345,12 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
         if img_src is None:
             continue
 
-        ci_path = scan_dir / 'camera_info.yaml'
+        # Intrinsics are in the sidecar .yaml next to the undistorted image
+        ci_path = img_src.with_suffix('.yaml')
         if not ci_path.exists():
-            ci_path = session_path / 'camera_info.yaml'
+            ci_path = img_src.with_name(img_src.stem + '.yaml')
         if not ci_path.exists():
+            print(f'  OAK-1: no intrinsics yaml for {img_src.name}, skipping')
             continue
         import yaml as _yaml
         ci = _yaml.safe_load(ci_path.read_text())
@@ -337,11 +358,13 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
         if img is None:
             continue
         ih, iw = img.shape[:2]
+        # Scale intrinsics to actual image size (yaml may store original capture size)
         sx, sy = iw / ci['width'], ih / ci['height']
-        fx = ci['fx'] * sx
-        fy = ci['fy'] * sy
+        fx  = ci['fx'] * sx
+        fy  = ci['fy'] * sy
         cx_k = ci['cx'] * sx
         cy_k = ci['cy'] * sy
+        f_px = (fx + fy) / 2.0
 
         T_scan = _load_calibration_for_scan(scan_dir, session_path)
         pose = _load_pose(scan_dir, T_scan)
@@ -349,38 +372,18 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
 
-        # Reproject OAK-1 image into the canonical tile format (same FOV and
-        # resolution as ERP tiles) so all cameras are identical to Gaussian
-        # Splatting. Mixed camera models/resolutions degrade GS quality.
-        # We render a central perspective crop at FOV_DEG using the OAK-1
-        # intrinsics, then resize to tile_size x tile_size.
-        _tile = tile_size  # canonical tile size from ERP pipeline
-        _f_tile = _tile / (2 * np.tan(np.radians(FOV_DEG / 2)))
-        _c_tile = _tile / 2.0
-        # Build pixel ray grid for the output tile
-        _x, _y = np.meshgrid(np.arange(_tile) + 0.5, np.arange(_tile) + 0.5)
-        _rays = np.stack([(_x - _c_tile) / _f_tile,
-                          (_y - _c_tile) / _f_tile,
-                          np.ones((_tile, _tile))], axis=-1)
-        # Project rays into OAK-1 pixel coords using its intrinsics
-        _u = (_rays[:,:,0] * fx + cx_k).astype(np.float32)
-        _v = (_rays[:,:,1] * fy + cy_k).astype(np.float32)
-        # Only keep rays that land within the OAK-1 image
-        _valid = (_u >= 0) & (_u < iw) & (_v >= 0) & (_v < ih)
-        _u = np.clip(_u, 0, iw - 1)
-        _v = np.clip(_v, 0, ih - 1)
-        tile_img = cv2.remap(img, _u, _v, cv2.INTER_LANCZOS4,
-                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # Zero out pixels outside the OAK-1 FOV — np.clip above prevents
-        # BORDER_CONSTANT from zeroing them, causing edge smearing instead.
-        tile_img[~_valid] = 0
-        # Write mask: white where OAK-1 FOV covers the tile, black where it doesn't
-        tile_mask = (_valid.astype(np.uint8) * 255)
-
         fname = f"pano_{len(panoramas):03d}.png"
         dst = images_dir / fname
-        cv2.imwrite(str(dst), tile_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
-        cv2.imwrite(str(mask_dir / f'{fname}.png'), tile_mask)
+        import shutil as _shutil
+        _shutil.copy2(str(img_src), str(dst))
+
+        # Copy undistorted mask if present
+        mask_src = scan_dir / (img_src.stem.replace('_undistorted', '_undistorted_mask') + '.png')
+        if not mask_src.exists():
+            mask_src = img_src.with_name(img_src.stem + '_mask.png')
+        if mask_src.exists():
+            cv2.imwrite(str(mask_dir / f'{fname}.png'),
+                        cv2.imread(str(mask_src), cv2.IMREAD_UNCHANGED))
 
         R_w2c = R_c2w_col.T
         T_tile = -R_w2c @ C_col
@@ -394,12 +397,11 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             'center': C_col,
             'R_c2w': R_c2w_col,
             'R_c2w_ros': R_c2w_ros,
-            'f_px': _f_tile,          # canonical focal length, same as ERP tiles
-            'tile_size': _tile,
-            'img_w': _tile, 'img_h': _tile,
-            # cx/cy mark this as an OAK-1 panorama so run_pipeline creates a
-            # PINHOLE camera entry in the DB with the correct intrinsics.
-            'cx': _tile / 2.0, 'cy': _tile / 2.0,
+            'f_px': f_px,
+            'tile_size': iw,
+            'img_w': iw, 'img_h': ih,
+            # cx/cy mark this as an OAK-1 panorama (PINHOLE, not SIMPLE_PINHOLE)
+            'cx': cx_k, 'cy': cy_k,
             'active_faces': [0],
             'tiles': [{
                 'face': 0,
@@ -409,6 +411,11 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             }],
         })
 
+    if panoramas:
+        print(f'  OAK-1 extra: {len(panoramas)} images  '
+              f'f_px={panoramas[0]["f_px"]:.1f}  '
+              f'cx={panoramas[0]["cx"]:.1f}  cy={panoramas[0]["cy"]:.1f}  '
+              f'{panoramas[0]["img_w"]}x{panoramas[0]["img_h"]}')
     return panoramas
 
 

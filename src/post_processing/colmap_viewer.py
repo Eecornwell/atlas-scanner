@@ -177,14 +177,15 @@ def generate_html(sparse_dir, output_path, max_pts=200000):
     sfm_pts  = np.zeros((0, 3), dtype=np.float32)
     sfm_cols = np.zeros((0, 3), dtype=np.float32)
     recon_ply = sparse_dir.parent / 'reconstructed.ply'
-    if recon_ply.exists():
+    if recon_ply.exists() and recon_ply.stat().st_size > 128:
         try:
             import open3d as _o3d
             _pcd = _o3d.io.read_point_cloud(str(recon_ply))
             sfm_pts  = np.asarray(_pcd.points, dtype=np.float32)
             sfm_cols = np.asarray(_pcd.colors, dtype=np.float32) if _pcd.has_colors() \
                        else np.zeros((len(sfm_pts), 3), dtype=np.float32)
-            print(f'  SfM PLY: {len(sfm_pts)} points from {recon_ply.name}')
+            if len(sfm_pts) > 0:
+                print(f'  SfM PLY: {len(sfm_pts)} points from {recon_ply.name}')
         except Exception as _e:
             print(f'  ⚠ Could not load SfM PLY: {_e}')
 
