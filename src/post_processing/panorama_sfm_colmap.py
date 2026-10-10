@@ -374,16 +374,61 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
 
         fname = f"pano_{len(panoramas):03d}.png"
         dst = images_dir / fname
-        import shutil as _shutil
-        _shutil.copy2(str(img_src), str(dst))
 
-        # Copy undistorted mask if present
+        # Pad image to canonical square size, centering content
+        _cs = tile_size  # canonical_size (e.g. 1536)
+        if iw != _cs or ih != _cs:
+            canvas = np.zeros((_cs, _cs, img.shape[2]), dtype=img.dtype)
+            # Center crop if larger than canvas
+            _img = img
+            _ih, _iw = ih, iw
+            if _iw > _cs:
+                _x0 = (_iw - _cs) // 2
+                _img = _img[:, _x0:_x0 + _cs]
+                _iw = _cs
+            if _ih > _cs:
+                _y0 = (_ih - _cs) // 2
+                _img = _img[_y0:_y0 + _cs, :]
+                _ih = _cs
+            _pad_x = (_cs - _iw) // 2
+            _pad_y = (_cs - _ih) // 2
+            canvas[_pad_y:_pad_y + _ih, _pad_x:_pad_x + _iw] = _img
+            out_img = canvas
+            # Adjust principal point for padding
+            cx_k = cx_k * (_iw / iw) + _pad_x
+            cy_k = cy_k * (_ih / ih) + _pad_y
+        else:
+            out_img = img
+            _pad_x, _pad_y = 0, 0
+        cv2.imwrite(str(dst), out_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+
+        # Copy undistorted mask if present, also padded to canonical size
         mask_src = scan_dir / (img_src.stem.replace('_undistorted', '_undistorted_mask') + '.png')
         if not mask_src.exists():
             mask_src = img_src.with_name(img_src.stem + '_mask.png')
         if mask_src.exists():
-            cv2.imwrite(str(mask_dir / f'{fname}.png'),
-                        cv2.imread(str(mask_src), cv2.IMREAD_UNCHANGED))
+            _mask = cv2.imread(str(mask_src), cv2.IMREAD_UNCHANGED)
+            if _mask is not None and (iw != _cs or ih != _cs):
+                _mh, _mw = _mask.shape[:2]
+                _mc = np.zeros((_cs, _cs), dtype=_mask.dtype) if _mask.ndim == 2 \
+                      else np.zeros((_cs, _cs, _mask.shape[2]), dtype=_mask.dtype)
+                if _mw > _cs:
+                    _mask = _mask[:, (_mw - _cs)//2:(_mw - _cs)//2 + _cs]
+                    _mw = _cs
+                if _mh > _cs:
+                    _mask = _mask[(_mh - _cs)//2:(_mh - _cs)//2 + _cs, :]
+                    _mh = _cs
+                _mc[_pad_y:_pad_y + _mh, _pad_x:_pad_x + _mw] = _mask
+                _mask = _mc
+            if _mask is not None:
+                cv2.imwrite(str(mask_dir / f'{fname}.png'), _mask)
+        else:
+            # No source mask — create one marking only the content area as valid
+            _mc = np.zeros((_cs, _cs), dtype=np.uint8)
+            _ih2 = min(ih, _cs)
+            _iw2 = min(iw, _cs)
+            _mc[_pad_y:_pad_y + _ih2, _pad_x:_pad_x + _iw2] = 255
+            cv2.imwrite(str(mask_dir / f'{fname}.png'), _mc)
 
         R_w2c = R_c2w_col.T
         T_tile = -R_w2c @ C_col
@@ -398,9 +443,9 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             'R_c2w': R_c2w_col,
             'R_c2w_ros': R_c2w_ros,
             'f_px': f_px,
-            'tile_size': iw,
-            'img_w': iw, 'img_h': ih,
-            # cx/cy mark this as an OAK-1 panorama (PINHOLE, not SIMPLE_PINHOLE)
+            'tile_size': _cs,
+            'img_w': _cs, 'img_h': _cs,
+            # cx/cy adjusted for padding
             'cx': cx_k, 'cy': cy_k,
             'active_faces': [0],
             'tiles': [{

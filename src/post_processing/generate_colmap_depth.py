@@ -444,7 +444,10 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
     cameras = _read_cameras(sparse_dir / 'cameras.bin')
     images  = _read_images(sparse_dir  / 'images.bin')
 
-    canonical_size = max(c['w'] for c in cameras.values())
+    # Canonical size is the ERP tile size — exclude non-square cameras (OAK-1)
+    # which use PINHOLE model (1) with w != h and would inflate the canonical size.
+    erp_cameras = {cid: c for cid, c in cameras.items() if c['w'] == c['h']}
+    canonical_size = max(c['w'] for c in erp_cameras.values()) if erp_cameras else max(c['w'] for c in cameras.values())
 
     T_camera_lidar = _load_T_camera_lidar(session)
     T_lidar_camera = np.linalg.inv(T_camera_lidar)
@@ -535,13 +538,25 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
 
             depth_img = _render_depth(pts_colmap, R_w2c, t_w2c, f_px, cx, cy, w, h,
                                       radius=radius, rgb_guide=rgb_guide)
-            if w < canonical_size:
-                pad_x = (canonical_size - w) // 2
-                pad_y = (canonical_size - h) // 2
-                depth_img = cv2.copyMakeBorder(
-                    depth_img, pad_y, canonical_size - h - pad_y,
-                    pad_x, canonical_size - w - pad_x,
-                    cv2.BORDER_CONSTANT, value=0)
+            if w != canonical_size or h != canonical_size:
+                # Pad or crop to canonical_size x canonical_size by centering.
+                # OAK-1 (1920x1080) and small ERP tiles both get centered into
+                # the canonical square canvas with zero border.
+                canvas = np.zeros((canonical_size, canonical_size), dtype=np.uint16)
+                src_h, src_w = depth_img.shape[:2]
+                # Center crop if larger than canvas, else pad
+                if src_w > canonical_size:
+                    x0 = (src_w - canonical_size) // 2
+                    depth_img = depth_img[:, x0:x0 + canonical_size]
+                    src_w = canonical_size
+                if src_h > canonical_size:
+                    y0 = (src_h - canonical_size) // 2
+                    depth_img = depth_img[y0:y0 + canonical_size, :]
+                    src_h = canonical_size
+                pad_x = (canonical_size - src_w) // 2
+                pad_y = (canonical_size - src_h) // 2
+                canvas[pad_y:pad_y + src_h, pad_x:pad_x + src_w] = depth_img
+                depth_img = canvas
             out   = depth_root / rel
             out.parent.mkdir(parents=True, exist_ok=True)
             try:
