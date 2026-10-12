@@ -22,6 +22,16 @@ final class CalibrationManager: ObservableObject {
     @Published var reprojectionError: Float = 0
     @Published var matchCount: Int = 0
     @Published var frameDebugInfo: String = ""
+    @Published var maskStatus: String = ""
+    @Published var colorProfileStatus: String = ""
+    @Published var colorProfile: ColorProfile?
+    @Published var colorPreviewIphone: UIImage?
+    @Published var colorPreviewOriginal: UIImage?
+    @Published var colorPreviewCorrected: UIImage?
+    @Published var featureRefineStatus: String = ""
+    @Published var featureMatchCount: Int = 0
+    @Published var featurePreviewIphone: UIImage?
+    @Published var featurePreviewSlice: UIImage?
 
     private(set) var calibrationFrames: [CalibrationFrame] = []
     var lastFrame: CalibrationFrame? { calibrationFrames.last }
@@ -51,57 +61,292 @@ final class CalibrationManager: ObservableObject {
         state = .optimizing
         optimizeError = nil
 
-        print("[Calib] building LiDAR bearings from depth \(frame.depthW)x\(frame.depthH)")
-        let bearings = ExtrinsicOptimizer.buildBearings(frame: frame)
-        print("[Calib] \(bearings.count) valid bearings")
-
-        guard !bearings.isEmpty else {
-            optimizeError = "No valid depth points"
+        guard let iphoneImg = frame.iphoneImage else {
+            optimizeError = "No iPhone image for calibration"
             state = .framesCollected(calibrationFrames.count)
             return
         }
 
-        print("[Calib] computing Insta360 edge map")
-        guard let edges = ExtrinsicOptimizer.sobelEdges(
-            from: frame.erpImage
-        ) else {
+        guard let erpCG = frame.erpImage.cgImage else {
             optimizeError = "Could not process Insta360 image"
             state = .framesCollected(calibrationFrames.count)
             return
         }
-        print("[Calib] edge map \(edges.w)x\(edges.h), running Nelder-Mead...")
 
-        let edgeMap = edges.edges
-        let edgeW = edges.w
-        let edgeH = edges.h
+        let outW = 256
+        let outH = 192
+        let di = frame.depthIntrinsics()
+        let fx = di.fx * Float(outW) / Float(frame.depthW)
+        let fy = di.fy * Float(outH) / Float(frame.depthH)
+        let cx = di.cx * Float(outW) / Float(frame.depthW)
+        let cy = di.cy * Float(outH) / Float(frame.depthH)
 
+        let erpW = erpCG.width
+        let erpH = erpCG.height
+        print("[Calib] photometric alignment: iPhone→\(outW)×\(outH),"
+            + " ERP \(erpW)×\(erpH)")
+
+        guard let iphoneGray = Self.resizeToGrayscale(
+            iphoneImg, width: outW, height: outH
+        ) else {
+            optimizeError = "Failed to process iPhone image"
+            state = .framesCollected(calibrationFrames.count)
+            return
+        }
+        guard let erpGray = Self.imageToGrayscale(erpCG) else {
+            optimizeError = "Failed to process ERP image"
+            state = .framesCollected(calibrationFrames.count)
+            return
+        }
+
+        let capturedSeed = seed
         let (refined, cost) = await Task.detached(
             priority: .userInitiated
         ) {
-            ExtrinsicOptimizer.optimizeEdgeBased(
-                bearings: bearings,
-                edgeMap: edgeMap,
-                edgeW: edgeW,
-                edgeH: edgeH,
-                seed: seed
+            ExtrinsicOptimizer.optimizePhotometric(
+                iphoneGray: iphoneGray,
+                outW: outW, outH: outH,
+                erpGray: erpGray,
+                erpW: erpW, erpH: erpH,
+                fx: fx, fy: fy, cx: cx, cy: cy,
+                seed: capturedSeed
             )
         }.value
 
-        print("[Calib] done: cost=\(cost)")
+        let dRoll  = refined.roll  - seed.roll
+        let dPitch = refined.pitch - seed.pitch
+        let dYaw   = refined.yaw   - seed.yaw
+        print("[Calib] done: NCC=\(String(format: "%.4f", -cost))")
+        print("[Calib] seed  RPY=(\(seed.roll),\(seed.pitch),\(seed.yaw))")
+        print("[Calib] refined RPY=(\(refined.roll),\(refined.pitch),\(refined.yaw))")
+        print("[Calib] delta RPY=(\(String(format: "%.2f", dRoll))°,"
+            + " \(String(format: "%.2f", dPitch))°,"
+            + " \(String(format: "%.2f", dYaw))°)")
 
         refinedRPY = SIMD3(
             Float(refined.roll), Float(refined.pitch), Float(refined.yaw)
         )
         refinedXYZ = SIMD3(Float(refined.x), Float(refined.y), Float(refined.z))
-        reprojectionError = cost
-        matchCount = bearings.count
+        reprojectionError = -cost
+        matchCount = outW * outH
 
-        frameDebugInfo = frame.debugDescription
+        let deltaStr = String(
+            format: "Δ RPY=(%.2f°, %.2f°, %.2f°) NCC=%.4f",
+            dRoll, dPitch, dYaw, -cost
+        )
+        frameDebugInfo = frame.debugDescription + "\n" + deltaStr
         overlayImage = CalibrationOverlayRenderer.render(
             frame: frame, extrinsic: refined
         )
         overlayVersion += 1
         state = .done(refined)
+    }
+
+    func computeColorProfile(
+        extrinsic: RigidTransform
+    ) {
+        guard let frame = calibrationFrames.first,
+              let iphoneImg = frame.iphoneImage else {
+            colorProfileStatus = "Color: no iPhone image"
+            return
+        }
+
+        let maskImage = Self.loadMaskImage(cameraId: cameraId)
+
+        guard let profile = ColorProfileCalibrator.compute(
+            iphoneImage: iphoneImg,
+            erpImage: frame.erpImage,
+            extrinsic: extrinsic,
+            frame: frame,
+            mask: maskImage
+        ) else {
+            colorProfileStatus = "Color: computation failed"
+            return
+        }
+
+        colorProfile = profile
+        ColorProfileCalibrator.save(profile)
+        colorProfileStatus = String(
+            format: "Color: L×%.2f  a%+.1f  b%+.1f",
+            profile.lGain, profile.aOffset, profile.bOffset
+        )
+
+        let thumbW = 512.0
+
+        if let iphone = iphoneImg.cgImage {
+            let iScale = thumbW / CGFloat(iphone.width)
+            let iSize = CGSize(
+                width: thumbW,
+                height: CGFloat(iphone.height) * iScale
+            )
+            let r = UIGraphicsImageRenderer(size: iSize)
+            colorPreviewIphone = r.image { _ in
+                iphoneImg.draw(
+                    in: CGRect(origin: .zero, size: iSize)
+                )
+            }
+        }
+
+        let erpSize = frame.erpImage.size
+        if erpSize.width > thumbW {
+            let scale = thumbW / erpSize.width
+            let sz = CGSize(
+                width: thumbW,
+                height: erpSize.height * scale
+            )
+            let renderer = UIGraphicsImageRenderer(size: sz)
+            let small = renderer.image { _ in
+                frame.erpImage.draw(
+                    in: CGRect(origin: .zero, size: sz)
+                )
+            }
+            colorPreviewOriginal = small
+            colorPreviewCorrected = ColorProfileCalibrator.apply(
+                profile, to: small
+            )
+        } else {
+            colorPreviewOriginal = frame.erpImage
+            colorPreviewCorrected = ColorProfileCalibrator.apply(
+                profile, to: frame.erpImage
+            )
+        }
+    }
+
+    func refineWithFeatures(
+        extrinsic: RigidTransform
+    ) async {
+        guard let frame = calibrationFrames.first,
+              let iphoneImg = frame.iphoneImage else {
+            featureRefineStatus = "Features: no iPhone image"
+            return
+        }
+
+        featureRefineStatus = "Features: detecting…"
+        let maskImage = Self.loadMaskImage(cameraId: cameraId)
+        let seed = extrinsic
+
+        // Color-correct the ERP before slicing so features match
+        let erp: UIImage
+        if let cp = colorProfile {
+            erp = ColorProfileCalibrator.apply(cp, to: frame.erpImage)
+            print("[FeatureCal] using color-corrected ERP")
+        } else if let cp = ColorProfileCalibrator.load() {
+            erp = ColorProfileCalibrator.apply(cp, to: frame.erpImage)
+            print("[FeatureCal] loaded saved color profile")
+        } else {
+            erp = frame.erpImage
+            print("[FeatureCal] no color profile — using raw ERP")
+        }
+
+        let result = await Task.detached(
+            priority: .userInitiated
+        ) {
+            FeatureBasedCalibrator.calibrate(
+                iphoneImage: iphoneImg,
+                erpImage: erp,
+                seed: seed,
+                frame: frame,
+                mask: maskImage
+            )
+        }.value
+
+        // Always show previews so user can verify the slice
+        featurePreviewIphone = result.iphonePreview
+        featurePreviewSlice = result.slicePreview
+
+        guard result.matchCount > 0 else {
+            featureRefineStatus =
+                "Features: failed (too few matches — see previews)"
+            return
+        }
+
+        featureMatchCount = result.matchCount
+        featureRefineStatus = String(
+            format: "Features: %d matches, cost %.1f"
+                + " | %d/%d kps",
+            result.matchCount, result.cost,
+            result.iphoneKPCount, result.sliceKPCount
+        )
+
+        let refined = result.extrinsic
+        refinedRPY = SIMD3(
+            Float(refined.roll),
+            Float(refined.pitch),
+            Float(refined.yaw)
+        )
+        refinedXYZ = SIMD3(
+            Float(refined.x),
+            Float(refined.y),
+            Float(refined.z)
+        )
+        reprojectionError = result.cost
+
+        let dR = refined.roll - extrinsic.roll
+        let dP = refined.pitch - extrinsic.pitch
+        let dY = refined.yaw - extrinsic.yaw
+        let deltaStr = String(
+            format: "Feature Δ RPY=(%.2f°, %.2f°, %.2f°)",
+            dR, dP, dY
+        )
+        frameDebugInfo += "\n" + deltaStr
+
+        overlayImage = CalibrationOverlayRenderer.render(
+            frame: frame, extrinsic: refined
+        )
+        overlayVersion += 1
+        state = .done(refined)
+    }
+
+    private static func resizeToGrayscale(
+        _ image: UIImage, width: Int, height: Int
+    ) -> [UInt8]? {
+        let size = CGSize(width: width, height: height)
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1.0
+        let renderer = UIGraphicsImageRenderer(size: size, format: fmt)
+        let resized = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        guard let cg = resized.cgImage else { return nil }
+        return imageToGrayscale(cg)
+    }
+
+    private static func imageToGrayscale(
+        _ cg: CGImage
+    ) -> [UInt8]? {
+        let w = cg.width, h = cg.height
+        var gray = [UInt8](repeating: 0, count: w * h)
+        guard let ctx = CGContext(
+            data: &gray, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return gray
+    }
+
+    /// Expands masked pixels by `radius` in all directions so the hard
+    /// mask boundary doesn't register as an edge during optimization.
+    private static func dilateMask(
+        _ mask: [Bool], w: Int, h: Int, radius: Int
+    ) -> [Bool] {
+        var dilated = mask
+        for y in 0..<h {
+            for x in 0..<w {
+                guard mask[y * w + x] else { continue }
+                let yLo = max(0, y - radius)
+                let yHi = min(h - 1, y + radius)
+                let xLo = max(0, x - radius)
+                let xHi = min(w - 1, x + radius)
+                for dy in yLo...yHi {
+                    for dx in xLo...xHi {
+                        dilated[dy * w + dx] = true
+                    }
+                }
+            }
+        }
+        return dilated
     }
 
     /// Saves the refined extrinsic to Documents/atlas_sessions/multi_camera.yaml.
@@ -120,6 +365,44 @@ final class CalibrationManager: ObservableObject {
         config = MultiCameraConfig(cameras: updated, iphone: config.iphone)
         try config.saveToDocuments()
         state = .saved
+    }
+
+    static func loadMaskImage(cameraId: String) -> UIImage? {
+        guard let dir = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+        ).first else {
+            print("[Calib] loadMask: no Documents dir")
+            return nil
+        }
+        let url = dir
+            .appendingPathComponent("atlas_sessions/masks")
+            .appendingPathComponent("\(cameraId).png")
+        let exists = FileManager.default.fileExists(atPath: url.path)
+        print("[Calib] loadMask: \(url.path) exists=\(exists)")
+
+        if !exists {
+            let masksDir = dir.appendingPathComponent("atlas_sessions/masks")
+            if let files = try? FileManager.default.contentsOfDirectory(
+                at: masksDir, includingPropertiesForKeys: nil
+            ) {
+                print("[Calib] loadMask: masks dir contains \(files.map { $0.lastPathComponent })")
+            } else {
+                print("[Calib] loadMask: masks dir does not exist or is empty")
+            }
+            return nil
+        }
+
+        guard let data = try? Data(contentsOf: url) else {
+            print("[Calib] loadMask: failed to read data from \(url.path)")
+            return nil
+        }
+        print("[Calib] loadMask: read \(data.count) bytes")
+        guard let img = UIImage(data: data) else {
+            print("[Calib] loadMask: UIImage(data:) failed")
+            return nil
+        }
+        print("[Calib] loadMask: loaded \(Int(img.size.width))x\(Int(img.size.height))")
+        return img
     }
 
     // MARK: - State
@@ -157,6 +440,7 @@ struct CalibrationFrame {
     let imageResW: Int          // camera.imageResolution.width — may differ on portrait apps
     let imageResH: Int          // camera.imageResolution.height — may differ on portrait apps
     let erpImage: UIImage       // Insta360 equirectangular
+    let iphoneImage: UIImage?   // iPhone RGB (landscape, for color calibration)
 
     struct DepthIntrinsics {
         let fx: Float
@@ -213,210 +497,3 @@ struct CalibrationFrame {
     }
 }
 
-// MARK: - Dual-fisheye → ERP stitcher
-
-enum DualFisheyeStitcher {
-
-    static func isDualFisheye(_ image: UIImage) -> Bool {
-        guard let cg = image.cgImage else { return false }
-        let ratio = Float(cg.width) / Float(cg.height)
-        guard ratio > 1.8 && ratio < 2.2 else { return false }
-
-        let checkW = 64, checkH = 32
-        var pixels = [UInt8](repeating: 0, count: checkW * checkH * 4)
-        guard let ctx = CGContext(
-            data: &pixels, width: checkW, height: checkH,
-            bitsPerComponent: 8, bytesPerRow: checkW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return false }
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: checkW, height: checkH))
-
-        var total: Float = 0
-        var count = 0
-        let patch = 4
-        for (cx, cy) in [(0, 0), (checkW - patch, 0),
-                          (0, checkH - patch), (checkW - patch, checkH - patch)] {
-            for dy in 0..<patch {
-                for dx in 0..<patch {
-                    let off = ((cy + dy) * checkW + (cx + dx)) * 4
-                    let luma = (Float(pixels[off]) + Float(pixels[off + 1])
-                                + Float(pixels[off + 2])) / 3
-                    total += luma
-                    count += 1
-                }
-            }
-        }
-        return (total / Float(count)) < 15
-    }
-
-    static func stitch(
-        _ dualFisheye: UIImage,
-        outputWidth: Int = 2048
-    ) -> UIImage? {
-        guard let origCG = dualFisheye.cgImage else { return nil }
-        let maxSrcW = 3072
-        let cg: CGImage
-        if origCG.width > maxSrcW {
-            let scale = CGFloat(maxSrcW) / CGFloat(origCG.width)
-            let newH = Int(CGFloat(origCG.height) * scale)
-            let renderer = UIGraphicsImageRenderer(
-                size: CGSize(width: maxSrcW, height: newH)
-            )
-            let downsampled = renderer.image { _ in
-                UIImage(cgImage: origCG).draw(
-                    in: CGRect(x: 0, y: 0, width: maxSrcW, height: newH)
-                )
-            }
-            guard let dsCG = downsampled.cgImage else { return nil }
-            cg = dsCG
-        } else {
-            cg = origCG
-        }
-        let srcW = cg.width, srcH = cg.height
-        let halfW = srcW / 2
-
-        var src = [UInt8](repeating: 0, count: srcW * srcH * 4)
-        guard let srcCtx = CGContext(
-            data: &src, width: srcW, height: srcH,
-            bitsPerComponent: 8, bytesPerRow: srcW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        srcCtx.draw(cg, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
-
-        let radius = Float(srcH) * 0.47
-        let halfFov: Float = 100 * .pi / 180
-        let focal = radius / halfFov
-
-        let fCx = Float(halfW) * 0.5
-        let fCy = Float(srcH) * 0.5
-        let bCx = Float(halfW) + Float(halfW) * 0.5
-        let bCy = Float(srcH) * 0.5
-
-        let outW = outputWidth
-        let outH = outputWidth / 2
-        var out = [UInt8](repeating: 0, count: outW * outH * 4)
-
-        let W = Float(outW), H = Float(outH)
-        let blendLo: Float = 85 * .pi / 180
-        let blendHi: Float = 95 * .pi / 180
-        let srcStride = srcW * 4
-
-        for ov in 0..<outH {
-            let lat = Float.pi * (0.5 - Float(ov) / H)
-            let cosLat = cos(lat)
-            let sinLat = sin(lat)
-
-            for ou in 0..<outW {
-                let lon = 2 * Float.pi * (Float(ou) / W - 0.5)
-                let bx = cosLat * sin(lon)
-                let by = -sinLat
-                let bz = cosLat * cos(lon)
-                let rxy = sqrt(bx * bx + by * by)
-
-                let tF = atan2(rxy, bz)
-                let tB = atan2(rxy, -bz)
-
-                let idx = (ov * outW + ou) * 4
-                var r: Float, g: Float, b: Float
-
-                if tF < blendLo {
-                    (r, g, b) = sampleLens(
-                        src: src, stride: srcStride,
-                        srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tF,
-                        cx: fCx, cy: fCy, f: focal, rad: radius,
-                        mirror: false
-                    )
-                } else if tB < blendLo {
-                    (r, g, b) = sampleLens(
-                        src: src, stride: srcStride,
-                        srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tB,
-                        cx: bCx, cy: bCy, f: focal, rad: radius,
-                        mirror: true
-                    )
-                } else {
-                    let wF = max(0, blendHi - tF)
-                    let wB = max(0, blendHi - tB)
-                    let sum = wF + wB
-                    let aF = sum > 0 ? wF / sum : 0.5
-
-                    let (fr, fg, fb) = sampleLens(
-                        src: src, stride: srcStride,
-                        srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tF,
-                        cx: fCx, cy: fCy, f: focal, rad: radius,
-                        mirror: false
-                    )
-                    let (br2, bg2, bb2) = sampleLens(
-                        src: src, stride: srcStride,
-                        srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tB,
-                        cx: bCx, cy: bCy, f: focal, rad: radius,
-                        mirror: true
-                    )
-                    r = aF * fr + (1 - aF) * br2
-                    g = aF * fg + (1 - aF) * bg2
-                    b = aF * fb + (1 - aF) * bb2
-                }
-
-                out[idx]     = UInt8(clamping: Int(r))
-                out[idx + 1] = UInt8(clamping: Int(g))
-                out[idx + 2] = UInt8(clamping: Int(b))
-                out[idx + 3] = 255
-            }
-        }
-
-        guard let outCtx = CGContext(
-            data: &out, width: outW, height: outH,
-            bitsPerComponent: 8, bytesPerRow: outW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ), let result = outCtx.makeImage() else { return nil }
-        return UIImage(cgImage: result)
-    }
-
-    private static func sampleLens(
-        src: [UInt8], stride: Int, srcW: Int, srcH: Int,
-        bx: Float, by: Float, rxy: Float, theta: Float,
-        cx: Float, cy: Float, f: Float, rad: Float,
-        mirror: Bool
-    ) -> (Float, Float, Float) {
-        let r = f * theta
-        guard r < rad else { return (0, 0, 0) }
-
-        let px: Float, py: Float
-        if rxy > 1e-6 {
-            let dx = mirror ? -bx : bx
-            px = cx + r * (dx / rxy)
-            py = cy + r * (by / rxy)
-        } else {
-            px = cx; py = cy
-        }
-
-        let ix = Int(px), iy = Int(py)
-        guard ix >= 0 && ix < srcW - 1 && iy >= 0 && iy < srcH - 1 else {
-            return (0, 0, 0)
-        }
-
-        let fx = px - Float(ix), fy = py - Float(iy)
-        let w00 = (1 - fx) * (1 - fy)
-        let w10 = fx * (1 - fy)
-        let w01 = (1 - fx) * fy
-        let w11 = fx * fy
-
-        let base = iy * stride + ix * 4
-        var rv: Float = 0, gv: Float = 0, bv: Float = 0
-        for (off, wt) in [(base, w00),
-                           (base + 4, w10),
-                           (base + stride, w01),
-                           (base + stride + 4, w11)] {
-            rv += Float(src[off]) * wt
-            gv += Float(src[off + 1]) * wt
-            bv += Float(src[off + 2]) * wt
-        }
-        return (rv, gv, bv)
-    }
-}

@@ -53,7 +53,25 @@ enum DualFisheyeStitcher {
         _ dualFisheye: UIImage,
         outputWidth: Int = 2048
     ) -> UIImage? {
-        guard let cg = dualFisheye.cgImage else { return nil }
+        guard let origCG = dualFisheye.cgImage else { return nil }
+        let maxSrcW = 3072
+        let cg: CGImage
+        if origCG.width > maxSrcW {
+            let scale = CGFloat(maxSrcW) / CGFloat(origCG.width)
+            let newH = Int(CGFloat(origCG.height) * scale)
+            let renderer = UIGraphicsImageRenderer(
+                size: CGSize(width: maxSrcW, height: newH)
+            )
+            let downsampled = renderer.image { _ in
+                UIImage(cgImage: origCG).draw(
+                    in: CGRect(x: 0, y: 0, width: maxSrcW, height: newH)
+                )
+            }
+            guard let dsCG = downsampled.cgImage else { return nil }
+            cg = dsCG
+        } else {
+            cg = origCG
+        }
         let srcW = cg.width, srcH = cg.height
         let halfW = srcW / 2
 

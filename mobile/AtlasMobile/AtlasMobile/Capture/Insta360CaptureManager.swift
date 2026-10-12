@@ -19,13 +19,38 @@ final class Insta360CaptureManager: ObservableObject {
         self.init(config: MultiCameraConfig.loadFromDeviceOrBundle())
     }
 
+    // MARK: - Thread-safe accessors
+
+    @MainActor
+    func connectedCount() -> Int {
+        connectedCameras.count
+    }
+
+    @MainActor
+    func connectedCamerasCopy() -> [CameraInstance] {
+        connectedCameras
+    }
+
+    @MainActor
+    func clockOffsetSummary() -> String? {
+        let offsets = connectedCameras.compactMap { $0.clockOffset }
+        guard !offsets.isEmpty else { return nil }
+        let descriptions = offsets.map { o in
+            if o.sampleCount == 0 {
+                return "timeout"
+            }
+            let sign = o.offsetMs >= 0 ? "+" : ""
+            return "\(sign)\(Int(o.offsetMs))ms"
+        }
+        return "sync: " + descriptions.joined(separator: ", ")
+    }
+
     // MARK: - Session lifecycle
 
     func discoverAndConnect() async {
         await MainActor.run { isConnecting = true }
         defer { Task { @MainActor in self.isConnecting = false } }
 
-        // Attempt to connect all configured cameras in parallel.
         let instances = cameraConfig.cameras.map { CameraInstance(config: $0) }
         for instance in instances {
             instance.onStatusUpdate = { [weak self] msg in
@@ -47,7 +72,6 @@ final class Insta360CaptureManager: ObservableObject {
             return result
         }
 
-        // Calibrate clock offset for each connected camera.
         await withTaskGroup(of: Void.self) { group in
             for cam in connected {
                 group.addTask { _ = await cam.calibrateClockOffset() }
@@ -98,30 +122,48 @@ final class Insta360CaptureManager: ObservableObject {
     }
 
     private func handleDisconnect(cameraId: String) {
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             self.connectedCameras.removeAll { $0.id == cameraId }
             self.onCameraDisconnected?(cameraId)
         }
     }
 
     func disconnect() async {
+        let cameras = await MainActor.run {
+            let current = connectedCameras
+            connectedCameras = []
+            return current
+        }
         await withTaskGroup(of: Void.self) { group in
-            for camera in connectedCameras {
+            for camera in cameras {
                 group.addTask { await camera.disconnect() }
             }
         }
-        await MainActor.run { connectedCameras = [] }
     }
 
     // MARK: - Capture
 
-    func captureAll(arkitTimestamp: Double, scanIndex: Int) async -> [Insta360CaptureResult] {
-        await withTaskGroup(of: Insta360CaptureResult?.self) { group in
-            for camera in connectedCameras {
+    func captureAll(arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8) async -> [Insta360CaptureResult] {
+        let cameras = await MainActor.run { connectedCameras }
+        return await captureWith(
+            cameras: cameras, arkitTimestamp: arkitTimestamp,
+            scanIndex: scanIndex, timeout: timeout
+        )
+    }
+
+    func captureWith(
+        cameras: [CameraInstance],
+        arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8
+    ) async -> [Insta360CaptureResult] {
+        guard !cameras.isEmpty else { return [] }
+        return await withTaskGroup(of: Insta360CaptureResult?.self) { group in
+            for camera in cameras {
                 group.addTask {
                     await camera.capture(
                         arkitTimestamp: arkitTimestamp,
-                        scanIndex: scanIndex
+                        scanIndex: scanIndex,
+                        timeout: timeout
                     )
                 }
             }
@@ -135,11 +177,12 @@ final class Insta360CaptureManager: ObservableObject {
 
     // MARK: - Download
 
-    /// Downloads all pending media from all cameras into the session raw/ directory.
     func downloadAllPending(into sessionDirectory: URL) async -> [Insta360DownloadResult] {
+        let cameras = await MainActor.run { connectedCameras }
+        guard !cameras.isEmpty else { return [] }
         let rawDir = sessionDirectory.appendingPathComponent("raw")
         return await withTaskGroup(of: [Insta360DownloadResult].self) { group in
-            for camera in connectedCameras {
+            for camera in cameras {
                 group.addTask { await camera.downloadPending(into: rawDir) }
             }
             var results: [Insta360DownloadResult] = []

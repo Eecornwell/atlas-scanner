@@ -153,20 +153,21 @@ enum ExtrinsicOptimizer {
         return total / Float(samples.count)
     }
 
-    // MARK: - Nelder-Mead (unchanged)
+    // MARK: - Nelder-Mead
 
     private struct NMResult { let params: [Float]; let cost: Float }
 
     private static func nelderMead(
         start: [Float],
+        steps: [Float]? = nil,
         cost: ([Float]) -> Float,
         maxIter: Int
     ) -> NMResult {
         let n = start.count
         let alpha: Float = 1.0, gamma: Float = 2.0, rho: Float = 0.5, sigma: Float = 0.5
         var simplex = [[Float]](repeating: start, count: n + 1)
-        let steps: [Float] = [0.15, 0.15, 0.15, 0.02, 0.02, 0.02]
-        for i in 0..<n { simplex[i + 1][i] += steps[i] }
+        let s = steps ?? [0.035, 0.035, 0.035, 0.005, 0.005, 0.005]
+        for i in 0..<n { simplex[i + 1][i] += s[min(i, s.count - 1)] }
         var costs = simplex.map { cost($0) }
 
         for _ in 0..<maxIter {
@@ -213,13 +214,47 @@ enum ExtrinsicOptimizer {
     static func buildBearings(frame: CalibrationFrame) -> [LiDARBearing] {
         let di = frame.depthIntrinsics()
         let fx = di.fx, fy = di.fy, cx = di.cx, cy = di.cy
+        let w = frame.depthW, h = frame.depthH
+
+        var depthGrad = [Float](repeating: 0, count: w * h)
+        for row in 1..<(h - 1) {
+            for col in 1..<(w - 1) {
+                let c = frame.depth[row * w + col]
+                guard c > 0.1 else { continue }
+                let l = frame.depth[row * w + col - 1]
+                let r = frame.depth[row * w + col + 1]
+                let u = frame.depth[(row - 1) * w + col]
+                let d = frame.depth[(row + 1) * w + col]
+                let gx = abs(r - l) / c
+                let gy = abs(d - u) / c
+                depthGrad[row * w + col] = max(gx, gy)
+            }
+        }
+
+        var grads: [Float] = []
+        for row in 1..<(h - 1) {
+            for col in 1..<(w - 1) {
+                let g = depthGrad[row * w + col]
+                if g > 0.01 { grads.append(g) }
+            }
+        }
+        grads.sort()
+        let threshold: Float
+        if grads.count > 100 {
+            threshold = grads[grads.count - min(grads.count, 2000)]
+        } else {
+            threshold = 0.05
+        }
 
         var bearings: [LiDARBearing] = []
-        bearings.reserveCapacity(frame.depthW * frame.depthH / 4)
+        bearings.reserveCapacity(2000)
 
-        for row in 0..<frame.depthH {
-            for col in 0..<frame.depthW {
-                let z = frame.depth[row * frame.depthW + col]
+        for row in 1..<(h - 1) {
+            for col in 1..<(w - 1) {
+                guard depthGrad[row * w + col] >= threshold else {
+                    continue
+                }
+                let z = frame.depth[row * w + col]
                 guard z > 0.15 && z < 5.0 else { continue }
                 let xCam = (Float(col) - cx) / fx * z
                 let yCam = (Float(row) - cy) / fy * z
@@ -269,6 +304,7 @@ enum ExtrinsicOptimizer {
         edgeW: Int,
         edgeH: Int,
         seed: RigidTransform,
+        mask: [Bool]? = nil,
         maxIterations: Int = 1500
     ) -> (result: RigidTransform, finalCost: Float) {
         guard !bearings.isEmpty else { return (seed, Float.infinity) }
@@ -278,7 +314,8 @@ enum ExtrinsicOptimizer {
             cost: { p in
                 edgeCost(
                     p, bearings: bearings,
-                    edgeMap: edgeMap, edgeW: edgeW, edgeH: edgeH
+                    edgeMap: edgeMap, edgeW: edgeW, edgeH: edgeH,
+                    mask: mask
                 )
             },
             maxIter: maxIterations
@@ -286,12 +323,29 @@ enum ExtrinsicOptimizer {
         return (paramsToRigidTransform(nm.params), nm.cost)
     }
 
+    /// Loads an ERP mask image and returns a Bool array (true = masked).
+    static func loadMaskBool(
+        _ maskImage: UIImage?, w: Int, h: Int
+    ) -> [Bool]? {
+        guard let cg = maskImage?.cgImage else { return nil }
+        var gray = [UInt8](repeating: 0, count: w * h)
+        guard let ctx = CGContext(
+            data: &gray, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return gray.map { $0 > 128 }
+    }
+
     private static func edgeCost(
         _ params: [Float],
         bearings: [LiDARBearing],
         edgeMap: [Float],
         edgeW: Int,
-        edgeH: Int
+        edgeH: Int,
+        mask: [Bool]?
     ) -> Float {
         let T = paramsToMatrix(params)
         let R = simd_float3x3(
@@ -301,6 +355,7 @@ enum ExtrinsicOptimizer {
         )
         let W = Float(edgeW), H = Float(edgeH)
         var total: Float = 0
+        var count = 0
 
         for b in bearings {
             let rotated = erpCorrection * simd_normalize(R * b.bearing)
@@ -309,9 +364,162 @@ enum ExtrinsicOptimizer {
             let u = Int(W * (0.5 + lon / (2 * .pi))) % edgeW
             let v = max(0, min(edgeH - 1, Int(H * (0.5 - lat / .pi))))
             guard u >= 0 else { continue }
-            total += edgeMap[v * edgeW + u]
+            let idx = v * edgeW + u
+            if let m = mask, m[idx] { continue }
+            total += edgeMap[idx]
+            count += 1
         }
-        return -total / Float(bearings.count)
+        guard count > 0 else { return 0 }
+        return -total / Float(count)
+    }
+
+    // MARK: - Photometric optimization (dense NCC)
+
+    static func optimizePhotometric(
+        iphoneGray: [UInt8],
+        outW: Int,
+        outH: Int,
+        erpGray: [UInt8],
+        erpW: Int,
+        erpH: Int,
+        fx: Float, fy: Float, cx: Float, cy: Float,
+        seed: RigidTransform,
+        maxIterations: Int = 800
+    ) -> (result: RigidTransform, finalCost: Float) {
+        let n = outW * outH
+        guard n > 0 else { return (seed, 0) }
+
+        // Neutralize Insta360 stitch seam — replace with median gray
+        // so seam artifacts don't create false NCC signal.
+        let seam = seamColumns(erpW: erpW)
+        var cleanErp = erpGray
+        if !seam.isEmpty {
+            let sorted = erpGray.sorted()
+            let median = sorted[erpGray.count / 2]
+            for col in seam {
+                for row in 0..<erpH {
+                    cleanErp[row * erpW + col] = median
+                }
+            }
+        }
+
+        // Precompute iPhone statistics for NCC
+        var sumA: Float = 0
+        var sumA2: Float = 0
+        for v in iphoneGray {
+            let fv = Float(v)
+            sumA += fv
+            sumA2 += fv * fv
+        }
+        let meanA = sumA / Float(n)
+        let stdA = sqrt(max(0, sumA2 - Float(n) * meanA * meanA))
+        guard stdA > 1 else { return (seed, 0) }
+
+        // Precompute ray directions (camera frame, don't change per eval)
+        var rays = [SIMD3<Float>](repeating: .zero, count: n)
+        for row in 0..<outH {
+            for col in 0..<outW {
+                let xCam = (Float(col) - cx) / fx
+                let yCam = (Float(row) - cy) / fy
+                rays[row * outW + col] = simd_normalize(
+                    SIMD3<Float>(-xCam, -yCam, 1.0)
+                )
+            }
+        }
+
+        let eWf = Float(erpW), eHf = Float(erpH)
+
+        let startParams: [Float] = [
+            Float(seed.roll * .pi / 180),
+            Float(seed.pitch * .pi / 180),
+            Float(seed.yaw * .pi / 180),
+        ]
+
+        let nm = nelderMead(
+            start: startParams,
+            steps: [0.087, 0.087, 0.087],
+            cost: { params in
+                let r = params[0], p = params[1], y = params[2]
+                let cr = cos(r), sr = sin(r)
+                let cp = cos(p), sp = sin(p)
+                let cy = cos(y), sy = sin(y)
+                let rSeed = simd_float3x3(rows: [
+                    SIMD3(cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr),
+                    SIMD3(sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr),
+                    SIMD3(-sp,   cp*sr,            cp*cr),
+                ])
+                let R = basisC * rSeed * basisD
+
+                var sumB: Float = 0
+                var sumB2: Float = 0
+                var sumAB: Float = 0
+
+                for i in 0..<n {
+                    let rotated = erpCorrection * (R * rays[i])
+                    let lat = -asin(max(-1, min(1, rotated.y)))
+                    let lon = atan2(rotated.x, rotated.z)
+
+                    var uf = eWf * (0.5 + lon / (2 * .pi)) - 0.5
+                    let vf = eHf * (0.5 - lat / .pi) - 0.5
+                    if uf < 0 { uf += eWf }
+                    if uf >= eWf { uf -= eWf }
+
+                    let u0 = Int(uf)
+                    let v0 = max(0, min(erpH - 1, Int(vf)))
+                    let u1 = (u0 + 1) % erpW
+                    let v1 = min(erpH - 1, v0 + 1)
+                    let fu = uf - Float(u0)
+                    let fv = vf - Float(v0)
+
+                    let p00 = Float(cleanErp[v0 * erpW + u0])
+                    let p10 = Float(cleanErp[v0 * erpW + u1])
+                    let p01 = Float(cleanErp[v1 * erpW + u0])
+                    let p11 = Float(cleanErp[v1 * erpW + u1])
+                    let val = (p00 + (p10 - p00) * fu)
+                        * (1 - fv)
+                        + (p01 + (p11 - p01) * fu) * fv
+
+                    sumB += val
+                    sumB2 += val * val
+                    sumAB += Float(iphoneGray[i]) * val
+                }
+
+                let meanB = sumB / Float(n)
+                let stdB = sqrt(
+                    max(0, sumB2 - Float(n) * meanB * meanB)
+                )
+                guard stdB > 1 else { return Float(0) }
+                let ncc = (sumAB - Float(n) * meanA * meanB)
+                    / (stdA * stdB)
+                return -ncc
+            },
+            maxIter: maxIterations
+        )
+
+        let result = RigidTransform(
+            roll: Double(nm.params[0] * 180 / .pi),
+            pitch: Double(nm.params[1] * 180 / .pi),
+            yaw: Double(nm.params[2] * 180 / .pi),
+            x: seed.x, y: seed.y, z: seed.z
+        )
+        return (result, nm.cost)
+    }
+
+    // MARK: - Stitch seam masking
+
+    /// Returns ERP column indices that fall within the Insta360 stitch seam.
+    /// The two fisheye lenses meet at lon=±90° → columns W/4 and 3W/4.
+    /// Band width scales with resolution (~2.5° each side).
+    static func seamColumns(erpW: Int) -> Set<Int> {
+        let band = max(15, erpW / 100)
+        let centers = [erpW / 4, erpW * 3 / 4]
+        var cols = Set<Int>()
+        for c in centers {
+            for dx in -band...band {
+                cols.insert(((c + dx) % erpW + erpW) % erpW)
+            }
+        }
+        return cols
     }
 
     // MARK: - Coordinate frame conversion

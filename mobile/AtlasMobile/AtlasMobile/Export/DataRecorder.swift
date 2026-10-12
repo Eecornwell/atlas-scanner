@@ -9,6 +9,7 @@ final class DataRecorder {
 
     private let iphoneDir: URL
     private let encoder = JSONEncoder()
+    private let ciContext = CIContext()
 
     init(sessionDirectory: URL) {
         self.sessionDirectory = sessionDirectory
@@ -21,26 +22,20 @@ final class DataRecorder {
         scanIndex: Int,
         arkitFrame: ARKitFrameData,
         insta360Results: [Insta360CaptureResult]
-    ) async {
+    ) {
         let scanName = String(format: "scan_%03d", scanIndex)
         let scanDir = iphoneDir.appendingPathComponent(scanName)
         try? FileManager.default.createDirectory(at: scanDir, withIntermediateDirectories: true)
 
-        // Save iPhone RGB
-        await savePixelBufferAsJPEG(arkitFrame.capturedImage, to: scanDir.appendingPathComponent("rgb.jpg"))
-
-        // Save depth map (Float32 binary)
-        saveDepthMap(arkitFrame.depthMap, to: scanDir.appendingPathComponent("depth.bin"))
-
-        // Save confidence map (UInt8 binary)
-        saveConfidenceMap(arkitFrame.confidenceMap, to: scanDir.appendingPathComponent("confidence.bin"))
-
-        // Save smoothed depth if available
-        if let smoothed = arkitFrame.smoothedDepthMap {
-            saveDepthMap(smoothed, to: scanDir.appendingPathComponent("depth_smoothed.bin"))
+        autoreleasepool {
+            savePixelBufferAsJPEG(arkitFrame.capturedImage, to: scanDir.appendingPathComponent("rgb.jpg"))
+            saveDepthMap(arkitFrame.depthMap, to: scanDir.appendingPathComponent("depth.bin"))
+            saveConfidenceMap(arkitFrame.confidenceMap, to: scanDir.appendingPathComponent("confidence.bin"))
+            if let smoothed = arkitFrame.smoothedDepthMap {
+                saveDepthMap(smoothed, to: scanDir.appendingPathComponent("depth_smoothed.bin"))
+            }
         }
 
-        // Save pose JSON
         let poseData = ScanPose(
             timestamp: arkitFrame.timestamp,
             transformMatrix: matrixToArray(arkitFrame.pose),
@@ -180,12 +175,11 @@ final class DataRecorder {
         try? data.write(to: url)
     }
 
-    private func savePixelBufferAsJPEG(_ pixelBuffer: CVPixelBuffer, to url: URL) async {
+    private func savePixelBufferAsJPEG(_ pixelBuffer: CVPixelBuffer, to url: URL) {
         // ARKit's capturedImage is always landscape (native sensor).
         // Rotate 90° CW so the saved JPEG matches portrait phone orientation.
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-        let context = CIContext()
-        guard let data = context.jpegRepresentation(
+        guard let data = ciContext.jpegRepresentation(
             of: ciImage,
             colorSpace: CGColorSpaceCreateDeviceRGB()
         ) else { return }

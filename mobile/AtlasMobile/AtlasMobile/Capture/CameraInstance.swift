@@ -36,7 +36,7 @@ final class CameraInstance: NSObject, Identifiable {
         onStatusUpdate?("[\(id)] Waiting for SDK connection...")
 
         var didResume = false
-        return await withCheckedContinuation { continuation in
+        return await withUnsafeContinuation { continuation in
             func finish(_ result: Bool) {
                 guard !didResume else { return }
                 didResume = true
@@ -69,18 +69,23 @@ final class CameraInstance: NSObject, Identifiable {
                     \.cameraState,
                     options: [.new]
                 ) { [weak self] _, change in
-                    guard let self, let state = change.newValue else { return }
-                    self.onStatusUpdate?("[\(self.id)] State → \(Self.stateName(state))")
-                    if state == .connected {
-                        self.kvoToken = nil
-                        self.isConnected = true
-                        self.startHeartbeat()
-                        self.monitorConnection()
-                        self.onStatusUpdate?("[\(self.id)] Connected!")
-                        finish(true)
-                    } else if state == .connectFailed {
-                        self.kvoToken = nil
-                        finish(false)
+                    guard let state = change.newValue else { return }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.onStatusUpdate?(
+                            "[\(self.id)] State → \(Self.stateName(state))"
+                        )
+                        if state == .connected {
+                            self.kvoToken = nil
+                            self.isConnected = true
+                            self.startHeartbeat()
+                            self.monitorConnection()
+                            self.onStatusUpdate?("[\(self.id)] Connected!")
+                            finish(true)
+                        } else if state == .connectFailed {
+                            self.kvoToken = nil
+                            finish(false)
+                        }
                     }
                 }
 
@@ -109,7 +114,14 @@ final class CameraInstance: NSObject, Identifiable {
         stopHeartbeat()
         kvoToken = nil
         disconnectToken = nil
+        onDisconnect = nil
+        onStatusUpdate = nil
         isConnected = false
+        pendingURIs.removeAll()
+    }
+
+    func clearPending() {
+        pendingURIs.removeAll()
     }
 
     func reconnect(maxRetries: Int = 3) async -> Bool {
@@ -129,36 +141,66 @@ final class CameraInstance: NSObject, Identifiable {
     // MARK: - Clock offset
 
     func calibrateClockOffset() async -> ClockOffset {
-        return await withCheckedContinuation { continuation in
+        var didResume = false
+        return await withUnsafeContinuation { (continuation: UnsafeContinuation<ClockOffset, Never>) in
+            func finish(_ value: ClockOffset) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+
+            let fallback = ClockOffset(
+                offsetMs: 0, sampleCount: 0, stdDevMs: 0
+            )
+
             INSCameraManager.shared().commandManager.syncTimeMsToCamera(
                 withTryCount: kClockSyncSamples,
                 dTimeMsMax: 200
             ) { [weak self] dTimeMs, error in
-                let offset = ClockOffset(
-                    offsetMs: error == nil ? Double(dTimeMs) : 0.0,
-                    sampleCount: error == nil ? Int(kClockSyncSamples) : 0,
-                    stdDevMs: 0.0
-                )
+                let offset = error == nil
+                    ? ClockOffset(
+                        offsetMs: Double(dTimeMs),
+                        sampleCount: Int(kClockSyncSamples),
+                        stdDevMs: 0.0)
+                    : fallback
                 self?.clockOffset = offset
-                continuation.resume(returning: offset)
+                DispatchQueue.main.async { finish(offset) }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                print("[Insta360] clock calibration timeout")
+                finish(fallback)
             }
         }
     }
 
     // MARK: - Capture
 
-    func capture(arkitTimestamp: Double, scanIndex: Int) async -> Insta360CaptureResult? {
-        guard isConnected else { return nil }
-
+    func capture(arkitTimestamp: Double, scanIndex: Int, timeout: Double = 15) async -> Insta360CaptureResult? {
         let insta360Ts = Date().timeIntervalSince1970
         let options = INSTakePictureOptions()
 
-        let uri: String? = await withCheckedContinuation { continuation in
-            INSCameraManager.shared().commandManager.takePicture(with: options) { error, photoInfo in
-                if let error {
-                    print("[Insta360] capture error: \(error)")
-                }
-                continuation.resume(returning: photoInfo?.uri)
+        var didResume = false
+        let uri: String? = await withUnsafeContinuation { (continuation: UnsafeContinuation<String?, Never>) in
+            func finish(_ value: String?) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+
+            DispatchQueue.main.async {
+                INSCameraManager.shared().commandManager
+                    .takePicture(with: options) { error, photoInfo in
+                        if let error {
+                            print("[Insta360] capture error: \(error)")
+                        }
+                        DispatchQueue.main.async { finish(photoInfo?.uri) }
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+                print("[Insta360] capture timeout (\(timeout)s)")
+                finish(nil)
             }
         }
 
@@ -182,18 +224,17 @@ final class CameraInstance: NSObject, Identifiable {
         let toDownload = pendingURIs
         pendingURIs.removeAll()
 
-        return await withTaskGroup(of: Insta360DownloadResult?.self) { group in
-            for item in toDownload {
-                group.addTask {
-                    await self.downloadOne(scanIndex: item.scanIndex, uri: item.uri, into: directory)
-                }
+        var results: [Insta360DownloadResult] = []
+        for item in toDownload {
+            if let r = await downloadOne(
+                scanIndex: item.scanIndex,
+                uri: item.uri,
+                into: directory
+            ) {
+                results.append(r)
             }
-            var results: [Insta360DownloadResult] = []
-            for await result in group {
-                if let r = result { results.append(r) }
-            }
-            return results
         }
+        return results
     }
 
     // MARK: - Private
@@ -207,33 +248,52 @@ final class CameraInstance: NSObject, Identifiable {
             at: destURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        // Remove stale file so fetchResource can write a fresh one.
         try? FileManager.default.removeItem(at: destURL)
 
-        return await withCheckedContinuation { continuation in
+        let cameraId = self.id
+        var didResume = false
+        return await withUnsafeContinuation { (continuation: UnsafeContinuation<Insta360DownloadResult?, Never>) in
+            func finish(_ value: Insta360DownloadResult?) {
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: value)
+            }
+
             INSCameraHTTPManager.socket().fetchResource(
                 withURI: uri,
                 toLocalFile: destURL,
                 progress: { _ in }
             ) { error in
-                if let error {
-                    print("[Insta360] download failed: \(error)")
-                    continuation.resume(returning: nil)
-                    return
+                DispatchQueue.main.async {
+                    if let error {
+                        print("[Insta360] download failed: \(error)")
+                        finish(nil)
+                        return
+                    }
+                    finish(Insta360DownloadResult(
+                        cameraId: cameraId,
+                        scanIndex: scanIndex,
+                        localURL: destURL,
+                        mediaType: .equirectangular
+                    ))
                 }
-                continuation.resume(returning: Insta360DownloadResult(
-                    cameraId: self.id,
-                    scanIndex: scanIndex,
-                    localURL: destURL,
-                    mediaType: .equirectangular
-                ))
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                print("[Insta360] download timeout (30s)")
+                finish(nil)
             }
         }
     }
 
     private func startHeartbeat() {
-        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: kHeartbeatInterval, repeats: true) { _ in
-            INSCameraManager.shared().commandManager.sendHeartbeats(with: nil)
+        heartbeatTimer = Timer.scheduledTimer(
+            withTimeInterval: kHeartbeatInterval,
+            repeats: true
+        ) { [weak self] _ in
+            guard self?.isConnected == true else { return }
+            INSCameraManager.shared().commandManager
+                .sendHeartbeats(with: nil)
         }
     }
 
@@ -242,12 +302,20 @@ final class CameraInstance: NSObject, Identifiable {
         heartbeatTimer = nil
     }
 
+    private static let disconnectStates: Set<INSCameraState> = [
+        .connectFailed, .noConnection,
+    ]
+
     private func monitorConnection() {
         disconnectToken = INSCameraManager.socket().observe(
             \.cameraState, options: [.new]
         ) { [weak self] _, change in
-            guard let self, let state = change.newValue else { return }
-            if state != .connected && self.isConnected {
+            guard let state = change.newValue else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isConnected,
+                      Self.disconnectStates.contains(state)
+                else { return }
+                print("[Insta360] disconnect detected: \(Self.stateName(state))")
                 self.isConnected = false
                 self.stopHeartbeat()
                 self.disconnectToken = nil

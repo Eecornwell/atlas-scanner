@@ -85,13 +85,12 @@ final class COLMAPExporter {
         let f_tile = Float(tileSize) / (2.0 * tan(tileFovDeg * .pi / 360.0))
         let c_tile = Float(tileSize) / 2.0
 
-        // Camera IDs: 1 = iPhone, 2+ = one per active face
         let iphoneCameraId: UInt32 = 1
-        // We write one camera per face direction (8 faces)
         let faceCount = 8
-        let tileCameraIds: [Int: UInt32] = Dictionary(
-            uniqueKeysWithValues: (0..<faceCount).map { ($0, UInt32($0 + 2)) }
-        )
+        let hasInsta360 = scans.contains { !$0.insta360ImageURLs.isEmpty }
+        let tileCameraIds: [Int: UInt32] = hasInsta360
+            ? Dictionary(uniqueKeysWithValues: (0..<faceCount).map { ($0, UInt32($0 + 2)) })
+            : [:]
 
         // Landscape values from pose.json (sensor native frame).
         let imgW_l = first.imageWidth
@@ -129,11 +128,21 @@ final class COLMAPExporter {
 
         try writeImagesBin(entries: imageEntries)
         try writePoints3DBin(points: allPoints)
-        try writeRigsBin(cameraConfig: cameraConfig, tileCameraIds: tileCameraIds,
-                         iphoneCameraId: iphoneCameraId)
-        try writeFramesBin(scans: scans, imageEntries: imageEntries,
-                           cameraConfig: cameraConfig, iphoneCameraId: iphoneCameraId,
-                           tileCameraIds: tileCameraIds)
+
+        if hasInsta360 {
+            try writeRigsBin(
+                cameraConfig: cameraConfig,
+                tileCameraIds: tileCameraIds,
+                iphoneCameraId: iphoneCameraId
+            )
+            try writeFramesBin(
+                scans: scans,
+                imageEntries: imageEntries,
+                cameraConfig: cameraConfig,
+                iphoneCameraId: iphoneCameraId,
+                tileCameraIds: tileCameraIds
+            )
+        }
         try copyImagesAndDepths(scans: scans)
     }
 
@@ -208,36 +217,38 @@ final class COLMAPExporter {
             ))
             imageId += 1
 
-            // Insta360 face tile entries
-            for camCfg in cameraConfig.cameras {
-                let T_insta_arkit = Self.erpFromARKit(camCfg.extrinsic)
-                let T_iphone_world = T_wc.inverse
-                let T_insta_world = T_insta_arkit * T_iphone_world
+            // Insta360 face tile entries — only for scans that have ERP images
+            if !scan.insta360ImageURLs.isEmpty {
+                for camCfg in cameraConfig.cameras {
+                    let T_insta_arkit = Self.erpFromARKit(camCfg.extrinsic)
+                    let T_iphone_world = T_wc.inverse
+                    let T_insta_world = T_insta_arkit * T_iphone_world
 
-                let R_insta_w2c = simd_float3x3(
-                    SIMD3(T_insta_world.columns.0.x, T_insta_world.columns.0.y, T_insta_world.columns.0.z),
-                    SIMD3(T_insta_world.columns.1.x, T_insta_world.columns.1.y, T_insta_world.columns.1.z),
-                    SIMD3(T_insta_world.columns.2.x, T_insta_world.columns.2.y, T_insta_world.columns.2.z)
-                )
-                let t_insta = SIMD3(T_insta_world.columns.3.x,
-                                    T_insta_world.columns.3.y,
-                                    T_insta_world.columns.3.z)
-                let C_insta = -R_insta_w2c.transpose * t_insta
-                let C_insta_col = Self.arkitToColmap * C_insta
-                let R_insta_col = R_insta_w2c * Self.arkitToColmap
+                    let R_insta_w2c = simd_float3x3(
+                        SIMD3(T_insta_world.columns.0.x, T_insta_world.columns.0.y, T_insta_world.columns.0.z),
+                        SIMD3(T_insta_world.columns.1.x, T_insta_world.columns.1.y, T_insta_world.columns.1.z),
+                        SIMD3(T_insta_world.columns.2.x, T_insta_world.columns.2.y, T_insta_world.columns.2.z)
+                    )
+                    let t_insta = SIMD3(T_insta_world.columns.3.x,
+                                        T_insta_world.columns.3.y,
+                                        T_insta_world.columns.3.z)
+                    let C_insta = -R_insta_w2c.transpose * t_insta
+                    let C_insta_col = Self.arkitToColmap * C_insta
+                    let R_insta_col = R_insta_w2c * Self.arkitToColmap
 
-                for (faceIdx, camFromPano) in faceRotations.enumerated() {
-                    guard let camId = tileCameraIds[faceIdx] else { continue }
-                    let R_tile = camFromPano * R_insta_col
-                    let t_tile = -(R_tile * C_insta_col)
-                    entries.append(ImageEntry(
-                        imageId: imageId,
-                        quatWXYZ: Self.rotationToQuatWXYZ(R_tile),
-                        tvec: t_tile,
-                        cameraId: camId,
-                        name: "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
-                    ))
-                    imageId += 1
+                    for (faceIdx, camFromPano) in faceRotations.enumerated() {
+                        guard let camId = tileCameraIds[faceIdx] else { continue }
+                        let R_tile = camFromPano * R_insta_col
+                        let t_tile = -(R_tile * C_insta_col)
+                        entries.append(ImageEntry(
+                            imageId: imageId,
+                            quatWXYZ: Self.rotationToQuatWXYZ(R_tile),
+                            tvec: t_tile,
+                            cameraId: camId,
+                            name: "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
+                        ))
+                        imageId += 1
+                    }
                 }
             }
 
@@ -279,11 +290,12 @@ final class COLMAPExporter {
         let fx_l = fx * scaleX, fy_l = fy * scaleY
         let cx_l = cx * scaleX, cy_l = cy * scaleY
 
+        let step = 4
         var pts: [SIMD3<Float>] = []
-        pts.reserveCapacity(count / 4)
+        pts.reserveCapacity((lidarH / step) * (lidarW / step))
 
-        for row in 0..<lidarH {
-            for col in 0..<lidarW {
+        for row in Swift.stride(from: 0, to: lidarH, by: step) {
+            for col in Swift.stride(from: 0, to: lidarW, by: step) {
                 let z = depths[row * lidarW + col]
                 guard z > 0.1 && z < 5.0 else { continue }
                 let x_cam = (Float(col) - cx_l) / fx_l * z
@@ -319,18 +331,33 @@ final class COLMAPExporter {
     // MARK: - points3D.bin
 
     private func writePoints3DBin(points: [SIMD3<Float>]) throws {
-        var data = Data()
-        data.appendLE(UInt64(points.count))
-        for (i, p) in points.enumerated() {
-            data.appendLE(UInt64(i + 1))
-            data.appendLE(Double(p.x))
-            data.appendLE(Double(p.y))
-            data.appendLE(Double(p.z))
-            data.append(contentsOf: [UInt8(128), 128, 128])  // grey
-            data.appendLE(Double(0))   // error
-            data.appendLE(UInt64(0))   // track_len = 0
+        let url = sparseDir.appendingPathComponent("points3D.bin")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+
+        var header = Data()
+        header.appendLE(UInt64(points.count))
+        handle.write(header)
+
+        let batchSize = 1024
+        for batchStart in Swift.stride(
+            from: 0, to: points.count, by: batchSize
+        ) {
+            var chunk = Data(capacity: batchSize * 51)
+            let end = min(batchStart + batchSize, points.count)
+            for i in batchStart..<end {
+                let p = points[i]
+                chunk.appendLE(UInt64(i + 1))
+                chunk.appendLE(Double(p.x))
+                chunk.appendLE(Double(p.y))
+                chunk.appendLE(Double(p.z))
+                chunk.append(contentsOf: [UInt8(128), 128, 128])
+                chunk.appendLE(Double(0))
+                chunk.appendLE(UInt64(0))
+            }
+            handle.write(chunk)
         }
-        try data.write(to: sparseDir.appendingPathComponent("points3D.bin"))
     }
 
     // MARK: - rigs.bin
@@ -394,7 +421,7 @@ final class COLMAPExporter {
 
     // MARK: - frames.bin
 
-    /// Writes frames.bin: one frame per scan, mapping each scan to its image IDs.
+    /// Writes frames.bin: one frame per rig scan (scans with Insta360 images).
     /// Frame pose = iPhone image w2c (the rig reference sensor).
     private func writeFramesBin(
         scans: [ScanExportData],
@@ -405,49 +432,54 @@ final class COLMAPExporter {
     ) throws {
         let rigId: UInt32 = 1
         let sensorTypeCamera: Int32 = 0
-        // Images per scan: 1 iPhone + N_cameras * 8 faces
-        let imagesPerScan = 1 + cameraConfig.cameras.count * tileCameraIds.count
+        let sensorsPerFrame = 1 + cameraConfig.cameras.count * tileCameraIds.count
+
+        // Index image entries by name for O(1) lookup
+        let entryByName = Dictionary(
+            uniqueKeysWithValues: imageEntries.map { ($0.name, $0) }
+        )
+
+        // Only include scans that have all rig cameras
+        let rigScans = scans.filter { !$0.insta360ImageURLs.isEmpty }
 
         var data = Data()
-        data.appendLE(UInt64(scans.count))  // num_frames
+        data.appendLE(UInt64(rigScans.count))
 
-        for (scanIdx, scan) in scans.enumerated() {
-            let baseImageId = UInt32(scanIdx * imagesPerScan + 1)
-            let iphoneImageId = baseImageId
-
-            // Frame pose = iPhone w2c in portrait camera frame
+        for (frameIdx, scan) in rigScans.enumerated() {
             let (R_w2c_l, t_w2c_mat) = Self.arkitToColmapW2C(scan.arkitPose)
-            let t_w2c_l = SIMD3(t_w2c_mat.columns.3.x,
-                                t_w2c_mat.columns.3.y,
-                                t_w2c_mat.columns.3.z)
+            let t_w2c_l = SIMD3(
+                t_w2c_mat.columns.3.x,
+                t_w2c_mat.columns.3.y,
+                t_w2c_mat.columns.3.z
+            )
             let R_w2c = Self.portraitRotation * R_w2c_l
             let t_w2c = Self.portraitRotation * t_w2c_l
             let q = Self.rotationToQuatWXYZ(R_w2c)
 
-            data.appendLE(UInt32(scanIdx + 1))  // frame_id
+            data.appendLE(UInt32(frameIdx + 1))
             data.appendLE(rigId)
-            // rig_from_world pose: qw qx qy qz tx ty tz
             for v in q { data.appendLE(Double(v)) }
             data.appendLE(Double(t_w2c.x))
             data.appendLE(Double(t_w2c.y))
             data.appendLE(Double(t_w2c.z))
 
-            // num_data entries
-            data.appendLE(UInt32(imagesPerScan))
+            data.appendLE(UInt32(sensorsPerFrame))
 
             // iPhone entry
+            let iphoneName = "face_iphone/\(scan.scanName).jpg"
+            let iphoneEntry = entryByName[iphoneName]
             data.appendLE(sensorTypeCamera)
             data.appendLE(iphoneCameraId)
-            data.appendLE(UInt64(iphoneImageId))
+            data.appendLE(UInt64(iphoneEntry?.imageId ?? 0))
 
             // Tile entries
-            var tileImageId = baseImageId + 1
             for _ in cameraConfig.cameras {
-                for (_, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {
+                for (faceIdx, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {
+                    let tileName = "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
+                    let tileEntry = entryByName[tileName]
                     data.appendLE(sensorTypeCamera)
                     data.appendLE(camId)
-                    data.appendLE(UInt64(tileImageId))
-                    tileImageId += 1
+                    data.appendLE(UInt64(tileEntry?.imageId ?? 0))
                 }
             }
         }
@@ -457,19 +489,43 @@ final class COLMAPExporter {
 
     // MARK: - Copy images & depths
 
-    private func copyImagesAndDepths(scans: [ScanExportData]) throws {
+    private func copyImagesAndDepths(
+        scans: [ScanExportData]
+    ) throws {
         let fm = FileManager.default
         let iphoneFaceDir = imagesDir.appendingPathComponent("face_iphone")
+        let masksDir = sessionDirectory.appendingPathComponent("colmap/masks")
+        let iphoneMaskDir = masksDir.appendingPathComponent("face_iphone")
         try fm.createDirectory(at: iphoneFaceDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: depthsDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: masksDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: iphoneMaskDir, withIntermediateDirectories: true)
 
         let slicer = ERPTileSlicer()
+        let colorProfile = ColorProfileCalibrator.load()
+        if let cp = colorProfile {
+            print("[Export] color profile: L×\(cp.lGain) a\(cp.aOffset) b\(cp.bOffset)")
+        } else {
+            print("[Export] no color profile — exporting uncorrected")
+        }
 
-        for scan in scans {
+        let maskImages = loadAllCameraMasks()
+
+        for scan in scans { autoreleasepool {
             // iPhone RGB
             if let src = scan.iphoneImageURL, fm.fileExists(atPath: src.path) {
-                let dst = iphoneFaceDir.appendingPathComponent("\(scan.scanName).jpg")
+                let dst = iphoneFaceDir.appendingPathComponent(
+                    "\(scan.scanName).jpg"
+                )
                 try? fm.copyItem(at: src, to: dst)
+
+                let maskDst = iphoneMaskDir.appendingPathComponent(
+                    "\(scan.scanName).png"
+                )
+                Self.writeWhiteMask(
+                    to: maskDst, width: scan.imageHeight,
+                    height: scan.imageWidth
+                )
             }
 
             // Smoothed depth
@@ -481,10 +537,29 @@ final class COLMAPExporter {
             }
 
             // Insta360 ERP → perspective face tiles
-            for (_, erpURL) in scan.insta360ImageURLs {
+            for (camId, erpURL) in scan.insta360ImageURLs {
                 guard let erpData = try? Data(contentsOf: erpURL),
-                      let erpImage = UIImage(data: erpData)
+                      let rawImage = UIImage(data: erpData)
                 else { continue }
+
+                let stitchedERP: UIImage
+                if DualFisheyeStitcher.isDualFisheye(rawImage) {
+                    guard let stitched = DualFisheyeStitcher.stitch(
+                        rawImage, outputWidth: 2048
+                    ) else { continue }
+                    stitchedERP = stitched
+                } else {
+                    stitchedERP = rawImage
+                }
+
+                let erpImage: UIImage
+                if let cp = colorProfile {
+                    erpImage = ColorProfileCalibrator.apply(
+                        cp, to: stitchedERP
+                    )
+                } else {
+                    erpImage = stitchedERP
+                }
 
                 let tiles = slicer.sliceTiles(from: erpImage)
                 for (faceIdx, tileImage) in tiles {
@@ -503,8 +578,109 @@ final class COLMAPExporter {
                         try? jpegData.write(to: dst)
                     }
                 }
+
+                if let erpMask = maskImages[camId] {
+                    let invertedMask = Self.invertMask(erpMask)
+                    let maskTiles = slicer.sliceMask(
+                        from: invertedMask
+                    )
+                    for (faceIdx, maskTile) in maskTiles {
+                        let maskFaceDir = masksDir.appendingPathComponent(
+                            String(format: "face_%02d", faceIdx)
+                        )
+                        try? fm.createDirectory(
+                            at: maskFaceDir,
+                            withIntermediateDirectories: true
+                        )
+                        let dst = maskFaceDir.appendingPathComponent(
+                            "\(scan.scanName).png"
+                        )
+                        if let pngData = maskTile.pngData() {
+                            try? pngData.write(to: dst)
+                        }
+                    }
+                } else {
+                    let tileSize = slicer.tileSize
+                    for faceIdx in 0..<8 {
+                        let maskFaceDir = masksDir.appendingPathComponent(
+                            String(format: "face_%02d", faceIdx)
+                        )
+                        try? fm.createDirectory(
+                            at: maskFaceDir,
+                            withIntermediateDirectories: true
+                        )
+                        let dst = maskFaceDir.appendingPathComponent(
+                            "\(scan.scanName).png"
+                        )
+                        Self.writeWhiteMask(
+                            to: dst, width: tileSize, height: tileSize
+                        )
+                    }
+                }
+            }
+        } }
+    }
+
+    /// All-white mask (COLMAP: white=valid).
+    private static func writeWhiteMask(
+        to url: URL, width: Int, height: Int
+    ) {
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: width, height: height)
+        )
+        let img = renderer.image { _ in
+            UIColor.white.setFill()
+            UIRectFill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        if let data = img.pngData() {
+            try? data.write(to: url)
+        }
+    }
+
+    /// Inverts a mask image (drawn: white=masked → COLMAP: white=valid).
+    private static func invertMask(_ mask: UIImage) -> UIImage {
+        guard let cg = mask.cgImage else { return mask }
+        let w = cg.width, h = cg.height
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(
+            data: &pixels, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return mask }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            pixels[i]     = 255 - pixels[i]
+            pixels[i + 1] = 255 - pixels[i + 1]
+            pixels[i + 2] = 255 - pixels[i + 2]
+        }
+        guard let outCtx = CGContext(
+            data: &pixels, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let result = outCtx.makeImage() else { return mask }
+        return UIImage(cgImage: result)
+    }
+
+    private func loadAllCameraMasks() -> [String: UIImage] {
+        guard let dir = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+        ).first?.appendingPathComponent("atlas_sessions/masks")
+        else { return [:] }
+        var result: [String: UIImage] = [:]
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: nil
+        ) {
+            for file in files where file.pathExtension == "png" {
+                let camId = file.deletingPathExtension().lastPathComponent
+                if let data = try? Data(contentsOf: file),
+                   let img = UIImage(data: data) {
+                    result[camId] = img
+                }
             }
         }
+        return result
     }
 
     // MARK: - Coordinate math
@@ -532,14 +708,13 @@ final class COLMAPExporter {
         return [q.real * sign, q.imag.x * sign, q.imag.y * sign, q.imag.z * sign]
     }
 
-    /// 8 equatorial face rotations matching atlas panorama_sfm_colmap.py FACES_CAM_FROM_PANO.
+    /// 8 equatorial face rotations (cam_from_pano) at 45° yaw steps.
+    /// Must match ERPTileSlicer.computeFaceRotations exactly.
     static func computeFaceRotations() -> [simd_float3x3] {
-        let instaCorrection = simd_quatf(angle: .pi / 2, axis: SIMD3(0, 1, 0))
-        return (0..<8).map { i in
-            let yawDeg = Float(i) * 45.0
-            let yawRad = yawDeg * .pi / 180.0
-            let faceRot = simd_quatf(angle: -yawRad, axis: SIMD3(0, 1, 0))
-            return simd_float3x3(faceRot * instaCorrection)
+        (0..<8).map { i in
+            let yawRad = Float(i) * .pi / 4.0
+            let faceQuat = simd_quatf(angle: -yawRad, axis: SIMD3(0, 1, 0))
+            return simd_float3x3(faceQuat)
         }
     }
 }

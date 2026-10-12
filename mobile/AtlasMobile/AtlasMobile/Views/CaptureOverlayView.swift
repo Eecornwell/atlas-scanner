@@ -169,7 +169,7 @@ struct CaptureOverlayView: View {
                     // Capture button
                     if sessionManager.isAutoCapturing {
                         Button {
-                            sessionManager.stopAutoCapture()
+                            Task { await sessionManager.stopAutoCapture() }
                         } label: {
                             ZStack {
                                 RoundedRectangle(cornerRadius: 8)
@@ -203,7 +203,7 @@ struct CaptureOverlayView: View {
                         // Auto/Manual capture toggle
                         Button {
                             if sessionManager.isAutoCapturing {
-                                sessionManager.stopAutoCapture()
+                                Task { await sessionManager.stopAutoCapture() }
                             } else {
                                 sessionManager.startAutoCapture()
                             }
@@ -218,6 +218,26 @@ struct CaptureOverlayView: View {
                                         : AnyShapeStyle(.ultraThinMaterial)
                                 )
                                 .clipShape(Circle())
+                        }
+
+                        if sessionManager.connectedCameraCount > 0 {
+                            Button {
+                                sessionManager.useInsta360.toggle()
+                            } label: {
+                                Text("360")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundColor(
+                                        sessionManager.useInsta360
+                                            ? .black : .white
+                                    )
+                                    .frame(width: 44, height: 44)
+                                    .background(
+                                        sessionManager.useInsta360
+                                            ? AnyShapeStyle(.green)
+                                            : AnyShapeStyle(.ultraThinMaterial)
+                                    )
+                                    .clipShape(Circle())
+                            }
                         }
 
                         // Visualization toggles

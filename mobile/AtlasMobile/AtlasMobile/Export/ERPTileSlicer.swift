@@ -60,15 +60,14 @@ final class ERPTileSlicer {
 
     // MARK: - Face rotations
 
-    /// 8 equatorial face rotations matching atlas panorama_sfm_colmap.py FACES_CAM_FROM_PANO.
-    /// Insta360 SDK ERP has forward at top (v=0); pre-compose R_y(+90°) to land
-    /// equatorial faces on the actual horizon band — same correction as atlas.
+    /// 8 equatorial face rotations (cam_from_pano) at 45° yaw steps.
+    /// DualFisheyeStitcher produces standard ERP: lon=0 at center,
+    /// v=0 at zenith, equator at v=H/2.
     static func computeFaceRotations() -> [simd_float3x3] {
-        let instaCorrection = simd_quatf(angle: .pi / 2, axis: SIMD3(0, 1, 0))
-        return (0..<8).map { i in
-            let yawRad = Float(i) * .pi / 4.0   // 45° steps
+        (0..<8).map { i in
+            let yawRad = Float(i) * .pi / 4.0
             let faceQuat = simd_quatf(angle: -yawRad, axis: SIMD3(0, 1, 0))
-            return simd_float3x3(faceQuat * instaCorrection)
+            return simd_float3x3(faceQuat)
         }
     }
 

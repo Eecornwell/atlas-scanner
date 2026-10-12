@@ -23,8 +23,12 @@ struct CalibrationView: View {
     @State private var iphoneThumbnail: UIImage?
     @State private var insta360Thumbnail: UIImage?
     @State private var captureCount: Int = 0
+    @State private var showMaskEditor = false
+    @State private var isComputingColorProfile = false
+    @State private var isRefiningFeatures = false
 
     private let inchesToM = 0.0254
+    private let ciContext = CIContext()
 
     var seed: RigidTransform {
         RigidTransform(
@@ -64,7 +68,22 @@ struct CalibrationView: View {
             .padding()
         }
         .navigationTitle("Calibration")
-        .onAppear { loadSeedFromConfig() }
+        .onAppear {
+            loadSeedFromConfig()
+            checkMaskStatus()
+        }
+        .sheet(isPresented: $showMaskEditor, onDismiss: {
+            checkMaskStatus()
+        }) {
+            if let erp = lastSuccessfulERP {
+                NavigationStack {
+                    MaskDrawingView(
+                        erpImage: erp,
+                        cameraId: "insta360_primary"
+                    )
+                }
+            }
+        }
     }
 
     private var seedSection: some View {
@@ -166,23 +185,35 @@ struct CalibrationView: View {
                     }
                 }
 
-                Button(action: reRenderOverlay) {
+                Button { showMaskEditor = true } label: {
                     Label(
-                        "Re-render Overlay",
-                        systemImage: "arrow.clockwise"
+                        "Draw Mask",
+                        systemImage: "pencil.tip.crop.circle"
                     )
                 }
                 .buttonStyle(.bordered)
-                .disabled(frameCount == 0)
+                .disabled(lastSuccessfulERP == nil)
+
+                Text(calibManager.maskStatus.isEmpty
+                    ? "Mask: checking…"
+                    : calibManager.maskStatus)
+                    .font(.system(.caption, design: .monospaced))
+                    .padding(6)
+                    .background(
+                        calibManager.maskStatus.contains("loaded")
+                            ? Color.green.opacity(0.2)
+                            : Color.orange.opacity(0.2)
+                    )
+                    .cornerRadius(6)
 
                 Button(action: runOptimization) {
-                    Label("Run Optimisation", systemImage: "wand.and.stars")
+                    Label("Run Optimization", systemImage: "wand.and.stars")
                 }
                 .buttonStyle(.bordered)
                 .disabled(frameCount == 0 || isOptimizing)
 
                 if isOptimizing {
-                    ProgressView("Optimising…")
+                    ProgressView("Optimizing…")
                 }
 
                 if let optError = calibManager.optimizeError {
@@ -218,11 +249,163 @@ struct CalibrationView: View {
             GroupBox("Refined Extrinsic") {
                 VStack(alignment: .leading, spacing: 6) {
                     resultText(result)
-                    Button("Save to Device") {
-                        saveCalibration(result)
+
+                    HStack(spacing: 12) {
+                        Button("Save to Device") {
+                            saveCalibration(result)
+                        }
+                        .buttonStyle(.borderedProminent)
+
+                        Button {
+                            isComputingColorProfile = true
+                            Task {
+                                calibManager.computeColorProfile(
+                                    extrinsic: result
+                                )
+                                isComputingColorProfile = false
+                            }
+                        } label: {
+                            Label(
+                                "Color Profile",
+                                systemImage: "paintpalette"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isComputingColorProfile)
+
+                        Button {
+                            isRefiningFeatures = true
+                            Task {
+                                await calibManager.refineWithFeatures(
+                                    extrinsic: result
+                                )
+                                isRefiningFeatures = false
+                            }
+                        } label: {
+                            Label(
+                                "Feature Refine",
+                                systemImage: "dot.radiowaves.up.forward"
+                            )
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isRefiningFeatures)
                     }
-                    .buttonStyle(.borderedProminent)
                     .padding(.top, 4)
+
+                    if !calibManager.colorProfileStatus.isEmpty {
+                        Text(calibManager.colorProfileStatus)
+                            .font(.system(
+                                .caption, design: .monospaced
+                            ))
+                            .padding(6)
+                            .background(
+                                calibManager.colorProfile != nil
+                                    ? Color.green.opacity(0.2)
+                                    : Color.orange.opacity(0.2)
+                            )
+                            .cornerRadius(6)
+                    }
+
+                    if isComputingColorProfile {
+                        ProgressView("Computing color profile…")
+                    }
+
+                    if !calibManager.featureRefineStatus.isEmpty {
+                        Text(calibManager.featureRefineStatus)
+                            .font(.system(
+                                .caption, design: .monospaced
+                            ))
+                            .padding(6)
+                            .background(
+                                calibManager.featureMatchCount > 0
+                                    ? Color.green.opacity(0.2)
+                                    : Color.orange.opacity(0.2)
+                            )
+                            .cornerRadius(6)
+                    }
+
+                    if isRefiningFeatures {
+                        ProgressView("Detecting features…")
+                    }
+
+                    if let iPreview = calibManager.featurePreviewIphone,
+                       let sPreview = calibManager.featurePreviewSlice {
+                        VStack(spacing: 4) {
+                            Text("Feature Match Preview")
+                                .font(.caption.weight(.semibold))
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: .leading
+                                )
+                            HStack(spacing: 6) {
+                                VStack(spacing: 2) {
+                                    Image(uiImage: iPreview)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                    Text("iPhone")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                VStack(spacing: 2) {
+                                    Image(uiImage: sPreview)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                    Text("ERP Slice")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    if let orig = calibManager.colorPreviewOriginal,
+                       let corr = calibManager.colorPreviewCorrected {
+                        VStack(spacing: 4) {
+                            Text("Color Correction Preview")
+                                .font(.caption.weight(.semibold))
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: .leading
+                                )
+
+                            if let iphone = calibManager.colorPreviewIphone {
+                                VStack(spacing: 2) {
+                                    Image(uiImage: iphone)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                    Text("iPhone (Reference)")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            HStack(spacing: 6) {
+                                VStack(spacing: 2) {
+                                    Image(uiImage: orig)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                    Text("Insta360 Original")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                VStack(spacing: 2) {
+                                    Image(uiImage: corr)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                    Text("Insta360 Corrected")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
                 }
                 .padding(.top, 4)
             }
@@ -262,9 +445,7 @@ struct CalibrationView: View {
                     Text("Overlay #\(calibManager.overlayVersion)")
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundColor(.secondary)
-                    Text("Left: edges (red=camera green=LiDAR yellow=aligned)")
-                        .font(.caption2).foregroundColor(.secondary)
-                    Text("Right: TURBO LiDAR dots (near=warm far=cool)")
+                    Text("JET depth dots: near=blue far=red (50/50 blend)")
                         .font(.caption2).foregroundColor(.secondary)
                     Text("Shifted horizontally → adjust Yaw")
                         .font(.caption2)
@@ -282,7 +463,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-03f")
+        Text("Build: 2026-10-11d")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -330,8 +511,8 @@ struct CalibrationView: View {
                 ? "Press Capture Frame to begin"
                 : "Start a session first, then return here"
         case .framesCollected(let n):  return "\(n) frame\(n == 1 ? "" : "s") captured"
-        case .optimizing:              return "Optimising…"
-        case .done:                    return "Optimisation complete — review overlay"
+        case .optimizing:              return "Optimizing…"
+        case .done:                    return "Optimization complete — review overlay"
         case .saved:                   return "Calibration saved"
         }
     }
@@ -485,13 +666,18 @@ struct CalibrationView: View {
 
         // ── Phase 3: Build frame + render overlay ──────────────────
 
+        let iphoneRGB = landscapeImage(
+            from: arkitFrame.capturedImage
+        )
+
         let frame = CalibrationFrame(
             depth: depthFloats,
             depthW: depthW, depthH: depthH,
             intrinsics: arkitFrame.intrinsics,
             imageW: bufW, imageH: bufH,
             imageResW: resW, imageResH: resH,
-            erpImage: erpImage
+            erpImage: erpImage,
+            iphoneImage: iphoneRGB
         )
         captureInfo = frame.debugDescription
         print("[Calib] \(frame.debugDescription)")
@@ -515,12 +701,34 @@ struct CalibrationView: View {
         calibManager.overlayVersion += 1
     }
 
+    private func checkMaskStatus() {
+        let img = CalibrationManager.loadMaskImage(
+            cameraId: "insta360_primary"
+        )
+        if let img = img {
+            calibManager.maskStatus = "Mask: loaded (\(Int(img.size.width))x\(Int(img.size.height)))"
+        } else {
+            calibManager.maskStatus = "Mask: none found"
+        }
+    }
+
     private func runOptimization() {
         Task { await calibManager.optimize(seed: seed) }
     }
 
     private func saveCalibration(_ result: RigidTransform) {
         try? calibManager.save(refined: result)
+    }
+
+    private func landscapeImage(
+        from buffer: CVPixelBuffer
+    ) -> UIImage? {
+        let ci = CIImage(cvPixelBuffer: buffer)
+        guard ci.extent.width > 0 else { return nil }
+        guard let cg = ciContext.createCGImage(
+            ci, from: ci.extent
+        ) else { return nil }
+        return UIImage(cgImage: cg)
     }
 
     private static func downsampleERP(

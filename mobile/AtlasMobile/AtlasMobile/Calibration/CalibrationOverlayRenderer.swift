@@ -1,43 +1,22 @@
 import UIKit
 import simd
 
-/// Renders a perspective verification overlay for extrinsic calibration.
+/// Renders a perspective verification overlay for extrinsic calibration,
+/// matching the visual style of tune_calibration.py --verify.
 ///
-/// Both RGB (Insta360 ERP) and LiDAR are projected through the same ERP
-/// intermediate and sampled at identical coordinates, guaranteeing
-/// pixel-perfect alignment regardless of depth buffer orientation or
-/// extrinsic rotation.
-///
-/// Left panel: edge alignment — red = camera edges, green = LiDAR edges,
-///   yellow = aligned.
-/// Right panel: TURBO-colored LiDAR dots on the Insta360 perspective crop.
+/// Single perspective crop of the Insta360 ERP (using the iPhone's actual
+/// intrinsics) with JET-colored LiDAR depth dots blended at 35/65.
+/// Rotated 90° CW for portrait display.
 enum CalibrationOverlayRenderer {
 
     static func render(
         frame: CalibrationFrame,
         extrinsic: RigidTransform
     ) -> UIImage? {
-        // Normalize ERP orientation before extracting pixels.
-        // UIImage may carry an EXIF rotation flag; cgImage ignores it,
-        // which would cause us to sample a rotated pixel grid.
-        let erpW: Int
-        let erpH: Int
-        let erpRGBA: [RGBA]
-        if let result = normalizedERPPixels(frame.erpImage) {
-            erpW = result.w
-            erpH = result.h
-            erpRGBA = result.pixels
-        } else {
+        guard let erp = normalizedERPPixels(frame.erpImage) else {
             return nil
         }
-
-        // Project LiDAR depth into the same ERP space as the Insta360
-        // image via LiDARERPRenderer. Both panels then sample from ERP
-        // using identical ray casting, so alignment is guaranteed.
-        let lidarERP = LiDARERPRenderer.project(
-            frame: frame, extrinsic: extrinsic,
-            erpW: erpW, erpH: erpH
-        )
+        let erpW = erp.w, erpH = erp.h, erpRGBA = erp.pixels
 
         let T = ExtrinsicOptimizer.seedToCameraMatrix(extrinsic)
         let R = simd_float3x3(
@@ -45,30 +24,35 @@ enum CalibrationOverlayRenderer {
             SIMD3(T.columns.1.x, T.columns.1.y, T.columns.1.z),
             SIMD3(T.columns.2.x, T.columns.2.y, T.columns.2.z)
         )
+        let t = SIMD3<Float>(
+            T.columns.3.x, T.columns.3.y, T.columns.3.z
+        )
 
         let outScale: Float = 3.0
         let di = frame.depthIntrinsics()
-
         let outW = Int(Float(frame.depthW) * outScale)
         let outH = Int(Float(frame.depthH) * outScale)
         let fxV = di.fx * outScale
         let fyV = di.fy * outScale
         let cxV = di.cx * outScale
         let cyV = di.cy * outScale
+        let wF = Float(erpW), hF = Float(erpH)
 
-        // -- Perspective crop: sample both RGB and LiDAR from ERP --
-        var perspRGBA = [RGBA](
+        // Seam columns to dim in the perspective view
+        let seamCols = ExtrinsicOptimizer.seamColumns(erpW: erpW)
+
+        // Sample ERP background through iPhone's perspective
+        var pixels = [RGBA](
             repeating: RGBA(r: 0, g: 0, b: 0, a: 255),
             count: outW * outH
         )
-        var lidarRaw = [UInt8](repeating: 0, count: outW * outH)
-        let wF = Float(erpW), hF = Float(erpH)
-
         for py in 0..<outH {
             for px in 0..<outW {
                 let rxV = (Float(px) - cxV) / fxV
                 let ryV = (Float(py) - cyV) / fyV
-                let ray = simd_normalize(SIMD3<Float>(-rxV, -ryV, 1))
+                let ray = simd_normalize(
+                    SIMD3<Float>(-rxV, -ryV, 1)
+                )
                 let b = ExtrinsicOptimizer.erpCorrection * (R * ray)
                 let lat = -asin(max(-1, min(1, b.y)))
                 let lon = atan2(b.x, b.z)
@@ -76,82 +60,119 @@ enum CalibrationOverlayRenderer {
                 u = ((u % erpW) + erpW) % erpW
                 let v = max(0, min(erpH - 1,
                     Int(hF * (0.5 - lat / .pi))))
-
-                let erpIdx = v * erpW + u
-                perspRGBA[py * outW + px] = erpRGBA[erpIdx]
-                lidarRaw[py * outW + px] = lidarERP[erpIdx]
+                var px4 = erpRGBA[v * erpW + u]
+                if seamCols.contains(u) {
+                    px4.r = UInt8(Float(px4.r) * 0.3)
+                    px4.g = UInt8(Float(px4.g) * 0.3)
+                    px4.b = UInt8(min(255,
+                        Float(px4.b) * 0.3 + 50))
+                }
+                pixels[py * outW + px] = px4
             }
         }
 
-        // Mask LiDAR where perspective crop is dark
-        let camGray = perspRGBA.map {
-            UInt8((Int($0.r) + Int($0.g) + Int($0.b)) / 3)
-        }
-        for i in 0..<(outW * outH) where camGray[i] < 30 {
-            lidarRaw[i] = 0
-        }
-        let lidarMask = lidarRaw.map { $0 > 10 }
+        // Unproject LiDAR depth to ERP bearings, then project back
+        // through the iPhone's perspective to find overlay positions.
+        // Dots land where LiDAR maps in the ERP view — misalignment
+        // means the extrinsic is off.
+        struct Dot { let px: Int; let py: Int; let dist: Float }
+        var dots = [Dot]()
+        dots.reserveCapacity(frame.depthW * frame.depthH / 4)
+        let Rt = R.transpose
+        let erpCt = ExtrinsicOptimizer.erpCorrection.transpose
 
-        // Dilate LiDAR for visibility and edge detection
-        let lidarDilated = dilateGray(
-            lidarRaw, w: outW, h: outH, radius: 2
-        )
+        for row in 0..<frame.depthH {
+            for col in 0..<frame.depthW {
+                let z = frame.depth[row * frame.depthW + col]
+                guard z > 0.15 && z < 5.0 else { continue }
+                let x = (Float(col) - di.cx) / di.fx * z
+                let y = (Float(row) - di.cy) / di.fy * z
+                let pt = R * SIMD3(-x, -y, z) + t
+                let norm = simd_length(pt)
+                guard norm > 0.3 else { continue }
+                let b = ExtrinsicOptimizer.erpCorrection
+                    * (pt / norm)
 
-        // -- Left panel: edge alignment --
-        let camEdges = sobelBinary(
-            gray: camGray, w: outW, h: outH, thresh: 0.06
-        )
-        let lidEdges = sobelBinary(
-            gray: lidarDilated, w: outW, h: outH, thresh: 0.04
-        )
-
-        var edgePanel = perspRGBA.map { px in
-            RGBA(
-                r: UInt8(Float(px.r) * 0.3),
-                g: UInt8(Float(px.g) * 0.3),
-                b: UInt8(Float(px.b) * 0.3), a: 255
-            )
-        }
-        for i in 0..<(outW * outH) {
-            let ce = camEdges[i], le = lidEdges[i]
-            if ce && le {
-                edgePanel[i] = RGBA(r: 220, g: 220, b: 0, a: 255)
-            } else if ce {
-                edgePanel[i] = RGBA(r: 220, g: 0, b: 0, a: 255)
-            } else if le {
-                edgePanel[i] = RGBA(r: 0, g: 220, b: 0, a: 255)
+                // Inverse-project bearing to perspective pixel
+                let cam = Rt * (erpCt * b)
+                guard cam.z > 0 else { continue }
+                let dpx = Int(-cam.x / cam.z * fxV + cxV)
+                let dpy = Int(-cam.y / cam.z * fyV + cyV)
+                guard dpx >= 3, dpx < outW - 3,
+                      dpy >= 3, dpy < outH - 3
+                else { continue }
+                dots.append(Dot(px: dpx, py: dpy, dist: norm))
             }
         }
 
-        // -- Right panel: TURBO-colored depth dots on perspective crop --
-        var depthPanel = perspRGBA
-        for i in 0..<(outW * outH) where lidarMask[i] {
-            let t = Float(lidarDilated[i]) / 255.0
-            let (tr, tg, tb) = turbo(t)
-            depthPanel[i] = RGBA(
-                r: clampByte(Float(perspRGBA[i].r) * 0.15 + tr * 0.85),
-                g: clampByte(Float(perspRGBA[i].g) * 0.15 + tg * 0.85),
-                b: clampByte(Float(perspRGBA[i].b) * 0.15 + tb * 0.85),
-                a: 255
-            )
+        guard !dots.isEmpty else {
+            return toImage(pixels, w: outW, h: outH)
         }
 
-        // White halo around LiDAR dots
-        let halo = haloFromMask(lidarMask, w: outW, h: outH)
-        for i in 0..<(outW * outH) where halo[i] {
-            depthPanel[i] = RGBA(r: 255, g: 255, b: 255, a: 255)
+        let dMin = dots.min(by: { $0.dist < $1.dist })!.dist
+        let dMax = dots.max(by: { $0.dist < $1.dist })!.dist
+        let dRange = dMax - dMin + 1e-6
+        let circleR = 3
+        let r2 = circleR * circleR
+
+        for dot in dots {
+            let tNorm = (dot.dist - dMin) / dRange
+            let (jr, jg, jb) = jet(tNorm)
+            for dy in -circleR...circleR {
+                for dx in -circleR...circleR {
+                    guard dx * dx + dy * dy <= r2 else {
+                        continue
+                    }
+                    let idx = (dot.py + dy) * outW + (dot.px + dx)
+                    let bg = pixels[idx]
+                    pixels[idx] = RGBA(
+                        r: clampByte(
+                            Float(bg.r) * 0.65 + jr * 0.35
+                        ),
+                        g: clampByte(
+                            Float(bg.g) * 0.65 + jg * 0.35
+                        ),
+                        b: clampByte(
+                            Float(bg.b) * 0.65 + jb * 0.35
+                        ),
+                        a: 255
+                    )
+                }
+            }
         }
 
-        return compositeHStack(
-            left: edgePanel, right: depthPanel,
-            w: outW, h: outH
-        )
+        return toImage(pixels, w: outW, h: outH)
+    }
+
+    // MARK: - JET colormap (matches cv2.COLORMAP_JET)
+
+    private static func jet(_ t: Float) -> (Float, Float, Float) {
+        let c = max(0, min(1, t))
+        let r: Float, g: Float, b: Float
+        if c < 0.125 {
+            r = 0; g = 0
+            b = 128 + c / 0.125 * 127
+        } else if c < 0.375 {
+            r = 0
+            g = (c - 0.125) / 0.25 * 255
+            b = 255
+        } else if c < 0.625 {
+            r = (c - 0.375) / 0.25 * 255
+            g = 255
+            b = 255 - (c - 0.375) / 0.25 * 255
+        } else if c < 0.875 {
+            r = 255
+            g = 255 - (c - 0.625) / 0.25 * 255
+            b = 0
+        } else {
+            r = 255 - (c - 0.875) / 0.125 * 127
+            g = 0; b = 0
+        }
+        return (r, g, b)
     }
 
     // MARK: - ERP image normalization
 
-    /// Draws the UIImage through UIGraphicsImageRenderer so EXIF
-    /// orientation is baked into the pixel data, then extracts RGBA.
     private static func normalizedERPPixels(
         _ image: UIImage
     ) -> (pixels: [RGBA], w: Int, h: Int)? {
@@ -159,14 +180,12 @@ enum CalibrationOverlayRenderer {
         let h = Int(image.size.height)
         guard w > 0, h > 0 else { return nil }
 
-        // Fast path: no rotation needed
         if image.imageOrientation == .up, let cg = image.cgImage,
            cg.width == w, cg.height == h {
             guard let px = renderRGBA(cgImage: cg) else { return nil }
             return (px, w, h)
         }
 
-        // Slow path: re-render to apply orientation
         let renderer = UIGraphicsImageRenderer(
             size: CGSize(width: w, height: h)
         )
@@ -176,107 +195,6 @@ enum CalibrationOverlayRenderer {
         guard let cg = normalized.cgImage else { return nil }
         guard let px = renderRGBA(cgImage: cg) else { return nil }
         return (px, cg.width, cg.height)
-    }
-
-    // MARK: - Morphological operations
-
-    private static func dilateGray(
-        _ gray: [UInt8], w: Int, h: Int, radius: Int
-    ) -> [UInt8] {
-        var out = gray
-        let r2 = radius * radius + 1
-        for y in 0..<h {
-            for x in 0..<w {
-                let val = gray[y * w + x]
-                guard val > 0 else { continue }
-                for dy in -radius...radius {
-                    let ny = y + dy
-                    guard ny >= 0 && ny < h else { continue }
-                    for dx in -radius...radius {
-                        guard dx * dx + dy * dy <= r2 else { continue }
-                        let nx = max(0, min(w - 1, x + dx))
-                        let idx = ny * w + nx
-                        if val > out[idx] { out[idx] = val }
-                    }
-                }
-            }
-        }
-        return out
-    }
-
-    private static func haloFromMask(
-        _ mask: [Bool], w: Int, h: Int
-    ) -> [Bool] {
-        var halo = [Bool](repeating: false, count: w * h)
-        for y in 0..<h {
-            for x in 0..<w {
-                guard mask[y * w + x] else { continue }
-                for dy in -3...3 {
-                    let ny = y + dy
-                    guard ny >= 0 && ny < h else { continue }
-                    for dx in -3...3 {
-                        let nx = max(0, min(w - 1, x + dx))
-                        let idx = ny * w + nx
-                        if !mask[idx] { halo[idx] = true }
-                    }
-                }
-            }
-        }
-        return halo
-    }
-
-    // MARK: - Edge detection
-
-    private static func sobelBinary(
-        gray: [UInt8], w: Int, h: Int, thresh: Float
-    ) -> [Bool] {
-        var mag = [Float](repeating: 0, count: w * h)
-        for y in 1..<(h - 1) {
-            for x in 1..<(w - 1) {
-                let gx =
-                    -Int(gray[(y-1)*w+(x-1)])
-                    - 2*Int(gray[y*w+(x-1)])
-                    - Int(gray[(y+1)*w+(x-1)])
-                    + Int(gray[(y-1)*w+(x+1)])
-                    + 2*Int(gray[y*w+(x+1)])
-                    + Int(gray[(y+1)*w+(x+1)])
-                let gy =
-                    -Int(gray[(y-1)*w+(x-1)])
-                    - 2*Int(gray[(y-1)*w+x])
-                    - Int(gray[(y-1)*w+(x+1)])
-                    + Int(gray[(y+1)*w+(x-1)])
-                    + 2*Int(gray[(y+1)*w+x])
-                    + Int(gray[(y+1)*w+(x+1)])
-                mag[y * w + x] = Float(gx * gx + gy * gy)
-            }
-        }
-        let maxV = mag.max() ?? 1
-        guard maxV > 0 else {
-            return [Bool](repeating: false, count: w * h)
-        }
-        let t2 = thresh * thresh * maxV
-        return mag.map { $0 > t2 }
-    }
-
-    // MARK: - TURBO colormap approximation
-
-    private static func turbo(_ t: Float) -> (Float, Float, Float) {
-        let c = max(0, min(1, t))
-        let r: Float, g: Float, b: Float
-        if c < 0.25 {
-            let s = c / 0.25
-            r = 48 + s * 21;  g = 18 + s * 199;  b = 59 + s * 179
-        } else if c < 0.5 {
-            let s = (c - 0.25) / 0.25
-            r = 69 + s * 53;  g = 217 + s * 38;  b = 238 - s * 196
-        } else if c < 0.75 {
-            let s = (c - 0.5) / 0.25
-            r = 122 + s * 132; g = 255 - s * 89; b = 42 - s * 26
-        } else {
-            let s = (c - 0.75) / 0.25
-            r = 254 - s * 132; g = 166 - s * 162; b = 16 - s * 13
-        }
-        return (r, g, b)
     }
 
     // MARK: - Image helpers
@@ -297,7 +215,7 @@ enum CalibrationOverlayRenderer {
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
-        return stride(from: 0, to: buf.count, by: 4).map {
+        return Swift.stride(from: 0, to: buf.count, by: 4).map {
             RGBA(
                 r: buf[$0], g: buf[$0+1],
                 b: buf[$0+2], a: buf[$0+3]
@@ -305,40 +223,23 @@ enum CalibrationOverlayRenderer {
         }
     }
 
-    private static func compositeHStack(
-        left: [RGBA], right: [RGBA], w: Int, h: Int
+    private static func toImage(
+        _ pixels: [RGBA], w: Int, h: Int
     ) -> UIImage? {
-        let divW = 4
-        let totalW = w * 2 + divW
-        var pixels = [UInt8](repeating: 0, count: totalW * h * 4)
-
-        for y in 0..<h {
-            for x in 0..<w {
-                let src = left[y * w + x]
-                let dst = (y * totalW + x) * 4
-                pixels[dst] = src.r; pixels[dst+1] = src.g
-                pixels[dst+2] = src.b; pixels[dst+3] = 255
-            }
-            for x in w..<(w + divW) {
-                let dst = (y * totalW + x) * 4
-                pixels[dst] = 0; pixels[dst+1] = 255
-                pixels[dst+2] = 255; pixels[dst+3] = 255
-            }
-            for x in 0..<w {
-                let src = right[y * w + x]
-                let dst = (y * totalW + w + divW + x) * 4
-                pixels[dst] = src.r; pixels[dst+1] = src.g
-                pixels[dst+2] = src.b; pixels[dst+3] = 255
-            }
+        var raw = [UInt8](repeating: 0, count: w * h * 4)
+        for i in 0..<(w * h) {
+            raw[i * 4] = pixels[i].r
+            raw[i * 4 + 1] = pixels[i].g
+            raw[i * 4 + 2] = pixels[i].b
+            raw[i * 4 + 3] = 255
         }
-
         guard let provider = CGDataProvider(
-            data: Data(pixels) as CFData
+            data: Data(raw) as CFData
         ) else { return nil }
         guard let cg = CGImage(
-            width: totalW, height: h,
+            width: w, height: h,
             bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: totalW * 4,
+            bytesPerRow: w * 4,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGBitmapInfo(
                 rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
@@ -347,8 +248,8 @@ enum CalibrationOverlayRenderer {
             decode: nil, shouldInterpolate: false,
             intent: .defaultIntent
         ) else { return nil }
-        // Rotate 90° CW for portrait display — depth buffer data
-        // is always landscape but phone is held in portrait.
-        return UIImage(cgImage: cg, scale: 1.0, orientation: .right)
+        return UIImage(
+            cgImage: cg, scale: 1.0, orientation: .right
+        )
     }
 }
