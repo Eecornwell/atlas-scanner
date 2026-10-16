@@ -43,11 +43,57 @@ struct CameraConfig: Codable {
     let mask: String?
     let faceCount: Int
     let tileFov: Double
+    var enabled: Bool
 
     enum CodingKeys: String, CodingKey {
         case id, model, serial, extrinsic, mask
         case faceCount = "face_count"
         case tileFov = "tile_fov"
+        case enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(
+            keyedBy: CodingKeys.self
+        )
+        id = try c.decode(String.self, forKey: .id)
+        model = try c.decode(
+            String.self, forKey: .model
+        )
+        serial = try c.decode(
+            String.self, forKey: .serial
+        )
+        extrinsic = try c.decode(
+            RigidTransform.self, forKey: .extrinsic
+        )
+        mask = try c.decodeIfPresent(
+            String.self, forKey: .mask
+        )
+        faceCount = try c.decodeIfPresent(
+            Int.self, forKey: .faceCount
+        ) ?? 8
+        tileFov = try c.decodeIfPresent(
+            Double.self, forKey: .tileFov
+        ) ?? 65.0
+        enabled = try c.decodeIfPresent(
+            Bool.self, forKey: .enabled
+        ) ?? true
+    }
+
+    init(
+        id: String, model: String, serial: String,
+        extrinsic: RigidTransform, mask: String?,
+        faceCount: Int = 8, tileFov: Double = 65.0,
+        enabled: Bool = true
+    ) {
+        self.id = id
+        self.model = model
+        self.serial = serial
+        self.extrinsic = extrinsic
+        self.mask = mask
+        self.faceCount = faceCount
+        self.tileFov = tileFov
+        self.enabled = enabled
     }
 }
 

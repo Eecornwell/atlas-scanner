@@ -1,12 +1,11 @@
 import UIKit
 import simd
 
-/// Renders a perspective verification overlay for extrinsic calibration,
-/// matching the visual style of tune_calibration.py --verify.
+/// Renders a verification overlay for extrinsic calibration.
 ///
-/// Single perspective crop of the Insta360 ERP (using the iPhone's actual
-/// intrinsics) with JET-colored LiDAR depth dots blended at 35/65.
-/// Rotated 90° CW for portrait display.
+/// Blends the iPhone RGB with the Insta360 ERP reprojected to the
+/// iPhone's perspective (50/50). If the extrinsic is correct, edges
+/// from both cameras align cleanly. If it's off, edges look doubled.
 enum CalibrationOverlayRenderer {
 
     static func render(
@@ -24,9 +23,6 @@ enum CalibrationOverlayRenderer {
             SIMD3(T.columns.1.x, T.columns.1.y, T.columns.1.z),
             SIMD3(T.columns.2.x, T.columns.2.y, T.columns.2.z)
         )
-        let t = SIMD3<Float>(
-            T.columns.3.x, T.columns.3.y, T.columns.3.z
-        )
 
         let outScale: Float = 3.0
         let di = frame.depthIntrinsics()
@@ -38,16 +34,19 @@ enum CalibrationOverlayRenderer {
         let cyV = di.cy * outScale
         let wF = Float(erpW), hF = Float(erpH)
 
-        // Seam columns to dim in the perspective view
-        let seamCols = ExtrinsicOptimizer.seamColumns(erpW: erpW)
+        // Get iPhone RGB pixels scaled to output size
+        let iphonePixels = frame.iphoneImage.flatMap {
+            scaledRGBA($0, toWidth: outW, height: outH)
+        }
 
-        // Sample ERP background through iPhone's perspective
         var pixels = [RGBA](
             repeating: RGBA(r: 0, g: 0, b: 0, a: 255),
             count: outW * outH
         )
+
         for py in 0..<outH {
             for px in 0..<outW {
+                // Reproject ERP to iPhone perspective
                 let rxV = (Float(px) - cxV) / fxV
                 let ryV = (Float(py) - cyV) / fyV
                 let ray = simd_normalize(
@@ -60,115 +59,24 @@ enum CalibrationOverlayRenderer {
                 u = ((u % erpW) + erpW) % erpW
                 let v = max(0, min(erpH - 1,
                     Int(hF * (0.5 - lat / .pi))))
-                var px4 = erpRGBA[v * erpW + u]
-                if seamCols.contains(u) {
-                    px4.r = UInt8(Float(px4.r) * 0.3)
-                    px4.g = UInt8(Float(px4.g) * 0.3)
-                    px4.b = UInt8(min(255,
-                        Float(px4.b) * 0.3 + 50))
-                }
-                pixels[py * outW + px] = px4
-            }
-        }
+                let erpPx = erpRGBA[v * erpW + u]
 
-        // Unproject LiDAR depth to ERP bearings, then project back
-        // through the iPhone's perspective to find overlay positions.
-        // Dots land where LiDAR maps in the ERP view — misalignment
-        // means the extrinsic is off.
-        struct Dot { let px: Int; let py: Int; let dist: Float }
-        var dots = [Dot]()
-        dots.reserveCapacity(frame.depthW * frame.depthH / 4)
-        let Rt = R.transpose
-        let erpCt = ExtrinsicOptimizer.erpCorrection.transpose
-
-        for row in 0..<frame.depthH {
-            for col in 0..<frame.depthW {
-                let z = frame.depth[row * frame.depthW + col]
-                guard z > 0.15 && z < 5.0 else { continue }
-                let x = (Float(col) - di.cx) / di.fx * z
-                let y = (Float(row) - di.cy) / di.fy * z
-                let pt = R * SIMD3(-x, -y, z) + t
-                let norm = simd_length(pt)
-                guard norm > 0.3 else { continue }
-                let b = ExtrinsicOptimizer.erpCorrection
-                    * (pt / norm)
-
-                // Inverse-project bearing to perspective pixel
-                let cam = Rt * (erpCt * b)
-                guard cam.z > 0 else { continue }
-                let dpx = Int(-cam.x / cam.z * fxV + cxV)
-                let dpy = Int(-cam.y / cam.z * fyV + cyV)
-                guard dpx >= 3, dpx < outW - 3,
-                      dpy >= 3, dpy < outH - 3
-                else { continue }
-                dots.append(Dot(px: dpx, py: dpy, dist: norm))
-            }
-        }
-
-        guard !dots.isEmpty else {
-            return toImage(pixels, w: outW, h: outH)
-        }
-
-        let dMin = dots.min(by: { $0.dist < $1.dist })!.dist
-        let dMax = dots.max(by: { $0.dist < $1.dist })!.dist
-        let dRange = dMax - dMin + 1e-6
-        let circleR = 3
-        let r2 = circleR * circleR
-
-        for dot in dots {
-            let tNorm = (dot.dist - dMin) / dRange
-            let (jr, jg, jb) = jet(tNorm)
-            for dy in -circleR...circleR {
-                for dx in -circleR...circleR {
-                    guard dx * dx + dy * dy <= r2 else {
-                        continue
-                    }
-                    let idx = (dot.py + dy) * outW + (dot.px + dx)
-                    let bg = pixels[idx]
+                let idx = py * outW + px
+                if let iphone = iphonePixels {
+                    let iPx = iphone[idx]
                     pixels[idx] = RGBA(
-                        r: clampByte(
-                            Float(bg.r) * 0.65 + jr * 0.35
-                        ),
-                        g: clampByte(
-                            Float(bg.g) * 0.65 + jg * 0.35
-                        ),
-                        b: clampByte(
-                            Float(bg.b) * 0.65 + jb * 0.35
-                        ),
+                        r: UInt8((Int(iPx.r) + Int(erpPx.r)) / 2),
+                        g: UInt8((Int(iPx.g) + Int(erpPx.g)) / 2),
+                        b: UInt8((Int(iPx.b) + Int(erpPx.b)) / 2),
                         a: 255
                     )
+                } else {
+                    pixels[idx] = erpPx
                 }
             }
         }
 
         return toImage(pixels, w: outW, h: outH)
-    }
-
-    // MARK: - JET colormap (matches cv2.COLORMAP_JET)
-
-    private static func jet(_ t: Float) -> (Float, Float, Float) {
-        let c = max(0, min(1, t))
-        let r: Float, g: Float, b: Float
-        if c < 0.125 {
-            r = 0; g = 0
-            b = 128 + c / 0.125 * 127
-        } else if c < 0.375 {
-            r = 0
-            g = (c - 0.125) / 0.25 * 255
-            b = 255
-        } else if c < 0.625 {
-            r = (c - 0.375) / 0.25 * 255
-            g = 255
-            b = 255 - (c - 0.375) / 0.25 * 255
-        } else if c < 0.875 {
-            r = 255
-            g = 255 - (c - 0.625) / 0.25 * 255
-            b = 0
-        } else {
-            r = 255 - (c - 0.875) / 0.125 * 127
-            g = 0; b = 0
-        }
-        return (r, g, b)
     }
 
     // MARK: - ERP image normalization
@@ -197,13 +105,22 @@ enum CalibrationOverlayRenderer {
         return (px, cg.width, cg.height)
     }
 
+    private static func scaledRGBA(
+        _ image: UIImage, toWidth w: Int, height h: Int
+    ) -> [RGBA]? {
+        let renderer = UIGraphicsImageRenderer(
+            size: CGSize(width: w, height: h)
+        )
+        let scaled = renderer.image { _ in
+            image.draw(in: CGRect(x: 0, y: 0, width: w, height: h))
+        }
+        guard let cg = scaled.cgImage else { return nil }
+        return renderRGBA(cgImage: cg)
+    }
+
     // MARK: - Image helpers
 
     private struct RGBA { var r, g, b, a: UInt8 }
-
-    private static func clampByte(_ v: Float) -> UInt8 {
-        UInt8(max(0, min(255, Int(v))))
-    }
 
     private static func renderRGBA(cgImage: CGImage) -> [RGBA]? {
         let w = cgImage.width, h = cgImage.height

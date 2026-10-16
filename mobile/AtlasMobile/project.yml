@@ -12,6 +12,7 @@ settings:
     CLANG_CXX_LIBRARY: libc++
     FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/Frameworks
     SWIFT_OBJC_BRIDGING_HEADER: AtlasMobile/AtlasMobile-Bridging-Header.h
+    USER_HEADER_SEARCH_PATHS: "$(SRCROOT)/AtlasMobile/Calibration $(SRCROOT)/AtlasMobile/Export"
 
 targets:
   AtlasMobile:

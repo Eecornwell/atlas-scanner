@@ -359,7 +359,8 @@ final class CalibrationManager: ObservableObject {
             return CameraConfig(
                 id: cam.id, model: cam.model, serial: cam.serial,
                 extrinsic: refined,
-                mask: cam.mask, faceCount: cam.faceCount, tileFov: cam.tileFov
+                mask: cam.mask, faceCount: cam.faceCount, tileFov: cam.tileFov,
+                enabled: cam.enabled
             )
         }
         config = MultiCameraConfig(cameras: updated, iphone: config.iphone)

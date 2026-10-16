@@ -124,12 +124,31 @@ Run once on a Mac to convert PromptDA and StableNormal to CoreML:
 
 ```bash
 cd mobile/offline_pipeline
-python3 convert_models.py
-# Outputs: AtlasMobile/Resources/PromptDA.mlpackage
-#          AtlasMobile/Resources/StableNormal.mlpackage
+pip install coremltools>=7.0   # first time only
+python3 convert_models.py --output-dir ../AtlasMobile/AtlasMobile/Resources/
+# Outputs: AtlasMobile/AtlasMobile/Resources/PromptDA.mlpackage   (~400 MB)
+#          AtlasMobile/AtlasMobile/Resources/StableNormal.mlpackage (~900 MB)
 ```
 
-Then drag both `.mlpackage` files into the Xcode project (Add to targets: AtlasMobile).
+**Headless / XcodeGen builds:** The `.mlpackage` directories are placed inside the
+`AtlasMobile/` source tree, so XcodeGen includes them automatically via the
+`sources: [{path: AtlasMobile}]` rule in `project.yml`. Just regenerate and build:
+
+```bash
+cd mobile/AtlasMobile
+/path/to/xcodegen generate --spec project.yml
+xcodebuild archive ...   # models are bundled in the app
+```
+
+**Xcode GUI:** Alternatively, drag both `.mlpackage` folders into the Xcode project
+navigator and check "Add to targets: AtlasMobile."
+
+`PostProcessingManager.swift` loads them at runtime via
+`Bundle.main.url(forResource:withExtension:"mlpackage")`. The "Full On-Device" export
+mode shows model availability — both should appear as "Ready" once bundled.
+
+> **Note:** This adds ~1.3 GB to the app binary. Use "Host Processing" mode with
+> `enhance_server.py` if binary size is a concern.
 
 ### Masks
 

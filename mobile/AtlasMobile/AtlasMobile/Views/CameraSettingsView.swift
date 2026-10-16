@@ -17,9 +17,26 @@ struct CameraSettingsView: View {
                         .foregroundColor(.secondary)
                 } else {
                     ForEach(Array(config.cameras.enumerated()), id: \.element.id) { index, cam in
-                        CameraRow(camera: cam)
-                            .contentShape(Rectangle())
-                            .onTapGesture { editingIndex = index }
+                        HStack {
+                            Toggle("", isOn: Binding(
+                                get: { config.cameras[index].enabled },
+                                set: { newVal in
+                                    var cameras = config.cameras
+                                    cameras[index].enabled = newVal
+                                    config = MultiCameraConfig(
+                                        cameras: cameras,
+                                        iphone: config.iphone
+                                    )
+                                    save()
+                                }
+                            ))
+                            .labelsHidden()
+                            .fixedSize()
+                            CameraRow(camera: cam)
+                                .contentShape(Rectangle())
+                                .onTapGesture { editingIndex = index }
+                                .opacity(cam.enabled ? 1.0 : 0.4)
+                        }
                     }
                     .onDelete(perform: deleteCamera)
                 }
@@ -127,7 +144,8 @@ struct CameraSettingsView: View {
         }
         await manager.discoverAndConnect()
         let count = manager.connectedCameras.count
-        let total = config.cameras.count
+        let total = config.cameras
+            .filter(\.enabled).count
         if count == total {
             connectionStatus = "\(count) camera\(count == 1 ? "" : "s") connected"
         } else if count > 0 {

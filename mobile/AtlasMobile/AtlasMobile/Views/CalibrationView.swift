@@ -26,6 +26,8 @@ struct CalibrationView: View {
     @State private var showMaskEditor = false
     @State private var isComputingColorProfile = false
     @State private var isRefiningFeatures = false
+    @State private var isRunningFullPipeline = false
+    @State private var pipelineStage: String = ""
 
     private let inchesToM = 0.0254
     private let ciContext = CIContext()
@@ -206,14 +208,26 @@ struct CalibrationView: View {
                     )
                     .cornerRadius(6)
 
-                Button(action: runOptimization) {
-                    Label("Run Optimization", systemImage: "wand.and.stars")
-                }
-                .buttonStyle(.bordered)
-                .disabled(frameCount == 0 || isOptimizing)
+                HStack(spacing: 12) {
+                    Button(action: runOptimization) {
+                        Label("Optimize", systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(frameCount == 0 || isOptimizing || isRunningFullPipeline)
 
-                if isOptimizing {
+                    Button(action: runFullPipeline) {
+                        Label("Run All", systemImage: "bolt.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(frameCount == 0 || isOptimizing || isRunningFullPipeline)
+                }
+
+                if isOptimizing && !isRunningFullPipeline {
                     ProgressView("Optimizing…")
+                }
+
+                if isRunningFullPipeline {
+                    ProgressView(pipelineStage.isEmpty ? "Running…" : pipelineStage)
                 }
 
                 if let optError = calibManager.optimizeError {
@@ -463,7 +477,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-11d")
+        Text("Build: 2026-10-16c")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -556,9 +570,12 @@ struct CalibrationView: View {
             return
         }
 
-        iphoneThumbnail = sessionManager.thumbnailFromPixelBuffer(
-            arkitFrame.capturedImage
-        )
+        let buf = arkitFrame.capturedImage
+        iphoneThumbnail = await Task.detached(
+            priority: .userInitiated
+        ) {
+            CaptureSessionManager.makeThumbnail(from: buf)
+        }.value
 
         // Copy depth NOW — ARKit recycles CVPixelBuffers during awaits.
         let depthBuf = arkitFrame.depthMap
@@ -628,7 +645,8 @@ struct CalibrationView: View {
         var downloadWarning: String?
 
         if !captured {
-            downloadWarning = "No 360° capture — using previous ERP"
+            captureError = "No 360° capture — check camera connection"
+            return
         } else if let fullImage =
             await sessionManager.downloadLastInsta360Image() {
             if DualFisheyeStitcher.isDualFisheye(fullImage) {
@@ -643,25 +661,19 @@ struct CalibrationView: View {
                 instaERP = Self.downsampleERP(fullImage, maxWidth: 2048)
             }
         } else {
-            downloadWarning = "Download failed — using previous ERP"
-            print("[Calib] download failed, falling back to previous ERP")
+            captureError = "360° download failed — try again"
+            return
         }
 
         if let erp = instaERP {
             lastSuccessfulERP = erp
             insta360Thumbnail = erp
-        } else {
-            instaERP = lastSuccessfulERP
         }
         captureCount += 1
 
         guard let erpImage = instaERP else {
-            captureError = "No 360° image available"
+            captureError = "360° stitch failed"
             return
-        }
-
-        if let warning = downloadWarning {
-            captureError = warning
         }
 
         // ── Phase 3: Build frame + render overlay ──────────────────
@@ -714,6 +726,34 @@ struct CalibrationView: View {
 
     private func runOptimization() {
         Task { await calibManager.optimize(seed: seed) }
+    }
+
+    private func runFullPipeline() {
+        isRunningFullPipeline = true
+        Task {
+            defer {
+                isRunningFullPipeline = false
+                pipelineStage = ""
+            }
+
+            pipelineStage = "Optimizing…"
+            await calibManager.optimize(seed: seed)
+
+            guard case .done(let result) = calibManager.state else {
+                return
+            }
+
+            pipelineStage = "Computing color profile…"
+            calibManager.computeColorProfile(extrinsic: result)
+
+            pipelineStage = "Feature refine…"
+            await calibManager.refineWithFeatures(extrinsic: result)
+
+            if case .done(let refined) = calibManager.state {
+                pipelineStage = "Saving…"
+                saveCalibration(refined)
+            }
+        }
     }
 
     private func saveCalibration(_ result: RigidTransform) {

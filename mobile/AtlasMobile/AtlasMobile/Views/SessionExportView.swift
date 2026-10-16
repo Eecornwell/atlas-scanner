@@ -8,6 +8,7 @@ struct SessionExportView: View {
     @AppStorage("hostURL") private var hostURL = "http://192.168.1.100:8765"
 
     @State private var selectedMode: ExportMode = .colmapOnly
+    @AppStorage("multiCameraExport") private var multiCameraExport = true
     @State private var isRunning = false
     @State private var isComplete = false
     @State private var isSharing = false
@@ -26,6 +27,21 @@ struct SessionExportView: View {
                         }
                     }
                 }
+
+                // Camera model
+                if selectedMode != .hostProcessing {
+                    Section("Camera Model") {
+                        Toggle("Multi-camera (native fisheye)", isOn: $multiCameraExport)
+                        Text(multiCameraExport
+                             ? "Insta360 exported as 2 equidistant fisheye lenses "
+                               + "(OPENCV_FISHEYE). Full FOV, requires 3DGUT."
+                             : "Insta360 exported as 8 perspective tiles "
+                               + "(SIMPLE_PINHOLE). Compatible with all pipelines.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
 
                 // Host URL (only shown for host mode)
                 if selectedMode == .hostProcessing {
@@ -189,6 +205,7 @@ struct SessionExportView: View {
         isRunning = false
         isComplete = true
     }
+
 }
 
 // MARK: - Sub-views

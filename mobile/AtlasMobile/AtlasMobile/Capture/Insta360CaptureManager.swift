@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import INSCameraSDK
 
 /// Manages connections and capture for multiple Insta360 cameras.
 final class Insta360CaptureManager: ObservableObject {
@@ -51,7 +52,21 @@ final class Insta360CaptureManager: ObservableObject {
         await MainActor.run { isConnecting = true }
         defer { Task { @MainActor in self.isConnecting = false } }
 
-        let instances = cameraConfig.cameras.map { CameraInstance(config: $0) }
+        // Re-trigger USB discovery so the SDK picks up cameras
+        // added after the initial onAppear setup() call.
+        await MainActor.run {
+            let socket = INSCameraManager.socket()
+            if socket.cameraState != .connected {
+                socket.setup()
+            }
+        }
+        // Give the SDK time to discover the camera on USB.
+        try? await Task.sleep(for: .seconds(2))
+
+        let enabledCameras = cameraConfig.cameras
+            .filter(\.enabled)
+        let instances = enabledCameras
+            .map { CameraInstance(config: $0) }
         for instance in instances {
             instance.onStatusUpdate = { [weak self] msg in
                 self?.onLogMessage?(msg)
@@ -91,8 +106,16 @@ final class Insta360CaptureManager: ObservableObject {
         await MainActor.run { isConnecting = true }
         defer { Task { @MainActor in self.isConnecting = false } }
 
+        await MainActor.run {
+            let socket = INSCameraManager.socket()
+            if socket.cameraState != .connected {
+                socket.setup()
+            }
+        }
+        try? await Task.sleep(for: .seconds(2))
+
         let connectedIds = Set(await MainActor.run { connectedCameras.map(\.id) })
-        let missing = cameraConfig.cameras.filter { !connectedIds.contains($0.id) }
+        let missing = cameraConfig.cameras.filter { $0.enabled && !connectedIds.contains($0.id) }
         guard !missing.isEmpty else { return }
 
         let reconnected: [CameraInstance] = await withTaskGroup(of: CameraInstance?.self) { group in
@@ -144,6 +167,13 @@ final class Insta360CaptureManager: ObservableObject {
 
     // MARK: - Capture
 
+    func clearCaptureState() async {
+        let cameras = await MainActor.run { connectedCameras }
+        for camera in cameras {
+            camera.clearCaptureState()
+        }
+    }
+
     func captureAll(arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8) async -> [Insta360CaptureResult] {
         let cameras = await MainActor.run { connectedCameras }
         return await captureWith(
@@ -156,9 +186,10 @@ final class Insta360CaptureManager: ObservableObject {
         cameras: [CameraInstance],
         arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8
     ) async -> [Insta360CaptureResult] {
-        guard !cameras.isEmpty else { return [] }
+        guard !cameras.isEmpty, !Task.isCancelled else { return [] }
         return await withTaskGroup(of: Insta360CaptureResult?.self) { group in
             for camera in cameras {
+                guard !Task.isCancelled else { break }
                 group.addTask {
                     await camera.capture(
                         arkitTimestamp: arkitTimestamp,

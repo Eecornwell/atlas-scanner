@@ -12,28 +12,16 @@ struct CaptureOverlayView: View {
             // Depth overlay (tap anywhere to dismiss)
             if sessionManager.showDepthOverlay,
                let depthImage = sessionManager.depthOverlayImage {
-                Image(uiImage: depthImage)
-                    .resizable()
-                    .scaledToFill()
-                    .ignoresSafeArea()
-                    .opacity(0.6)
-                    .onTapGesture { sessionManager.toggleDepthOverlay() }
-
-                VStack {
-                    Button {
-                        sessionManager.toggleDepthOverlay()
-                    } label: {
-                        Label("Back to Camera", systemImage: "xmark.circle.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(.black.opacity(0.7))
-                            .cornerRadius(20)
-                    }
-                    .padding(.top, 60)
-                    Spacer()
+                GeometryReader { geo in
+                    DepthOverlayUIView(image: depthImage)
+                        .frame(
+                            width: geo.size.width,
+                            height: geo.size.height
+                        )
                 }
+                .ignoresSafeArea()
+                .allowsHitTesting(true)
+                .onTapGesture { sessionManager.toggleDepthOverlay() }
             }
 
             // Capture flash
@@ -254,7 +242,35 @@ struct CaptureOverlayView: View {
                             sessionManager.toggleDepthOverlay()
                         }
 
-                        // Calibration
+                        // Quick calibration check
+                        if sessionManager.connectedCameraCount > 0 {
+                            Button {
+                                Task {
+                                    await sessionManager
+                                        .quickCalibrationCheck()
+                                }
+                            } label: {
+                                ZStack {
+                                    Image(systemName: "eye.circle")
+                                        .font(.title3)
+                                        .foregroundColor(
+                                            sessionManager.isCheckingCalib
+                                                ? .yellow : .white
+                                        )
+                                        .frame(width: 44, height: 44)
+                                        .background(.ultraThinMaterial)
+                                        .clipShape(Circle())
+                                    if sessionManager.isCheckingCalib {
+                                        ProgressView()
+                                            .tint(.white)
+                                            .scaleEffect(0.6)
+                                    }
+                                }
+                            }
+                            .disabled(sessionManager.isCheckingCalib)
+                        }
+
+                        // Full calibration view
                         Button { showCalibration = true } label: {
                             Image(systemName: "scope")
                                 .font(.title3)
@@ -279,6 +295,39 @@ struct CaptureOverlayView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 30)
+            }
+        }
+        .overlay {
+            if sessionManager.showCalibCheck,
+               let calibImage = sessionManager.calibCheckImage {
+                ZStack {
+                    Color.black.ignoresSafeArea()
+                    Image(uiImage: calibImage)
+                        .resizable()
+                        .scaledToFit()
+                        .ignoresSafeArea()
+                    VStack {
+                        HStack {
+                            Button {
+                                sessionManager.dismissCalibCheck()
+                            } label: {
+                                Label("Close", systemImage: "xmark.circle.fill")
+                                    .font(.headline)
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .background(.black.opacity(0.7))
+                                    .cornerRadius(20)
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 60)
+                        .padding(.leading, 20)
+                        Spacer()
+                    }
+                }
+                .onTapGesture { sessionManager.dismissCalibCheck() }
+                .transition(.opacity)
             }
         }
         .sheet(isPresented: $showCalibration) {
@@ -419,6 +468,28 @@ private struct TrackingStateBadge: View {
             return "Not available"
         @unknown default:
             return "Unknown"
+        }
+    }
+}
+
+private struct DepthOverlayUIView: UIViewRepresentable {
+    let image: UIImage
+
+    func makeUIView(context: Context) -> UIImageView {
+        let iv = UIImageView()
+        iv.contentMode = .scaleAspectFill
+        iv.clipsToBounds = true
+        iv.alpha = 0.6
+        return iv
+    }
+
+    func updateUIView(_ uiView: UIImageView, context: Context) {
+        UIView.transition(
+            with: uiView,
+            duration: 0.15,
+            options: .transitionCrossDissolve
+        ) {
+            uiView.image = image
         }
     }
 }

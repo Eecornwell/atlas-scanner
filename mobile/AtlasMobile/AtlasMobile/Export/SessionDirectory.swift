@@ -28,11 +28,19 @@ enum SessionDirectory {
 
         guard let contents = try? FileManager.default.contentsOfDirectory(
             at: sessionsDir,
-            includingPropertiesForKeys: [.creationDateKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
-        return contents.sorted { a, b in
+        let sessions = contents.filter { url in
+            let isDir = (try? url.resourceValues(
+                forKeys: [.isDirectoryKey]
+            ).isDirectory) ?? false
+            return isDir
+                && url.lastPathComponent.hasPrefix("session_")
+        }
+
+        return sessions.sorted { a, b in
             let aDate = (try? a.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
             let bDate = (try? b.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
             return aDate > bDate
