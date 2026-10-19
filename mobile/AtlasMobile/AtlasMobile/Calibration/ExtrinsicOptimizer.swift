@@ -14,16 +14,6 @@ import UIKit
 /// dense bearing vectors.
 enum ExtrinsicOptimizer {
 
-    /// Rz(-90°) in ERP space: corrects for the 90° mismatch between
-    /// the landscape depth buffer's bearing frame and the ERP convention.
-    /// Empirically confirmed: physical seed (0,-10,-90) produces correct
-    /// overlay alignment with this correction applied.
-    static let erpCorrection = simd_float3x3(rows: [
-        SIMD3<Float>( 0,  1,  0),
-        SIMD3<Float>(-1,  0,  0),
-        SIMD3<Float>( 0,  0,  1),
-    ])
-
     // MARK: - Public
 
     /// Matched pair: LiDAR bearing in iPhone camera frame + Insta360 ERP pixel.
@@ -138,7 +128,7 @@ enum ExtrinsicOptimizer {
         var total: Float = 0
 
         for s in samples {
-            let b = erpCorrection * simd_normalize(R * s.lidarBearing)
+            let b = simd_normalize(R * s.lidarBearing)
             let lat = -asin(max(-1, min(1, b.y)))
             let lon = atan2(b.x, b.z)
             var u = W * (0.5 + lon / (2 * .pi))
@@ -358,7 +348,7 @@ enum ExtrinsicOptimizer {
         var count = 0
 
         for b in bearings {
-            let rotated = erpCorrection * simd_normalize(R * b.bearing)
+            let rotated = simd_normalize(R * b.bearing)
             let lat = -asin(max(-1, min(1, rotated.y)))
             let lon = atan2(rotated.x, rotated.z)
             let u = Int(W * (0.5 + lon / (2 * .pi))) % edgeW
@@ -415,12 +405,17 @@ enum ExtrinsicOptimizer {
         let stdA = sqrt(max(0, sumA2 - Float(n) * meanA * meanA))
         guard stdA > 1 else { return (seed, 0) }
 
-        // Precompute ray directions (camera frame, don't change per eval)
+        // Precompute ray directions (camera frame, don't change per eval).
+        // Flip 180° because iphoneGray comes from CIImage→CGImage which
+        // inverts Y, producing a landscape image that is 180° from the
+        // intrinsic convention.
         var rays = [SIMD3<Float>](repeating: .zero, count: n)
         for row in 0..<outH {
             for col in 0..<outW {
-                let xCam = (Float(col) - cx) / fx
-                let yCam = (Float(row) - cy) / fy
+                let lCol = outW - 1 - col
+                let lRow = outH - 1 - row
+                let xCam = (Float(lCol) - cx) / fx
+                let yCam = (Float(lRow) - cy) / fy
                 rays[row * outW + col] = simd_normalize(
                     SIMD3<Float>(-xCam, -yCam, 1.0)
                 )
@@ -437,7 +432,7 @@ enum ExtrinsicOptimizer {
 
         let nm = nelderMead(
             start: startParams,
-            steps: [0.087, 0.087, 0.087],
+            steps: [0.02, 0.02, 0.02],
             cost: { params in
                 let r = params[0], p = params[1], y = params[2]
                 let cr = cos(r), sr = sin(r)
@@ -455,7 +450,7 @@ enum ExtrinsicOptimizer {
                 var sumAB: Float = 0
 
                 for i in 0..<n {
-                    let rotated = erpCorrection * (R * rays[i])
+                    let rotated = R * rays[i]
                     let lat = -asin(max(-1, min(1, rotated.y)))
                     let lon = atan2(rotated.x, rotated.z)
 
@@ -533,12 +528,14 @@ enum ExtrinsicOptimizer {
     // Full translation: t = basisC * t_seed
     //
     // basisC maps seed-frame → ERP-frame directions.
+    // Absorbs a 180° yaw so that seed yaw=0 aligns with the Insta360
+    // forward direction (lon=π, ERP edges u=0).
     // basisD maps camera-frame → seed-frame directions.
 
     private static let basisC = simd_float3x3(rows: [
         SIMD3<Float>( 0, -1,  0),
-        SIMD3<Float>( 0,  0, -1),
-        SIMD3<Float>( 1,  0,  0),
+        SIMD3<Float>( 0,  0,  1),
+        SIMD3<Float>(-1,  0,  0),
     ])
 
     private static let basisD = simd_float3x3(rows: [

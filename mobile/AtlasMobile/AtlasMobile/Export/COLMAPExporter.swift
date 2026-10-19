@@ -1,5 +1,6 @@
 import Accelerate
 import Foundation
+import ImageIO
 import simd
 import ARKit
 import UIKit
@@ -155,12 +156,33 @@ final class COLMAPExporter {
         let hasInsta360 = filteredScans.contains { !$0.insta360ImageURLs.isEmpty }
 
         // Landscape values from pose.json (sensor native frame).
-        let imgW_l = first.imageWidth
-        let imgH_l = first.imageHeight
-        let fx_l = first.intrinsics[0][0]
-        let fy_l = first.intrinsics[1][1]
-        let cx_l = first.intrinsics[0][2]
-        let cy_l = first.intrinsics[1][2]
+        // imageResolution may differ from capturedImage buffer;
+        // read the saved JPEG to get actual pixel dimensions.
+        var imgW_l = first.imageWidth
+        var imgH_l = first.imageHeight
+        if let url = first.iphoneImageURL,
+           let jpegSize = Self.imageDimensions(url) {
+            // JPEG is portrait (rotated .right from landscape buffer)
+            let actualW_l = jpegSize.height
+            let actualH_l = jpegSize.width
+            if actualW_l != first.imageWidth
+                || actualH_l != first.imageHeight {
+                print(
+                    "[Export] imageRes=\(first.imageWidth)"
+                    + "×\(first.imageHeight)"
+                    + " actual=\(actualW_l)×\(actualH_l)"
+                    + " — scaling intrinsics"
+                )
+                imgW_l = actualW_l
+                imgH_l = actualH_l
+            }
+        }
+        let scaleX = Float(imgW_l) / Float(first.imageWidth)
+        let scaleY = Float(imgH_l) / Float(first.imageHeight)
+        let fx_l = first.intrinsics[0][0] * scaleX
+        let fy_l = first.intrinsics[1][1] * scaleY
+        let cx_l = first.intrinsics[0][2] * scaleX
+        let cy_l = first.intrinsics[1][2] * scaleY
 
         // Portrait values for cameras.bin — saved JPEG is rotated 90° CW.
         let imgW_p = imgH_l
@@ -246,6 +268,7 @@ final class COLMAPExporter {
         }
         try copyImagesAndDepths(
             scans: filteredScans,
+            cameraConfig: cameraConfig,
             useFisheye: useFisheye
         )
     }
@@ -809,6 +832,7 @@ final class COLMAPExporter {
 
     private func copyImagesAndDepths(
         scans: [ScanExportData],
+        cameraConfig: MultiCameraConfig,
         useFisheye: Bool
     ) throws {
         let fm = FileManager.default
@@ -852,9 +876,11 @@ final class COLMAPExporter {
                 let maskDst = iphoneMaskDir.appendingPathComponent(
                     "\(scan.scanName).png"
                 )
+                let jpegSize = Self.imageDimensions(dst)
                 Self.writeWhiteMask(
-                    to: maskDst, width: scan.imageHeight,
-                    height: scan.imageWidth
+                    to: maskDst,
+                    width: jpegSize?.width ?? scan.imageHeight,
+                    height: jpegSize?.height ?? scan.imageWidth
                 )
             }
 
@@ -874,8 +900,13 @@ final class COLMAPExporter {
 
                 let stitchedERP: UIImage
                 if DualFisheyeStitcher.isDualFisheye(rawImage) {
+                    let model = cameraConfig.cameras
+                        .first { $0.id == camId }?.model ?? ""
+                    let roll = DualFisheyeStitcher
+                        .rollCorrection(forModel: model)
                     guard let stitched = DualFisheyeStitcher.stitch(
-                        rawImage, outputWidth: 2048
+                        rawImage, outputWidth: 2048,
+                        rollDeg: roll
                     ) else { continue }
                     stitchedERP = stitched
                 } else {
@@ -999,6 +1030,21 @@ final class COLMAPExporter {
         if let data = img.pngData() {
             try? data.write(to: url)
         }
+    }
+
+    private static func imageDimensions(
+        _ url: URL
+    ) -> (width: Int, height: Int)? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL, nil
+        ) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(
+            source, 0, nil
+        ) as? [CFString: Any] else { return nil }
+        guard let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int
+        else { return nil }
+        return (w, h)
     }
 
     /// Inverts a mask image (drawn: white=masked → COLMAP: white=valid).

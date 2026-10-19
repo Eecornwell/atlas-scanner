@@ -89,7 +89,10 @@ final class Insta360CaptureManager: ObservableObject {
 
         await withTaskGroup(of: Void.self) { group in
             for cam in connected {
-                group.addTask { _ = await cam.calibrateClockOffset() }
+                group.addTask {
+                    _ = await cam.calibrateClockOffset()
+                    await cam.disableStabilization()
+                }
             }
         }
 

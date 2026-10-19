@@ -9,13 +9,13 @@ import UIKit
 ///   1. User provides physical seed (RPY + XYZ from mount measurements)
 ///   2. addFrame() — stores ARKit depth + Insta360 ERP pairs
 ///   3. optimize() — runs KAZE+FLANN matching then Nelder-Mead 6-DOF refinement
-///   4. overlayImage — visual verification composite
+///   4. overlayPair — side-by-side verification images
 ///   5. save() — writes refined extrinsic to multi_camera.yaml in Documents
 @MainActor
 final class CalibrationManager: ObservableObject {
 
     @Published var state: CalibrationState = .idle
-    @Published var overlayImage: UIImage?
+    @Published var overlayPair: CalibrationOverlayRenderer.Pair?
     @Published var overlayVersion: Int = 0
     @Published var refinedRPY: SIMD3<Float> = .zero
     @Published var refinedXYZ: SIMD3<Float> = .zero
@@ -135,7 +135,7 @@ final class CalibrationManager: ObservableObject {
             dRoll, dPitch, dYaw, -cost
         )
         frameDebugInfo = frame.debugDescription + "\n" + deltaStr
-        overlayImage = CalibrationOverlayRenderer.render(
+        overlayPair = CalibrationOverlayRenderer.render(
             frame: frame, extrinsic: refined
         )
         overlayVersion += 1
@@ -290,7 +290,7 @@ final class CalibrationManager: ObservableObject {
         )
         frameDebugInfo += "\n" + deltaStr
 
-        overlayImage = CalibrationOverlayRenderer.render(
+        overlayPair = CalibrationOverlayRenderer.render(
             frame: frame, extrinsic: refined
         )
         overlayVersion += 1
@@ -414,6 +414,13 @@ final class CalibrationManager: ObservableObject {
         case optimizing
         case done(RigidTransform)
         case saved
+
+        var isOptimized: Bool {
+            switch self {
+            case .done, .saved: return true
+            default: return false
+            }
+        }
 
         static func == (lhs: CalibrationState, rhs: CalibrationState) -> Bool {
             switch (lhs, rhs) {

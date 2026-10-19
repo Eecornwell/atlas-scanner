@@ -8,6 +8,16 @@ import UIKit
 /// and export pipeline expects.
 enum DualFisheyeStitcher {
 
+    /// Roll correction for a given camera model's dual-fisheye output.
+    /// The ONE X2 on a portrait phone rig is mounted sideways and needs -90°.
+    static func rollCorrection(forModel model: String) -> Float {
+        let m = model.lowercased()
+        if m.contains("x2") || m.contains("one x2") {
+            return -90
+        }
+        return 0
+    }
+
     /// Returns true if the image appears to be dual-fisheye rather than ERP.
     /// Checks for ~2:1 aspect ratio with dark (black) corners.
     static func isDualFisheye(_ image: UIImage) -> Bool {
@@ -48,10 +58,14 @@ enum DualFisheyeStitcher {
     /// - Parameters:
     ///   - dualFisheye: The raw dual-fisheye image from the Insta360 ONE X2.
     ///   - outputWidth: Width of the output ERP (height = width / 2).
+    ///   - rollDeg: Roll correction in degrees to compensate for camera
+    ///     mounting orientation. Negative = CCW correction of the ERP output.
+    ///     Use ``rollCorrection(forModel:)`` to get the value for a camera.
     /// - Returns: An equirectangular UIImage, or nil on failure.
     static func stitch(
         _ dualFisheye: UIImage,
-        outputWidth: Int = 2048
+        outputWidth: Int = 2048,
+        rollDeg: Float = 0
     ) -> UIImage? {
         guard let origCG = dualFisheye.cgImage else { return nil }
         let maxSrcW = 3072
@@ -103,6 +117,10 @@ enum DualFisheyeStitcher {
         let blendHi: Float = 95 * .pi / 180
         let srcStride = srcW * 4
 
+        let rollRad = rollDeg * .pi / 180
+        let cosR = cos(rollRad), sinR = sin(rollRad)
+        let applyRoll = abs(rollDeg) > 0.1
+
         for ov in 0..<outH {
             let lat = Float.pi * (0.5 - Float(ov) / H)
             let cosLat = cos(lat)
@@ -110,9 +128,16 @@ enum DualFisheyeStitcher {
 
             for ou in 0..<outW {
                 let lon = 2 * Float.pi * (Float(ou) / W - 0.5)
-                let bx = cosLat * sin(lon)
-                let by = -sinLat
+                var bx = cosLat * sin(lon)
+                var by = -sinLat
                 let bz = cosLat * cos(lon)
+
+                if applyRoll {
+                    let bx0 = bx
+                    bx = bx0 * cosR - by * sinR
+                    by = bx0 * sinR + by * cosR
+                }
+
                 let rxy = sqrt(bx * bx + by * by)
 
                 let tF = atan2(rxy, bz)

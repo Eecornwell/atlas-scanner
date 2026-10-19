@@ -208,21 +208,39 @@ struct CaptureOverlayView: View {
                                 .clipShape(Circle())
                         }
 
-                        if sessionManager.connectedCameraCount > 0 {
+                        ForEach(
+                            sessionManager.connectedCamerasList
+                        ) { cam in
+                            let on = sessionManager
+                                .isCameraEnabled(cam.id)
                             Button {
-                                sessionManager.useInsta360.toggle()
+                                sessionManager
+                                    .toggleCamera(cam.id)
                             } label: {
-                                Text("360")
-                                    .font(.caption2.weight(.bold))
-                                    .foregroundColor(
-                                        sessionManager.useInsta360
-                                            ? .black : .white
+                                Text(cam.id)
+                                    .font(
+                                        .system(
+                                            size: 9,
+                                            weight: .bold,
+                                            design: .monospaced
+                                        )
                                     )
-                                    .frame(width: 44, height: 44)
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.6)
+                                    .foregroundColor(
+                                        on ? .black : .white
+                                    )
+                                    .frame(
+                                        width: 44, height: 44
+                                    )
                                     .background(
-                                        sessionManager.useInsta360
-                                            ? AnyShapeStyle(.green)
-                                            : AnyShapeStyle(.ultraThinMaterial)
+                                        on
+                                            ? AnyShapeStyle(
+                                                .green
+                                            )
+                                            : AnyShapeStyle(
+                                                .ultraThinMaterial
+                                            )
                                     )
                                     .clipShape(Circle())
                             }

@@ -71,7 +71,7 @@ enum LiDARERPRenderer {
                 let pt = R * SIMD3(-x, -y, z) + t
                 let norm = simd_length(pt)
                 guard norm > 0.05 else { continue }
-                let b = ExtrinsicOptimizer.erpCorrection * (pt / norm)
+                let b = pt / norm
                 let lat = -asin(max(-1, min(1, b.y)))
                 let lon = atan2(b.x, b.z)
                 let u = Int(Float(erpW) * (0.5 + lon / (2 * .pi))) % erpW

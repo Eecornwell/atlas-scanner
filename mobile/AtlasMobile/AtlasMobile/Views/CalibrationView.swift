@@ -448,25 +448,85 @@ struct CalibrationView: View {
 
     @ViewBuilder
     private var overlaySection: some View {
-        if let preview = calibManager.overlayImage {
-            GroupBox("Verification Overlay") {
+        if let pair = calibManager.overlayPair {
+            GroupBox("Verification") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Image(uiImage: preview)
-                        .resizable()
-                        .scaledToFit()
-                        .cornerRadius(8)
-                        .id(calibManager.overlayVersion)
-                    Text("Overlay #\(calibManager.overlayVersion)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundColor(.secondary)
-                    Text("JET depth dots: near=blue far=red (50/50 blend)")
+                    HStack(spacing: 4) {
+                        if calibManager.state.isOptimized,
+                           let depthOnErp = pair.depthOnErp
+                        {
+                            VStack(spacing: 2) {
+                                Text("Depth+360°")
+                                    .font(.system(
+                                        .caption2,
+                                        design: .monospaced
+                                    ))
+                                    .foregroundColor(
+                                        .secondary
+                                    )
+                                Image(
+                                    uiImage: depthOnErp
+                                )
+                                .resizable()
+                                .scaledToFit()
+                                .cornerRadius(6)
+                            }
+                            if let iphone = pair.iphone {
+                                VStack(spacing: 2) {
+                                    Text("iPhone")
+                                        .font(.system(
+                                            .caption2,
+                                            design:
+                                                .monospaced
+                                        ))
+                                        .foregroundColor(
+                                            .secondary
+                                        )
+                                    Image(uiImage: iphone)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                }
+                            }
+                        } else {
+                            if let iphone = pair.iphone {
+                                VStack(spacing: 2) {
+                                    Text("iPhone")
+                                        .font(.system(
+                                            .caption2,
+                                            design:
+                                                .monospaced
+                                        ))
+                                        .foregroundColor(
+                                            .secondary
+                                        )
+                                    Image(uiImage: iphone)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .cornerRadius(6)
+                                }
+                            }
+                            VStack(spacing: 2) {
+                                Text("360°")
+                                    .font(.system(
+                                        .caption2,
+                                        design: .monospaced
+                                    ))
+                                    .foregroundColor(
+                                        .secondary
+                                    )
+                                Image(
+                                    uiImage: pair.erpSlice
+                                )
+                                .resizable()
+                                .scaledToFit()
+                                .cornerRadius(6)
+                            }
+                        }
+                    }
+                    .id(calibManager.overlayVersion)
+                    Text("Images should show the same scene when extrinsic is correct")
                         .font(.caption2).foregroundColor(.secondary)
-                    Text("Shifted horizontally → adjust Yaw")
-                        .font(.caption2)
-                    Text("Shifted vertically → adjust Pitch")
-                        .font(.caption2)
-                    Text("Rotated → adjust Roll")
-                        .font(.caption2)
                     if !calibManager.frameDebugInfo.isEmpty {
                         Text(calibManager.frameDebugInfo)
                             .font(.system(.caption2, design: .monospaced))
@@ -477,7 +537,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-16c")
+        Text("Build: 2026-10-18e")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -556,10 +616,7 @@ struct CalibrationView: View {
         }
 
         isCapturingFrame = true
-        defer {
-            isCapturingFrame = false
-            lastCaptureTime = Date()
-        }
+        defer { isCapturingFrame = false }
 
         // ── Phase 1: iPhone capture (instant) ──────────────────────
 
@@ -651,10 +708,16 @@ struct CalibrationView: View {
             await sessionManager.downloadLastInsta360Image() {
             if DualFisheyeStitcher.isDualFisheye(fullImage) {
                 let src = fullImage
+                let camModel = sessionManager
+                    .connectedCamerasList.first?.model ?? ""
+                let roll = DualFisheyeStitcher
+                    .rollCorrection(forModel: camModel)
                 let stitched = await Task.detached(
                     priority: .userInitiated
                 ) {
-                    DualFisheyeStitcher.stitch(src, outputWidth: 2048)
+                    DualFisheyeStitcher.stitch(
+                        src, outputWidth: 2048, rollDeg: roll
+                    )
                 }.value
                 instaERP = stitched
             } else {
@@ -669,6 +732,7 @@ struct CalibrationView: View {
             lastSuccessfulERP = erp
             insta360Thumbnail = erp
         }
+        lastCaptureTime = Date()
         captureCount += 1
 
         guard let erpImage = instaERP else {
@@ -700,13 +764,13 @@ struct CalibrationView: View {
             frame: frame, extrinsic: seed
         )
         print("[Calib] overlay render: \(overlay != nil ? "OK" : "nil")")
-        calibManager.overlayImage = overlay
+        calibManager.overlayPair = overlay
         calibManager.overlayVersion += 1
     }
 
     private func reRenderOverlay() {
         guard let frame = calibManager.lastFrame else { return }
-        calibManager.overlayImage =
+        calibManager.overlayPair =
             CalibrationOverlayRenderer.render(
                 frame: frame, extrinsic: seed
             )

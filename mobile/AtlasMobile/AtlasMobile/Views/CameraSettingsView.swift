@@ -16,7 +16,7 @@ struct CameraSettingsView: View {
                     Text("No Insta360 cameras configured")
                         .foregroundColor(.secondary)
                 } else {
-                    ForEach(Array(config.cameras.enumerated()), id: \.element.id) { index, cam in
+                    ForEach(Array(config.cameras.enumerated()), id: \.offset) { index, cam in
                         HStack {
                             Toggle("", isOn: Binding(
                                 get: { config.cameras[index].enabled },
@@ -103,10 +103,17 @@ struct CameraSettingsView: View {
         }
         .navigationTitle("Camera Settings")
         .sheet(isPresented: $showAddCamera) {
-            CameraFormView(title: "Add Camera", buttonLabel: "Add") { newCamera in
+            CameraFormView(
+                title: "Add Camera",
+                buttonLabel: "Add",
+                defaultId: nextCameraId()
+            ) { newCamera in
                 var cameras = config.cameras
                 cameras.append(newCamera)
-                config = MultiCameraConfig(cameras: cameras, iphone: config.iphone)
+                config = MultiCameraConfig(
+                    cameras: cameras,
+                    iphone: config.iphone
+                )
                 save()
             }
         }
@@ -158,6 +165,19 @@ struct CameraSettingsView: View {
         }
         await manager.disconnect()
         isTesting = false
+    }
+
+    private func nextCameraId() -> String {
+        let existing = Set(config.cameras.map(\.id))
+        for n in 1...99 {
+            let candidate = String(
+                format: "insta360_%02d", n
+            )
+            if !existing.contains(candidate) {
+                return candidate
+            }
+        }
+        return "insta360_\(config.cameras.count + 1)"
     }
 
     private func save() {
@@ -222,12 +242,14 @@ private struct CameraFormView: View {
 
     private let inchesToM = 0.0254
 
-    init(title: String, buttonLabel: String, existing: CameraConfig? = nil,
+    init(title: String, buttonLabel: String,
+         existing: CameraConfig? = nil,
+         defaultId: String = "insta360_01",
          onSave: @escaping (CameraConfig) -> Void) {
         self.title = title
         self.buttonLabel = buttonLabel
         self.onSave = onSave
-        _id = State(initialValue: existing?.id ?? "insta360_01")
+        _id = State(initialValue: existing?.id ?? defaultId)
         _model = State(initialValue: existing?.model ?? "X5")
         _serial = State(initialValue: existing?.serial ?? "")
         _forwardM = State(initialValue: existing?.extrinsic.x ?? 0.0)

@@ -399,12 +399,16 @@ enum FeatureBasedCalibrator {
 
         for row in 0..<outH {
             for col in 0..<outW {
-                let xCam = (Float(col) - outCx) / outFx
-                let yCam = (Float(row) - outCy) / outFy
+                // Flip 180° so the slice matches the iPhone UIImage,
+                // which is vertically flipped from intrinsic convention
+                // due to CIImage→CGImage coordinate inversion.
+                let lCol = outW - 1 - col
+                let lRow = outH - 1 - row
+                let xCam = (Float(lCol) - outCx) / outFx
+                let yCam = (Float(lRow) - outCy) / outFy
                 let ray = SIMD3<Float>(-xCam, -yCam, 1.0)
 
-                let rotated = ExtrinsicOptimizer.erpCorrection
-                    * simd_normalize(R * ray)
+                let rotated = simd_normalize(R * ray)
                 let lat = -asin(max(-1, min(1, rotated.y)))
                 let lon = atan2(rotated.x, rotated.z)
 
@@ -490,9 +494,10 @@ enum FeatureBasedCalibrator {
         for m in matches {
             let iKp = iKeypoints[m.queryIdx]
 
-            // iPhone pixel → camera bearing
-            let imgX = Float(iKp.x) * sliceToImgX
-            let imgY = Float(iKp.y) * sliceToImgY
+            // iPhone pixel → camera bearing (unfliip 180° to get
+            // intrinsic-convention coordinates from flipped image)
+            let imgX = Float(slice.w - 1 - iKp.x) * sliceToImgX
+            let imgY = Float(slice.h - 1 - iKp.y) * sliceToImgY
             let xCam = (imgX - imgCx) / imgFx
             let yCam = (imgY - imgCy) / imgFy
             let bearing = simd_normalize(
@@ -543,8 +548,7 @@ enum FeatureBasedCalibrator {
         let W = Float(erpW), H = Float(erpH)
 
         return samples.map { s in
-            let b = ExtrinsicOptimizer.erpCorrection
-                * simd_normalize(R * s.lidarBearing)
+            let b = simd_normalize(R * s.lidarBearing)
             let lat = -asin(max(-1, min(1, b.y)))
             let lon = atan2(b.x, b.z)
             let u = W * (0.5 + lon / (2 * .pi))

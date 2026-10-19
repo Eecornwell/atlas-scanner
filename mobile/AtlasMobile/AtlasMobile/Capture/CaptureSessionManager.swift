@@ -43,7 +43,8 @@ final class CaptureSessionManager: ObservableObject {
     @Published var thumbnailVersion: Int = 0
     /// Live connection diagnostic log for Insta360 cameras.
     @Published var connectionLog: [String] = []
-    @Published var useInsta360 = true
+    @Published var connectedCamerasList: [CameraInstance] = []
+    @Published var disabledCameraIds: Set<String> = []
 
     @Published private(set) var isEndingSession = false
     @Published var teardownStage: String = ""
@@ -59,6 +60,32 @@ final class CaptureSessionManager: ObservableObject {
             .assign(to: &$depthOverlayImage)
     }
 
+    // MARK: - Per-camera toggles
+
+    var enabledCameras: [CameraInstance] {
+        connectedCamerasList.filter {
+            !disabledCameraIds.contains($0.id)
+        }
+    }
+
+    func isCameraEnabled(_ id: String) -> Bool {
+        !disabledCameraIds.contains(id)
+    }
+
+    func toggleCamera(_ id: String) {
+        if disabledCameraIds.contains(id) {
+            disabledCameraIds.remove(id)
+        } else {
+            disabledCameraIds.insert(id)
+        }
+    }
+
+    private func syncCamerasList() async {
+        let cameras = await insta360Manager
+            .connectedCamerasCopy()
+        connectedCamerasList = cameras
+    }
+
     func startSession() async {
         guard !isSessionActive, !isEndingSession else { return }
 
@@ -72,6 +99,8 @@ final class CaptureSessionManager: ObservableObject {
 
         insta360Manager = Insta360CaptureManager()
         connectionLog = []
+        connectedCamerasList = []
+        disabledCameraIds = []
         insta360Manager.onLogMessage = { [weak self] msg in
             Task { @MainActor in
                 self?.connectionLog.append(msg)
@@ -107,6 +136,8 @@ final class CaptureSessionManager: ObservableObject {
                 guard let self, self.isSessionActive else { return }
                 let count = await manager.connectedCount()
                 self.connectedCameraCount = count
+                let cameras = await manager.connectedCamerasCopy()
+                self.connectedCamerasList = cameras
                 let syncInfo = await manager.clockOffsetSummary()
                 let suffix = syncInfo.map { " (\($0))" } ?? ""
                 if count == configuredCount {
@@ -118,7 +149,6 @@ final class CaptureSessionManager: ObservableObject {
                 } else {
                     self.cameraStatus = "No cameras found"
                 }
-                let cameras = await manager.connectedCamerasCopy()
                 masks.loadMasks(
                     for: cameras,
                     sessionDirectory: sessionDir
@@ -174,9 +204,10 @@ final class CaptureSessionManager: ObservableObject {
                 $0 >= Self.minInsta360Interval
             } ?? true
 
+            let activeCams = enabledCameras
             var sent360 = false
-            if insta360Ready, connectedCameraCount > 0,
-               useInsta360, isAutoCapturing
+            if insta360Ready, !activeCams.isEmpty,
+               isAutoCapturing
             {
                 insta360CommandCount += 1
                 let cmdNum = insta360CommandCount
@@ -190,9 +221,12 @@ final class CaptureSessionManager: ObservableObject {
                 sent360 = true
                 let manager = insta360Manager
                 let scan = currentScan
+                let cams = activeCams
+                insta360BackgroundTask?.cancel()
                 insta360BackgroundTask = Task { [weak self] in
                     let captureStart = ContinuousClock.now
-                    let _ = await manager.captureAll(
+                    let _ = await manager.captureWith(
+                        cameras: cams,
                         arkitTimestamp: CACurrentMediaTime(),
                         scanIndex: scan,
                         timeout: 12
@@ -257,12 +291,15 @@ final class CaptureSessionManager: ObservableObject {
                 + " \(ms(t1 - t0))ms\(i360tag)"
         } else {
             let insta360Results: [Insta360CaptureResult]
-            if useInsta360, connectedCameraCount > 0 {
-                insta360Results = await insta360Manager.captureAll(
-                    arkitTimestamp: arkitFrame.timestamp,
-                    scanIndex: currentScan,
-                    timeout: 30
-                )
+            let manualCams = enabledCameras
+            if !manualCams.isEmpty {
+                insta360Results = await insta360Manager
+                    .captureWith(
+                        cameras: manualCams,
+                        arkitTimestamp: arkitFrame.timestamp,
+                        scanIndex: currentScan,
+                        timeout: 30
+                    )
             } else {
                 insta360Results = []
             }
@@ -367,19 +404,21 @@ final class CaptureSessionManager: ObservableObject {
         )
         isAutoCapturing = false
 
-        insta360BackgroundTask?.cancel()
+        let bgTask = insta360BackgroundTask
         insta360BackgroundTask = nil
+        bgTask?.cancel()
 
         let task = autoCaptureTask
         autoCaptureTask = nil
         task?.cancel()
         _ = await task?.value
+        _ = await bgTask?.value
 
         await insta360Manager.clearCaptureState()
         connectionLog.append("STOP: task done")
     }
 
-    private static let buildTag = "10d"
+    private static let buildTag = "10f"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -418,6 +457,7 @@ final class CaptureSessionManager: ObservableObject {
         teardownStage = "4-disconnect"
         await manager.disconnect()
         connectedCameraCount = 0
+        connectedCamerasList = []
 
         teardownStage = "5-trajectory"
         await recorder?.saveTrajectory(trajectoryRecorder?.export())
@@ -478,11 +518,16 @@ final class CaptureSessionManager: ObservableObject {
         {
             if DualFisheyeStitcher.isDualFisheye(raw) {
                 let src = raw
+                let camModel = await insta360Manager
+                    .connectedCamerasCopy().first?.model ?? ""
+                let roll = DualFisheyeStitcher
+                    .rollCorrection(forModel: camModel)
                 erpImage = await Task.detached(
                     priority: .userInitiated
                 ) {
                     DualFisheyeStitcher.stitch(
-                        src, outputWidth: 2048
+                        src, outputWidth: 2048,
+                        rollDeg: roll
                     )
                 }.value
             } else {
@@ -532,12 +577,19 @@ final class CaptureSessionManager: ObservableObject {
             .first(where: { $0.enabled })
         else { return }
 
+        let resW = Int(
+            frame.camera.imageResolution.width
+        )
+        let resH = Int(
+            frame.camera.imageResolution.height
+        )
+
         let calibFrame = CalibrationFrame(
             depth: depthArr,
             depthW: depthW, depthH: depthH,
             intrinsics: frame.camera.intrinsics,
             imageW: bufW, imageH: bufH,
-            imageResW: bufW, imageResH: bufH,
+            imageResW: resW, imageResH: resH,
             erpImage: erp,
             iphoneImage: nil
         )
@@ -548,18 +600,41 @@ final class CaptureSessionManager: ObservableObject {
                 extrinsic: camCfg.extrinsic
             )
 
-        calibCheckImage = overlay
+        calibCheckImage = overlay?.depthOnErp
+            ?? overlay?.erpSlice
         showCalibCheck = overlay != nil
     }
 
     // MARK: - Calibration capture
 
     func triggerInsta360Capture() async -> Bool {
-        let count = await insta360Manager.connectedCount()
+        // Cancel any in-flight auto-capture to avoid race.
+        // Await it to ensure its takePicture callback has
+        // fully drained before we send a new one.
+        if let task = insta360BackgroundTask {
+            task.cancel()
+            _ = await task.value
+            insta360BackgroundTask = nil
+            try? await Task.sleep(for: .seconds(1))
+        }
+
+        var count = await insta360Manager.connectedCount()
         connectionLog.append(
             "[Calib] triggerCapture: count=\(count)"
         )
+
+        if count == 0 {
+            connectionLog.append(
+                "[Calib] no cameras — reconnecting"
+            )
+            await insta360Manager.retryConnection()
+            count = await insta360Manager.connectedCount()
+            connectionLog.append(
+                "[Calib] after reconnect: count=\(count)"
+            )
+        }
         guard count > 0 else { return false }
+
         let results = await insta360Manager.captureAll(
             arkitTimestamp: CACurrentMediaTime(),
             scanIndex: -1,
@@ -569,15 +644,9 @@ final class CaptureSessionManager: ObservableObject {
             "[Calib] results=\(results.count)"
             + " ids=\(results.map(\.mediaIdentifier))"
         )
-        let ok = results.contains(where: {
+        return results.contains(where: {
             !$0.mediaIdentifier.isEmpty
         })
-        if !ok {
-            connectionLog.append(
-                "[Calib] capture failed"
-            )
-        }
-        return ok
     }
 
     func downloadLastInsta360Image() async -> UIImage? {
@@ -614,6 +683,7 @@ final class CaptureSessionManager: ObservableObject {
             let count = await manager.connectedCount()
             let total = configuredCount
             self.connectedCameraCount = count
+            await self.syncCamerasList()
             let syncInfo = await manager.clockOffsetSummary()
             let suffix = syncInfo.map { " (\($0))" } ?? ""
             if count == total {
@@ -635,6 +705,7 @@ final class CaptureSessionManager: ObservableObject {
                 let count = await self.insta360Manager.connectedCount()
                 let total = self.insta360Manager.cameraConfig.cameras.count
                 self.connectedCameraCount = count
+                await self.syncCamerasList()
                 if count == 0 {
                     self.cameraStatus = "Camera disconnected"
                 } else {

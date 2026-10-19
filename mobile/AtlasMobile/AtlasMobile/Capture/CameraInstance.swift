@@ -199,6 +199,7 @@ final class CameraInstance: NSObject, Identifiable {
         for attempt in 1...maxRetries {
             if await connect() {
                 _ = await calibrateClockOffset()
+                await disableStabilization()
                 return true
             }
             if attempt < maxRetries {
@@ -269,7 +270,7 @@ final class CameraInstance: NSObject, Identifiable {
     func capture(
         arkitTimestamp: Double,
         scanIndex: Int,
-        timeout: Double = 15
+        timeout: Double = 45
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -283,105 +284,61 @@ final class CameraInstance: NSObject, Identifiable {
             )
             return nil
         }
-
-        let sdkState = await MainActor.run {
-            INSCameraManager.socket().cameraState
-        }
-        if sdkState != .connected {
-            onStatusUpdate?(
-                "[\(id)] capture skipped — SDK state "
-                + Self.stateName(sdkState)
-            )
+        defer {
             lock.lock()
             _captureInFlight = false
             lock.unlock()
+        }
+
+        guard await ensureSDKConnected() else {
             return nil
         }
 
+        let insta360Ts = Date().timeIntervalSince1970
+
+        _ = await setPhotoSingleMode()
         onStatusUpdate?(
             "[\(id)] takePicture sending…"
         )
+        var uri = await attemptTakePicture(
+            timeout: timeout
+        )
 
-        let insta360Ts = Date().timeIntervalSince1970
-        let options = INSTakePictureOptions()
+        if uri == nil {
+            onStatusUpdate?(
+                "[\(id)] no URI — clearing capture state"
+            )
+            await stopCurrentCapture()
+            try? await Task.sleep(for: .seconds(2))
 
-        let uri: String? = await withTaskCancellationHandler {
-            await withCheckedContinuation {
-                continuation in
-                self.lock.lock()
-                self._captureGen += 1
-                let gen = self._captureGen
-                self._captureCont = continuation
-                self.lock.unlock()
-
-                DispatchQueue.main.async {
-                    INSCameraManager.shared()
-                        .commandManager
-                        .takePicture(
-                            with: options
-                        ) { error, photoInfo in
-                            let uri = photoInfo?.uri
-                            self.onStatusUpdate?(
-                                "[\(self.id)] takePicture "
-                                + "cb: gen=\(gen) uri="
-                                + "\(uri ?? "nil")"
-                                + (error.map {
-                                    " err=\($0)"
-                                } ?? "")
-                            )
-                            DispatchQueue.main.async {
-                                self.lock.lock()
-                                guard gen == self._captureGen
-                                else {
-                                    self.lock.unlock()
-                                    self.onStatusUpdate?(
-                                        "[\(self.id)] stale cb"
-                                        + " ignored (gen"
-                                        + " \(gen))"
-                                    )
-                                    return
-                                }
-                                let cont = self._captureCont
-                                self._captureCont = nil
-                                self._captureInFlight = false
-                                self.lock.unlock()
-                                cont?.resume(
-                                    returning: uri
-                                )
-                            }
-                        }
-                }
-
-                DispatchQueue.main.asyncAfter(
-                    deadline: .now() + timeout
-                ) {
-                    self.lock.lock()
-                    guard gen == self._captureGen else {
-                        self.lock.unlock()
-                        self.onStatusUpdate?(
-                            "[\(self.id)] stale timeout"
-                            + " ignored (gen \(gen))"
-                        )
-                        return
-                    }
-                    let cont = self._captureCont
-                    self._captureCont = nil
-                    self._captureInFlight = false
-                    self.lock.unlock()
-                    self.onStatusUpdate?(
-                        "[\(self.id)] takePicture timeout"
-                        + " (\(Int(timeout))s)"
-                    )
-                    cont?.resume(returning: nil)
-                }
+            let recovered = await waitForConnected(
+                maxWait: 10
+            )
+            if !recovered {
+                onStatusUpdate?(
+                    "[\(id)] reconnect failed"
+                )
+                return Insta360CaptureResult(
+                    cameraId: id,
+                    scanIndex: scanIndex,
+                    arkitTimestamp: arkitTimestamp,
+                    insta360Timestamp: insta360Ts,
+                    mediaIdentifier: ""
+                )
             }
-        } onCancel: {
-            self.lock.lock()
-            let cont = self._captureCont
-            self._captureCont = nil
-            self._captureInFlight = false
-            self.lock.unlock()
-            cont?.resume(returning: nil)
+
+            _ = await setPhotoSingleMode()
+            onStatusUpdate?(
+                "[\(id)] retry takePicture…"
+            )
+            uri = await attemptTakePicture(
+                timeout: timeout
+            )
+            if uri == nil {
+                onStatusUpdate?(
+                    "[\(id)] retry failed"
+                )
+            }
         }
 
         if let uri {
@@ -399,6 +356,289 @@ final class CameraInstance: NSObject, Identifiable {
             insta360Timestamp: insta360Ts,
             mediaIdentifier: uri ?? ""
         )
+    }
+
+    private func waitForConnected(
+        maxWait: Double
+    ) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < maxWait {
+            let state = await MainActor.run {
+                INSCameraManager.socket().cameraState
+            }
+            if state == .connected {
+                onStatusUpdate?(
+                    "[\(id)] reconnected after "
+                    + "\(Int(Date().timeIntervalSince(start)))s"
+                )
+                return true
+            }
+            onStatusUpdate?(
+                "[\(id)] waiting… state="
+                + Self.stateName(state)
+            )
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+
+    private func ensureSDKConnected() async -> Bool {
+        var state = await MainActor.run {
+            INSCameraManager.socket().cameraState
+        }
+        if state == .connected { return true }
+
+        onStatusUpdate?(
+            "[\(id)] SDK state "
+            + Self.stateName(state)
+            + " — recovering"
+        )
+        await MainActor.run {
+            INSCameraManager.socket().setup()
+        }
+        try? await Task.sleep(for: .seconds(5))
+        state = await MainActor.run {
+            INSCameraManager.socket().cameraState
+        }
+        if state == .connected {
+            onStatusUpdate?(
+                "[\(id)] SDK recovered → "
+                + Self.stateName(state)
+            )
+            return true
+        }
+        onStatusUpdate?(
+            "[\(id)] capture skipped — SDK state "
+            + Self.stateName(state)
+        )
+        return false
+    }
+
+    private var _stopCont: CheckedContinuation<
+        Void, Never
+    >?
+
+    private func stopCurrentCapture() async {
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>)
+                in
+            self.lock.lock()
+            self._stopCont = continuation
+            self.lock.unlock()
+
+            func finish() {
+                self.lock.lock()
+                let cont = self._stopCont
+                self._stopCont = nil
+                self.lock.unlock()
+                cont?.resume()
+            }
+
+            DispatchQueue.main.async {
+                INSCameraManager.shared()
+                    .commandManager
+                    .stopTakePicture { [weak self] error in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "stopCapture: \(error)"
+                            )
+                        }
+                        finish()
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 3
+            ) {
+                finish()
+            }
+        }
+    }
+
+    func disableStabilization() async {
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>)
+                in
+            let resumed = NSLock()
+            var didResume = false
+
+            func finish() {
+                resumed.lock()
+                defer { resumed.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let opts = INSCameraOptions()
+                opts.enableInternalFlowstate = false
+                var types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .internalFlowstate.rawValue
+                    ),
+                ]
+                opts.horizonIndicatorEnable = false
+                types.append(
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .horizontalEnableGlobal
+                            .rawValue
+                    )
+                )
+                INSCameraManager.shared()
+                    .commandManager
+                    .setOptions(
+                        opts,
+                        forTypes: types
+                    ) { [weak self] error, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "disableStab err: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "stabilization disabled"
+                            )
+                        }
+                        finish()
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 5
+            ) {
+                finish()
+            }
+        }
+    }
+
+    private func setPhotoSingleMode() async -> Bool {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                let opts = INSCameraOptions()
+                opts.photoSubMode = UInt32(
+                    INSPhotoSubMode.single.rawValue
+                )
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .photoSubMode.rawValue
+                    )
+                ]
+                INSCameraManager.shared()
+                    .commandManager
+                    .setOptions(
+                        opts,
+                        forTypes: types
+                    ) { [weak self] error, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "setPhotoSubMode err: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "photoSubMode → single"
+                            )
+                        }
+                        continuation.resume(
+                            returning: error == nil
+                        )
+                    }
+            }
+        }
+    }
+
+    private func attemptTakePicture(
+        timeout: Double
+    ) async -> String? {
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation {
+                continuation in
+                self.lock.lock()
+                self._captureGen += 1
+                let gen = self._captureGen
+                self._captureCont = continuation
+                self.lock.unlock()
+
+                DispatchQueue.main.async {
+                    self.stopHeartbeat()
+                    let opts = INSTakePictureOptions()
+                    opts.countDown = 0
+                    INSCameraManager.shared()
+                        .commandManager
+                        .takePicture(
+                            with: opts
+                        ) { error, photoInfo in
+                            let uri = photoInfo?.uri
+                            self.onStatusUpdate?(
+                                "[\(self.id)] cb:"
+                                + " gen=\(gen)"
+                                + " uri="
+                                + "\(uri ?? "nil")"
+                                + (error.map {
+                                    " err=\($0)"
+                                } ?? "")
+                            )
+                            DispatchQueue.main.async {
+                                self.startHeartbeat()
+                            }
+                            self.lock.lock()
+                            guard gen
+                                == self._captureGen
+                            else {
+                                self.lock.unlock()
+                                return
+                            }
+                            let cont =
+                                self._captureCont
+                            self._captureCont = nil
+                            self.lock.unlock()
+                            cont?.resume(
+                                returning: uri
+                            )
+                        }
+                }
+
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + timeout
+                ) {
+                    self.lock.lock()
+                    guard gen == self._captureGen else {
+                        self.lock.unlock()
+                        return
+                    }
+                    let cont = self._captureCont
+                    self._captureCont = nil
+                    self.lock.unlock()
+                    self.startHeartbeat()
+                    self.onStatusUpdate?(
+                        "[\(self.id)] takePicture"
+                        + " timeout"
+                        + " (\(Int(timeout))s)"
+                    )
+                    cont?.resume(returning: nil)
+                }
+            }
+        } onCancel: {
+            self.lock.lock()
+            self._captureGen += 1
+            let cont = self._captureCont
+            self._captureCont = nil
+            self.lock.unlock()
+            DispatchQueue.main.async {
+                self.startHeartbeat()
+            }
+            cont?.resume(returning: nil)
+        }
     }
 
     // MARK: - Download
@@ -446,16 +686,19 @@ final class CameraInstance: NSObject, Identifiable {
         let clockCont = _clockCont
         let captureCont = _captureCont
         let downloadCont = _downloadCont
+        let stopCont = _stopCont
         _connectCont = nil
         _clockCont = nil
         _captureCont = nil
         _downloadCont = nil
+        _stopCont = nil
         lock.unlock()
 
         connectCont?.resume(returning: false)
         clockCont?.resume(returning: fallback)
         captureCont?.resume(returning: nil)
         downloadCont?.resume(returning: nil)
+        stopCont?.resume()
     }
 
     private func downloadOne(

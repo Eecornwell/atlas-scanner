@@ -70,8 +70,7 @@ enum ColorProfileCalibrator {
                 let yCam = (Float(row) - di.cy) / di.fy
                 let ray = SIMD3<Float>(-xCam, -yCam, 1.0)
 
-                let rotated = ExtrinsicOptimizer.erpCorrection
-                    * simd_normalize(R * ray)
+                let rotated = simd_normalize(R * ray)
                 let lat = -asin(max(-1, min(1, rotated.y)))
                 let lon = atan2(rotated.x, rotated.z)
                 var eCol = Int(Float(eW) * (0.5 + lon / (2 * .pi)))
