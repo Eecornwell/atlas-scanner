@@ -502,12 +502,6 @@ private struct DepthOverlayUIView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: UIImageView, context: Context) {
-        UIView.transition(
-            with: uiView,
-            duration: 0.15,
-            options: .transitionCrossDissolve
-        ) {
-            uiView.image = image
-        }
+        uiView.image = image
     }
 }

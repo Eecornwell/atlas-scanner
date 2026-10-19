@@ -96,7 +96,7 @@ extension ARKitCapture: ARSessionDelegate {
         )
 
         let wantsOverlay = showDepthOverlay
-        if wantsOverlay, frame.timestamp - lastDepthUpdate > 0.1 {
+        if wantsOverlay, frame.timestamp - lastDepthUpdate > 0.033 {
             lastDepthUpdate = frame.timestamp
             if let depth = frame.sceneDepth?.depthMap {
                 let image = colorizeDepthMap(depth, orientation: .portrait)
