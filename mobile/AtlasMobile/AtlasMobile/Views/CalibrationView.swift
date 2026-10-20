@@ -28,6 +28,8 @@ struct CalibrationView: View {
     @State private var isRefiningFeatures = false
     @State private var isRunningFullPipeline = false
     @State private var pipelineStage: String = ""
+    @State private var selectedCameraId: String = ""
+    @State private var availableCameraIds: [String] = []
 
     private let inchesToM = 0.0254
     private let ciContext = CIContext()
@@ -61,6 +63,9 @@ struct CalibrationView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if availableCameraIds.count > 1 {
+                    cameraPicker
+                }
                 statusBanner
                 seedSection
                 calibrationSection
@@ -71,6 +76,7 @@ struct CalibrationView: View {
         }
         .navigationTitle("Calibration")
         .onAppear {
+            reloadCameraList()
             loadSeedFromConfig()
             checkMaskStatus()
         }
@@ -81,11 +87,44 @@ struct CalibrationView: View {
                 NavigationStack {
                     MaskDrawingView(
                         erpImage: erp,
-                        cameraId: "insta360_primary"
+                        cameraId: selectedCameraId
                     )
                 }
             }
         }
+    }
+
+    private var cameraPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Camera").font(.headline)
+            Picker("Camera", selection: $selectedCameraId) {
+                ForEach(
+                    availableCameraIds, id: \.self
+                ) { id in
+                    Text(id).tag(id)
+                }
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: selectedCameraId) { _ in
+                calibManager.cameraId = selectedCameraId
+                loadSeedFromConfig()
+                checkMaskStatus()
+                calibManager.clearFrames()
+            }
+        }
+    }
+
+    private func reloadCameraList() {
+        let config = MultiCameraConfig
+            .loadFromDeviceOrBundle()
+        let ids = config.cameras.map(\.id)
+        availableCameraIds = ids
+        if selectedCameraId.isEmpty
+            || !ids.contains(selectedCameraId)
+        {
+            selectedCameraId = ids.first ?? ""
+        }
+        calibManager.cameraId = selectedCameraId
     }
 
     private var seedSection: some View {
@@ -537,7 +576,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-18e")
+        Text("Build: 2026-10-21b")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -594,8 +633,12 @@ struct CalibrationView: View {
     // MARK: - Actions
 
     private func loadSeedFromConfig() {
-        let config = MultiCameraConfig.loadFromDeviceOrBundle()
-        guard let cam = config.cameras.first else { return }
+        let config = MultiCameraConfig
+            .loadFromDeviceOrBundle()
+        let cam = config.cameras.first(where: {
+            $0.id == selectedCameraId
+        }) ?? config.cameras.first
+        guard let cam else { return }
         forwardM = cam.extrinsic.x
         leftM    = cam.extrinsic.y
         upM      = cam.extrinsic.z
@@ -709,7 +752,12 @@ struct CalibrationView: View {
             if DualFisheyeStitcher.isDualFisheye(fullImage) {
                 let src = fullImage
                 let camModel = sessionManager
-                    .connectedCamerasList.first?.model ?? ""
+                    .connectedCamerasList.first?.model
+                    ?? MultiCameraConfig
+                        .loadFromDeviceOrBundle()
+                        .cameras.first(where: {
+                            $0.id == selectedCameraId
+                        })?.model ?? ""
                 let roll = DualFisheyeStitcher
                     .rollCorrection(forModel: camModel)
                 let stitched = await Task.detached(
@@ -779,7 +827,8 @@ struct CalibrationView: View {
 
     private func checkMaskStatus() {
         let img = CalibrationManager.loadMaskImage(
-            cameraId: "insta360_primary"
+            cameraId: selectedCameraId.isEmpty
+                ? "insta360_primary" : selectedCameraId
         )
         if let img = img {
             calibManager.maskStatus = "Mask: loaded (\(Int(img.size.width))x\(Int(img.size.height)))"

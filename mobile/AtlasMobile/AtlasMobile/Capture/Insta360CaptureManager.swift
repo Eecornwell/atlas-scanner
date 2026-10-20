@@ -52,18 +52,36 @@ final class Insta360CaptureManager: ObservableObject {
         await MainActor.run { isConnecting = true }
         defer { Task { @MainActor in self.isConnecting = false } }
 
-        // Re-trigger USB discovery so the SDK picks up cameras
-        // added after the initial onAppear setup() call.
-        await MainActor.run {
+        let needsSetup = await MainActor.run {
+            () -> Bool in
             let socket = INSCameraManager.socket()
-            if socket.cameraState != .connected {
-                socket.setup()
+            for cam in connectedCameras {
+                cam.onDisconnect = nil
+            }
+            connectedCameras = []
+            if socket.cameraState == .connected {
+                return false
+            }
+            socket.setup()
+            return true
+        }
+        if needsSetup {
+            let ok = await waitForSDKConnected(
+                maxWait: 20
+            )
+            if !ok {
+                onLogMessage?(
+                    "SDK not connected after 20s"
+                    + " — is USB plugged in?"
+                )
+                return
             }
         }
-        // Give the SDK time to discover the camera on USB.
-        try? await Task.sleep(for: .seconds(2))
 
-        let enabledCameras = cameraConfig.cameras
+        // Reload config so newly added cameras are picked up.
+        let freshConfig = MultiCameraConfig
+            .loadFromDeviceOrBundle()
+        let enabledCameras = freshConfig.cameras
             .filter(\.enabled)
         let instances = enabledCameras
             .map { CameraInstance(config: $0) }
@@ -94,6 +112,16 @@ final class Insta360CaptureManager: ObservableObject {
                     await cam.disableStabilization()
                 }
             }
+        }
+
+        try? await Task.sleep(for: .seconds(5))
+
+        if let first = connected.first {
+            let ok = await first.warmUpCommandChannel()
+            onLogMessage?(
+                "post-connect warmup: "
+                + (ok ? "OK" : "failed")
+            )
         }
 
         for cam in connected {
@@ -147,6 +175,28 @@ final class Insta360CaptureManager: ObservableObject {
         await MainActor.run { connectedCameras.append(contentsOf: reconnected) }
     }
 
+    private func waitForSDKConnected(
+        maxWait: Double
+    ) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < maxWait
+        {
+            let state = await MainActor.run {
+                INSCameraManager.socket().cameraState
+            }
+            if state == .connected { return true }
+            let left = Int(
+                maxWait
+                    - Date().timeIntervalSince(start)
+            )
+            onLogMessage?(
+                "SDK waiting… \(left)s left"
+            )
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+
     private func handleDisconnect(cameraId: String) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -174,6 +224,14 @@ final class Insta360CaptureManager: ObservableObject {
         let cameras = await MainActor.run { connectedCameras }
         for camera in cameras {
             camera.clearCaptureState()
+        }
+    }
+
+    func stopInFlightCapture() {
+        DispatchQueue.main.async {
+            INSCameraManager.shared()
+                .commandManager
+                .stopTakePicture { _ in }
         }
     }
 

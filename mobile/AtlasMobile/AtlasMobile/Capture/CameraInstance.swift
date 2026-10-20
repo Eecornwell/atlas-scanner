@@ -296,28 +296,44 @@ final class CameraInstance: NSObject, Identifiable {
 
         let insta360Ts = Date().timeIntervalSince1970
 
-        _ = await setPhotoSingleMode()
+        let camName = await MainActor.run {
+            INSCameraManager.shared().currentCamera?.name
+                ?? "unknown"
+        }
         onStatusUpdate?(
-            "[\(id)] takePicture sending…"
-        )
-        var uri = await attemptTakePicture(
-            timeout: timeout
+            "[\(id)] camera=\(camName)"
+            + " — checking readiness"
         )
 
-        if uri == nil {
+        let ready = await waitForCameraReady(maxWait: 10)
+        guard !Task.isCancelled else {
+            return nil
+        }
+        if ready {
             onStatusUpdate?(
-                "[\(id)] no URI — clearing capture state"
+                "[\(id)] camera ready — warming up"
             )
-            await stopCurrentCapture()
-            try? await Task.sleep(for: .seconds(2))
+        } else {
+            onStatusUpdate?(
+                "[\(id)] camera not ready"
+                + " — trying anyway"
+            )
+        }
 
-            let recovered = await waitForConnected(
-                maxWait: 10
+        _ = await warmUpCommandChannel()
+
+        let firstTimeout = min(timeout * 0.4, 12)
+        var uri = await attemptTakePicture(
+            timeout: firstTimeout
+        )
+        if uri?.isEmpty == true { uri = nil }
+
+        if uri == nil, !Task.isCancelled {
+            onStatusUpdate?(
+                "[\(id)] attempt 1 failed — wait & retry"
             )
-            if !recovered {
-                onStatusUpdate?(
-                    "[\(id)] reconnect failed"
-                )
+            try? await Task.sleep(for: .seconds(4))
+            guard !Task.isCancelled else {
                 return Insta360CaptureResult(
                     cameraId: id,
                     scanIndex: scanIndex,
@@ -326,19 +342,32 @@ final class CameraInstance: NSObject, Identifiable {
                     mediaIdentifier: ""
                 )
             }
-
-            _ = await setPhotoSingleMode()
-            onStatusUpdate?(
-                "[\(id)] retry takePicture…"
+            uri = await attemptTakePicture(
+                timeout: min(timeout, 15)
             )
+            if uri?.isEmpty == true { uri = nil }
+        }
+
+        if uri == nil, !Task.isCancelled {
+            onStatusUpdate?(
+                "[\(id)] attempt 2 failed"
+                + " — warm up & retry"
+            )
+            _ = await warmUpCommandChannel()
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else {
+                return Insta360CaptureResult(
+                    cameraId: id,
+                    scanIndex: scanIndex,
+                    arkitTimestamp: arkitTimestamp,
+                    insta360Timestamp: insta360Ts,
+                    mediaIdentifier: ""
+                )
+            }
             uri = await attemptTakePicture(
                 timeout: timeout
             )
-            if uri == nil {
-                onStatusUpdate?(
-                    "[\(id)] retry failed"
-                )
-            }
+            if uri?.isEmpty == true { uri = nil }
         }
 
         if let uri {
@@ -383,7 +412,7 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     private func ensureSDKConnected() async -> Bool {
-        var state = await MainActor.run {
+        let state = await MainActor.run {
             INSCameraManager.socket().cameraState
         }
         if state == .connected { return true }
@@ -391,27 +420,111 @@ final class CameraInstance: NSObject, Identifiable {
         onStatusUpdate?(
             "[\(id)] SDK state "
             + Self.stateName(state)
-            + " — recovering"
+            + " — waiting"
         )
-        await MainActor.run {
-            INSCameraManager.socket().setup()
-        }
-        try? await Task.sleep(for: .seconds(5))
-        state = await MainActor.run {
-            INSCameraManager.socket().cameraState
-        }
-        if state == .connected {
-            onStatusUpdate?(
-                "[\(id)] SDK recovered → "
-                + Self.stateName(state)
-            )
-            return true
+        return await waitForConnected(maxWait: 10)
+    }
+
+    private func waitForCameraReady(
+        maxWait: Double = 10
+    ) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < maxWait {
+            guard !Task.isCancelled else { return false }
+            let ready = await withCheckedContinuation {
+                (cont: CheckedContinuation<Bool, Never>) in
+                DispatchQueue.main.async {
+                    INSCameraManager.shared()
+                        .commandManager
+                        .getCurrentCaptureStatus {
+                            error, status in
+                            if let error {
+                                self.onStatusUpdate?(
+                                    "[\(self.id)] status"
+                                    + " err: \(error)"
+                                )
+                                cont.resume(returning: false)
+                                return
+                            }
+                            let state = status?.state
+                                ?? .notCapture
+                            if state == .notCapture {
+                                cont.resume(returning: true)
+                            } else {
+                                self.onStatusUpdate?(
+                                    "[\(self.id)] camera"
+                                    + " state="
+                                    + "\(state.rawValue)"
+                                    + " — waiting"
+                                )
+                                cont.resume(returning: false)
+                            }
+                        }
+                }
+            }
+            if ready { return true }
+            try? await Task.sleep(for: .seconds(1))
         }
         onStatusUpdate?(
-            "[\(id)] capture skipped — SDK state "
-            + Self.stateName(state)
+            "[\(id)] camera not ready after"
+            + " \(Int(maxWait))s"
         )
         return false
+    }
+
+    func warmUpCommandChannel() async -> Bool {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Bool, Never>)
+                in
+            let done = NSLock()
+            var didResume = false
+
+            func finish(_ result: Bool) {
+                done.lock()
+                defer { done.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                cont.resume(returning: result)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .storageState.rawValue
+                    ),
+                ]
+                INSCameraManager.shared()
+                    .commandManager
+                    .getOptionsWithTypes(
+                        types
+                    ) { error, _, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")]"
+                                + " warmup: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")]"
+                                + " warmup OK"
+                            )
+                        }
+                        finish(error == nil)
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 5
+            ) { [weak self] in
+                self?.onStatusUpdate?(
+                    "[\(self?.id ?? "?")]"
+                    + " warmup timeout"
+                )
+                finish(false)
+            }
+        }
     }
 
     private var _stopCont: CheckedContinuation<
@@ -518,45 +631,6 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    private func setPhotoSingleMode() async -> Bool {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.async {
-                let opts = INSCameraOptions()
-                opts.photoSubMode = UInt32(
-                    INSPhotoSubMode.single.rawValue
-                )
-                let types: [NSNumber] = [
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .photoSubMode.rawValue
-                    )
-                ]
-                INSCameraManager.shared()
-                    .commandManager
-                    .setOptions(
-                        opts,
-                        forTypes: types
-                    ) { [weak self] error, _ in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "setPhotoSubMode err: "
-                                + "\(error)"
-                            )
-                        } else {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "photoSubMode → single"
-                            )
-                        }
-                        continuation.resume(
-                            returning: error == nil
-                        )
-                    }
-            }
-        }
-    }
-
     private func attemptTakePicture(
         timeout: Double
     ) async -> String? {
@@ -570,13 +644,10 @@ final class CameraInstance: NSObject, Identifiable {
                 self.lock.unlock()
 
                 DispatchQueue.main.async {
-                    self.stopHeartbeat()
-                    let opts = INSTakePictureOptions()
-                    opts.countDown = 0
                     INSCameraManager.shared()
                         .commandManager
                         .takePicture(
-                            with: opts
+                            with: nil
                         ) { error, photoInfo in
                             let uri = photoInfo?.uri
                             self.onStatusUpdate?(
@@ -588,9 +659,6 @@ final class CameraInstance: NSObject, Identifiable {
                                     " err=\($0)"
                                 } ?? "")
                             )
-                            DispatchQueue.main.async {
-                                self.startHeartbeat()
-                            }
                             self.lock.lock()
                             guard gen
                                 == self._captureGen
@@ -619,7 +687,6 @@ final class CameraInstance: NSObject, Identifiable {
                     let cont = self._captureCont
                     self._captureCont = nil
                     self.lock.unlock()
-                    self.startHeartbeat()
                     self.onStatusUpdate?(
                         "[\(self.id)] takePicture"
                         + " timeout"
@@ -634,9 +701,6 @@ final class CameraInstance: NSObject, Identifiable {
             let cont = self._captureCont
             self._captureCont = nil
             self.lock.unlock()
-            DispatchQueue.main.async {
-                self.startHeartbeat()
-            }
             cont?.resume(returning: nil)
         }
     }

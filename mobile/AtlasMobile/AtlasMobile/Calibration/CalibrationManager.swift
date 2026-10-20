@@ -35,7 +35,7 @@ final class CalibrationManager: ObservableObject {
 
     private(set) var calibrationFrames: [CalibrationFrame] = []
     var lastFrame: CalibrationFrame? { calibrationFrames.last }
-    private let cameraId: String
+    var cameraId: String
 
     init(cameraId: String = "insta360_primary") {
         self.cameraId = cameraId
@@ -56,83 +56,109 @@ final class CalibrationManager: ObservableObject {
 
     @Published var optimizeError: String?
 
+    private var bestFrameIndex: Int = 0
+
     func optimize(seed: RigidTransform) async {
-        guard let frame = calibrationFrames.first else { return }
+        guard !calibrationFrames.isEmpty else { return }
         state = .optimizing
         optimizeError = nil
 
-        guard let iphoneImg = frame.iphoneImage else {
-            optimizeError = "No iPhone image for calibration"
-            state = .framesCollected(calibrationFrames.count)
-            return
-        }
-
-        guard let erpCG = frame.erpImage.cgImage else {
-            optimizeError = "Could not process Insta360 image"
-            state = .framesCollected(calibrationFrames.count)
-            return
-        }
-
         let outW = 256
         let outH = 192
-        let di = frame.depthIntrinsics()
-        let fx = di.fx * Float(outW) / Float(frame.depthW)
-        let fy = di.fy * Float(outH) / Float(frame.depthH)
-        let cx = di.cx * Float(outW) / Float(frame.depthW)
-        let cy = di.cy * Float(outH) / Float(frame.depthH)
-
-        let erpW = erpCG.width
-        let erpH = erpCG.height
-        print("[Calib] photometric alignment: iPhone→\(outW)×\(outH),"
-            + " ERP \(erpW)×\(erpH)")
-
-        guard let iphoneGray = Self.resizeToGrayscale(
-            iphoneImg, width: outW, height: outH
-        ) else {
-            optimizeError = "Failed to process iPhone image"
-            state = .framesCollected(calibrationFrames.count)
-            return
-        }
-        guard let erpGray = Self.imageToGrayscale(erpCG) else {
-            optimizeError = "Failed to process ERP image"
-            state = .framesCollected(calibrationFrames.count)
-            return
-        }
-
         let capturedSeed = seed
-        let (refined, cost) = await Task.detached(
-            priority: .userInitiated
-        ) {
-            ExtrinsicOptimizer.optimizePhotometric(
-                iphoneGray: iphoneGray,
-                outW: outW, outH: outH,
-                erpGray: erpGray,
-                erpW: erpW, erpH: erpH,
-                fx: fx, fy: fy, cx: cx, cy: cy,
-                seed: capturedSeed
-            )
-        }.value
+
+        var bestRefined: RigidTransform?
+        var bestCost = Float.infinity
+        var bestIdx = 0
+        var bestFrame: CalibrationFrame?
+        var validCount = 0
+
+        for (idx, frame) in calibrationFrames.enumerated() {
+            guard let iphoneImg = frame.iphoneImage,
+                  let erpCG = frame.erpImage.cgImage
+            else { continue }
+
+            let di = frame.depthIntrinsics()
+            let fx = di.fx * Float(outW) / Float(frame.depthW)
+            let fy = di.fy * Float(outH) / Float(frame.depthH)
+            let cx = di.cx * Float(outW) / Float(frame.depthW)
+            let cy = di.cy * Float(outH) / Float(frame.depthH)
+            let erpW = erpCG.width
+            let erpH = erpCG.height
+
+            guard let iphoneGray = Self.resizeToGrayscale(
+                iphoneImg, width: outW, height: outH
+            ),
+                  let erpGray = Self.imageToGrayscale(erpCG)
+            else { continue }
+
+            validCount += 1
+            let (refined, cost) = await Task.detached(
+                priority: .userInitiated
+            ) {
+                ExtrinsicOptimizer.optimizePhotometric(
+                    iphoneGray: iphoneGray,
+                    outW: outW, outH: outH,
+                    erpGray: erpGray,
+                    erpW: erpW, erpH: erpH,
+                    fx: fx, fy: fy, cx: cx, cy: cy,
+                    seed: capturedSeed
+                )
+            }.value
+
+            print("[Calib] frame \(idx): NCC="
+                + "\(String(format: "%.4f", -cost))")
+
+            if cost < bestCost {
+                bestCost = cost
+                bestRefined = refined
+                bestIdx = idx
+                bestFrame = frame
+            }
+        }
+
+        guard let refined = bestRefined,
+              let frame = bestFrame
+        else {
+            optimizeError = "No valid frames for calibration"
+            state = .framesCollected(calibrationFrames.count)
+            return
+        }
+
+        bestFrameIndex = bestIdx
 
         let dRoll  = refined.roll  - seed.roll
         let dPitch = refined.pitch - seed.pitch
         let dYaw   = refined.yaw   - seed.yaw
-        print("[Calib] done: NCC=\(String(format: "%.4f", -cost))")
-        print("[Calib] seed  RPY=(\(seed.roll),\(seed.pitch),\(seed.yaw))")
-        print("[Calib] refined RPY=(\(refined.roll),\(refined.pitch),\(refined.yaw))")
-        print("[Calib] delta RPY=(\(String(format: "%.2f", dRoll))°,"
+        print("[Calib] best frame \(bestIdx)/\(validCount):"
+            + " NCC=\(String(format: "%.4f", -bestCost))")
+        print("[Calib] seed  RPY=(\(seed.roll),"
+            + "\(seed.pitch),\(seed.yaw))")
+        print("[Calib] refined RPY=(\(refined.roll),"
+            + "\(refined.pitch),\(refined.yaw))")
+        print("[Calib] delta RPY=("
+            + "\(String(format: "%.2f", dRoll))°,"
             + " \(String(format: "%.2f", dPitch))°,"
             + " \(String(format: "%.2f", dYaw))°)")
 
         refinedRPY = SIMD3(
-            Float(refined.roll), Float(refined.pitch), Float(refined.yaw)
+            Float(refined.roll),
+            Float(refined.pitch),
+            Float(refined.yaw)
         )
-        refinedXYZ = SIMD3(Float(refined.x), Float(refined.y), Float(refined.z))
-        reprojectionError = -cost
-        matchCount = outW * outH
+        refinedXYZ = SIMD3(
+            Float(refined.x),
+            Float(refined.y),
+            Float(refined.z)
+        )
+        reprojectionError = Float(-bestCost)
+        matchCount = outW * outH * validCount
 
         let deltaStr = String(
-            format: "Δ RPY=(%.2f°, %.2f°, %.2f°) NCC=%.4f",
-            dRoll, dPitch, dYaw, -cost
+            format: "best %d/%d Δ RPY=(%.2f°, %.2f°, %.2f°)"
+                + " NCC=%.4f",
+            bestIdx + 1, validCount,
+            dRoll, dPitch, dYaw, -bestCost
         )
         frameDebugInfo = frame.debugDescription + "\n" + deltaStr
         overlayPair = CalibrationOverlayRenderer.render(
@@ -145,12 +171,18 @@ final class CalibrationManager: ObservableObject {
     func computeColorProfile(
         extrinsic: RigidTransform
     ) {
-        guard let frame = calibrationFrames.first,
-              let iphoneImg = frame.iphoneImage else {
+        let frameIdx = min(
+            bestFrameIndex, calibrationFrames.count - 1
+        )
+        guard frameIdx >= 0,
+              let iphoneImg = calibrationFrames[frameIdx]
+                  .iphoneImage
+        else {
             colorProfileStatus = "Color: no iPhone image"
             return
         }
 
+        let frame = calibrationFrames[frameIdx]
         let maskImage = Self.loadMaskImage(cameraId: cameraId)
 
         guard let profile = ColorProfileCalibrator.compute(
@@ -215,9 +247,8 @@ final class CalibrationManager: ObservableObject {
     func refineWithFeatures(
         extrinsic: RigidTransform
     ) async {
-        guard let frame = calibrationFrames.first,
-              let iphoneImg = frame.iphoneImage else {
-            featureRefineStatus = "Features: no iPhone image"
+        guard !calibrationFrames.isEmpty else {
+            featureRefineStatus = "Features: no frames"
             return
         }
 
@@ -225,50 +256,110 @@ final class CalibrationManager: ObservableObject {
         let maskImage = Self.loadMaskImage(cameraId: cameraId)
         let seed = extrinsic
 
-        // Color-correct the ERP before slicing so features match
-        let erp: UIImage
-        if let cp = colorProfile {
-            erp = ColorProfileCalibrator.apply(cp, to: frame.erpImage)
-            print("[FeatureCal] using color-corrected ERP")
-        } else if let cp = ColorProfileCalibrator.load() {
-            erp = ColorProfileCalibrator.apply(cp, to: frame.erpImage)
-            print("[FeatureCal] loaded saved color profile")
-        } else {
-            erp = frame.erpImage
-            print("[FeatureCal] no color profile — using raw ERP")
+        let cp = colorProfile ?? ColorProfileCalibrator.load()
+        if cp != nil {
+            print("[FeatureCal] using color profile")
         }
 
-        let result = await Task.detached(
-            priority: .userInitiated
-        ) {
-            FeatureBasedCalibrator.calibrate(
-                iphoneImage: iphoneImg,
-                erpImage: erp,
-                seed: seed,
-                frame: frame,
-                mask: maskImage
-            )
-        }.value
+        struct FrameResult {
+            let extrinsic: RigidTransform
+            let matchCount: Int
+            let cost: Float
+            let iphoneKPCount: Int
+            let sliceKPCount: Int
+            let iphonePreview: UIImage?
+            let slicePreview: UIImage?
+            let frameIndex: Int
+        }
 
-        // Always show previews so user can verify the slice
-        featurePreviewIphone = result.iphonePreview
-        featurePreviewSlice = result.slicePreview
+        var results: [FrameResult] = []
 
-        guard result.matchCount > 0 else {
+        for (idx, frame) in calibrationFrames.enumerated() {
+            guard let iphoneImg = frame.iphoneImage
+            else { continue }
+
+            let erp: UIImage
+            if let cp {
+                erp = ColorProfileCalibrator.apply(
+                    cp, to: frame.erpImage
+                )
+            } else {
+                erp = frame.erpImage
+            }
+
+            let r = await Task.detached(
+                priority: .userInitiated
+            ) {
+                FeatureBasedCalibrator.calibrate(
+                    iphoneImage: iphoneImg,
+                    erpImage: erp,
+                    seed: seed,
+                    frame: frame,
+                    mask: maskImage
+                )
+            }.value
+
+            print("[FeatureCal] frame \(idx):"
+                + " \(r.matchCount) matches,"
+                + " cost=\(String(format: "%.1f", r.cost))")
+
+            guard r.matchCount > 0 else { continue }
+
+            results.append(FrameResult(
+                extrinsic: r.extrinsic,
+                matchCount: r.matchCount,
+                cost: r.cost,
+                iphoneKPCount: r.iphoneKPCount,
+                sliceKPCount: r.sliceKPCount,
+                iphonePreview: r.iphonePreview,
+                slicePreview: r.slicePreview,
+                frameIndex: idx
+            ))
+        }
+
+        guard !results.isEmpty else {
             featureRefineStatus =
-                "Features: failed (too few matches — see previews)"
+                "Features: failed (no matches in any frame)"
             return
         }
 
-        featureMatchCount = result.matchCount
+        let refined: RigidTransform
+        if results.count == 1 {
+            refined = results[0].extrinsic
+        } else {
+            let rolls = results.map { $0.extrinsic.roll }
+                .sorted()
+            let pitches = results.map { $0.extrinsic.pitch }
+                .sorted()
+            let yaws = results.map { $0.extrinsic.yaw }
+                .sorted()
+            let midIdx = results.count / 2
+            refined = RigidTransform(
+                roll: rolls[midIdx],
+                pitch: pitches[midIdx],
+                yaw: yaws[midIdx],
+                x: seed.x, y: seed.y, z: seed.z
+            )
+            print("[FeatureCal] median of \(results.count)"
+                + " frames: RPY=(\(refined.roll),"
+                + " \(refined.pitch), \(refined.yaw))")
+        }
+
+        let bestPreview = results.max(by: {
+            $0.matchCount < $1.matchCount
+        })!
+        featurePreviewIphone = bestPreview.iphonePreview
+        featurePreviewSlice = bestPreview.slicePreview
+
+        let totalMatches = results.reduce(0) {
+            $0 + $1.matchCount
+        }
+        featureMatchCount = totalMatches
         featureRefineStatus = String(
-            format: "Features: %d matches, cost %.1f"
-                + " | %d/%d kps",
-            result.matchCount, result.cost,
-            result.iphoneKPCount, result.sliceKPCount
+            format: "Features: %d matches across %d frames",
+            totalMatches, results.count
         )
 
-        let refined = result.extrinsic
         refinedRPY = SIMD3(
             Float(refined.roll),
             Float(refined.pitch),
@@ -279,19 +370,23 @@ final class CalibrationManager: ObservableObject {
             Float(refined.y),
             Float(refined.z)
         )
-        reprojectionError = result.cost
+        reprojectionError = bestPreview.cost
 
         let dR = refined.roll - extrinsic.roll
         let dP = refined.pitch - extrinsic.pitch
         let dY = refined.yaw - extrinsic.yaw
         let deltaStr = String(
-            format: "Feature Δ RPY=(%.2f°, %.2f°, %.2f°)",
-            dR, dP, dY
+            format: "Feature median %d frames"
+                + " Δ RPY=(%.2f°, %.2f°, %.2f°)",
+            results.count, dR, dP, dY
         )
         frameDebugInfo += "\n" + deltaStr
 
+        let overlayFrame = calibrationFrames[
+            bestPreview.frameIndex
+        ]
         overlayPair = CalibrationOverlayRenderer.render(
-            frame: frame, extrinsic: refined
+            frame: overlayFrame, extrinsic: refined
         )
         overlayVersion += 1
         state = .done(refined)

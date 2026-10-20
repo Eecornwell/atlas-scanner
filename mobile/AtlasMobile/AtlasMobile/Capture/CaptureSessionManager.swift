@@ -94,7 +94,7 @@ final class CaptureSessionManager: ObservableObject {
         lastCapturedThumbnail = nil
         captureTiming = "[\(Self.buildTag)]"
         teardownStage = ""
-        lastInsta360CommandTime = nil
+        isInsta360Busy = false
         insta360CommandCount = 0
 
         insta360Manager = Insta360CaptureManager()
@@ -196,34 +196,22 @@ final class CaptureSessionManager: ObservableObject {
         guard isSessionActive, !isEndingSession else { return }
 
         if fast {
-            let now = ContinuousClock.now
-            let delta = lastInsta360CommandTime.map {
-                now - $0
-            }
-            let insta360Ready = delta.map {
-                $0 >= Self.minInsta360Interval
-            } ?? true
-
             let activeCams = enabledCameras
             var sent360 = false
-            if insta360Ready, !activeCams.isEmpty,
+            if !isInsta360Busy, !activeCams.isEmpty,
                isAutoCapturing
             {
+                isInsta360Busy = true
                 insta360CommandCount += 1
                 let cmdNum = insta360CommandCount
-                let deltaSec = delta.map { d -> String in
-                    let c = d.components
-                    let sec = Double(c.seconds)
-                        + Double(c.attoseconds) / 1e18
-                    return String(format: "%.1fs", sec)
-                } ?? "first"
-                lastInsta360CommandTime = now
                 sent360 = true
                 let manager = insta360Manager
                 let scan = currentScan
                 let cams = activeCams
-                insta360BackgroundTask?.cancel()
                 insta360BackgroundTask = Task { [weak self] in
+                    defer {
+                        self?.isInsta360Busy = false
+                    }
                     let captureStart = ContinuousClock.now
                     let _ = await manager.captureWith(
                         cameras: cams,
@@ -240,7 +228,7 @@ final class CaptureSessionManager: ObservableObject {
                         )
                     self?.connectionLog.append(
                         "360#\(cmdNum) scan#\(scan)"
-                        + " Δ\(deltaSec) ack=\(captureMs)ms"
+                        + " ack=\(captureMs)ms"
                     )
                     guard let self,
                           let dir = self.sessionDirectory
@@ -374,8 +362,7 @@ final class CaptureSessionManager: ObservableObject {
     private var insta360BackgroundTask: Task<Void, Never>?
 
     private static let autoCaptureCooldown: UInt64 = 2_500_000_000
-    private var lastInsta360CommandTime: ContinuousClock.Instant?
-    private static let minInsta360Interval: Duration = .seconds(6.0)
+    private var isInsta360Busy = false
     private var insta360CommandCount = 0
 
     func startAutoCapture() {
@@ -418,7 +405,7 @@ final class CaptureSessionManager: ObservableObject {
         connectionLog.append("STOP: task done")
     }
 
-    private static let buildTag = "10f"
+    private static let buildTag = "10g"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -573,7 +560,12 @@ final class CaptureSessionManager: ObservableObject {
 
         let config = MultiCameraConfig
             .loadFromDeviceOrBundle()
+        let connectedId = await insta360Manager
+            .connectedCamerasCopy().first?.id
         guard let camCfg = config.cameras
+            .first(where: {
+                $0.id == connectedId
+            }) ?? config.cameras
             .first(where: { $0.enabled })
         else { return }
 
@@ -609,16 +601,20 @@ final class CaptureSessionManager: ObservableObject {
 
     func triggerInsta360Capture() async -> Bool {
         // Cancel any in-flight auto-capture to avoid race.
-        // Await it to ensure its takePicture callback has
-        // fully drained before we send a new one.
         if let task = insta360BackgroundTask {
             task.cancel()
             _ = await task.value
             insta360BackgroundTask = nil
-            try? await Task.sleep(for: .seconds(1))
+        }
+
+        // Wait for initial connection to finish before
+        // checking camera count — avoids double setup().
+        if let task = connectTask {
+            _ = await task.value
         }
 
         var count = await insta360Manager.connectedCount()
+        await syncCamerasList()
         connectionLog.append(
             "[Calib] triggerCapture: count=\(count)"
         )
@@ -627,8 +623,9 @@ final class CaptureSessionManager: ObservableObject {
             connectionLog.append(
                 "[Calib] no cameras — reconnecting"
             )
-            await insta360Manager.retryConnection()
+            await insta360Manager.discoverAndConnect()
             count = await insta360Manager.connectedCount()
+            await syncCamerasList()
             connectionLog.append(
                 "[Calib] after reconnect: count=\(count)"
             )
