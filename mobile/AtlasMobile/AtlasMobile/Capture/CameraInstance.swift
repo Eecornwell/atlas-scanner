@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import INSCameraSDK
 
@@ -29,6 +30,7 @@ final class CameraInstance: NSObject, Identifiable {
     private var _downloadCont: CheckedContinuation<
         Insta360DownloadResult?, Never
     >?
+    private(set) var isPhotoModeSet = false
 
     private(set) var isConnected: Bool {
         get {
@@ -199,6 +201,7 @@ final class CameraInstance: NSObject, Identifiable {
         for attempt in 1...maxRetries {
             if await connect() {
                 _ = await calibrateClockOffset()
+                await switchToPhotoMode()
                 await disableStabilization()
                 return true
             }
@@ -267,10 +270,20 @@ final class CameraInstance: NSObject, Identifiable {
 
     // MARK: - Capture
 
+    func prepareForCapture() async -> Bool {
+        guard await ensureSDKConnected() else {
+            return false
+        }
+        _ = await warmUpCommandChannel()
+        await ensurePhotoMode()
+        return true
+    }
+
     func capture(
         arkitTimestamp: Double,
         scanIndex: Int,
-        timeout: Double = 45
+        timeout: Double = 45,
+        skipPreChecks: Bool = false
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -290,84 +303,42 @@ final class CameraInstance: NSObject, Identifiable {
             lock.unlock()
         }
 
-        guard await ensureSDKConnected() else {
-            return nil
+        if !skipPreChecks {
+            guard await ensureSDKConnected() else {
+                return nil
+            }
         }
 
         let insta360Ts = Date().timeIntervalSince1970
 
-        let camName = await MainActor.run {
-            INSCameraManager.shared().currentCamera?.name
-                ?? "unknown"
-        }
-        onStatusUpdate?(
-            "[\(id)] camera=\(camName)"
-            + " — checking readiness"
-        )
-
-        let ready = await waitForCameraReady(maxWait: 10)
-        guard !Task.isCancelled else {
-            return nil
-        }
-        if ready {
-            onStatusUpdate?(
-                "[\(id)] camera ready — warming up"
-            )
-        } else {
-            onStatusUpdate?(
-                "[\(id)] camera not ready"
-                + " — trying anyway"
-            )
+        if !skipPreChecks {
+            _ = await warmUpCommandChannel()
+            await ensurePhotoMode()
         }
 
-        _ = await warmUpCommandChannel()
-
-        let firstTimeout = min(timeout * 0.4, 12)
-        var uri = await attemptTakePicture(
-            timeout: firstTimeout
+        var uri: String?
+        uri = await attemptTakePicture(
+            timeout: timeout
         )
         if uri?.isEmpty == true { uri = nil }
 
-        if uri == nil, !Task.isCancelled {
+        if uri == nil {
             onStatusUpdate?(
-                "[\(id)] attempt 1 failed — wait & retry"
+                "[\(id)] attempt 1 failed"
+                + " — waiting 15s for camera"
             )
-            try? await Task.sleep(for: .seconds(4))
-            guard !Task.isCancelled else {
-                return Insta360CaptureResult(
-                    cameraId: id,
-                    scanIndex: scanIndex,
-                    arkitTimestamp: arkitTimestamp,
-                    insta360Timestamp: insta360Ts,
-                    mediaIdentifier: ""
+            try? await Task.sleep(
+                for: .seconds(15)
+            )
+            let recovered = await waitForCommandReady(
+                maxWait: 75
+            )
+            if recovered, !Task.isCancelled {
+                uri = await attemptTakePicture(
+                    timeout: timeout
                 )
+                if uri?.isEmpty == true { uri = nil }
             }
-            uri = await attemptTakePicture(
-                timeout: min(timeout, 15)
-            )
-            if uri?.isEmpty == true { uri = nil }
-        }
-
-        if uri == nil, !Task.isCancelled {
-            onStatusUpdate?(
-                "[\(id)] attempt 2 failed"
-                + " — warm up & retry"
-            )
-            _ = await warmUpCommandChannel()
-            try? await Task.sleep(for: .seconds(3))
-            guard !Task.isCancelled else {
-                return Insta360CaptureResult(
-                    cameraId: id,
-                    scanIndex: scanIndex,
-                    arkitTimestamp: arkitTimestamp,
-                    insta360Timestamp: insta360Ts,
-                    mediaIdentifier: ""
-                )
-            }
-            uri = await attemptTakePicture(
-                timeout: timeout
-            )
-            if uri?.isEmpty == true { uri = nil }
         }
 
         if let uri {
@@ -472,7 +443,30 @@ final class CameraInstance: NSObject, Identifiable {
         return false
     }
 
-    func warmUpCommandChannel() async -> Bool {
+    func waitForCommandReady(
+        maxWait: Double = 60
+    ) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < maxWait {
+            let ok = await warmUpCommandChannel(
+                timeout: 5
+            )
+            if ok { return true }
+            let elapsed = Int(
+                Date().timeIntervalSince(start)
+            )
+            onStatusUpdate?(
+                "[\(id)] commands not ready"
+                + " (\(elapsed)s) — retrying"
+            )
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+
+    func warmUpCommandChannel(
+        timeout: Double = 15
+    ) async -> Bool {
         await withCheckedContinuation {
             (cont: CheckedContinuation<Bool, Never>)
                 in
@@ -516,12 +510,18 @@ final class CameraInstance: NSObject, Identifiable {
             }
 
             DispatchQueue.main.asyncAfter(
-                deadline: .now() + 5
+                deadline: .now() + timeout
             ) { [weak self] in
-                self?.onStatusUpdate?(
-                    "[\(self?.id ?? "?")]"
-                    + " warmup timeout"
-                )
+                done.lock()
+                let alreadyDone = didResume
+                done.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")]"
+                        + " warmup timeout"
+                        + " (\(Int(timeout))s)"
+                    )
+                }
                 finish(false)
             }
         }
@@ -564,6 +564,244 @@ final class CameraInstance: NSObject, Identifiable {
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + 3
             ) {
+                finish()
+            }
+        }
+    }
+
+    func warmupCapture(
+        timeout: Double = 150
+    ) async -> Bool {
+        onStatusUpdate?(
+            "[\(id)] priming pipeline…"
+        )
+        return await withCheckedContinuation {
+            (cont: CheckedContinuation<Bool, Never>)
+                in
+            let done = NSLock()
+            var didResume = false
+
+            func finish(_ ok: Bool) {
+                done.lock()
+                defer { done.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                cont.resume(returning: ok)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let opts = INSTakePictureOptions()
+                opts.mode = .normal
+                let exp = INSCameraExposureOptions()
+                exp.program = 3
+                exp.shutterSpeed = CMTime(
+                    value: 120, timescale: 1
+                )
+                opts.currenExposureOptions = exp
+                INSCameraManager.shared()
+                    .commandManager
+                    .takePicture(
+                        with: opts
+                    ) { [weak self] error,
+                        photoInfo in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "warmupCapture: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "warmupCapture OK"
+                            )
+                        }
+                        finish(error == nil)
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + timeout
+            ) { [weak self] in
+                done.lock()
+                let alreadyDone = didResume
+                done.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] "
+                        + "warmupCapture timeout"
+                        + " (\(Int(timeout))s)"
+                    )
+                }
+                finish(false)
+            }
+        }
+    }
+
+    private func checkSensorIsAll() async -> Bool {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Bool, Never>) in
+            let done = NSLock()
+            var didResume = false
+
+            func finish(_ result: Bool) {
+                done.lock()
+                defer { done.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                cont.resume(returning: result)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                INSCameraManager.shared()
+                    .commandManager
+                    .getActiveSensor {
+                        error, device, _, _, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "getActiveSensor: "
+                                + "\(error)"
+                            )
+                            finish(false)
+                            return
+                        }
+                        let isAll = device == .all
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] "
+                            + "sensor="
+                            + "\(device.rawValue)"
+                            + (isAll
+                                ? " (all)"
+                                : " (not all)")
+                        )
+                        finish(isAll)
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 10
+            ) { [weak self] in
+                done.lock()
+                let alreadyDone = didResume
+                done.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] "
+                        + "getActiveSensor timeout"
+                    )
+                }
+                finish(false)
+            }
+        }
+    }
+
+    func switchToPhotoMode() async {
+        let skipActivation = await checkSensorIsAll()
+
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>)
+                in
+            let resumed = NSLock()
+            var didResume = false
+
+            func finish() {
+                resumed.lock()
+                defer { resumed.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let opts = INSCameraOptions()
+                opts.photoSubMode = 6
+                opts.focusSensor = .all
+                opts.expectOutputType = .default
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .photoSubMode.rawValue
+                    ),
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .focusSensor.rawValue
+                    ),
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .expectOutputType.rawValue
+                    ),
+                ]
+                INSCameraManager.shared()
+                    .commandManager
+                    .setOptions(
+                        opts,
+                        forTypes: types
+                    ) { [weak self] error, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "setPhotoMode err: "
+                                + "\(error)"
+                            )
+                            finish()
+                            return
+                        }
+                        self?.isPhotoModeSet = true
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] "
+                            + "photo mode set"
+                        )
+
+                        if skipActivation {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "sensor already .all"
+                                + " — skip activation"
+                            )
+                            finish()
+                            return
+                        }
+
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] "
+                            + "activating sensors…"
+                        )
+                        INSCameraManager.shared()
+                            .commandManager
+                            .setActiveSensorWith(
+                                .all
+                            ) { [weak self] error,
+                                _, _, _ in
+                                if let error {
+                                    self?.onStatusUpdate?(
+                                        "[\(self?.id ?? "?")] "
+                                        + "activeSensor err: "
+                                        + "\(error)"
+                                    )
+                                } else {
+                                    self?.onStatusUpdate?(
+                                        "[\(self?.id ?? "?")] "
+                                        + "sensor activated"
+                                    )
+                                }
+                                finish()
+                            }
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 90
+            ) { [weak self] in
+                resumed.lock()
+                let alreadyDone = didResume
+                resumed.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] "
+                        + "switchToPhotoMode timeout"
+                    )
+                }
                 finish()
             }
         }
@@ -631,6 +869,14 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
+    func ensurePhotoMode() async {
+        guard !isPhotoModeSet else { return }
+        let ready = await warmUpCommandChannel()
+        guard ready else { return }
+        await switchToPhotoMode()
+        await disableStabilization()
+    }
+
     private func attemptTakePicture(
         timeout: Double
     ) async -> String? {
@@ -644,10 +890,18 @@ final class CameraInstance: NSObject, Identifiable {
                 self.lock.unlock()
 
                 DispatchQueue.main.async {
+                    let opts = INSTakePictureOptions()
+                    opts.mode = .normal
+                    let exp = INSCameraExposureOptions()
+                    exp.program = 3
+                    exp.shutterSpeed = CMTime(
+                        value: 120, timescale: 1
+                    )
+                    opts.currenExposureOptions = exp
                     INSCameraManager.shared()
                         .commandManager
                         .takePicture(
-                            with: nil
+                            with: opts
                         ) { error, photoInfo in
                             let uri = photoInfo?.uri
                             self.onStatusUpdate?(

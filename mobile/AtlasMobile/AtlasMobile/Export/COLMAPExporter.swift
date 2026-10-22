@@ -120,19 +120,24 @@ final class COLMAPExporter {
         var filteredScans: [ScanExportData] = []
         var skippedNames: [String] = []
         for scan in scans {
-            if let url = scan.iphoneImageURL,
-               let score = Self.blurScore(
-                   imageURL: url
-               ),
-               score < Self.blurThreshold
-            {
-                let tag = String(
-                    format: "%.1f", score
-                )
-                skippedNames.append(
-                    "\(scan.scanName) (\(tag))"
-                )
-            } else {
+            let skipped: Bool = autoreleasepool {
+                if let url = scan.iphoneImageURL,
+                   let score = Self.blurScore(
+                       imageURL: url
+                   ),
+                   score < Self.blurThreshold
+                {
+                    let tag = String(
+                        format: "%.1f", score
+                    )
+                    skippedNames.append(
+                        "\(scan.scanName) (\(tag))"
+                    )
+                    return true
+                }
+                return false
+            }
+            if !skipped {
                 filteredScans.append(scan)
             }
         }
@@ -237,34 +242,38 @@ final class COLMAPExporter {
             )
         }
 
-        let (imageEntries, allPoints) = buildImageEntriesAndPoints(
-            scans: filteredScans,
-            cameraConfig: cameraConfig,
-            iphoneCameraId: iphoneCameraId,
-            tileCameraIds: tileCameraIds,
-            fisheyeCameraIds: fisheyeCameraIds,
-            imgW: imgW_l, imgH: imgH_l,
-            fx: fx_l, fy: fy_l, cx: cx_l, cy: cy_l
-        )
+        do {
+            let (imageEntries, allPoints) =
+                buildImageEntriesAndPoints(
+                    scans: filteredScans,
+                    cameraConfig: cameraConfig,
+                    iphoneCameraId: iphoneCameraId,
+                    tileCameraIds: tileCameraIds,
+                    fisheyeCameraIds: fisheyeCameraIds,
+                    imgW: imgW_l, imgH: imgH_l,
+                    fx: fx_l, fy: fy_l,
+                    cx: cx_l, cy: cy_l
+                )
 
-        try writeImagesBin(entries: imageEntries)
-        try writePoints3DBin(points: allPoints)
+            try writeImagesBin(entries: imageEntries)
+            try writePoints3DBin(points: allPoints)
 
-        if hasInsta360 {
-            try writeRigsBin(
-                cameraConfig: cameraConfig,
-                tileCameraIds: tileCameraIds,
-                fisheyeCameraIds: fisheyeCameraIds,
-                iphoneCameraId: iphoneCameraId
-            )
-            try writeFramesBin(
-                scans: filteredScans,
-                imageEntries: imageEntries,
-                cameraConfig: cameraConfig,
-                iphoneCameraId: iphoneCameraId,
-                tileCameraIds: tileCameraIds,
-                fisheyeCameraIds: fisheyeCameraIds
-            )
+            if hasInsta360 {
+                try writeRigsBin(
+                    cameraConfig: cameraConfig,
+                    tileCameraIds: tileCameraIds,
+                    fisheyeCameraIds: fisheyeCameraIds,
+                    iphoneCameraId: iphoneCameraId
+                )
+                try writeFramesBin(
+                    scans: filteredScans,
+                    imageEntries: imageEntries,
+                    cameraConfig: cameraConfig,
+                    iphoneCameraId: iphoneCameraId,
+                    tileCameraIds: tileCameraIds,
+                    fisheyeCameraIds: fisheyeCameraIds
+                )
+            }
         }
         try copyImagesAndDepths(
             scans: filteredScans,
@@ -433,13 +442,14 @@ final class COLMAPExporter {
                 }
             }
 
-            // LiDAR depth unprojection
-            if let depthPts = unprojectDepth(
-                scan: scan, T_wc: T_wc,
-                imgW: imgW, imgH: imgH,
-                fx: fx, fy: fy, cx: cx, cy: cy
-            ) {
-                allPoints.append(contentsOf: depthPts)
+            autoreleasepool {
+                if let depthPts = unprojectDepth(
+                    scan: scan, T_wc: T_wc,
+                    imgW: imgW, imgH: imgH,
+                    fx: fx, fy: fy, cx: cx, cy: cy
+                ) {
+                    allPoints.append(contentsOf: depthPts)
+                }
             }
         }
 
@@ -533,33 +543,36 @@ final class COLMAPExporter {
     private static func loadImageRGBA(
         url: URL?
     ) -> (data: [UInt8], w: Int, h: Int)? {
-        guard let url,
-              let imgData = try? Data(
-                  contentsOf: url
-              ),
-              let uiImage = UIImage(data: imgData),
-              let cg = uiImage.cgImage
-        else { return nil }
-        let w = cg.width, h = cg.height
-        guard w > 0, h > 0 else { return nil }
-        var buf = [UInt8](
-            repeating: 0, count: w * h * 4
-        )
-        guard let ctx = CGContext(
-            data: &buf, width: w, height: h,
-            bitsPerComponent: 8, bytesPerRow: w * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo
-                .noneSkipLast.rawValue
-        ) else { return nil }
-        ctx.draw(
-            cg,
-            in: CGRect(
-                x: 0, y: 0,
-                width: w, height: h
+        autoreleasepool {
+            guard let url,
+                  let imgData = try? Data(
+                      contentsOf: url
+                  ),
+                  let uiImage = UIImage(data: imgData),
+                  let cg = uiImage.cgImage
+            else { return nil }
+            let w = cg.width, h = cg.height
+            guard w > 0, h > 0 else { return nil }
+            var buf = [UInt8](
+                repeating: 0, count: w * h * 4
             )
-        )
-        return (buf, w, h)
+            guard let ctx = CGContext(
+                data: &buf, width: w, height: h,
+                bitsPerComponent: 8,
+                bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo
+                    .noneSkipLast.rawValue
+            ) else { return nil }
+            ctx.draw(
+                cg,
+                in: CGRect(
+                    x: 0, y: 0,
+                    width: w, height: h
+                )
+            )
+            return (buf, w, h)
+        }
     }
 
     private static func sampleColor(
@@ -852,7 +865,45 @@ final class COLMAPExporter {
             print("[Export] no color profile — exporting uncorrected")
         }
 
-        let maskImages = loadAllCameraMasks()
+        let invertedMasks: [String: UIImage] =
+            loadAllCameraMasks().mapValues {
+                Self.invertMask($0)
+            }
+
+        var precomputedMaskTiles: [String: [Int: Data]] = [:]
+        for (camId, mask) in invertedMasks {
+            var tiles: [Int: Data] = [:]
+            if useFisheye {
+                let feSize = Self.fisheyeSize
+                for isFront in [true, false] {
+                    autoreleasepool {
+                        guard let (_, feMask) =
+                            Self.reprojectERPtoFisheye(
+                                erpImage: mask,
+                                erpMask: nil,
+                                fisheyeSize: feSize,
+                                isFrontLens: isFront
+                            ),
+                            let png = feMask.pngData()
+                        else { return }
+                        tiles[isFront ? 0 : 1] = png
+                    }
+                }
+            } else {
+                for faceIdx in 0..<8 {
+                    autoreleasepool {
+                        if let tile = slicer.sliceTile(
+                            at: faceIdx, from: mask
+                        ),
+                            let png = tile.pngData()
+                        {
+                            tiles[faceIdx] = png
+                        }
+                    }
+                }
+            }
+            precomputedMaskTiles[camId] = tiles
+        }
 
         if useFisheye {
             let frontDir = imagesDir.appendingPathComponent("fisheye_front")
@@ -894,121 +945,151 @@ final class COLMAPExporter {
 
             // Insta360 images
             for (camId, erpURL) in scan.insta360ImageURLs {
-                guard let erpData = try? Data(contentsOf: erpURL),
-                      let rawImage = UIImage(data: erpData)
-                else { continue }
+                // Stitch inside inner autoreleasepool so raw
+                // dual-fisheye data (~89 MB) is freed immediately.
+                let stitchedERP: UIImage? = autoreleasepool {
+                    guard let erpData = try? Data(
+                        contentsOf: erpURL
+                    ),
+                        let rawImage = UIImage(data: erpData)
+                    else { return nil as UIImage? }
 
-                let stitchedERP: UIImage
-                if DualFisheyeStitcher.isDualFisheye(rawImage) {
-                    let model = cameraConfig.cameras
-                        .first { $0.id == camId }?.model ?? ""
-                    let roll = DualFisheyeStitcher
-                        .rollCorrection(forModel: model)
-                    guard let stitched = DualFisheyeStitcher.stitch(
-                        rawImage, outputWidth: 2048,
-                        rollDeg: roll
-                    ) else { continue }
-                    stitchedERP = stitched
-                } else {
-                    stitchedERP = rawImage
+                    if DualFisheyeStitcher.isDualFisheye(
+                        rawImage
+                    ) {
+                        let model = cameraConfig.cameras
+                            .first { $0.id == camId }?
+                            .model ?? ""
+                        let roll = DualFisheyeStitcher
+                            .rollCorrection(forModel: model)
+                        return DualFisheyeStitcher.stitch(
+                            rawImage, outputWidth: 2048,
+                            rollDeg: roll
+                        )
+                    } else {
+                        return rawImage
+                    }
+                }
+                guard let stitchedERP else { continue }
+
+                let erpImage: UIImage = autoreleasepool {
+                    if let cp = colorProfile {
+                        return ColorProfileCalibrator.apply(
+                            cp, to: stitchedERP
+                        )
+                    }
+                    return stitchedERP
                 }
 
-                let erpImage: UIImage
-                if let cp = colorProfile {
-                    erpImage = ColorProfileCalibrator.apply(
-                        cp, to: stitchedERP
-                    )
-                } else {
-                    erpImage = stitchedERP
-                }
+                let erpMask = invertedMasks[camId]
 
-                let erpMask = maskImages[camId].map { Self.invertMask($0) }
+                let camTiles = precomputedMaskTiles[camId]
 
                 if useFisheye {
-                    // Reproject ERP → 2 equidistant fisheye images
                     let feSize = Self.fisheyeSize
                     for isFront in [true, false] {
-                        let subdir = isFront ? "fisheye_front" : "fisheye_back"
-                        guard let (feImage, feMask) = Self.reprojectERPtoFisheye(
-                            erpImage: erpImage,
-                            erpMask: erpMask,
-                            fisheyeSize: feSize,
-                            isFrontLens: isFront
-                        ) else { continue }
+                        autoreleasepool {
+                            let subdir = isFront
+                                ? "fisheye_front"
+                                : "fisheye_back"
+                            guard let (feImage, feMask) =
+                                Self.reprojectERPtoFisheye(
+                                    erpImage: erpImage,
+                                    erpMask: erpMask,
+                                    fisheyeSize: feSize,
+                                    isFrontLens: isFront
+                                ) else { return }
 
-                        let imgDir = imagesDir.appendingPathComponent(subdir)
-                        let imgDst = imgDir.appendingPathComponent(
-                            "\(scan.scanName).jpg"
-                        )
-                        if let jpegData = feImage.jpegData(
-                            compressionQuality: 0.92
-                        ) {
-                            try? jpegData.write(to: imgDst)
-                        }
+                            let imgDst = imagesDir
+                                .appendingPathComponent(subdir)
+                                .appendingPathComponent(
+                                    "\(scan.scanName).jpg"
+                                )
+                            if let jpegData =
+                                feImage.jpegData(
+                                    compressionQuality: 0.92
+                                )
+                            {
+                                try? jpegData.write(
+                                    to: imgDst
+                                )
+                            }
 
-                        let mskDir = masksDir.appendingPathComponent(subdir)
-                        let mskDst = mskDir.appendingPathComponent(
-                            "\(scan.scanName).png"
-                        )
-                        if let pngData = feMask.pngData() {
-                            try? pngData.write(to: mskDst)
+                            let mskDst = masksDir
+                                .appendingPathComponent(subdir)
+                                .appendingPathComponent(
+                                    "\(scan.scanName).png"
+                                )
+                            if let png = camTiles?[
+                                isFront ? 0 : 1
+                            ] {
+                                try? png.write(to: mskDst)
+                            } else if let png =
+                                feMask.pngData()
+                            {
+                                try? png.write(to: mskDst)
+                            }
                         }
                     }
                 } else {
-                    // ERP → 8 perspective face tiles
-                    let tiles = slicer.sliceTiles(from: erpImage)
-                    for (faceIdx, tileImage) in tiles {
-                        let faceDir = imagesDir.appendingPathComponent(
-                            String(format: "face_%02d", faceIdx)
-                        )
-                        try? fm.createDirectory(
-                            at: faceDir, withIntermediateDirectories: true
-                        )
-                        let dst = faceDir.appendingPathComponent(
-                            "\(scan.scanName).jpg"
-                        )
-                        if let jpegData = tileImage.jpegData(
-                            compressionQuality: 0.92
-                        ) {
-                            try? jpegData.write(to: dst)
-                        }
-                    }
-
-                    if let invertedMask = erpMask {
-                        let maskTiles = slicer.sliceMask(
-                            from: invertedMask
-                        )
-                        for (faceIdx, maskTile) in maskTiles {
-                            let maskFaceDir = masksDir.appendingPathComponent(
-                                String(format: "face_%02d", faceIdx)
-                            )
+                    for faceIdx in 0..<8 {
+                        autoreleasepool {
+                            let faceDir = imagesDir
+                                .appendingPathComponent(
+                                    String(
+                                        format: "face_%02d",
+                                        faceIdx
+                                    )
+                                )
                             try? fm.createDirectory(
-                                at: maskFaceDir,
-                                withIntermediateDirectories: true
+                                at: faceDir,
+                                withIntermediateDirectories:
+                                    true
                             )
-                            let dst = maskFaceDir.appendingPathComponent(
-                                "\(scan.scanName).png"
-                            )
-                            if let pngData = maskTile.pngData() {
-                                try? pngData.write(to: dst)
+                            let dst = faceDir
+                                .appendingPathComponent(
+                                    "\(scan.scanName).jpg"
+                                )
+                            if let tile = slicer.sliceTile(
+                                at: faceIdx,
+                                from: erpImage
+                            ),
+                                let jpegData =
+                                    tile.jpegData(
+                                        compressionQuality:
+                                            0.92
+                                    )
+                            {
+                                try? jpegData.write(to: dst)
                             }
-                        }
-                    } else {
-                        let tileSize = slicer.tileSize
-                        for faceIdx in 0..<8 {
-                            let maskFaceDir = masksDir.appendingPathComponent(
-                                String(format: "face_%02d", faceIdx)
-                            )
+
+                            let maskFaceDir = masksDir
+                                .appendingPathComponent(
+                                    String(
+                                        format: "face_%02d",
+                                        faceIdx
+                                    )
+                                )
                             try? fm.createDirectory(
                                 at: maskFaceDir,
-                                withIntermediateDirectories: true
+                                withIntermediateDirectories:
+                                    true
                             )
-                            let dst = maskFaceDir.appendingPathComponent(
-                                "\(scan.scanName).png"
-                            )
-                            Self.writeWhiteMask(
-                                to: dst, width: tileSize, height: tileSize
-                            )
+                            let mskDst = maskFaceDir
+                                .appendingPathComponent(
+                                    "\(scan.scanName).png"
+                                )
+                            if let png =
+                                camTiles?[faceIdx]
+                            {
+                                try? png.write(to: mskDst)
+                            } else {
+                                Self.writeWhiteMask(
+                                    to: mskDst,
+                                    width: slicer.tileSize,
+                                    height: slicer.tileSize
+                                )
+                            }
                         }
                     }
                 }

@@ -38,6 +38,18 @@ final class ERPTileSlicer {
         return results
     }
 
+    /// Slices a single face tile from an ERP image. Lower peak memory
+    /// than `sliceTiles` when tiles are written to disk one at a time.
+    func sliceTile(at faceIndex: Int, from erpImage: UIImage) -> UIImage? {
+        guard let cgErp = erpImage.cgImage else { return nil }
+        let maps = buildSamplingMaps(erpW: cgErp.width, erpH: cgErp.height)
+        guard faceIndex < maps.count else { return nil }
+        let map = maps[faceIndex]
+        guard let tile = remap(source: cgErp, uMap: map.u, vMap: map.v)
+        else { return nil }
+        return UIImage(cgImage: tile)
+    }
+
     /// Slices a single-channel ERP mask into per-face tile masks.
     func sliceMask(from erpMask: UIImage) -> [(faceIndex: Int, mask: UIImage)] {
         guard let cgMask = erpMask.cgImage else { return [] }

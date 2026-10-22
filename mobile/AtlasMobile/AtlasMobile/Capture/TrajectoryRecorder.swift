@@ -7,10 +7,14 @@ import simd
 final class TrajectoryRecorder {
     private var poses: [(timestamp: Double, pose: simd_float4x4)] = []
     private let lock = NSLock()
+    private var lastRecordedTs: Double = 0
 
     func recordPose(timestamp: Double, pose: simd_float4x4) {
         lock.lock()
-        poses.append((timestamp: timestamp, pose: pose))
+        if timestamp - lastRecordedTs >= 0.1 {
+            poses.append((timestamp: timestamp, pose: pose))
+            lastRecordedTs = timestamp
+        }
         lock.unlock()
     }
 

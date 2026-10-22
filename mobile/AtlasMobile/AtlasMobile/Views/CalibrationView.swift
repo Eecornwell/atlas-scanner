@@ -28,7 +28,8 @@ struct CalibrationView: View {
     @State private var isRefiningFeatures = false
     @State private var isRunningFullPipeline = false
     @State private var pipelineStage: String = ""
-    @State private var selectedCameraId: String = ""
+    @AppStorage("calibSelectedCameraId")
+    private var selectedCameraId: String = ""
     @State private var availableCameraIds: [String] = []
 
     private let inchesToM = 0.0254
@@ -179,6 +180,17 @@ struct CalibrationView: View {
                 .disabled(
                     !sessionManager.isSessionActive || isCapturingFrame
                 )
+
+                if !sessionManager.isPipelineReady
+                    && !sessionManager.connectedCamerasList.isEmpty
+                {
+                    Label(
+                        "360° camera warming up…",
+                        systemImage: "hourglass"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                }
 
                 if let error = captureError {
                     Label(error, systemImage: "exclamationmark.triangle")
@@ -576,7 +588,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-21b")
+        Text("Build: 2026-10-22o")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -661,7 +673,20 @@ struct CalibrationView: View {
         isCapturingFrame = true
         defer { isCapturingFrame = false }
 
-        // ── Phase 1: iPhone capture (instant) ──────────────────────
+        // ── Phase 0: Prepare Insta360 (overhead) ──────────────
+        // Warmup await, connection check, command warmup all
+        // happen here — BEFORE the time-critical section.
+
+        let instaReady = await sessionManager
+            .prepareInsta360ForCapture()
+        if !instaReady {
+            captureError = "No 360° camera — check connection"
+            return
+        }
+
+        // ── Phase 1: Near-simultaneous capture ────────────────
+        // Insta360 pre-flight is done. Now fire Insta360 and
+        // capture ARKit as close together as possible.
 
         guard let arkitFrame =
             sessionManager.arkitCapture.captureCurrentFrame()
@@ -671,13 +696,6 @@ struct CalibrationView: View {
         }
 
         let buf = arkitFrame.capturedImage
-        iphoneThumbnail = await Task.detached(
-            priority: .userInitiated
-        ) {
-            CaptureSessionManager.makeThumbnail(from: buf)
-        }.value
-
-        // Copy depth NOW — ARKit recycles CVPixelBuffers during awaits.
         let depthBuf = arkitFrame.depthMap
         let depthW = CVPixelBufferGetWidth(depthBuf)
         let depthH = CVPixelBufferGetHeight(depthBuf)
@@ -732,12 +750,15 @@ struct CalibrationView: View {
             + " cy=\(arkitFrame.intrinsics[2][1])"
             + " portrait=\(resW < resH)")
 
-        // Let SwiftUI show flash + thumbnail before Insta360 blocks.
-        await Task.yield()
+        iphoneThumbnail = await Task.detached(
+            priority: .userInitiated
+        ) {
+            CaptureSessionManager.makeThumbnail(from: buf)
+        }.value
 
-        // ── Phase 2: Insta360 capture (WiFi, 1-3 s) ───────────────
+        // ── Phase 2: Insta360 capture (fast — pre-flight done) ──
 
-        let captured = await sessionManager.triggerInsta360Capture()
+        let captured = await sessionManager.fireInsta360Capture()
 
         // Download and stitch the Insta360 image; fall back to the
         // previous successful ERP so the overlay always renders.

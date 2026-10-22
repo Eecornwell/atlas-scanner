@@ -6,9 +6,12 @@ import INSCameraSDK
 final class Insta360CaptureManager: ObservableObject {
     @Published var connectedCameras: [CameraInstance] = []
     @Published var isConnecting = false
+    @Published var isPipelineReady = false
 
     var onCameraDisconnected: ((String) -> Void)?
     var onLogMessage: ((String) -> Void)?
+
+    private var warmupTask: Task<Void, Never>?
 
     let cameraConfig: MultiCameraConfig
 
@@ -49,7 +52,10 @@ final class Insta360CaptureManager: ObservableObject {
     // MARK: - Session lifecycle
 
     func discoverAndConnect() async {
-        await MainActor.run { isConnecting = true }
+        await MainActor.run {
+            isConnecting = true
+            isPipelineReady = false
+        }
         defer { Task { @MainActor in self.isConnecting = false } }
 
         let needsSetup = await MainActor.run {
@@ -105,32 +111,98 @@ final class Insta360CaptureManager: ObservableObject {
             return result
         }
 
-        await withTaskGroup(of: Void.self) { group in
-            for cam in connected {
-                group.addTask {
-                    _ = await cam.calibrateClockOffset()
-                    await cam.disableStabilization()
-                }
-            }
-        }
-
-        try? await Task.sleep(for: .seconds(5))
-
-        if let first = connected.first {
-            let ok = await first.warmUpCommandChannel()
-            onLogMessage?(
-                "post-connect warmup: "
-                + (ok ? "OK" : "failed")
-            )
-        }
-
         for cam in connected {
             cam.onDisconnect = { [weak self] in
                 self?.handleDisconnect(cameraId: cam.id)
             }
         }
-
         await MainActor.run { connectedCameras = connected }
+
+        var commandsReady = false
+        if let first = connected.first {
+            commandsReady = await first.waitForCommandReady(
+                maxWait: 90
+            )
+            onLogMessage?(
+                "command channel: "
+                + (commandsReady ? "ready" : "timeout")
+            )
+        }
+
+        if commandsReady {
+            await withTaskGroup(of: Void.self) { group in
+                for cam in connected {
+                    group.addTask {
+                        _ = await cam.calibrateClockOffset()
+                        await cam.switchToPhotoMode()
+                        await cam.disableStabilization()
+                    }
+                }
+            }
+            onLogMessage?(
+                "camera configured"
+            )
+        }
+
+        warmupTask = Task { [weak self] in
+            guard let first = connected.first
+            else { return }
+
+            if !commandsReady {
+                self?.onLogMessage?(
+                    "waiting for camera boot…"
+                )
+                let ready = await first
+                    .waitForCommandReady(maxWait: 120)
+                guard ready else {
+                    self?.onLogMessage?(
+                        "camera unresponsive"
+                    )
+                    return
+                }
+                for cam in connected {
+                    _ = await cam.calibrateClockOffset()
+                    await cam.switchToPhotoMode()
+                    await cam.disableStabilization()
+                }
+                self?.onLogMessage?(
+                    "camera configured (deferred)"
+                )
+            }
+
+            var primed = await first.warmupCapture()
+            if !primed {
+                self?.stopInFlightCapture()
+                self?.onLogMessage?(
+                    "warmup busy — retry in 10s…"
+                )
+                try? await Task.sleep(
+                    for: .seconds(10)
+                )
+                primed = await first.warmupCapture()
+            }
+            if !primed {
+                self?.stopInFlightCapture()
+                self?.onLogMessage?(
+                    "warmup retry failed"
+                    + " — waiting 30s…"
+                )
+                try? await Task.sleep(
+                    for: .seconds(30)
+                )
+                primed = await first.warmupCapture()
+            }
+            await MainActor.run {
+                self?.isPipelineReady = true
+            }
+            self?.onLogMessage?(
+                primed
+                    ? "pipeline primed — ready"
+                    : "pipeline prime failed"
+                    + " — proceeding"
+            )
+        }
+
     }
 
     func retryConnection() async {
@@ -206,6 +278,8 @@ final class Insta360CaptureManager: ObservableObject {
     }
 
     func disconnect() async {
+        warmupTask?.cancel()
+        warmupTask = nil
         let cameras = await MainActor.run {
             let current = connectedCameras
             connectedCameras = []
@@ -229,25 +303,57 @@ final class Insta360CaptureManager: ObservableObject {
 
     func stopInFlightCapture() {
         DispatchQueue.main.async {
+            let socket = INSCameraManager.socket()
+            guard socket.cameraState == .connected else {
+                return
+            }
             INSCameraManager.shared()
                 .commandManager
                 .stopTakePicture { _ in }
         }
     }
 
-    func captureAll(arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8) async -> [Insta360CaptureResult] {
+    func awaitWarmup() async {
+        if let task = warmupTask {
+            onLogMessage?("awaiting pipeline warmup…")
+            await task.value
+            warmupTask = nil
+        }
+    }
+
+    func prepareCameras() async {
+        await awaitWarmup()
+        let cameras = await MainActor.run {
+            connectedCameras
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for cam in cameras {
+                group.addTask {
+                    _ = await cam.prepareForCapture()
+                }
+            }
+        }
+    }
+
+    func captureAll(arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8, skipPreChecks: Bool = false) async -> [Insta360CaptureResult] {
         let cameras = await MainActor.run { connectedCameras }
         return await captureWith(
             cameras: cameras, arkitTimestamp: arkitTimestamp,
-            scanIndex: scanIndex, timeout: timeout
+            scanIndex: scanIndex, timeout: timeout,
+            skipPreChecks: skipPreChecks
         )
     }
 
     func captureWith(
         cameras: [CameraInstance],
-        arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8
+        arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8,
+        skipPreChecks: Bool = false
     ) async -> [Insta360CaptureResult] {
         guard !cameras.isEmpty, !Task.isCancelled else { return [] }
+
+        if !skipPreChecks {
+            await awaitWarmup()
+        }
         return await withTaskGroup(of: Insta360CaptureResult?.self) { group in
             for camera in cameras {
                 guard !Task.isCancelled else { break }
