@@ -142,6 +142,8 @@ enum ColorProfileCalibrator {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return image }
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1, y: -1)
         ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
 
         for i in stride(from: 0, to: pixels.count, by: 4) {

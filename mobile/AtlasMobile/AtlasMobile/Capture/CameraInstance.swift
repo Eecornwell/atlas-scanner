@@ -283,7 +283,8 @@ final class CameraInstance: NSObject, Identifiable {
         arkitTimestamp: Double,
         scanIndex: Int,
         timeout: Double = 45,
-        skipPreChecks: Bool = false
+        skipPreChecks: Bool = false,
+        retryOnFailure: Bool = true
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -322,7 +323,7 @@ final class CameraInstance: NSObject, Identifiable {
         )
         if uri?.isEmpty == true { uri = nil }
 
-        if uri == nil {
+        if uri == nil, retryOnFailure {
             onStatusUpdate?(
                 "[\(id)] attempt 1 failed"
                 + " — waiting 15s for camera"
@@ -570,7 +571,7 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     func warmupCapture(
-        timeout: Double = 150
+        timeout: Double = 30
     ) async -> Bool {
         onStatusUpdate?(
             "[\(id)] priming pipeline…"

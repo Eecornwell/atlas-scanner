@@ -13,8 +13,10 @@ final class ERPTileSlicer {
     /// Pre-computed cam-from-pano rotation matrices for each face.
     let faceRotations: [simd_float3x3]
 
-    /// Pre-computed (u, v) sampling maps per face, lazily built on first use.
+    /// Pre-computed (u, v) sampling maps per face, keyed by ERP dimensions.
     private var samplingMaps: [(u: [Float], v: [Float])]?
+    private var cachedW: Int = 0
+    private var cachedH: Int = 0
 
     init(tileSize: Int = 1024, tileFovDeg: Float = 65.0) {
         self.tileSize = tileSize
@@ -86,8 +88,9 @@ final class ERPTileSlicer {
     // MARK: - Sampling map construction
 
     private func buildSamplingMaps(erpW: Int, erpH: Int) -> [(u: [Float], v: [Float])] {
-        // Cache maps keyed to ERP dimensions — they only depend on tileSize/fov/erpSize
-        if let cached = samplingMaps { return cached }
+        if let cached = samplingMaps, cachedW == erpW, cachedH == erpH {
+            return cached
+        }
 
         let n = tileSize * tileSize
         let (f, cx, cy) = tileIntrinsics()
@@ -155,37 +158,40 @@ final class ERPTileSlicer {
         }
 
         samplingMaps = maps
+        cachedW = erpW
+        cachedH = erpH
         return maps
     }
 
     // MARK: - vImage remap
 
     /// Bilinear remap of a CGImage using pre-computed float (u, v) maps.
+    ///
+    /// Draws the source into a buffer with a flipped CTM so row 0 = image
+    /// top (standard top-down layout), matching the UV map convention.
     private func remap(source: CGImage, uMap: [Float], vMap: [Float]) -> CGImage? {
         let srcW = source.width, srcH = source.height
-        let bytesPerPixel = 4
-        let srcStride = srcW * bytesPerPixel
+        let srcBPP = 4
+        let srcStride = srcW * srcBPP
 
-        // Render source into RGBA8 buffer
-        guard let srcCtx = CGContext(
-            data: nil,
-            width: srcW, height: srcH,
+        var srcPx = [UInt8](repeating: 0, count: srcH * srcStride)
+        guard let readCtx = CGContext(
+            data: &srcPx, width: srcW, height: srcH,
             bitsPerComponent: 8, bytesPerRow: srcStride,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ) else { return nil }
-        srcCtx.draw(source, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
-        guard let srcBytes = srcCtx.data else { return nil }
-        let src = srcBytes.bindMemory(to: UInt8.self, capacity: srcH * srcStride)
+        readCtx.translateBy(x: 0, y: CGFloat(srcH))
+        readCtx.scaleBy(x: 1, y: -1)
+        readCtx.draw(source, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
 
-        let dstStride = tileSize * bytesPerPixel
-        let dstBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: tileSize * dstStride)
-        defer { dstBuf.deallocate() }
+        let dstBPP = 4
+        let dstStride = tileSize * dstBPP
+        var dstPx = [UInt8](repeating: 0, count: tileSize * dstStride)
 
         let n = tileSize * tileSize
         for i in 0..<n {
             let u = uMap[i], v = vMap[i]
-            // Bilinear interpolation
             let x0 = Int(u), y0 = Int(v)
             let x1 = min(x0 + 1, srcW - 1)
             let y1 = min(y0 + 1, srcH - 1)
@@ -193,27 +199,30 @@ final class ERPTileSlicer {
             let x0c = max(0, min(x0, srcW - 1))
             let y0c = max(0, min(y0, srcH - 1))
 
-            let p00 = src + y0c * srcStride + x0c * bytesPerPixel
-            let p10 = src + y0c * srcStride + x1  * bytesPerPixel
-            let p01 = src + y1  * srcStride + x0c * bytesPerPixel
-            let p11 = src + y1  * srcStride + x1  * bytesPerPixel
+            let off00 = y0c * srcStride + x0c * srcBPP
+            let off10 = y0c * srcStride + x1  * srcBPP
+            let off01 = y1  * srcStride + x0c * srcBPP
+            let off11 = y1  * srcStride + x1  * srcBPP
 
-            let dst = dstBuf + i * bytesPerPixel
-            for c in 0..<4 {
-                let v00 = Float(p00[c]), v10 = Float(p10[c])
-                let v01 = Float(p01[c]), v11 = Float(p11[c])
+            let dstOff = i * dstBPP
+            for c in 0..<3 {
+                let v00 = Float(srcPx[off00 + c])
+                let v10 = Float(srcPx[off10 + c])
+                let v01 = Float(srcPx[off01 + c])
+                let v11 = Float(srcPx[off11 + c])
                 let top = v00 + (v10 - v00) * fx
                 let bot = v01 + (v11 - v01) * fx
-                dst[c] = UInt8(clamping: Int(top + (bot - top) * fy))
+                dstPx[dstOff + c] = UInt8(clamping: Int(top + (bot - top) * fy))
             }
+            dstPx[dstOff + 3] = 255
         }
 
         guard let dstCtx = CGContext(
-            data: dstBuf,
+            data: &dstPx,
             width: tileSize, height: tileSize,
             bitsPerComponent: 8, bytesPerRow: dstStride,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ) else { return nil }
 
         return dstCtx.makeImage()

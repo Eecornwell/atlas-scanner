@@ -26,7 +26,7 @@ final class COLMAPExporter {
     }
 
     // Fisheye lens constants — match DualFisheyeStitcher's equidistant model
-    private static let fisheyeSize = 1024
+    private static let fisheyeSize = 2048
     private static let fisheyeHalfFovRad: Float = 100 * .pi / 180
     private static let fisheyeRadiusFrac: Float = 0.47
 
@@ -945,32 +945,54 @@ final class COLMAPExporter {
 
             // Insta360 images
             for (camId, erpURL) in scan.insta360ImageURLs {
-                // Stitch inside inner autoreleasepool so raw
-                // dual-fisheye data (~89 MB) is freed immediately.
                 let stitchedERP: UIImage? = autoreleasepool {
-                    guard let erpData = try? Data(
-                        contentsOf: erpURL
-                    ),
-                        let rawImage = UIImage(data: erpData)
+                    guard let source =
+                        CGImageSourceCreateWithURL(
+                            erpURL as CFURL, nil
+                        ),
+                        let props =
+                            CGImageSourceCopyPropertiesAtIndex(
+                                source, 0, nil
+                            ) as? [CFString: Any],
+                        let imgW = props[
+                            kCGImagePropertyPixelWidth
+                        ] as? Int,
+                        let imgH = props[
+                            kCGImagePropertyPixelHeight
+                        ] as? Int
                     else { return nil as UIImage? }
 
-                    if DualFisheyeStitcher.isDualFisheye(
-                        rawImage
-                    ) {
+                    let ratio = Float(imgW) / Float(imgH)
+                    let isDual = ratio > 1.8
+                        && ratio < 2.2
+
+                    if isDual {
                         let model = cameraConfig.cameras
                             .first { $0.id == camId }?
                             .model ?? ""
                         let roll = DualFisheyeStitcher
                             .rollCorrection(forModel: model)
                         return DualFisheyeStitcher.stitch(
-                            rawImage, outputWidth: 2048,
+                            url: erpURL,
+                            outputWidth: 5120,
                             rollDeg: roll
                         )
                     } else {
-                        return rawImage
+                        guard let data = try? Data(
+                            contentsOf: erpURL
+                        ) else { return nil as UIImage? }
+                        return UIImage(data: data)
                     }
                 }
                 guard let stitchedERP else { continue }
+
+                if let dbgData = stitchedERP.jpegData(compressionQuality: 0.85) {
+                    let dbgDir = imagesDir.appendingPathComponent("debug_erp")
+                    try? fm.createDirectory(at: dbgDir, withIntermediateDirectories: true)
+                    try? dbgData.write(
+                        to: dbgDir.appendingPathComponent("\(scan.scanName)_\(camId).jpg")
+                    )
+                }
 
                 let erpImage: UIImage = autoreleasepool {
                     if let cp = colorProfile {

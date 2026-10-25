@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 
 /// Presented after endSession() — lets the user choose how to process the session.
@@ -114,6 +115,9 @@ struct SessionExportView: View {
                 }
             }
             .task { await postProcessor.loadModels() }
+            .onChange(of: multiCameraExport) { _ in
+                isComplete = false
+            }
         }
     }
 
@@ -173,27 +177,78 @@ struct SessionExportView: View {
         isSharing = true
     }
 
+    private func runCOLMAPExport() async {
+        postProcessor.progress = ExportProgress(
+            stage: "Building COLMAP model…",
+            current: 0, total: 1
+        )
+
+        let dir = sessionDirectory
+        let useMulti = UserDefaults.standard.bool(
+            forKey: "multiCameraExport"
+        )
+        print("[Export] mode: \(useMulti ? "nativeFisheye" : "pinholeTiles")")
+        do {
+            try await Task.detached(
+                priority: .userInitiated
+            ) {
+                let fm = FileManager.default
+                let colmapDir = dir
+                    .appendingPathComponent("colmap")
+                if fm.fileExists(atPath: colmapDir.path) {
+                    try? fm.removeItem(at: colmapDir)
+                }
+
+                let recorder = DataRecorder(
+                    sessionDirectory: dir
+                )
+                let scans = recorder.buildExportData(
+                    sessionDirectory: dir
+                )
+                guard !scans.isEmpty else {
+                    throw NSError(
+                        domain: "Export",
+                        code: 1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "No scans with valid"
+                                + " pose data found."
+                        ]
+                    )
+                }
+                let config = MultiCameraConfig
+                    .loadFromDeviceOrBundle()
+                let mode: CameraExportMode = useMulti
+                    ? .nativeFisheye
+                    : .pinholeTiles
+                let exporter = COLMAPExporter(
+                    sessionDirectory: dir
+                )
+                try exporter.export(
+                    scans: scans,
+                    cameraConfig: config,
+                    cameraExportMode: mode
+                )
+            }.value
+            postProcessor.progress = ExportProgress(
+                stage: "COLMAP model ready",
+                current: 1, total: 1,
+                isComplete: true
+            )
+        } catch {
+            postProcessor.progress = ExportProgress(
+                stage: "COLMAP export failed",
+                error: error.localizedDescription
+            )
+        }
+    }
+
     private func runExport() async {
         isRunning = true
 
         switch selectedMode {
         case .colmapOnly:
-            let sparseDir = sessionDirectory
-                .appendingPathComponent("colmap/sparse/0")
-            let camerasExist = FileManager.default
-                .fileExists(atPath: sparseDir.appendingPathComponent("cameras.bin").path)
-
-            if camerasExist {
-                postProcessor.progress = ExportProgress(
-                    stage: "COLMAP model ready",
-                    current: 1, total: 1, isComplete: true
-                )
-            } else {
-                postProcessor.progress = ExportProgress(
-                    stage: "COLMAP export failed — no output files found",
-                    error: "Check that the session has at least one scan with valid pose data."
-                )
-            }
+            await runCOLMAPExport()
 
         case .fullOnDevice:
             await postProcessor.runFullPipeline(sessionDirectory: sessionDirectory)

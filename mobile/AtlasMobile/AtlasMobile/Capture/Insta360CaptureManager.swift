@@ -170,6 +170,7 @@ final class Insta360CaptureManager: ObservableObject {
                 )
             }
 
+            self?.stopInFlightCapture()
             var primed = await first.warmupCapture()
             if !primed {
                 self?.stopInFlightCapture()
@@ -280,6 +281,7 @@ final class Insta360CaptureManager: ObservableObject {
     func disconnect() async {
         warmupTask?.cancel()
         warmupTask = nil
+        stopInFlightCapture()
         let cameras = await MainActor.run {
             let current = connectedCameras
             connectedCameras = []
@@ -347,7 +349,8 @@ final class Insta360CaptureManager: ObservableObject {
     func captureWith(
         cameras: [CameraInstance],
         arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8,
-        skipPreChecks: Bool = false
+        skipPreChecks: Bool = false,
+        retryOnFailure: Bool = true
     ) async -> [Insta360CaptureResult] {
         guard !cameras.isEmpty, !Task.isCancelled else { return [] }
 
@@ -361,7 +364,9 @@ final class Insta360CaptureManager: ObservableObject {
                     await camera.capture(
                         arkitTimestamp: arkitTimestamp,
                         scanIndex: scanIndex,
-                        timeout: timeout
+                        timeout: timeout,
+                        skipPreChecks: skipPreChecks,
+                        retryOnFailure: retryOnFailure
                     )
                 }
             }

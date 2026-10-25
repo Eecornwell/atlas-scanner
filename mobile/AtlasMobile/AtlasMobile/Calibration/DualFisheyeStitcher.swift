@@ -1,15 +1,15 @@
 import UIKit
+import ImageIO
 
-/// Converts Insta360 ONE X2 dual-fisheye images to equirectangular (ERP).
+/// Converts Insta360 dual-fisheye images to equirectangular (ERP).
 ///
-/// The ONE X2 stores photos as two side-by-side equidistant fisheye circles
-/// (front lens on the left, back lens on the right). This stitcher reprojects
-/// them into a standard lat/lon ERP image that the rest of the calibration
-/// and export pipeline expects.
+/// Insta360 cameras (ONE X2, X5, etc.) store photos as two side-by-side
+/// equidistant fisheye circles (front lens left, back lens right). This
+/// stitcher reprojects them into a standard lat/lon ERP image that the
+/// rest of the calibration and export pipeline expects.
 enum DualFisheyeStitcher {
 
     /// Roll correction for a given camera model's dual-fisheye output.
-    /// The ONE X2 on a portrait phone rig is mounted sideways and needs -90°.
     static func rollCorrection(forModel model: String) -> Float {
         let m = model.lowercased()
         if m.contains("x2") || m.contains("one x2") {
@@ -53,39 +53,78 @@ enum DualFisheyeStitcher {
         return (total / Float(count)) < 15
     }
 
-    /// Stitch a dual-fisheye image to equirectangular.
-    ///
-    /// - Parameters:
-    ///   - dualFisheye: The raw dual-fisheye image from the Insta360 ONE X2.
-    ///   - outputWidth: Width of the output ERP (height = width / 2).
-    ///   - rollDeg: Roll correction in degrees to compensate for camera
-    ///     mounting orientation. Negative = CCW correction of the ERP output.
-    ///     Use ``rollCorrection(forModel:)`` to get the value for a camera.
-    /// - Returns: An equirectangular UIImage, or nil on failure.
+    /// Stitch from a file URL — uses ImageIO to downsample during
+    /// decode, avoiding a full-resolution pixel buffer in memory.
+    static func stitch(
+        url: URL,
+        outputWidth: Int = 2048,
+        rollDeg: Float = 0
+    ) -> UIImage? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL, nil
+        ) else { return nil }
+        let srcMax = max(3072, outputWidth + outputWidth / 4)
+        let cg = downsampleSource(
+            source, maxWidth: srcMax
+        )
+        guard let cg else { return nil }
+        return stitchCGImage(
+            cg, outputWidth: outputWidth,
+            rollDeg: rollDeg
+        )
+    }
+
     static func stitch(
         _ dualFisheye: UIImage,
         outputWidth: Int = 2048,
         rollDeg: Float = 0
     ) -> UIImage? {
-        guard let origCG = dualFisheye.cgImage else { return nil }
-        let maxSrcW = 3072
+        guard let origCG = dualFisheye.cgImage
+        else { return nil }
+        let maxSrcW = max(3072, outputWidth + outputWidth / 4)
         let cg: CGImage
         if origCG.width > maxSrcW {
-            let scale = CGFloat(maxSrcW) / CGFloat(origCG.width)
-            let newH = Int(CGFloat(origCG.height) * scale)
-            let renderer = UIGraphicsImageRenderer(
-                size: CGSize(width: maxSrcW, height: newH)
-            )
-            let downsampled = renderer.image { _ in
-                UIImage(cgImage: origCG).draw(
-                    in: CGRect(x: 0, y: 0, width: maxSrcW, height: newH)
-                )
-            }
-            guard let dsCG = downsampled.cgImage else { return nil }
-            cg = dsCG
+            guard let data = dualFisheye.jpegData(
+                compressionQuality: 0.95
+            ), let source = CGImageSourceCreateWithData(
+                data as CFData, nil
+            ), let ds = downsampleSource(
+                source, maxWidth: maxSrcW
+            ) else { return nil }
+            cg = ds
         } else {
             cg = origCG
         }
+        return stitchCGImage(
+            cg, outputWidth: outputWidth,
+            rollDeg: rollDeg
+        )
+    }
+
+    private static func downsampleSource(
+        _ source: CGImageSource,
+        maxWidth: Int
+    ) -> CGImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize:
+                maxWidth,
+            kCGImageSourceCreateThumbnailFromImageAlways:
+                true,
+            kCGImageSourceCreateThumbnailWithTransform:
+                true,
+            kCGImageSourceShouldCacheImmediately:
+                true,
+        ]
+        return CGImageSourceCreateThumbnailAtIndex(
+            source, 0, options as CFDictionary
+        )
+    }
+
+    private static func stitchCGImage(
+        _ cg: CGImage,
+        outputWidth: Int,
+        rollDeg: Float
+    ) -> UIImage? {
         let srcW = cg.width, srcH = cg.height
         let halfW = srcW / 2
 
@@ -94,7 +133,7 @@ enum DualFisheyeStitcher {
             data: &src, width: srcW, height: srcH,
             bitsPerComponent: 8, bytesPerRow: srcW * 4,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ) else { return nil }
         srcCtx.draw(cg, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
 
@@ -194,7 +233,7 @@ enum DualFisheyeStitcher {
             data: &out, width: outW, height: outH,
             bitsPerComponent: 8, bytesPerRow: outW * 4,
             space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
         ), let result = outCtx.makeImage() else { return nil }
         return UIImage(cgImage: result)
     }

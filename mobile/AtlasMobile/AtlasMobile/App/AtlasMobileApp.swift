@@ -50,6 +50,9 @@ struct AtlasMobileApp: App {
     @StateObject private var sessionManager = CaptureSessionManager()
 
     init() {
+        UserDefaults.standard.register(defaults: [
+            "multiCameraExport": true,
+        ])
         INSCameraSDKLogger.shared().logLevel = INSCameraSDKLogLevel.debug
         INSCameraSDKLogger.shared().logDelegate = SDKLogForwarder.shared
     }

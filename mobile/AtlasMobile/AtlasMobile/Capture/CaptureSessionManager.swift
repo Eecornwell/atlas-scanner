@@ -230,15 +230,13 @@ final class CaptureSessionManager: ObservableObject {
                 let cams = activeCams
                 insta360BackgroundTask?.cancel()
                 insta360BackgroundTask = Task { [weak self] in
-                    defer {
-                        self?.isInsta360Busy = false
-                    }
                     let captureStart = ContinuousClock.now
                     let _ = await manager.captureWith(
                         cameras: cams,
                         arkitTimestamp: CACurrentMediaTime(),
                         scanIndex: scan,
-                        timeout: 12
+                        timeout: 30,
+                        retryOnFailure: false
                     )
                     let capComp = (ContinuousClock.now
                         - captureStart).components
@@ -251,30 +249,27 @@ final class CaptureSessionManager: ObservableObject {
                         "360#\(cmdNum) scan#\(scan)"
                         + " ack=\(captureMs)ms"
                     )
+                    self?.isInsta360Busy = false
                     guard let self,
                           let dir = self.sessionDirectory
-                    else {
-                        self?.logMessage(
-                            "[360] dl skip: self="
-                            + "\(self != nil)"
-                            + " dir="
-                            + "\(self?.sessionDirectory != nil)"
-                        )
-                        return
-                    }
+                    else { return }
+                    guard !Task.isCancelled else { return }
                     let downloads =
                         await manager.downloadAllPending(
                             into: dir
                         )
-                    self.logMessage(
-                        "[360] dl=\(downloads.count)"
-                        + (downloads.first.map {
-                            " \($0.localURL.lastPathComponent)"
-                        } ?? "")
-                    )
-                    await self.updateInstaPreview(
-                        from: downloads
-                    )
+                    if !downloads.isEmpty {
+                        let fname = downloads.first?
+                            .localURL.lastPathComponent
+                            ?? ""
+                        self.logMessage(
+                            "[360] dl=\(downloads.count)"
+                            + " \(fname)"
+                        )
+                        await self.updateInstaPreview(
+                            from: downloads
+                        )
+                    }
                 }
             }
 
@@ -426,7 +421,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "10g"
+    private static let buildTag = "10m"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -493,29 +488,7 @@ final class CaptureSessionManager: ObservableObject {
         }
         dataRecorder = nil
 
-        guard let dir, !scans.isEmpty else { return }
-
-        let exporter = COLMAPExporter(
-            sessionDirectory: dir
-        )
-        let useMultiCam = UserDefaults.standard
-            .bool(forKey: "multiCameraExport")
-        let exportMode: CameraExportMode =
-            useMultiCam
-                ? .nativeFisheye : .pinholeTiles
-        do {
-            try await Task.detached(
-                priority: .userInitiated
-            ) {
-                try exporter.export(
-                    scans: scans,
-                    cameraConfig: config,
-                    cameraExportMode: exportMode
-                )
-            }.value
-        } catch {
-            exportError = error.localizedDescription
-        }
+        guard dir != nil, !scans.isEmpty else { return }
     }
 
     // MARK: - Visualization toggles
