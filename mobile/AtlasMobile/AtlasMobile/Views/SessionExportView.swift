@@ -12,9 +12,8 @@ struct SessionExportView: View {
     @AppStorage("multiCameraExport") private var multiCameraExport = true
     @State private var isRunning = false
     @State private var isComplete = false
-    @State private var isSharing = false
     @State private var isZipping = false
-    @State private var shareZipURL: URL?
+    @State private var shareItem: ShareableURL?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -32,7 +31,11 @@ struct SessionExportView: View {
                 // Camera model
                 if selectedMode != .hostProcessing {
                     Section("Camera Model") {
-                        Toggle("Multi-camera (native fisheye)", isOn: $multiCameraExport)
+                        Picker("Export Mode", selection: $multiCameraExport) {
+                            Text("Canonical Tiles").tag(false)
+                            Text("Fisheye").tag(true)
+                        }
+                        .pickerStyle(.segmented)
                         Text(multiCameraExport
                              ? "Insta360 exported as 2 equidistant fisheye lenses "
                                + "(OPENCV_FISHEYE). Full FOV, requires 3DGUT."
@@ -100,6 +103,9 @@ struct SessionExportView: View {
                     }
                 }
             }
+            .sheet(item: $shareItem) { item in
+                ShareSheet(url: item.url)
+            }
             .navigationTitle("Export Session")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -143,11 +149,6 @@ struct SessionExportView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(isZipping)
-                .sheet(isPresented: $isSharing) {
-                    if let zipURL = shareZipURL {
-                        ShareSheet(url: zipURL)
-                    }
-                }
             }
         }
     }
@@ -169,12 +170,26 @@ struct SessionExportView: View {
             let zipURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("\(dir.lastPathComponent).zip")
             try? FileManager.default.removeItem(at: zipURL)
-            return ZipWriter.write(sourceDir: dir, to: zipURL) ? zipURL : nil
+            let ok = ZipWriter.write(sourceDir: dir, to: zipURL)
+            print("[Share] zip \(ok ? "OK" : "FAILED")"
+                + " → \(zipURL.lastPathComponent)")
+            if ok, let attrs = try? FileManager.default
+                .attributesOfItem(atPath: zipURL.path),
+                let size = attrs[.size] as? Int
+            {
+                print("[Share] zip size: "
+                    + "\(size / 1_048_576) MB")
+            }
+            return ok ? zipURL : nil
         }.value
+        guard let url else {
+            print("[Share] zip returned nil")
+            isZipping = false
+            return
+        }
         isZipping = false
-        guard let url else { return }
-        shareZipURL = url
-        isSharing = true
+        shareItem = ShareableURL(url: url)
+        print("[Share] presenting sheet")
     }
 
     private func runCOLMAPExport() async {
@@ -314,6 +329,11 @@ private struct ModelStatusRow: View {
                 .font(.caption)
         }
     }
+}
+
+private struct ShareableURL: Identifiable {
+    let id = UUID()
+    let url: URL
 }
 
 private struct ShareSheet: UIViewControllerRepresentable {

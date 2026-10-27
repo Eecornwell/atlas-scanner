@@ -175,21 +175,10 @@ final class Insta360CaptureManager: ObservableObject {
             if !primed {
                 self?.stopInFlightCapture()
                 self?.onLogMessage?(
-                    "warmup busy — retry in 10s…"
+                    "warmup busy — retry in 3s…"
                 )
                 try? await Task.sleep(
-                    for: .seconds(10)
-                )
-                primed = await first.warmupCapture()
-            }
-            if !primed {
-                self?.stopInFlightCapture()
-                self?.onLogMessage?(
-                    "warmup retry failed"
-                    + " — waiting 30s…"
-                )
-                try? await Task.sleep(
-                    for: .seconds(30)
+                    for: .seconds(3)
                 )
                 primed = await first.warmupCapture()
             }

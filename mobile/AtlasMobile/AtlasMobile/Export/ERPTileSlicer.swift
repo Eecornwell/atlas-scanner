@@ -163,6 +163,53 @@ final class ERPTileSlicer {
         return maps
     }
 
+    // MARK: - Pre-extracted pixel path
+
+    /// Extract ERP pixels in top-down layout matching the
+    /// sampling maps. Call once, then pass the buffer to
+    /// `sliceTile(at:srcPx:srcW:srcH:)` for each face.
+    static func extractPixelsTopDown(
+        _ image: UIImage
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        guard let cg = image.cgImage else { return nil }
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+        var px = [UInt8](
+            repeating: 0, count: w * h * 4
+        )
+        guard let ctx = CGContext(
+            data: &px, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ) else { return nil }
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(
+            cg,
+            in: CGRect(x: 0, y: 0, width: w, height: h)
+        )
+        return (px, w, h)
+    }
+
+    /// Slice a single face from pre-extracted pixels.
+    func sliceTile(
+        at faceIndex: Int,
+        srcPx: [UInt8], srcW: Int, srcH: Int
+    ) -> UIImage? {
+        let maps = buildSamplingMaps(
+            erpW: srcW, erpH: srcH
+        )
+        guard faceIndex < maps.count else { return nil }
+        let map = maps[faceIndex]
+        guard let tile = remapPixels(
+            srcPx: srcPx, srcW: srcW, srcH: srcH,
+            uMap: map.u, vMap: map.v
+        ) else { return nil }
+        return UIImage(cgImage: tile)
+    }
+
     // MARK: - vImage remap
 
     /// Bilinear remap of a CGImage using pre-computed float (u, v) maps.
@@ -184,6 +231,20 @@ final class ERPTileSlicer {
         readCtx.translateBy(x: 0, y: CGFloat(srcH))
         readCtx.scaleBy(x: 1, y: -1)
         readCtx.draw(source, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
+
+        return remapPixels(
+            srcPx: srcPx, srcW: srcW, srcH: srcH,
+            uMap: uMap, vMap: vMap
+        )
+    }
+
+    /// Bilinear remap from a pre-extracted top-down pixel buffer.
+    private func remapPixels(
+        srcPx: [UInt8], srcW: Int, srcH: Int,
+        uMap: [Float], vMap: [Float]
+    ) -> CGImage? {
+        let srcBPP = 4
+        let srcStride = srcW * srcBPP
 
         let dstBPP = 4
         let dstStride = tileSize * dstBPP

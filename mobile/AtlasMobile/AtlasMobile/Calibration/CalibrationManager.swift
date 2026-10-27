@@ -261,23 +261,18 @@ final class CalibrationManager: ObservableObject {
             print("[FeatureCal] using color profile")
         }
 
-        struct FrameResult {
-            let extrinsic: RigidTransform
-            let matchCount: Int
-            let cost: Float
-            let iphoneKPCount: Int
-            let sliceKPCount: Int
-            let iphonePreview: UIImage?
-            let slicePreview: UIImage?
-            let frameIndex: Int
+        // Prepare per-frame ERP images (color-corrected)
+        struct FrameInput {
+            let index: Int
+            let frame: CalibrationFrame
+            let iphoneImage: UIImage
+            let erpImage: UIImage
         }
-
-        var results: [FrameResult] = []
-
-        for (idx, frame) in calibrationFrames.enumerated() {
-            guard let iphoneImg = frame.iphoneImage
+        var inputs: [FrameInput] = []
+        for (idx, frame) in calibrationFrames.enumerated()
+        {
+            guard let iImg = frame.iphoneImage
             else { continue }
-
             let erp: UIImage
             if let cp {
                 erp = ColorProfileCalibrator.apply(
@@ -286,78 +281,159 @@ final class CalibrationManager: ObservableObject {
             } else {
                 erp = frame.erpImage
             }
+            inputs.append(FrameInput(
+                index: idx, frame: frame,
+                iphoneImage: iImg, erpImage: erp
+            ))
+        }
 
-            let r = await Task.detached(
+        guard !inputs.isEmpty else {
+            featureRefineStatus =
+                "Features: no valid frames"
+            return
+        }
+
+        let erpW = Int(
+            inputs[0].erpImage.size.width
+        )
+        let erpH = Int(
+            inputs[0].erpImage.size.height
+        )
+
+        // ---------- Round 1: match all frames at seed ----------
+        featureRefineStatus = "Features: round 1…"
+        var allSamples:
+            [ExtrinsicOptimizer.MatchSample] = []
+        var bestMatchIdx = 0
+        var bestMatchCount = 0
+        var bestPreviewI: UIImage?
+        var bestPreviewS: UIImage?
+
+        for fi in inputs {
+            let mr = await Task.detached(
                 priority: .userInitiated
             ) {
-                FeatureBasedCalibrator.calibrate(
-                    iphoneImage: iphoneImg,
-                    erpImage: erp,
+                FeatureBasedCalibrator.matchFrame(
+                    iphoneImage: fi.iphoneImage,
+                    erpImage: fi.erpImage,
                     seed: seed,
-                    frame: frame,
+                    frame: fi.frame,
                     mask: maskImage
                 )
             }.value
 
-            print("[FeatureCal] frame \(idx):"
-                + " \(r.matchCount) matches,"
-                + " cost=\(String(format: "%.1f", r.cost))")
+            print("[FeatureCal] R1 frame \(fi.index):"
+                + " \(mr.samples.count) samples,"
+                + " \(mr.nccMatchCount) NCC,"
+                + " \(mr.iphoneKPCount) kp")
 
-            guard r.matchCount > 0 else { continue }
+            allSamples.append(contentsOf: mr.samples)
 
-            results.append(FrameResult(
-                extrinsic: r.extrinsic,
-                matchCount: r.matchCount,
-                cost: r.cost,
-                iphoneKPCount: r.iphoneKPCount,
-                sliceKPCount: r.sliceKPCount,
-                iphonePreview: r.iphonePreview,
-                slicePreview: r.slicePreview,
-                frameIndex: idx
-            ))
+            if mr.samples.count > bestMatchCount {
+                bestMatchCount = mr.samples.count
+                bestMatchIdx = fi.index
+                bestPreviewI = mr.iphonePreview
+                bestPreviewS = mr.slicePreview
+            }
         }
 
-        guard !results.isEmpty else {
-            featureRefineStatus =
-                "Features: failed (no matches in any frame)"
+        print("[FeatureCal] R1 total: \(allSamples.count)"
+            + " samples from \(inputs.count) frames")
+
+        guard allSamples.count >= 8 else {
+            featureRefineStatus = String(
+                format: "Features: too few matches"
+                    + " (%d across %d frames)",
+                allSamples.count, inputs.count
+            )
             return
         }
 
+        // ---------- Joint optimization round 1 ----------
+        var round1 = FeatureBasedCalibrator.optimizeJoint(
+            samples: &allSamples,
+            seed: seed,
+            erpW: erpW, erpH: erpH
+        )
+
+        print("[FeatureCal] R1 result:"
+            + " RPY=(\(String(format: "%.3f", round1.roll)),"
+            + " \(String(format: "%.3f", round1.pitch)),"
+            + " \(String(format: "%.3f", round1.yaw)))"
+            + " inliers=\(allSamples.count)")
+
+        // ---------- Round 2: re-slice at refined seed ----------
+        featureRefineStatus = "Features: round 2…"
+        var allSamples2:
+            [ExtrinsicOptimizer.MatchSample] = []
+
+        for fi in inputs {
+            let refinedSeed = round1
+            let mr = await Task.detached(
+                priority: .userInitiated
+            ) {
+                FeatureBasedCalibrator.matchFrame(
+                    iphoneImage: fi.iphoneImage,
+                    erpImage: fi.erpImage,
+                    seed: refinedSeed,
+                    frame: fi.frame,
+                    mask: maskImage
+                )
+            }.value
+
+            print("[FeatureCal] R2 frame \(fi.index):"
+                + " \(mr.samples.count) samples")
+
+            allSamples2.append(contentsOf: mr.samples)
+
+            if mr.samples.count > bestMatchCount {
+                bestMatchCount = mr.samples.count
+                bestMatchIdx = fi.index
+                bestPreviewI = mr.iphonePreview
+                bestPreviewS = mr.slicePreview
+            }
+        }
+
+        print("[FeatureCal] R2 total:"
+            + " \(allSamples2.count) samples")
+
+        // ---------- Joint optimization round 2 ----------
         let refined: RigidTransform
-        if results.count == 1 {
-            refined = results[0].extrinsic
-        } else {
-            let rolls = results.map { $0.extrinsic.roll }
-                .sorted()
-            let pitches = results.map { $0.extrinsic.pitch }
-                .sorted()
-            let yaws = results.map { $0.extrinsic.yaw }
-                .sorted()
-            let midIdx = results.count / 2
-            refined = RigidTransform(
-                roll: rolls[midIdx],
-                pitch: pitches[midIdx],
-                yaw: yaws[midIdx],
-                x: seed.x, y: seed.y, z: seed.z
+        let finalSampleCount: Int
+        if allSamples2.count >= 8 {
+            refined = FeatureBasedCalibrator.optimizeJoint(
+                samples: &allSamples2,
+                seed: round1,
+                erpW: erpW, erpH: erpH,
+                finalIterations: 1500
             )
-            print("[FeatureCal] median of \(results.count)"
-                + " frames: RPY=(\(refined.roll),"
-                + " \(refined.pitch), \(refined.yaw))")
+            finalSampleCount = allSamples2.count
+        } else {
+            refined = round1
+            finalSampleCount = allSamples.count
         }
 
-        let bestPreview = results.max(by: {
-            $0.matchCount < $1.matchCount
-        })!
-        featurePreviewIphone = bestPreview.iphonePreview
-        featurePreviewSlice = bestPreview.slicePreview
+        print("[FeatureCal] final:"
+            + " RPY=(\(String(format: "%.3f", refined.roll)),"
+            + " \(String(format: "%.3f", refined.pitch)),"
+            + " \(String(format: "%.3f", refined.yaw)))"
+            + " inliers=\(finalSampleCount)")
 
-        let totalMatches = results.reduce(0) {
-            $0 + $1.matchCount
-        }
-        featureMatchCount = totalMatches
+        // ---------- Update UI ----------
+        featurePreviewIphone = bestPreviewI
+        featurePreviewSlice = bestPreviewS
+        featureMatchCount = finalSampleCount
+
+        let finalCost = FeatureBasedCalibrator.jointCost(
+            samples: allSamples2.isEmpty
+                ? allSamples : allSamples2,
+            extrinsic: refined,
+            erpW: erpW, erpH: erpH
+        )
         featureRefineStatus = String(
-            format: "Features: %d matches across %d frames",
-            totalMatches, results.count
+            format: "Features: %d inliers, %d frames,"
+                + " cost=%.1f",
+            finalSampleCount, inputs.count, finalCost
         )
 
         refinedRPY = SIMD3(
@@ -370,20 +446,21 @@ final class CalibrationManager: ObservableObject {
             Float(refined.y),
             Float(refined.z)
         )
-        reprojectionError = bestPreview.cost
+        reprojectionError = finalCost
 
         let dR = refined.roll - extrinsic.roll
         let dP = refined.pitch - extrinsic.pitch
         let dY = refined.yaw - extrinsic.yaw
         let deltaStr = String(
-            format: "Feature median %d frames"
-                + " Δ RPY=(%.2f°, %.2f°, %.2f°)",
-            results.count, dR, dP, dY
+            format: "Joint %d frames, 2 rounds"
+                + " Δ RPY=(%.2f°, %.2f°, %.2f°)"
+                + " cost=%.1f",
+            inputs.count, dR, dP, dY, finalCost
         )
         frameDebugInfo += "\n" + deltaStr
 
         let overlayFrame = calibrationFrames[
-            bestPreview.frameIndex
+            bestMatchIdx
         ]
         overlayPair = CalibrationOverlayRenderer.render(
             frame: overlayFrame, extrinsic: refined

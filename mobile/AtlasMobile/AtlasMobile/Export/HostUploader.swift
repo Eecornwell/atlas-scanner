@@ -130,72 +130,190 @@ final class HostUploader: NSObject, ObservableObject {
 /// Produces a standard ZIP file compatible with all unzip tools.
 enum ZipWriter {
 
+    private static let chunkSize = 2 * 1024 * 1024 // 2 MB
+    private static let streamThreshold = 8 * 1024 * 1024
+    private static let compressedExts: Set<String> = [
+        "jpg", "jpeg", "png", "heic", "heif",
+        "insv", "insp", "mp4", "mov", "m4a",
+        "zip", "gz", "zst",
+    ]
+
     static func write(sourceDir: URL, to destURL: URL) -> Bool {
         var entries: [(localPath: URL, zipPath: String)] = []
         guard let enumerator = FileManager.default.enumerator(
             at: sourceDir,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return false }
 
         let srcPath = sourceDir.standardizedFileURL.path
         let sessionName = sourceDir.lastPathComponent
         for case let fileURL as URL in enumerator {
-            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
+            guard (try? fileURL.resourceValues(
+                forKeys: [.isRegularFileKey]
+            ))?.isRegularFile == true
             else { continue }
             let filePath = fileURL.standardizedFileURL.path
-            let relToSession = String(filePath.dropFirst(srcPath.count))
-                .drop(while: { $0 == "/" })
+            let relToSession = String(
+                filePath.dropFirst(srcPath.count)
+            ).drop(while: { $0 == "/" })
             let zipPath = sessionName + "/" + relToSession
             entries.append((fileURL, zipPath))
         }
 
-        var archive = Data()
+        guard FileManager.default.createFile(
+            atPath: destURL.path, contents: nil
+        ) else { return false }
+        guard let fh = try? FileHandle(
+            forWritingTo: destURL
+        ) else { return false }
+        defer { try? fh.close() }
+
         var centralDirectory = Data()
-        var offsets: [UInt32] = []
+        var written: UInt32 = 0
+        var count: UInt16 = 0
 
         for entry in entries {
-            guard let fileData = try? Data(contentsOf: entry.localPath) else { continue }
-            let compressed = deflate(fileData)
-            let useDeflate = compressed.count < fileData.count
-            let payload = useDeflate ? compressed : fileData
-            let method: UInt16 = useDeflate ? 8 : 0
+            autoreleasepool {
+                let nameData = entry.zipPath.data(
+                    using: .utf8
+                ) ?? Data()
+                let ext = entry.localPath
+                    .pathExtension.lowercased()
+                let skipDeflate = compressedExts
+                    .contains(ext)
+                let fileSize = (
+                    try? entry.localPath.resourceValues(
+                        forKeys: [.fileSizeKey]
+                    )
+                )?.fileSize ?? 0
 
-            let nameData = entry.zipPath.data(using: .utf8) ?? Data()
-            let crc = crc32(fileData)
-            let offset = UInt32(archive.count)
-            offsets.append(offset)
+                let offset = written
 
-            // Local file header
-            archive += localHeader(
-                name: nameData, method: method,
-                crc: crc, compSize: UInt32(payload.count),
-                uncompSize: UInt32(fileData.count)
-            )
-            archive += payload
+                if fileSize >= streamThreshold
+                    || skipDeflate
+                {
+                    guard let result = writeStored(
+                        fh: fh, localPath: entry.localPath,
+                        nameData: nameData,
+                        fileSize: fileSize
+                    ) else { return }
+                    written += result.bytesWritten
+                    centralDirectory += centralEntry(
+                        name: nameData, method: 0,
+                        crc: result.crc,
+                        compSize: UInt32(fileSize),
+                        uncompSize: UInt32(fileSize),
+                        offset: offset
+                    )
+                } else {
+                    guard let fileData = try? Data(
+                        contentsOf: entry.localPath
+                    ) else { return }
+                    let compressed = deflate(fileData)
+                    let useDeflate =
+                        compressed.count < fileData.count
+                    let payload = useDeflate
+                        ? compressed : fileData
+                    let method: UInt16 =
+                        useDeflate ? 8 : 0
+                    let crc = crc32(fileData)
 
-            // Central directory entry
-            centralDirectory += centralEntry(
-                name: nameData, method: method,
-                crc: crc, compSize: UInt32(payload.count),
-                uncompSize: UInt32(fileData.count),
-                offset: offset
-            )
+                    let header = localHeader(
+                        name: nameData, method: method,
+                        crc: crc,
+                        compSize: UInt32(payload.count),
+                        uncompSize: UInt32(
+                            fileData.count
+                        )
+                    )
+                    fh.write(header)
+                    fh.write(payload)
+                    written += UInt32(header.count)
+                        + UInt32(payload.count)
+                    centralDirectory += centralEntry(
+                        name: nameData, method: method,
+                        crc: crc,
+                        compSize: UInt32(payload.count),
+                        uncompSize: UInt32(
+                            fileData.count
+                        ),
+                        offset: offset
+                    )
+                }
+                count += 1
+            }
         }
 
-        let cdOffset = UInt32(archive.count)
-        let cdSize   = UInt32(centralDirectory.count)
-        archive += centralDirectory
-        archive += endOfCentralDirectory(
-            count: UInt16(entries.count), cdSize: cdSize, cdOffset: cdOffset
+        let cdOffset = written
+        let cdSize = UInt32(centralDirectory.count)
+        fh.write(centralDirectory)
+        fh.write(endOfCentralDirectory(
+            count: count,
+            cdSize: cdSize, cdOffset: cdOffset
+        ))
+
+        return true
+    }
+
+    private struct StoredResult {
+        let crc: UInt32
+        let bytesWritten: UInt32
+    }
+
+    private static func writeStored(
+        fh: FileHandle,
+        localPath: URL,
+        nameData: Data,
+        fileSize: Int
+    ) -> StoredResult? {
+        guard let rfh = try? FileHandle(
+            forReadingFrom: localPath
+        ) else { return nil }
+        defer { try? rfh.close() }
+
+        // Pass 1: streaming CRC
+        var crc: UInt32 = 0xFFFFFFFF
+        while true {
+            let chunk = autoreleasepool {
+                rfh.readData(ofLength: chunkSize)
+            }
+            if chunk.isEmpty { break }
+            for byte in chunk {
+                crc ^= UInt32(byte)
+                for _ in 0..<8 {
+                    crc = (crc & 1) != 0
+                        ? (crc >> 1) ^ 0xEDB88320
+                        : crc >> 1
+                }
+            }
+        }
+        crc ^= 0xFFFFFFFF
+
+        // Write header
+        let header = localHeader(
+            name: nameData, method: 0,
+            crc: crc,
+            compSize: UInt32(fileSize),
+            uncompSize: UInt32(fileSize)
         )
+        fh.write(header)
 
-        do {
-            try archive.write(to: destURL)
-            return true
-        } catch {
-            return false
+        // Pass 2: stream file data to zip
+        rfh.seek(toFileOffset: 0)
+        while true {
+            let chunk = autoreleasepool {
+                rfh.readData(ofLength: chunkSize)
+            }
+            if chunk.isEmpty { break }
+            fh.write(chunk)
         }
+
+        return StoredResult(
+            crc: crc,
+            bytesWritten: UInt32(header.count)
+                + UInt32(fileSize)
+        )
     }
 
     // MARK: - Deflate

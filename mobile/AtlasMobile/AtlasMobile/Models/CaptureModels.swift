@@ -17,7 +17,8 @@ struct Insta360CaptureResult {
     let cameraId: String
     let scanIndex: Int
     let arkitTimestamp: Double
-    let insta360Timestamp: Double
+    let commandTimestamp: Double
+    let callbackTimestamp: Double
     let mediaIdentifier: String
 }
 
@@ -26,6 +27,7 @@ struct Insta360DownloadResult {
     let scanIndex: Int
     let localURL: URL
     let mediaType: MediaType
+    let exifTimestamp: Double?
 
     enum MediaType {
         case equirectangular

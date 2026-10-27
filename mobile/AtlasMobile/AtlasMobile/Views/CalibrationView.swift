@@ -588,7 +588,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-25b")
+        Text("Build: 2026-10-27b")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }

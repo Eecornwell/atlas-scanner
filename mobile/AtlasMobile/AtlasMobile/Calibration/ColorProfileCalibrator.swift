@@ -171,6 +171,33 @@ enum ColorProfileCalibrator {
         return UIImage(cgImage: result)
     }
 
+    static func applyInPlace(
+        _ profile: ColorProfile,
+        pixels: inout [UInt8]
+    ) {
+        for i in stride(
+            from: 0, to: pixels.count, by: 4
+        ) {
+            let r = Float(pixels[i])
+            let g = Float(pixels[i + 1])
+            let b = Float(pixels[i + 2])
+            var (l, a, bVal) = rgbToLAB(r, g, b)
+            l *= profile.lGain
+            a += profile.aOffset
+            bVal += profile.bOffset
+            let (rO, gO, bO) = labToRGB(l, a, bVal)
+            pixels[i] = UInt8(
+                max(0, min(255, rO))
+            )
+            pixels[i + 1] = UInt8(
+                max(0, min(255, gO))
+            )
+            pixels[i + 2] = UInt8(
+                max(0, min(255, bO))
+            )
+        }
+    }
+
     // MARK: - Persistence
 
     private static let profileURL: URL? = {

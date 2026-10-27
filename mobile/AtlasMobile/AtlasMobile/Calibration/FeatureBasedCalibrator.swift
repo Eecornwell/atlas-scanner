@@ -28,33 +28,36 @@ enum FeatureBasedCalibrator {
 
     // MARK: - Public API
 
-    static func calibrate(
+    struct MatchFrameResult {
+        let samples: [ExtrinsicOptimizer.MatchSample]
+        let iphoneKPCount: Int
+        let nccMatchCount: Int
+        let iphonePreview: UIImage?
+        let slicePreview: UIImage?
+    }
+
+    static func matchFrame(
         iphoneImage: UIImage,
         erpImage: UIImage,
         seed: RigidTransform,
         frame: CalibrationFrame,
-        mask: UIImage? = nil
-    ) -> CalibrationResult {
-        let matchSize = 384
-
+        mask: UIImage? = nil,
+        matchSize: Int = 512
+    ) -> MatchFrameResult {
         let hasCG = erpImage.cgImage != nil
         let erpSz = erpImage.size
-        print("[FeatureCal] ERP \(Int(erpSz.width))×\(Int(erpSz.height))"
+        print("[FeatureCal] ERP \(Int(erpSz.width))"
+            + "×\(Int(erpSz.height))"
             + " cgImage=\(hasCG)"
             + " iPhone \(Int(iphoneImage.size.width))"
             + "×\(Int(iphoneImage.size.height))")
 
-        func fail(
-            _ msg: String,
-            iPreview: UIImage? = nil,
-            sPreview: UIImage? = nil
-        ) -> CalibrationResult {
-            print("[FeatureCal] FAIL: \(msg)")
-            return CalibrationResult(
-                extrinsic: seed, matchCount: 0, cost: .infinity,
-                iphoneKPCount: 0, sliceKPCount: 0,
-                iphonePreview: iPreview,
-                slicePreview: sPreview
+        func empty(_ msg: String) -> MatchFrameResult {
+            print("[FeatureCal] matchFrame: \(msg)")
+            return MatchFrameResult(
+                samples: [], iphoneKPCount: 0,
+                nccMatchCount: 0,
+                iphonePreview: nil, slicePreview: nil
             )
         }
 
@@ -64,68 +67,61 @@ enum FeatureBasedCalibrator {
             frame: frame,
             outputSize: matchSize
         ) else {
-            return fail("failed to create ERP slice")
+            return empty("failed to create ERP slice")
         }
 
         let iphoneResized = resizeImage(
             iphoneImage, width: slice.w, height: slice.h
         )
         guard let iphoneResized else {
-            return fail("failed to resize iPhone image",
-                        sPreview: slice.image)
-        }
-
-        func previewFail(_ msg: String) -> CalibrationResult {
-            return fail(msg,
-                        iPreview: iphoneResized,
-                        sPreview: slice.image)
+            return empty("failed to resize iPhone image")
         }
 
         print("[FeatureCal] matching at \(slice.w)×\(slice.h)")
 
-        // Convert both to grayscale
-        guard let iGray = FeatureDetector.toGrayscale(iphoneResized),
-              let sGray = FeatureDetector.toGrayscale(slice.image)
+        guard let iGray = FeatureDetector.toGrayscale(
+            iphoneResized
+        ),
+            let sGray = FeatureDetector.toGrayscale(
+                slice.image
+            )
         else {
-            return previewFail("grayscale conversion failed")
+            return empty("grayscale conversion failed")
         }
 
-        // Detect FAST corners on the iPhone image
         let iFeats = FeatureDetector.detectAndDescribe(
             gray: iGray.pixels, width: iGray.width,
             height: iGray.height,
-            maxKeypoints: 1500, fastThreshold: 15
+            maxKeypoints: 2000, fastThreshold: 12
         )
 
-        print("[FeatureCal] iPhone corners: \(iFeats.keypoints.count)")
+        print("[FeatureCal] iPhone corners:"
+            + " \(iFeats.keypoints.count)")
 
         guard iFeats.keypoints.count >= 20 else {
-            return previewFail(
-                "too few iPhone corners (\(iFeats.keypoints.count))")
+            return MatchFrameResult(
+                samples: [],
+                iphoneKPCount: iFeats.keypoints.count,
+                nccMatchCount: 0,
+                iphonePreview: iphoneResized,
+                slicePreview: slice.image
+            )
         }
 
-        // NCC patch correlation: for each iPhone corner, search a
-        // small window in the ERP slice for the best match.
-        // Since the images are already roughly aligned (same FOV,
-        // seed is close), correct matches are near the same position.
         let nccMatches = correlationMatch(
-            grayA: iGray.pixels, wA: iGray.width, hA: iGray.height,
-            grayB: sGray.pixels, wB: sGray.width, hB: sGray.height,
+            grayA: iGray.pixels,
+            wA: iGray.width, hA: iGray.height,
+            grayB: sGray.pixels,
+            wB: sGray.width, hB: sGray.height,
             keypoints: iFeats.keypoints,
-            searchRadius: 30,
-            patchHalf: 7,
+            searchRadius: 32,
+            patchHalf: 10,
             minNCC: 0.4
         )
 
         print("[FeatureCal] NCC matches: \(nccMatches.count)"
             + " (of \(iFeats.keypoints.count) corners)")
 
-        guard nccMatches.count >= 6 else {
-            return previewFail(
-                "too few NCC matches (\(nccMatches.count))")
-        }
-
-        // Build optimizer samples from NCC matches
         let maskBool: [Bool]?
         if let maskCG = mask?.cgImage {
             let mw = Int(erpImage.size.width)
@@ -137,7 +133,7 @@ enum FeatureBasedCalibrator {
             maskBool = nil
         }
 
-        var samples = buildSamplesFromNCC(
+        let samples = buildSamplesFromNCC(
             matches: nccMatches,
             iKeypoints: iFeats.keypoints,
             slice: slice,
@@ -146,16 +142,47 @@ enum FeatureBasedCalibrator {
             mask: maskBool
         )
 
-        print("[FeatureCal] \(samples.count) samples for optimizer")
-        guard samples.count >= 6 else {
-            return previewFail(
-                "too few valid samples (\(samples.count))")
+        print("[FeatureCal] \(samples.count) samples")
+
+        return MatchFrameResult(
+            samples: samples,
+            iphoneKPCount: iFeats.keypoints.count,
+            nccMatchCount: nccMatches.count,
+            iphonePreview: iphoneResized,
+            slicePreview: slice.image
+        )
+    }
+
+    static func calibrate(
+        iphoneImage: UIImage,
+        erpImage: UIImage,
+        seed: RigidTransform,
+        frame: CalibrationFrame,
+        mask: UIImage? = nil
+    ) -> CalibrationResult {
+        let mr = matchFrame(
+            iphoneImage: iphoneImage,
+            erpImage: erpImage,
+            seed: seed,
+            frame: frame,
+            mask: mask
+        )
+
+        guard mr.samples.count >= 6 else {
+            return CalibrationResult(
+                extrinsic: seed, matchCount: 0,
+                cost: .infinity,
+                iphoneKPCount: mr.iphoneKPCount,
+                sliceKPCount: mr.nccMatchCount,
+                iphonePreview: mr.iphonePreview,
+                slicePreview: mr.slicePreview
+            )
         }
 
         let erpW = Int(erpImage.size.width)
         let erpH = Int(erpImage.size.height)
+        var samples = mr.samples
 
-        // Iterative outlier rejection
         var currentSeed = seed
         for pass in 0..<3 {
             guard samples.count >= 4 else { break }
@@ -187,7 +214,8 @@ enum FeatureBasedCalibrator {
 
                 print("[FeatureCal] pass \(pass):"
                     + " cost=\(String(format: "%.1f", cost))"
-                    + " median=\(String(format: "%.1f", medianR))"
+                    + " median="
+                    + "\(String(format: "%.1f", medianR))"
                     + " kept \(samples.count)/\(before)")
             } else {
                 print("[FeatureCal] pass \(pass):"
@@ -197,12 +225,19 @@ enum FeatureBasedCalibrator {
         }
 
         guard samples.count >= 4 else {
-            return previewFail(
-                "too few inliers after rejection (\(samples.count))")
+            return CalibrationResult(
+                extrinsic: seed, matchCount: 0,
+                cost: .infinity,
+                iphoneKPCount: mr.iphoneKPCount,
+                sliceKPCount: mr.nccMatchCount,
+                iphonePreview: mr.iphonePreview,
+                slicePreview: mr.slicePreview
+            )
         }
 
         let result = RigidTransform(
-            roll: currentSeed.roll, pitch: currentSeed.pitch,
+            roll: currentSeed.roll,
+            pitch: currentSeed.pitch,
             yaw: currentSeed.yaw,
             x: seed.x, y: seed.y, z: seed.z
         )
@@ -223,10 +258,74 @@ enum FeatureBasedCalibrator {
             extrinsic: result,
             matchCount: samples.count,
             cost: finalCost,
-            iphoneKPCount: iFeats.keypoints.count,
-            sliceKPCount: nccMatches.count,
-            iphonePreview: iphoneResized,
-            slicePreview: slice.image
+            iphoneKPCount: mr.iphoneKPCount,
+            sliceKPCount: mr.nccMatchCount,
+            iphonePreview: mr.iphonePreview,
+            slicePreview: mr.slicePreview
+        )
+    }
+
+    static func optimizeJoint(
+        samples: inout [ExtrinsicOptimizer.MatchSample],
+        seed: RigidTransform,
+        erpW: Int,
+        erpH: Int,
+        passes: Int = 3,
+        finalIterations: Int = 1200
+    ) -> RigidTransform {
+        var current = seed
+        for pass in 0..<passes {
+            guard samples.count >= 4 else { break }
+            let iters = pass == passes - 1
+                ? finalIterations : 500
+            let (refined, cost) = ExtrinsicOptimizer.optimize(
+                samples: samples,
+                seed: current,
+                erpW: erpW, erpH: erpH,
+                maxIterations: iters
+            )
+            current = refined
+
+            if pass < passes - 1 {
+                let residuals = computeResiduals(
+                    samples: samples,
+                    extrinsic: refined,
+                    erpW: erpW, erpH: erpH
+                )
+                let sorted = residuals.sorted()
+                let medianR = sorted[sorted.count / 2]
+                let threshold = max(medianR * 2.5, 200)
+                let before = samples.count
+                samples = zip(samples, residuals)
+                    .filter { $0.1 <= threshold }
+                    .map { $0.0 }
+                print("[FeatureCal] joint pass \(pass):"
+                    + " cost=\(String(format: "%.1f", cost))"
+                    + " median="
+                    + "\(String(format: "%.1f", medianR))"
+                    + " kept \(samples.count)/\(before)")
+            } else {
+                print("[FeatureCal] joint pass \(pass):"
+                    + " cost=\(String(format: "%.1f", cost))"
+                    + " inliers=\(samples.count)")
+            }
+        }
+        return RigidTransform(
+            roll: current.roll, pitch: current.pitch,
+            yaw: current.yaw,
+            x: seed.x, y: seed.y, z: seed.z
+        )
+    }
+
+    static func jointCost(
+        samples: [ExtrinsicOptimizer.MatchSample],
+        extrinsic: RigidTransform,
+        erpW: Int,
+        erpH: Int
+    ) -> Float {
+        return meanResidual(
+            samples: samples, extrinsic: extrinsic,
+            erpW: erpW, erpH: erpH
         )
     }
 
@@ -234,8 +333,8 @@ enum FeatureBasedCalibrator {
 
     struct NCCMatch {
         let queryIdx: Int
-        let matchX: Int
-        let matchY: Int
+        let matchX: Float
+        let matchY: Float
         let score: Float
     }
 
@@ -332,9 +431,62 @@ enum FeatureBasedCalibrator {
             }
 
             if bestNCC >= minNCC {
+                var subX = Float(bestX)
+                var subY = Float(bestY)
+
+                let computeNCC = { (sx: Int, sy: Int) -> Float in
+                    guard sx >= patchHalf,
+                          sx < wB - patchHalf,
+                          sy >= patchHalf,
+                          sy < hB - patchHalf
+                    else { return -1 }
+                    var sB: Float = 0
+                    for dy2 in -patchHalf...patchHalf {
+                        for dx2 in -patchHalf...patchHalf {
+                            sB += Float(
+                                grayB[(sy + dy2) * wB
+                                       + (sx + dx2)]
+                            )
+                        }
+                    }
+                    let mB = sB / Float(n)
+                    var cr2: Float = 0, vB: Float = 0
+                    for dy2 in -patchHalf...patchHalf {
+                        for dx2 in -patchHalf...patchHalf {
+                            let bv = Float(
+                                grayB[(sy + dy2) * wB
+                                       + (sx + dx2)]
+                            ) - mB
+                            let i2 = (dy2 + patchHalf)
+                                * patchSize
+                                + (dx2 + patchHalf)
+                            cr2 += patchA[i2] * bv
+                            vB += bv * bv
+                        }
+                    }
+                    let d = stdA * sqrt(vB)
+                    return d > 1e-6 ? cr2 / d : -1
+                }
+
+                let nL = computeNCC(bestX - 1, bestY)
+                let nR = computeNCC(bestX + 1, bestY)
+                let denom_x = nL - 2 * bestNCC + nR
+                if abs(denom_x) > 1e-8 {
+                    let dx = 0.5 * (nL - nR) / denom_x
+                    if abs(dx) < 1 { subX += dx }
+                }
+
+                let nU = computeNCC(bestX, bestY - 1)
+                let nD = computeNCC(bestX, bestY + 1)
+                let denom_y = nU - 2 * bestNCC + nD
+                if abs(denom_y) > 1e-8 {
+                    let dy = 0.5 * (nU - nD) / denom_y
+                    if abs(dy) < 1 { subY += dy }
+                }
+
                 results.append(NCCMatch(
                     queryIdx: qi,
-                    matchX: bestX, matchY: bestY,
+                    matchX: subX, matchY: subY,
                     score: bestNCC
                 ))
             }
@@ -504,13 +656,27 @@ enum FeatureBasedCalibrator {
                 SIMD3<Float>(-xCam, -yCam, 1.0)
             )
 
-            // NCC match position in slice → lon/lat → ERP pixel
-            let sIdx = m.matchY * slice.w + m.matchX
-            guard sIdx >= 0, sIdx < slice.lonMap.count else {
-                continue
-            }
-            let lon = slice.lonMap[sIdx]
-            let lat = slice.latMap[sIdx]
+            // NCC match position in slice → lon/lat (bilinear)
+            let mx = m.matchX, my = m.matchY
+            let mx0 = max(0, min(slice.w - 1, Int(mx)))
+            let my0 = max(0, min(slice.h - 1, Int(my)))
+            let mx1 = min(mx0 + 1, slice.w - 1)
+            let my1 = min(my0 + 1, slice.h - 1)
+            let fx = mx - Float(mx0)
+            let fy = my - Float(my0)
+            let i00 = my0 * slice.w + mx0
+            let i10 = my0 * slice.w + mx1
+            let i01 = my1 * slice.w + mx0
+            let i11 = my1 * slice.w + mx1
+            guard i11 < slice.lonMap.count else { continue }
+            let lon = slice.lonMap[i00] * (1 - fx) * (1 - fy)
+                + slice.lonMap[i10] * fx * (1 - fy)
+                + slice.lonMap[i01] * (1 - fx) * fy
+                + slice.lonMap[i11] * fx * fy
+            let lat = slice.latMap[i00] * (1 - fx) * (1 - fy)
+                + slice.latMap[i10] * fx * (1 - fy)
+                + slice.latMap[i01] * (1 - fx) * fy
+                + slice.latMap[i11] * fx * fy
 
             let eU = erpW * (0.5 + lon / (2 * .pi))
             let eV = erpH * (0.5 - lat / .pi)

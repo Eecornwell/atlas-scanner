@@ -1,5 +1,6 @@
 import CoreMedia
 import Foundation
+import ImageIO
 import INSCameraSDK
 
 private let kHeartbeatInterval: TimeInterval = 0.5
@@ -24,7 +25,7 @@ final class CameraInstance: NSObject, Identifiable {
     private var _pendingURIs: [(scanIndex: Int, uri: String)] = []
     private var _connectCont: CheckedContinuation<Bool, Never>?
     private var _clockCont: CheckedContinuation<ClockOffset, Never>?
-    private var _captureCont: CheckedContinuation<String?, Never>?
+    private var _captureCont: CheckedContinuation<CaptureAck?, Never>?
     private var _captureInFlight = false
     private var _captureGen: UInt64 = 0
     private var _downloadCont: CheckedContinuation<
@@ -310,20 +311,20 @@ final class CameraInstance: NSObject, Identifiable {
             }
         }
 
-        let insta360Ts = Date().timeIntervalSince1970
-
         if !skipPreChecks {
             _ = await warmUpCommandChannel()
             await ensurePhotoMode()
         }
 
-        var uri: String?
-        uri = await attemptTakePicture(
+        let commandTs = ProcessInfo.processInfo.systemUptime
+        var captureResult: (
+            uri: String, callbackTimestamp: Double
+        )?
+        captureResult = await attemptTakePicture(
             timeout: timeout
         )
-        if uri?.isEmpty == true { uri = nil }
 
-        if uri == nil, retryOnFailure {
+        if captureResult == nil, retryOnFailure {
             onStatusUpdate?(
                 "[\(id)] attempt 1 failed"
                 + " — waiting 15s for camera"
@@ -335,14 +336,13 @@ final class CameraInstance: NSObject, Identifiable {
                 maxWait: 75
             )
             if recovered, !Task.isCancelled {
-                uri = await attemptTakePicture(
+                captureResult = await attemptTakePicture(
                     timeout: timeout
                 )
-                if uri?.isEmpty == true { uri = nil }
             }
         }
 
-        if let uri {
+        if let uri = captureResult?.uri {
             lock.lock()
             _pendingURIs.append(
                 (scanIndex: scanIndex, uri: uri)
@@ -354,8 +354,10 @@ final class CameraInstance: NSObject, Identifiable {
             cameraId: id,
             scanIndex: scanIndex,
             arkitTimestamp: arkitTimestamp,
-            insta360Timestamp: insta360Ts,
-            mediaIdentifier: uri ?? ""
+            commandTimestamp: commandTs,
+            callbackTimestamp: captureResult?
+                .callbackTimestamp ?? commandTs,
+            mediaIdentifier: captureResult?.uri ?? ""
         )
     }
 
@@ -571,8 +573,10 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     func warmupCapture(
-        timeout: Double = 30
+        timeout: Double = 15
     ) async -> Bool {
+        _ = await warmUpCommandChannel(timeout: 8)
+        await ensurePhotoMode()
         onStatusUpdate?(
             "[\(id)] priming pipeline…"
         )
@@ -878,9 +882,13 @@ final class CameraInstance: NSObject, Identifiable {
         await disableStabilization()
     }
 
+    private typealias CaptureAck = (
+        uri: String, callbackTimestamp: Double
+    )
+
     private func attemptTakePicture(
         timeout: Double
-    ) async -> String? {
+    ) async -> CaptureAck? {
         return await withTaskCancellationHandler {
             await withCheckedContinuation {
                 continuation in
@@ -904,6 +912,8 @@ final class CameraInstance: NSObject, Identifiable {
                         .takePicture(
                             with: opts
                         ) { error, photoInfo in
+                            let cbTs = ProcessInfo
+                                .processInfo.systemUptime
                             let uri = photoInfo?.uri
                             self.onStatusUpdate?(
                                 "[\(self.id)] cb:"
@@ -925,9 +935,22 @@ final class CameraInstance: NSObject, Identifiable {
                                 self._captureCont
                             self._captureCont = nil
                             self.lock.unlock()
-                            cont?.resume(
-                                returning: uri
-                            )
+                            if let uri,
+                               !uri.isEmpty,
+                               error == nil
+                            {
+                                cont?.resume(
+                                    returning: CaptureAck(
+                                        uri: uri,
+                                        callbackTimestamp:
+                                            cbTs
+                                    )
+                                )
+                            } else {
+                                cont?.resume(
+                                    returning: nil
+                                )
+                            }
                         }
                 }
 
@@ -1072,11 +1095,16 @@ final class CameraInstance: NSObject, Identifiable {
                             finish(nil)
                             return
                         }
+                        let exifTs = Self
+                            .extractExifTimestamp(
+                                from: destURL
+                            )
                         finish(Insta360DownloadResult(
                             cameraId: cameraId,
                             scanIndex: scanIndex,
                             localURL: destURL,
-                            mediaType: .equirectangular
+                            mediaType: .equirectangular,
+                            exifTimestamp: exifTs
                         ))
                     }
                 }
@@ -1141,5 +1169,42 @@ final class CameraInstance: NSObject, Identifiable {
                     self.onDisconnect?()
                 }
             }
+    }
+
+    // MARK: - EXIF
+
+    private static let exifDateFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        return fmt
+    }()
+
+    static func extractExifTimestamp(
+        from url: URL
+    ) -> Double? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL, nil
+        ) else { return nil }
+        guard let props = CGImageSourceCopyPropertiesAtIndex(
+            source, 0, nil
+        ) as? [String: Any] else { return nil }
+        guard let exif = props[
+            kCGImagePropertyExifDictionary as String
+        ] as? [String: Any] else { return nil }
+        guard let dateStr = exif[
+            kCGImagePropertyExifDateTimeOriginal as String
+        ] as? String else { return nil }
+        guard let base = exifDateFormatter.date(
+            from: dateStr
+        ) else { return nil }
+        var ts = base.timeIntervalSince1970
+        if let sub = exif[
+            kCGImagePropertyExifSubsecTimeOriginal as String
+        ] as? String, let frac = Double("0." + sub) {
+            ts += frac
+        }
+        return ts
     }
 }

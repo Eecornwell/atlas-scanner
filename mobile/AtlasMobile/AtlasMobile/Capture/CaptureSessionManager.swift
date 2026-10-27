@@ -231,13 +231,15 @@ final class CaptureSessionManager: ObservableObject {
                 insta360BackgroundTask?.cancel()
                 insta360BackgroundTask = Task { [weak self] in
                     let captureStart = ContinuousClock.now
-                    let _ = await manager.captureWith(
-                        cameras: cams,
-                        arkitTimestamp: CACurrentMediaTime(),
-                        scanIndex: scan,
-                        timeout: 30,
-                        retryOnFailure: false
-                    )
+                    let arkitTs = CACurrentMediaTime()
+                    let captureResults = await manager
+                        .captureWith(
+                            cameras: cams,
+                            arkitTimestamp: arkitTs,
+                            scanIndex: scan,
+                            timeout: 30,
+                            retryOnFailure: false
+                        )
                     let capComp = (ContinuousClock.now
                         - captureStart).components
                     let captureMs = Int(capComp.seconds) * 1000
@@ -249,6 +251,11 @@ final class CaptureSessionManager: ObservableObject {
                         "360#\(cmdNum) scan#\(scan)"
                         + " ack=\(captureMs)ms"
                     )
+                    self?.dataRecorder?
+                        .updateInsta360Captures(
+                            scanIndex: scan,
+                            results: captureResults
+                        )
                     self?.isInsta360Busy = false
                     guard let self,
                           let dir = self.sessionDirectory
@@ -266,6 +273,11 @@ final class CaptureSessionManager: ObservableObject {
                             "[360] dl=\(downloads.count)"
                             + " \(fname)"
                         )
+                        self.dataRecorder?
+                            .updateExposureTimestamps(
+                                scanIndex: scan,
+                                downloads: downloads
+                            )
                         await self.updateInstaPreview(
                             from: downloads
                         )
@@ -421,7 +433,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "10m"
+    private static let buildTag = "11e"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
@@ -453,6 +465,16 @@ final class CaptureSessionManager: ObservableObject {
                 await insta360Manager.downloadAllPending(
                     into: dir
                 )
+            let byScan = Dictionary(
+                grouping: downloads,
+                by: \.scanIndex
+            )
+            for (scan, dls) in byScan {
+                dataRecorder?.updateExposureTimestamps(
+                    scanIndex: scan,
+                    downloads: dls
+                )
+            }
             await dataRecorder?.saveDownloadedMedia(
                 downloads
             )
@@ -517,6 +539,13 @@ final class CaptureSessionManager: ObservableObject {
         isCheckingCalib = true
         defer { isCheckingCalib = false }
 
+        AudioServicesPlaySystemSound(1108)
+        // Snapshot the ARKit frame at shutter time so
+        // the depth overlay matches the 360° capture,
+        // not the user's position seconds later after
+        // download + stitch complete.
+        let shutterFrame = arkitCapture.session?
+            .currentFrame
         let captured = await triggerInsta360Capture()
         var erpImage: UIImage?
         if captured,
@@ -548,8 +577,7 @@ final class CaptureSessionManager: ObservableObject {
             return
         }
 
-        guard let frame = arkitCapture.session?
-            .currentFrame else { return }
+        guard let frame = shutterFrame else { return }
 
         let depthMap = frame.sceneDepth?.depthMap
             ?? frame.smoothedSceneDepth?.depthMap

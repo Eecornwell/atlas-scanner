@@ -47,13 +47,79 @@ final class DataRecorder {
             insta360Captures: insta360Results.map { result in
                 Insta360CaptureRef(
                     cameraId: result.cameraId,
-                    timestamp: result.insta360Timestamp,
-                    clockOffsetMs: result.arkitTimestamp - result.insta360Timestamp
+                    arkitTimestamp: result.arkitTimestamp,
+                    commandTimestamp: result.commandTimestamp,
+                    callbackTimestamp: result.callbackTimestamp
                 )
             }
         )
         if let poseJSON = try? encoder.encode(poseData) {
             try? poseJSON.write(to: scanDir.appendingPathComponent("pose.json"))
+        }
+    }
+
+    func updateInsta360Captures(
+        scanIndex: Int,
+        results: [Insta360CaptureResult]
+    ) {
+        guard !results.isEmpty else { return }
+        let scanName = String(
+            format: "scan_%03d", scanIndex
+        )
+        let poseURL = iphoneDir
+            .appendingPathComponent(scanName)
+            .appendingPathComponent("pose.json")
+        guard let data = try? Data(
+            contentsOf: poseURL
+        ) else { return }
+        guard var pose = try? JSONDecoder().decode(
+            ScanPose.self, from: data
+        ) else { return }
+        pose.insta360Captures = results.map {
+            Insta360CaptureRef(
+                cameraId: $0.cameraId,
+                arkitTimestamp: $0.arkitTimestamp,
+                commandTimestamp: $0.commandTimestamp,
+                callbackTimestamp: $0.callbackTimestamp
+            )
+        }
+        if let updated = try? encoder.encode(pose) {
+            try? updated.write(to: poseURL)
+        }
+    }
+
+    func updateExposureTimestamps(
+        scanIndex: Int,
+        downloads: [Insta360DownloadResult]
+    ) {
+        let byCamera = Dictionary(
+            uniqueKeysWithValues: downloads.compactMap {
+                d in
+                d.exifTimestamp.map { (d.cameraId, $0) }
+            }
+        )
+        guard !byCamera.isEmpty else { return }
+        let scanName = String(
+            format: "scan_%03d", scanIndex
+        )
+        let poseURL = iphoneDir
+            .appendingPathComponent(scanName)
+            .appendingPathComponent("pose.json")
+        guard let data = try? Data(
+            contentsOf: poseURL
+        ) else { return }
+        guard var pose = try? JSONDecoder().decode(
+            ScanPose.self, from: data
+        ) else { return }
+        for i in pose.insta360Captures.indices {
+            let cam = pose.insta360Captures[i].cameraId
+            if let exif = byCamera[cam] {
+                pose.insta360Captures[i]
+                    .exifTimestamp = exif
+            }
+        }
+        if let updated = try? encoder.encode(pose) {
+            try? updated.write(to: poseURL)
         }
     }
 
@@ -212,7 +278,7 @@ struct ScanPose: Codable {
     let imageHeight: Int
     let depthWidth: Int
     let depthHeight: Int
-    let insta360Captures: [Insta360CaptureRef]
+    var insta360Captures: [Insta360CaptureRef]
 
     enum CodingKeys: String, CodingKey {
         case timestamp
@@ -228,12 +294,16 @@ struct ScanPose: Codable {
 
 struct Insta360CaptureRef: Codable {
     let cameraId: String
-    let timestamp: Double
-    let clockOffsetMs: Double
+    let arkitTimestamp: Double
+    let commandTimestamp: Double
+    let callbackTimestamp: Double
+    var exifTimestamp: Double?
 
     enum CodingKeys: String, CodingKey {
         case cameraId = "camera_id"
-        case timestamp
-        case clockOffsetMs = "clock_offset_ms"
+        case arkitTimestamp = "arkit_timestamp"
+        case commandTimestamp = "command_timestamp"
+        case callbackTimestamp = "callback_timestamp"
+        case exifTimestamp = "exif_timestamp"
     }
 }

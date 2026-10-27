@@ -89,6 +89,27 @@ struct CaptureOverlayView: View {
                         }
                     }
 
+                    if !sessionManager.isPipelineReady
+                        && !sessionManager
+                            .connectedCamerasList.isEmpty
+                    {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                            Text("360\u{00B0} camera warming up\u{2026}")
+                                .font(.caption.weight(.medium))
+                                .foregroundColor(.orange)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial)
+                        .cornerRadius(8)
+                        .frame(
+                            maxWidth: .infinity,
+                            alignment: .leading
+                        )
+                    }
+
                     if showConnectionLog {
                         VStack(spacing: 4) {
                             HStack {

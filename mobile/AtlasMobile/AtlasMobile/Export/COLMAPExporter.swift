@@ -54,14 +54,16 @@ final class COLMAPExporter {
         SIMD3( 0,  0, 1),
     ])
 
-    // Optimizer Camera frame (X=up,Y=right,Z=forward) from
+    // COLMAP camera frame (X=right,Y=down,Z=forward) from
     // ARKit camera frame (X=right,Y=up,Z=backward).
     private static let cameraFromARKit = simd_float3x3(rows: [
-        SIMD3<Float>(0, 1, 0),
-        SIMD3<Float>(1, 0, 0),
-        SIMD3<Float>(0, 0, -1),
+        SIMD3<Float>(1,  0,  0),
+        SIMD3<Float>(0, -1,  0),
+        SIMD3<Float>(0,  0, -1),
     ])
 
+    static let tileSize = 2048
+    static let tileFovDeg: Float = 65.0
     static let blurThreshold: Float = 300.0
 
     /// Seed extrinsic → ERP-from-ARKit 4x4 for composing with T_wc.inverse.
@@ -109,8 +111,8 @@ final class COLMAPExporter {
 
         guard let first = scans.first else { return }
 
-        let tileSize = 1024
-        let tileFovDeg: Float = 65.0
+        let tileSize = Self.tileSize
+        let tileFovDeg = Self.tileFovDeg
         let f_tile = Float(tileSize) / (2.0 * tan(tileFovDeg * .pi / 360.0))
         let c_tile = Float(tileSize) / 2.0
 
@@ -709,10 +711,9 @@ final class COLMAPExporter {
             if !fisheyeCameraIds.isEmpty {
                 let ids = fisheyeCameraIds[camIdx]
 
-                // Front lens: identity rotation from ERP → fisheye camera
-                let R_front = R_insta * rRotT
+                let Rc = R_insta * Self.arkitToColmap * rRotT
                 let t_front = t_insta
-                let qF = Self.rotationToQuatWXYZ(R_front)
+                let qF = Self.rotationToQuatWXYZ(Rc)
                 data.appendLE(sensorTypeCamera)
                 data.appendLE(ids.front)
                 data.appendLE(UInt8(1))
@@ -721,8 +722,7 @@ final class COLMAPExporter {
                 data.appendLE(Double(t_front.y))
                 data.appendLE(Double(t_front.z))
 
-                // Back lens: R_y(π) rotation from ERP
-                let R_back = Self.R_y_pi * R_insta * rRotT
+                let R_back = Self.R_y_pi * Rc
                 let t_back = Self.R_y_pi * t_insta
                 let qB = Self.rotationToQuatWXYZ(R_back)
                 data.appendLE(sensorTypeCamera)
@@ -735,7 +735,7 @@ final class COLMAPExporter {
             } else {
                 for (faceIdx, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {
                     let camFromPano = faceRotations[faceIdx]
-                    let R_tile = camFromPano * R_insta * rRotT
+                    let R_tile = camFromPano * R_insta * Self.arkitToColmap * rRotT
                     let t_tile = camFromPano * t_insta
                     let q = Self.rotationToQuatWXYZ(R_tile)
                     data.appendLE(sensorTypeCamera)
@@ -766,23 +766,17 @@ final class COLMAPExporter {
     ) throws {
         let rigId: UInt32 = 1
         let sensorTypeCamera: Int32 = 0
-        let sensorsPerFrame: Int
-        if !fisheyeCameraIds.isEmpty {
-            sensorsPerFrame = 1 + cameraConfig.cameras.count * 2
-        } else {
-            sensorsPerFrame = 1 + cameraConfig.cameras.count * tileCameraIds.count
-        }
 
         let entryByName = Dictionary(
             uniqueKeysWithValues: imageEntries.map { ($0.name, $0) }
         )
 
-        let rigScans = scans.filter { !$0.insta360ImageURLs.isEmpty }
-
         var data = Data()
-        data.appendLE(UInt64(rigScans.count))
+        let countOffset = data.count
+        data.appendLE(UInt64(0))
+        var frameCount: UInt64 = 0
 
-        for (frameIdx, scan) in rigScans.enumerated() {
+        for scan in scans {
             let (R_w2c_l, t_w2c_mat) = Self.arkitToColmapW2C(scan.arkitPose)
             let t_w2c_l = SIMD3(
                 t_w2c_mat.columns.3.x,
@@ -793,50 +787,78 @@ final class COLMAPExporter {
             let t_w2c = Self.portraitRotation * t_w2c_l
             let q = Self.rotationToQuatWXYZ(R_w2c)
 
-            data.appendLE(UInt32(frameIdx + 1))
+            // Collect sensor observations, skipping
+            // any with image_id 0 (no capture).
+            var obs: [(Int32, UInt32, UInt64)] = []
+
+            let iphoneName =
+                "face_iphone/\(scan.scanName).jpg"
+            if let e = entryByName[iphoneName] {
+                obs.append((
+                    sensorTypeCamera,
+                    iphoneCameraId,
+                    UInt64(e.imageId)
+                ))
+            }
+
+            if !fisheyeCameraIds.isEmpty {
+                for ids in fisheyeCameraIds {
+                    let fn =
+                        "fisheye_front/\(scan.scanName).jpg"
+                    if let e = entryByName[fn] {
+                        obs.append((
+                            sensorTypeCamera, ids.front,
+                            UInt64(e.imageId)
+                        ))
+                    }
+                    let bn =
+                        "fisheye_back/\(scan.scanName).jpg"
+                    if let e = entryByName[bn] {
+                        obs.append((
+                            sensorTypeCamera, ids.back,
+                            UInt64(e.imageId)
+                        ))
+                    }
+                }
+            } else {
+                for _ in cameraConfig.cameras {
+                    for (faceIdx, camId) in tileCameraIds
+                        .sorted(by: { $0.key < $1.key })
+                    {
+                        let tn = "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
+                        if let e = entryByName[tn] {
+                            obs.append((
+                                sensorTypeCamera, camId,
+                                UInt64(e.imageId)
+                            ))
+                        }
+                    }
+                }
+            }
+
+            guard !obs.isEmpty else { continue }
+
+            frameCount += 1
+            data.appendLE(UInt32(frameCount))
             data.appendLE(rigId)
             for v in q { data.appendLE(Double(v)) }
             data.appendLE(Double(t_w2c.x))
             data.appendLE(Double(t_w2c.y))
             data.appendLE(Double(t_w2c.z))
 
-            data.appendLE(UInt32(sensorsPerFrame))
-
-            // iPhone entry
-            let iphoneName = "face_iphone/\(scan.scanName).jpg"
-            let iphoneEntry = entryByName[iphoneName]
-            data.appendLE(sensorTypeCamera)
-            data.appendLE(iphoneCameraId)
-            data.appendLE(UInt64(iphoneEntry?.imageId ?? 0))
-
-            if !fisheyeCameraIds.isEmpty {
-                // Fisheye entries
-                for ids in fisheyeCameraIds {
-                    let frontName = "fisheye_front/\(scan.scanName).jpg"
-                    let frontEntry = entryByName[frontName]
-                    data.appendLE(sensorTypeCamera)
-                    data.appendLE(ids.front)
-                    data.appendLE(UInt64(frontEntry?.imageId ?? 0))
-
-                    let backName = "fisheye_back/\(scan.scanName).jpg"
-                    let backEntry = entryByName[backName]
-                    data.appendLE(sensorTypeCamera)
-                    data.appendLE(ids.back)
-                    data.appendLE(UInt64(backEntry?.imageId ?? 0))
-                }
-            } else {
-                // Tile entries
-                for _ in cameraConfig.cameras {
-                    for (faceIdx, camId) in tileCameraIds.sorted(by: { $0.key < $1.key }) {
-                        let tileName = "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
-                        let tileEntry = entryByName[tileName]
-                        data.appendLE(sensorTypeCamera)
-                        data.appendLE(camId)
-                        data.appendLE(UInt64(tileEntry?.imageId ?? 0))
-                    }
-                }
+            data.appendLE(UInt32(obs.count))
+            for (sType, camId, imgId) in obs {
+                data.appendLE(sType)
+                data.appendLE(camId)
+                data.appendLE(imgId)
             }
         }
+
+        var countBytes = Data()
+        countBytes.appendLE(frameCount)
+        data.replaceSubrange(
+            countOffset..<countOffset + 8, with: countBytes
+        )
 
         try data.write(to: sparseDir.appendingPathComponent("frames.bin"))
     }
@@ -851,13 +873,14 @@ final class COLMAPExporter {
         let fm = FileManager.default
         let iphoneFaceDir = imagesDir.appendingPathComponent("face_iphone")
         let masksDir = sessionDirectory.appendingPathComponent("colmap/masks")
-        let iphoneMaskDir = masksDir.appendingPathComponent("face_iphone")
         try fm.createDirectory(at: iphoneFaceDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: depthsDir, withIntermediateDirectories: true)
         try fm.createDirectory(at: masksDir, withIntermediateDirectories: true)
-        try fm.createDirectory(at: iphoneMaskDir, withIntermediateDirectories: true)
 
-        let slicer = ERPTileSlicer()
+        let slicer = ERPTileSlicer(
+            tileSize: Self.tileSize,
+            tileFovDeg: Self.tileFovDeg
+        )
         let colorProfile = ColorProfileCalibrator.load()
         if let cp = colorProfile {
             print("[Export] color profile: L×\(cp.lGain) a\(cp.aOffset) b\(cp.bOffset)")
@@ -865,44 +888,58 @@ final class COLMAPExporter {
             print("[Export] no color profile — exporting uncorrected")
         }
 
-        let invertedMasks: [String: UIImage] =
-            loadAllCameraMasks().mapValues {
-                Self.invertMask($0)
-            }
-
+        // Build mask pixel cache AND precomputed tiles
+        // in one pass, then release UIImages immediately
+        // so ~50 MB per camera doesn't persist through
+        // the 50+ scan loop.
+        var maskPixelCache: [String: [UInt8]] = [:]
         var precomputedMaskTiles: [String: [Int: Data]] = [:]
-        for (camId, mask) in invertedMasks {
-            var tiles: [Int: Data] = [:]
-            if useFisheye {
-                let feSize = Self.fisheyeSize
-                for isFront in [true, false] {
-                    autoreleasepool {
-                        guard let (_, feMask) =
-                            Self.reprojectERPtoFisheye(
-                                erpImage: mask,
-                                erpMask: nil,
-                                fisheyeSize: feSize,
-                                isFrontLens: isFront
-                            ),
-                            let png = feMask.pngData()
-                        else { return }
-                        tiles[isFront ? 0 : 1] = png
+        for (camId, mask) in loadAllCameraMasks() {
+            autoreleasepool {
+                let inv = Self.invertMask(mask)
+                guard let mPx =
+                    Self.extractERPPixels(inv)
+                else { return }
+                maskPixelCache[camId] = mPx.px
+
+                var tiles: [Int: Data] = [:]
+                if useFisheye {
+                    let feSize = Self.fisheyeSize
+                    for isFront in [true, false] {
+                        autoreleasepool {
+                            guard var result =
+                                Self.reprojectERPtoFisheye(
+                                    erpPx: mPx.px,
+                                    erpW: mPx.w,
+                                    erpH: mPx.h,
+                                    maskPx: nil,
+                                    fisheyeSize: feSize,
+                                    isFrontLens: isFront
+                                ),
+                                let png = Self.pngDataFromPixels(
+                                    &result.maskPx,
+                                    width: feSize,
+                                    height: feSize
+                                )
+                            else { return }
+                            tiles[isFront ? 0 : 1] = png
+                        }
                     }
-                }
-            } else {
-                for faceIdx in 0..<8 {
-                    autoreleasepool {
-                        if let tile = slicer.sliceTile(
-                            at: faceIdx, from: mask
-                        ),
-                            let png = tile.pngData()
-                        {
-                            tiles[faceIdx] = png
+                } else {
+                    for faceIdx in 0..<8 {
+                        autoreleasepool {
+                            if let tile = slicer.sliceTile(
+                                at: faceIdx, from: inv
+                            ),
+                                let png = tile.pngData()
+                            {
+                                tiles[faceIdx] = png
+                            }
                         }
                     }
                 }
+                precomputedMaskTiles[camId] = tiles
             }
-            precomputedMaskTiles[camId] = tiles
         }
 
         if useFisheye {
@@ -923,16 +960,6 @@ final class COLMAPExporter {
                     "\(scan.scanName).jpg"
                 )
                 try? fm.copyItem(at: src, to: dst)
-
-                let maskDst = iphoneMaskDir.appendingPathComponent(
-                    "\(scan.scanName).png"
-                )
-                let jpegSize = Self.imageDimensions(dst)
-                Self.writeWhiteMask(
-                    to: maskDst,
-                    width: jpegSize?.width ?? scan.imageHeight,
-                    height: jpegSize?.height ?? scan.imageWidth
-                )
             }
 
             // Smoothed depth
@@ -945,7 +972,13 @@ final class COLMAPExporter {
 
             // Insta360 images
             for (camId, erpURL) in scan.insta360ImageURLs {
-                let stitchedERP: UIImage? = autoreleasepool {
+                let camTiles = precomputedMaskTiles[camId]
+
+                // Stitch to raw pixels — never creates a
+                // UIImage for the ERP, saving ~134 MB peak.
+                let buildERPPixels = {
+                    [self]
+                    () -> (px: [UInt8], w: Int, h: Int)? in
                     guard let source =
                         CGImageSourceCreateWithURL(
                             erpURL as CFURL, nil
@@ -960,64 +993,102 @@ final class COLMAPExporter {
                         let imgH = props[
                             kCGImagePropertyPixelHeight
                         ] as? Int
-                    else { return nil as UIImage? }
+                    else { return nil }
 
                     let ratio = Float(imgW) / Float(imgH)
                     let isDual = ratio > 1.8
                         && ratio < 2.2
 
+                    var pixels: (px: [UInt8],
+                                 w: Int, h: Int)?
                     if isDual {
+                        let erpW = useFisheye
+                            ? min(5120, imgW)
+                            : min(8192, imgW)
                         let model = cameraConfig.cameras
                             .first { $0.id == camId }?
                             .model ?? ""
                         let roll = DualFisheyeStitcher
                             .rollCorrection(forModel: model)
-                        return DualFisheyeStitcher.stitch(
-                            url: erpURL,
-                            outputWidth: 5120,
-                            rollDeg: roll
-                        )
+                        pixels = DualFisheyeStitcher
+                            .stitchToPixels(
+                                url: erpURL,
+                                outputWidth: erpW,
+                                rollDeg: roll,
+                                allowSubsample: useFisheye
+                            )
                     } else {
-                        guard let data = try? Data(
-                            contentsOf: erpURL
-                        ) else { return nil as UIImage? }
-                        return UIImage(data: data)
+                        let img = autoreleasepool {
+                            () -> UIImage? in
+                            guard let data = try? Data(
+                                contentsOf: erpURL
+                            ) else { return nil }
+                            return UIImage(data: data)
+                        }
+                        if let img {
+                            pixels = Self.extractERPPixels(
+                                img
+                            )
+                        }
                     }
-                }
-                guard let stitchedERP else { continue }
+                    guard var px = pixels
+                    else { return nil }
 
-                if let dbgData = stitchedERP.jpegData(compressionQuality: 0.85) {
-                    let dbgDir = imagesDir.appendingPathComponent("debug_erp")
-                    try? fm.createDirectory(at: dbgDir, withIntermediateDirectories: true)
-                    try? dbgData.write(
-                        to: dbgDir.appendingPathComponent("\(scan.scanName)_\(camId).jpg")
-                    )
-                }
-
-                let erpImage: UIImage = autoreleasepool {
-                    if let cp = colorProfile {
-                        return ColorProfileCalibrator.apply(
-                            cp, to: stitchedERP
+                    if isDual {
+                        print(
+                            "[Export] ERP \(px.w)"
+                            + "×\(px.h)"
+                            + " from \(imgW)×\(imgH) src"
                         )
                     }
-                    return stitchedERP
+
+                    autoreleasepool {
+                        let dbgDir = imagesDir
+                            .appendingPathComponent(
+                                "debug_erp"
+                            )
+                        try? fm.createDirectory(
+                            at: dbgDir,
+                            withIntermediateDirectories:
+                                true
+                        )
+                        Self.writeJPEGFromPixels(
+                            &px.px,
+                            width: px.w, height: px.h,
+                            quality: 0.85,
+                            to: dbgDir
+                                .appendingPathComponent(
+                                    "\(scan.scanName)"
+                                    + "_\(camId).jpg"
+                                )
+                        )
+                    }
+
+                    if let cp = colorProfile {
+                        ColorProfileCalibrator.applyInPlace(
+                            cp, pixels: &px.px
+                        )
+                    }
+                    return px
                 }
-
-                let erpMask = invertedMasks[camId]
-
-                let camTiles = precomputedMaskTiles[camId]
 
                 if useFisheye {
+                    guard let erp = buildERPPixels()
+                    else { continue }
+                    let maskData: [UInt8]? =
+                        maskPixelCache[camId]
                     let feSize = Self.fisheyeSize
                     for isFront in [true, false] {
                         autoreleasepool {
                             let subdir = isFront
                                 ? "fisheye_front"
                                 : "fisheye_back"
-                            guard let (feImage, feMask) =
+                            guard var result =
                                 Self.reprojectERPtoFisheye(
-                                    erpImage: erpImage,
-                                    erpMask: erpMask,
+                                    erpPx: erp.px,
+                                    erpW: erp.w,
+                                    erpH: erp.h,
+                                    maskPx: maskData,
                                     fisheyeSize: feSize,
                                     isFrontLens: isFront
                                 ) else { return }
@@ -1027,15 +1098,13 @@ final class COLMAPExporter {
                                 .appendingPathComponent(
                                     "\(scan.scanName).jpg"
                                 )
-                            if let jpegData =
-                                feImage.jpegData(
-                                    compressionQuality: 0.92
-                                )
-                            {
-                                try? jpegData.write(
-                                    to: imgDst
-                                )
-                            }
+                            Self.writeJPEGFromPixels(
+                                &result.imagePx,
+                                width: feSize,
+                                height: feSize,
+                                quality: 0.92,
+                                to: imgDst
+                            )
 
                             let mskDst = masksDir
                                 .appendingPathComponent(subdir)
@@ -1047,13 +1116,19 @@ final class COLMAPExporter {
                             ] {
                                 try? png.write(to: mskDst)
                             } else if let png =
-                                feMask.pngData()
+                                Self.pngDataFromPixels(
+                                    &result.maskPx,
+                                    width: feSize,
+                                    height: feSize
+                                )
                             {
                                 try? png.write(to: mskDst)
                             }
                         }
                     }
                 } else {
+                    guard let erp = buildERPPixels()
+                    else { continue }
                     for faceIdx in 0..<8 {
                         autoreleasepool {
                             let faceDir = imagesDir
@@ -1074,7 +1149,9 @@ final class COLMAPExporter {
                                 )
                             if let tile = slicer.sliceTile(
                                 at: faceIdx,
-                                from: erpImage
+                                srcPx: erp.px,
+                                srcW: erp.w,
+                                srcH: erp.h
                             ),
                                 let jpegData =
                                     tile.jpegData(
@@ -1133,6 +1210,61 @@ final class COLMAPExporter {
         if let data = img.pngData() {
             try? data.write(to: url)
         }
+    }
+
+    private static func writeJPEGFromPixels(
+        _ px: inout [UInt8],
+        width: Int, height: Int,
+        quality: CGFloat, to url: URL
+    ) {
+        guard let ctx = CGContext(
+            data: &px, width: width, height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ), let cg = ctx.makeImage() else { return }
+        let data = NSMutableData()
+        guard let dest =
+            CGImageDestinationCreateWithData(
+                data,
+                "public.jpeg" as CFString, 1, nil
+            )
+        else { return }
+        CGImageDestinationAddImage(
+            dest, cg,
+            [kCGImageDestinationLossyCompressionQuality:
+                quality] as CFDictionary
+        )
+        guard CGImageDestinationFinalize(dest)
+        else { return }
+        try? (data as Data).write(to: url)
+    }
+
+    private static func pngDataFromPixels(
+        _ px: inout [UInt8],
+        width: Int, height: Int
+    ) -> Data? {
+        guard let ctx = CGContext(
+            data: &px, width: width, height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ), let cg = ctx.makeImage() else { return nil }
+        let data = NSMutableData()
+        guard let dest =
+            CGImageDestinationCreateWithData(
+                data,
+                "public.png" as CFString, 1, nil
+            )
+        else { return nil }
+        CGImageDestinationAddImage(dest, cg, nil)
+        guard CGImageDestinationFinalize(dest)
+        else { return nil }
+        return data as Data
     }
 
     private static func imageDimensions(
@@ -1200,42 +1332,37 @@ final class COLMAPExporter {
 
     /// Reprojects an equirectangular image to an equidistant fisheye image.
     /// Returns the fisheye image and its circular mask.
+    private static func extractERPPixels(
+        _ image: UIImage
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        guard let cg = image.cgImage else { return nil }
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+        var px = [UInt8](
+            repeating: 0, count: w * h * 4
+        )
+        guard let ctx = CGContext(
+            data: &px, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ) else { return nil }
+        ctx.draw(
+            cg,
+            in: CGRect(x: 0, y: 0, width: w, height: h)
+        )
+        return (px, w, h)
+    }
+
     private static func reprojectERPtoFisheye(
-        erpImage: UIImage,
-        erpMask: UIImage?,
+        erpPx: [UInt8], erpW: Int, erpH: Int,
+        maskPx: [UInt8]?,
         fisheyeSize: Int,
         isFrontLens: Bool
-    ) -> (image: UIImage, mask: UIImage)? {
-        guard let erpCG = erpImage.cgImage else { return nil }
-        let erpW = erpCG.width, erpH = erpCG.height
+    ) -> (imagePx: [UInt8], maskPx: [UInt8])? {
         guard erpW > 0, erpH > 0 else { return nil }
 
-        // Read ERP pixels
-        var erpPx = [UInt8](repeating: 0, count: erpW * erpH * 4)
-        guard let erpCtx = CGContext(
-            data: &erpPx, width: erpW, height: erpH,
-            bitsPerComponent: 8, bytesPerRow: erpW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else { return nil }
-        erpCtx.draw(erpCG, in: CGRect(x: 0, y: 0, width: erpW, height: erpH))
-
-        // Read ERP mask pixels (if available)
-        var maskPx: [UInt8]?
-        if let maskCG = erpMask?.cgImage {
-            var mp = [UInt8](repeating: 255, count: erpW * erpH * 4)
-            if let mCtx = CGContext(
-                data: &mp, width: erpW, height: erpH,
-                bitsPerComponent: 8, bytesPerRow: erpW * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-            ) {
-                mCtx.draw(maskCG, in: CGRect(x: 0, y: 0, width: erpW, height: erpH))
-                maskPx = mp
-            }
-        }
-
-        // Fisheye model parameters
         let radius = Float(fisheyeSize) * fisheyeRadiusFrac
         let focal = radius / fisheyeHalfFovRad
         let cx = Float(fisheyeSize) / 2.0
@@ -1260,8 +1387,8 @@ final class COLMAPExporter {
 
                 guard r < radius, r > 0.001 else {
                     if r <= 0.001 {
-                        // Center pixel — sample ERP center of hemisphere
-                        let eu: Float = isFrontLens ? erpWf * 0.5 : 0
+                        let eu: Float = isFrontLens
+                            ? erpWf * 0.5 : 0
                         let ev: Float = erpHf * 0.5
                         let eix = min(Int(eu), erpW - 1)
                         let eiy = min(Int(ev), erpH - 1)
@@ -1282,20 +1409,16 @@ final class COLMAPExporter {
                 let sinT = sinf(theta)
                 let cosT = cosf(theta)
 
-                // Camera ray → world ray (ERP frame)
                 let bx = xSign * sinT * dx / r
                 let by = sinT * dy / r
                 let bz = zSign * cosT
 
-                // World ray → ERP (lat, lon)
                 let lat = asinf(max(-1, min(1, -by)))
                 let lon = atan2f(bx, bz)
 
-                // ERP pixel coordinates
                 let eu = (lon / (2 * .pi) + 0.5) * erpWf
                 let ev = (0.5 - lat / .pi) * erpHf
 
-                // Bilinear sample
                 let eix = min(max(Int(eu), 0), erpW - 2)
                 let eiy = min(max(Int(ev), 0), erpH - 2)
                 let fx = eu - Float(eix)
@@ -1306,11 +1429,14 @@ final class COLMAPExporter {
                 let w11 = fx * fy
                 let base = eiy * erpStride + eix * 4
 
-                var rv: Float = 0, gv: Float = 0, bv: Float = 0
-                for (off, wt) in [(base, w00),
-                                   (base + 4, w10),
-                                   (base + erpStride, w01),
-                                   (base + erpStride + 4, w11)] {
+                var rv: Float = 0, gv: Float = 0
+                var bv: Float = 0
+                for (off, wt) in [
+                    (base, w00),
+                    (base + 4, w10),
+                    (base + erpStride, w01),
+                    (base + erpStride + 4, w11),
+                ] {
                     rv += Float(erpPx[off]) * wt
                     gv += Float(erpPx[off + 1]) * wt
                     bv += Float(erpPx[off + 2]) * wt
@@ -1320,7 +1446,6 @@ final class COLMAPExporter {
                 outPx[idx + 2] = UInt8(clamping: Int(bv))
                 outPx[idx + 3] = 255
 
-                // Mask: white if inside circle AND ERP mask is valid
                 var maskVal: UInt8 = 255
                 if let mp = maskPx {
                     let mOff = eiy * erpStride + eix * 4
@@ -1333,22 +1458,7 @@ final class COLMAPExporter {
             }
         }
 
-        let outStride = S * 4
-        guard let imgCtx = CGContext(
-            data: &outPx, width: S, height: S,
-            bitsPerComponent: 8, bytesPerRow: outStride,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ), let imgCG = imgCtx.makeImage() else { return nil }
-
-        guard let maskCtx = CGContext(
-            data: &outMask, width: S, height: S,
-            bitsPerComponent: 8, bytesPerRow: outStride,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ), let maskCG = maskCtx.makeImage() else { return nil }
-
-        return (UIImage(cgImage: imgCG), UIImage(cgImage: maskCG))
+        return (outPx, outMask)
     }
 
     // MARK: - Blur detection

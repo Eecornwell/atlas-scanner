@@ -58,18 +58,48 @@ enum DualFisheyeStitcher {
     static func stitch(
         url: URL,
         outputWidth: Int = 2048,
-        rollDeg: Float = 0
+        rollDeg: Float = 0,
+        allowSubsample: Bool = false
     ) -> UIImage? {
-        guard let source = CGImageSourceCreateWithURL(
-            url as CFURL, nil
+        guard let px = stitchToPixels(
+            url: url, outputWidth: outputWidth,
+            rollDeg: rollDeg,
+            allowSubsample: allowSubsample
         ) else { return nil }
-        let srcMax = max(3072, outputWidth + outputWidth / 4)
-        let cg = downsampleSource(
-            source, maxWidth: srcMax
+        return pixelsToImage(
+            px.px, width: px.w, height: px.h
         )
-        guard let cg else { return nil }
-        return stitchCGImage(
-            cg, outputWidth: outputWidth,
+    }
+
+    /// Stitch and return raw RGBA pixels (no UIImage).
+    /// Avoids the double-allocation of UIImage + pixel
+    /// extraction when callers only need the buffer.
+    static func stitchToPixels(
+        url: URL,
+        outputWidth: Int = 2048,
+        rollDeg: Float = 0,
+        allowSubsample: Bool = false
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        let srcMax = max(
+            3072, outputWidth + outputWidth / 4
+        )
+        let src = autoreleasepool {
+            () -> (d: [UInt8], w: Int, h: Int)? in
+            guard let source =
+                CGImageSourceCreateWithURL(
+                    url as CFURL, nil
+                ),
+                let cg = downsampleSource(
+                    source, maxWidth: srcMax,
+                    subsample: allowSubsample
+                )
+            else { return nil }
+            return extractPixels(cg)
+        }
+        guard let src else { return nil }
+        return stitchPixelsToPixels(
+            src.d, width: src.w, height: src.h,
+            outputWidth: outputWidth,
             rollDeg: rollDeg
         )
     }
@@ -81,31 +111,43 @@ enum DualFisheyeStitcher {
     ) -> UIImage? {
         guard let origCG = dualFisheye.cgImage
         else { return nil }
-        let maxSrcW = max(3072, outputWidth + outputWidth / 4)
-        let cg: CGImage
-        if origCG.width > maxSrcW {
-            guard let data = dualFisheye.jpegData(
-                compressionQuality: 0.95
-            ), let source = CGImageSourceCreateWithData(
-                data as CFData, nil
-            ), let ds = downsampleSource(
-                source, maxWidth: maxSrcW
-            ) else { return nil }
-            cg = ds
-        } else {
-            cg = origCG
+        let maxSrcW = max(
+            3072, outputWidth + outputWidth / 4
+        )
+        let px = autoreleasepool {
+            () -> (d: [UInt8], w: Int, h: Int)? in
+            let cg: CGImage
+            if origCG.width > maxSrcW {
+                guard let data = dualFisheye.jpegData(
+                    compressionQuality: 0.95
+                ), let source =
+                    CGImageSourceCreateWithData(
+                        data as CFData, nil
+                    ),
+                    let ds = downsampleSource(
+                        source, maxWidth: maxSrcW
+                    )
+                else { return nil }
+                cg = ds
+            } else {
+                cg = origCG
+            }
+            return extractPixels(cg)
         }
-        return stitchCGImage(
-            cg, outputWidth: outputWidth,
+        guard let px else { return nil }
+        return stitchFromPixels(
+            px.d, width: px.w, height: px.h,
+            outputWidth: outputWidth,
             rollDeg: rollDeg
         )
     }
 
     private static func downsampleSource(
         _ source: CGImageSource,
-        maxWidth: Int
+        maxWidth: Int,
+        subsample: Bool = false
     ) -> CGImage? {
-        let options: [CFString: Any] = [
+        var options: [CFString: Any] = [
             kCGImageSourceThumbnailMaxPixelSize:
                 maxWidth,
             kCGImageSourceCreateThumbnailFromImageAlways:
@@ -115,29 +157,88 @@ enum DualFisheyeStitcher {
             kCGImageSourceShouldCacheImmediately:
                 true,
         ]
+        // Hint JPEG decoder to use 1/2 subsample for
+        // large images (X5 72MP = 9504 wide), avoiding
+        // a ~228 MB full-resolution decode buffer.
+        if subsample,
+            let props =
+            CGImageSourceCopyPropertiesAtIndex(
+                source, 0, nil
+            ) as? [CFString: Any],
+            let srcW = props[
+                kCGImagePropertyPixelWidth
+            ] as? Int,
+            srcW > 8000
+        {
+            options[kCGImageSourceSubsampleFactor] = 2
+        }
         return CGImageSourceCreateThumbnailAtIndex(
             source, 0, options as CFDictionary
         )
     }
 
-    private static func stitchCGImage(
-        _ cg: CGImage,
+    private static func extractPixels(
+        _ cg: CGImage
+    ) -> (d: [UInt8], w: Int, h: Int)? {
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+        var px = [UInt8](
+            repeating: 0, count: w * h * 4
+        )
+        guard let ctx = CGContext(
+            data: &px, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ) else { return nil }
+        ctx.draw(
+            cg,
+            in: CGRect(x: 0, y: 0, width: w, height: h)
+        )
+        return (px, w, h)
+    }
+
+    static func pixelsToImage(
+        _ px: [UInt8], width: Int, height: Int
+    ) -> UIImage? {
+        var buf = px
+        guard let ctx = CGContext(
+            data: &buf, width: width, height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ), let cg = ctx.makeImage()
+        else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    private static func stitchFromPixels(
+        _ src: [UInt8],
+        width srcW: Int, height srcH: Int,
         outputWidth: Int,
         rollDeg: Float
     ) -> UIImage? {
-        let srcW = cg.width, srcH = cg.height
+        guard let px = stitchPixelsToPixels(
+            src, width: srcW, height: srcH,
+            outputWidth: outputWidth,
+            rollDeg: rollDeg
+        ) else { return nil }
+        return pixelsToImage(
+            px.px, width: px.w, height: px.h
+        )
+    }
+
+    private static func stitchPixelsToPixels(
+        _ src: [UInt8],
+        width srcW: Int, height srcH: Int,
+        outputWidth: Int,
+        rollDeg: Float
+    ) -> (px: [UInt8], w: Int, h: Int)? {
         let halfW = srcW / 2
 
-        var src = [UInt8](repeating: 0, count: srcW * srcH * 4)
-        guard let srcCtx = CGContext(
-            data: &src, width: srcW, height: srcH,
-            bitsPerComponent: 8, bytesPerRow: srcW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ) else { return nil }
-        srcCtx.draw(cg, in: CGRect(x: 0, y: 0, width: srcW, height: srcH))
-
-        // Equidistant fisheye model for ONE X2 (~200° per lens)
         let radius = Float(srcH) * 0.47
         let halfFov: Float = 100 * .pi / 180
         let focal = radius / halfFov
@@ -149,7 +250,9 @@ enum DualFisheyeStitcher {
 
         let outW = outputWidth
         let outH = outputWidth / 2
-        var out = [UInt8](repeating: 0, count: outW * outH * 4)
+        var out = [UInt8](
+            repeating: 0, count: outW * outH * 4
+        )
 
         let W = Float(outW), H = Float(outH)
         let blendLo: Float = 85 * .pi / 180
@@ -166,7 +269,8 @@ enum DualFisheyeStitcher {
             let sinLat = sin(lat)
 
             for ou in 0..<outW {
-                let lon = 2 * Float.pi * (Float(ou) / W - 0.5)
+                let lon = 2 * Float.pi
+                    * (Float(ou) / W - 0.5)
                 var bx = cosLat * sin(lon)
                 var by = -sinLat
                 let bz = cosLat * cos(lon)
@@ -187,16 +291,22 @@ enum DualFisheyeStitcher {
 
                 if tF < blendLo {
                     (r, g, b) = sampleLens(
-                        src: src, stride: srcStride, srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tF,
-                        cx: fCx, cy: fCy, f: focal, rad: radius,
+                        src: src, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: focal, rad: radius,
                         mirror: false
                     )
                 } else if tB < blendLo {
                     (r, g, b) = sampleLens(
-                        src: src, stride: srcStride, srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tB,
-                        cx: bCx, cy: bCy, f: focal, rad: radius,
+                        src: src, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: focal, rad: radius,
                         mirror: true
                     )
                 } else {
@@ -206,15 +316,21 @@ enum DualFisheyeStitcher {
                     let aF = sum > 0 ? wF / sum : 0.5
 
                     let (fr, fg, fb) = sampleLens(
-                        src: src, stride: srcStride, srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tF,
-                        cx: fCx, cy: fCy, f: focal, rad: radius,
+                        src: src, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: focal, rad: radius,
                         mirror: false
                     )
                     let (br2, bg2, bb2) = sampleLens(
-                        src: src, stride: srcStride, srcW: srcW, srcH: srcH,
-                        bx: bx, by: by, rxy: rxy, theta: tB,
-                        cx: bCx, cy: bCy, f: focal, rad: radius,
+                        src: src, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: focal, rad: radius,
                         mirror: true
                     )
                     r = aF * fr + (1 - aF) * br2
@@ -222,20 +338,18 @@ enum DualFisheyeStitcher {
                     b = aF * fb + (1 - aF) * bb2
                 }
 
-                out[idx]     = UInt8(clamping: Int(r))
-                out[idx + 1] = UInt8(clamping: Int(g))
-                out[idx + 2] = UInt8(clamping: Int(b))
+                out[idx] = UInt8(clamping: Int(r))
+                out[idx + 1] = UInt8(
+                    clamping: Int(g)
+                )
+                out[idx + 2] = UInt8(
+                    clamping: Int(b)
+                )
                 out[idx + 3] = 255
             }
         }
 
-        guard let outCtx = CGContext(
-            data: &out, width: outW, height: outH,
-            bitsPerComponent: 8, bytesPerRow: outW * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ), let result = outCtx.makeImage() else { return nil }
-        return UIImage(cgImage: result)
+        return (out, outW, outH)
     }
 
     // MARK: - Private
