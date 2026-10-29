@@ -18,7 +18,7 @@ _ALLOWED_OUTPUT = Path(os.path.expanduser("~/atlas_ws/output")).resolve()
 def _safe_resolve(p: Path) -> Path:
     """Resolve path and raise ValueError if it escapes the allowed data root."""
     resolved = p.resolve()
-    if _ALLOWED_ROOT not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_ROOT):
         raise ValueError(f"Path '{resolved}' is outside the allowed root '{_ALLOWED_ROOT}'")
     return resolved
 
@@ -26,8 +26,14 @@ def _safe_resolve(p: Path) -> Path:
 def _safe_output(output_dir: str, *parts) -> Path:
     """Join parts onto output_dir, resolve, and confirm the result stays within
     the allowed output root before returning the Path."""
-    resolved = Path(output_dir).joinpath(*parts).resolve()
-    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+    base = Path(output_dir).resolve()
+    if not base.is_relative_to(_ALLOWED_OUTPUT):
+        raise ValueError(f"Output dir '{base}' is outside the allowed output root '{_ALLOWED_OUTPUT}'")
+    # Strip leading separators and collapse '..' from each part to prevent
+    # joinpath from silently discarding the base on absolute components.
+    sanitized = [Path(p).name if Path(p).is_absolute() else Path(os.path.normpath(p)) for p in parts]
+    resolved = base.joinpath(*sanitized).resolve()
+    if not resolved.is_relative_to(_ALLOWED_OUTPUT):
         raise ValueError(f"Output path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'")
     return resolved
 
@@ -45,8 +51,17 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
 
     base_path = _safe_resolve(Path(base_dir))
     
-    # Find all fusion_scan directories
-    fusion_dirs = sorted([d for d in base_path.iterdir() if d.is_dir() and d.name.startswith('fusion_scan')])
+    # Find all fusion_scan directories, resolving each to guard against symlinks
+    # that escape the allowed data root.
+    fusion_dirs = []
+    for d in sorted(base_path.iterdir()):
+        if not (d.is_dir() and d.name.startswith('fusion_scan')):
+            continue
+        try:
+            fusion_dirs.append(_safe_resolve(d))
+        except ValueError:
+            print(f"  Skipping '{d.name}': resolves outside allowed root")
+            continue
     
     # Filter by camera index if specified
     if cam_index is not None:
@@ -69,26 +84,33 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
     total_count = 0
     
     for fusion_dir in fusion_dirs:
+        def _safe_glob(pattern):
+            results = []
+            for f in fusion_dir.glob(pattern):
+                try:
+                    results.append(_safe_resolve(f))
+                except ValueError:
+                    pass
+            return results
+
         # Find masked equirectangular image - prefer blended version
-        masked_files = list(fusion_dir.glob("equirect_*_masked.png"))
-        masked_raw_files = list(fusion_dir.glob("equirect_*_masked_raw.png"))
-        equirect_files = list(fusion_dir.glob("equirect_*.jpg")) + list(fusion_dir.glob("equirect_*.png"))
+        equirect_files = _safe_glob("equirect_*.jpg") + _safe_glob("equirect_*.png")
 
         # Prefer raw dual-fisheye ERP; strip masked variants
         equirect_files = [f for f in equirect_files if '_masked' not in f.name]
         dual_raw = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
         if dual_raw.exists():
-            equirect_files = [dual_raw]
+            equirect_files = [_safe_resolve(dual_raw)]
 
         # Prefer masked ERP for SuperGlue (excludes scanner body from feature detection)
-        masked = sorted(fusion_dir.glob('equirect_*_masked.png'))
+        masked = sorted(_safe_glob('equirect_*_masked.png'))
         if masked:
             equirect_files = [masked[-1]]  # use most recent masked variant
 
         # Dual-fisheye fallback: synthesise ERP from dual_fisheye.jpg
         if not equirect_files:
             dual_src = fusion_dir / 'dual_fisheye.jpg'
-            single_files = list(fusion_dir.glob('fisheye_*.jpg'))
+            single_files = _safe_glob('fisheye_*.jpg')
             if dual_src.exists() or single_files:
                 import sys as _sys
                 _sys.path.insert(0, str(Path(__file__).parent.parent / 'capture'))
@@ -96,29 +118,28 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                 if dual_src.exists():
                     dst = fusion_dir / 'equirect_dual_fisheye_raw.jpg'
                     if not dst.exists():
-                        fisheye_jpg_to_erp(str(dual_src), str(dst))
-                    equirect_files = [dst]
+                        fisheye_jpg_to_erp(str(_safe_resolve(dual_src)), str(dst))
+                    equirect_files = [_safe_resolve(dst)]
                     print(f"  Synthesised ERP from dual fisheye for {fusion_dir.name}")
                 elif single_files:
                     src = single_files[0]
                     dst = fusion_dir / f'equirect_{src.stem}.jpg'
                     if not dst.exists():
                         fisheye_jpg_to_erp(str(src), str(dst))
-                    equirect_files = [dst]
+                    equirect_files = [_safe_resolve(dst)]
                     print(f"  Synthesised ERP from single fisheye for {fusion_dir.name}")
 
         # OAK-1 fallback: use undistorted PNG directly (already in pinhole space)
         if not equirect_files:
-            oak1_files = [f for f in sorted(fusion_dir.glob('oak1_*_undistorted.png'))]
+            oak1_files = sorted(_safe_glob('oak1_*_undistorted.png'))
             if not oak1_files:
-                # Fall back to raw if undistorted not available
-                oak1_files = [f for f in sorted(fusion_dir.glob('oak1_*.png'))
+                oak1_files = [f for f in sorted(_safe_glob('oak1_*.png'))
                               if '_undistorted' not in f.name]
             if oak1_files:
                 equirect_files = [oak1_files[0]]
                 print(f"  Using OAK-1 image for {fusion_dir.name}: {oak1_files[0].name}")
-        
-        ply_files = list(fusion_dir.glob("sensor_lidar*.ply")) or list(fusion_dir.glob("world_lidar.ply"))
+
+        ply_files = _safe_glob("sensor_lidar*.ply") or _safe_glob("world_lidar.ply")
         
         if total_count >= max_scans:
             break
@@ -141,11 +162,14 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                 _hw_for_res = ''
                 try:
                     import json as _j
-                    _sc = src_img.parent.parent / 'session_config.json'
+                    _sc = _safe_resolve(src_img.parent.parent) / 'session_config.json'
                     if _sc.exists():
                         _hw_for_res = _j.loads(_sc.read_text()).get('camera_hw', '')
-                except Exception:
+                except (OSError, _j.JSONDecodeError, KeyError, ValueError):
                     pass
+                # Fallback: detect OAK-1 from image filename
+                if not _hw_for_res and src_img.name.startswith('oak1_'):
+                    _hw_for_res = 'oak1'
                 MATCHER_MAX_W = 1600 if _hw_for_res in ('x5',) else 1024 if _hw_for_res in ('x3',) else 800
                 scale = MATCHER_MAX_W / src_w
                 MATCHER_W = MATCHER_MAX_W
@@ -176,12 +200,15 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                 is_world_frame = ply_files[0].name == 'world_lidar.ply'
                 # Detect camera_hw from session_config.json so generate_intensity_images
                 # can load the correct calibration without relying on multi_camera.yaml
-                _sess_cfg = fusion_dir.parent / 'session_config.json'
+                try:
+                    _sess_cfg = _safe_resolve(fusion_dir.parent) / 'session_config.json'
+                except ValueError:
+                    _sess_cfg = Path('/dev/null')
                 _cam_hw = ''
                 if _sess_cfg.exists():
                     try:
                         _cam_hw = _json.loads(_sess_cfg.read_text()).get('camera_hw', '')
-                    except Exception:
+                    except (OSError, _json.JSONDecodeError, KeyError):
                         pass
                 with open(_safe_output(output_dir, f"{total_count:06d}_source.json"), 'w') as sf:
                     _json.dump({'scan_dir': str(_safe_resolve(fusion_dir)),
@@ -212,17 +239,44 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
     _is_oak1 = False
     _oak1_intrinsics = None
     _oak1_distortion = None
-    _source_jsons = sorted(Path(output_dir).glob('*_source.json'))
+    _source_jsons = sorted(_safe_output(output_dir).glob('*_source.json'))
     if _source_jsons:
         try:
             _sd = json.loads(_source_jsons[0].read_text())
-            if _sd.get('camera_hw') == 'oak1':
+            _cam_hw = _sd.get('camera_hw', '')
+            _scan_p_raw = Path(_sd.get('scan_dir', ''))
+            # Fallback 1: oak1_*_undistorted.png in scan dir
+            if not _cam_hw:
+                try:
+                    _sp = _safe_resolve(_scan_p_raw)
+                    if list(_sp.glob('oak1_*_undistorted.png')) or list(_sp.glob('oak1_*.png')):
+                        _cam_hw = 'oak1'
+                except (ValueError, OSError):
+                    pass
+            # Fallback 2: plumb_bob already in calib.json from a previous run
+            if not _cam_hw:
+                _cj = _safe_output(output_dir) / 'calib.json'
+                if _cj.exists():
+                    try:
+                        if json.loads(_cj.read_text()).get('camera', {}).get('camera_model') == 'plumb_bob':
+                            _cam_hw = 'oak1'
+                    except (OSError, ValueError, KeyError):
+                        pass
+            if _cam_hw == 'oak1':
                 _is_oak1 = True
-                _scan_p = Path(_sd.get('scan_dir', ''))
-                _ci_p = _scan_p / 'camera_info.yaml'
-                if not _ci_p.exists():
-                    _ci_p = _scan_p.parent.parent / 'camera_info.yaml'
-                if _ci_p.exists():
+                try:
+                    _scan_p = _safe_resolve(_scan_p_raw)
+                except ValueError:
+                    _scan_p = None
+                _ci_p = None
+                if _scan_p is not None:
+                    _ci_p = _scan_p / 'camera_info.yaml'
+                    if not _ci_p.exists():
+                        try:
+                            _ci_p = _safe_resolve(_scan_p.parent.parent) / 'camera_info.yaml'
+                        except ValueError:
+                            _ci_p = None
+                if _ci_p is not None and _ci_p.exists():
                     import yaml as _yaml
                     _ci = _yaml.safe_load(_ci_p.read_text())
                     _sx = img_w / _ci['width']
@@ -232,7 +286,7 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
                         _ci['cx']*_sx, _ci['cy']*_sy
                     ]
                     _oak1_distortion = _ci['D'][:8]
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, _yaml.YAMLError):
             pass
 
     # Create metadata files
@@ -259,6 +313,25 @@ def combine_scans_for_calibration(base_dir, output_dir, max_scans=4, cam_index=N
             }
         }
         print(f"  OAK-1: using plumb_bob camera model  fx={_oak1_intrinsics[0]:.0f} fy={_oak1_intrinsics[1]:.0f}")
+        # Warn if scene depth variation is low — calibration may be degenerate
+        # (rotation and translation become indistinguishable at a single depth)
+        _depth_range = 0.0
+        try:
+            import struct as _struct
+            _ply0 = Path(output_dir) / '000000.ply'
+            if _ply0.exists():
+                with open(_ply0, 'rb') as _pf:
+                    while _pf.readline().strip() != b'end_header': pass
+                    _n0 = int(next(l.split()[-1] for l in open(str(_ply0)).readlines() if l.startswith('element vertex')))
+                    _raw = np.frombuffer(_pf.read(_n0*4*4), dtype=np.float32).reshape(_n0,4)
+                _ranges = np.linalg.norm(_raw[:,:3], axis=1)
+                _depth_range = float(_ranges.max() - _ranges.min())
+        except Exception:
+            pass
+        if _depth_range > 0 and _depth_range < 1.5:
+            print(f"  ⚠ OAK-1 calibration WARNING: scene depth range is only {_depth_range:.1f}m.")
+            print(f"    Calibration may be degenerate (rotation/translation indistinguishable).")
+            print(f"    For accurate calibration, include objects at 0.5m AND 3m+ in the same frame.")
     else:
         calib_data = {
             "camera": {
@@ -339,7 +412,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     try:
-        _safe_resolve(Path(base_dir))
+        base_dir = str(_safe_resolve(Path(base_dir)))
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)

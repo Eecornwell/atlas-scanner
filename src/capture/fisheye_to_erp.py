@@ -3,11 +3,22 @@
 Usage: fisheye_to_erp.py <input.insp> <output.jpg> <erp_width> <erp_height>
 """
 import sys, cv2, numpy as np
+from pathlib import Path
+
+_ALLOWED_DATA = Path.home().resolve() / 'atlas_ws' / 'data'
+
+
+def _safe_path(p) -> Path:
+    resolved = Path(p).resolve()
+    if not resolved.is_relative_to(_ALLOWED_DATA):
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
 
 
 def fisheye_jpg_to_erp(input_path, output_path, erp_w=5760, erp_h=2880, dual=False):
     """Project a fisheye image to equirectangular ERP and write to output_path."""
-    data = open(input_path, 'rb').read()
+    with open(input_path, 'rb') as _fh:
+        data = _fh.read()
     fisheye = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if fisheye is None:
         print(f'Could not decode {input_path}', file=sys.stderr)
@@ -52,6 +63,11 @@ def fisheye_jpg_to_erp(input_path, output_path, erp_w=5760, erp_h=2880, dual=Fal
 
 
 if __name__ == '__main__':
-    input_path, output_path = sys.argv[1], sys.argv[2]
+    try:
+        input_path = _safe_path(sys.argv[1])
+        output_path = _safe_path(sys.argv[2])
+    except (ValueError, IndexError) as e:
+        print(f'Error: {e}', file=sys.stderr)
+        sys.exit(1)
     erp_w, erp_h = int(sys.argv[3]), int(sys.argv[4])
-    fisheye_jpg_to_erp(input_path, output_path, erp_w, erp_h)
+    fisheye_jpg_to_erp(str(input_path), str(output_path), erp_w, erp_h)

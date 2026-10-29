@@ -32,7 +32,7 @@ _ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -60,17 +60,18 @@ def open_db3(bag_dir):
     if not zstd:
         raise FileNotFoundError(f"No .db3 file in {bag_dir}")
     safe_zstd = _safe_data(zstd[0])
-    out = str(safe_zstd).replace(".zstd", "")
-    _safe_data(out)
+    # Derive output path using Path operations to avoid string-replace path traversal
+    out = safe_zstd.with_suffix('')  # removes .zstd, leaving .db3
+    _safe_data(out)  # validate the derived path is still within allowed root
     print(f"  Decompressing {zstd[0].name}...")
-    result = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", out, "-f"],
+    result = subprocess.run(["zstd", "-d", str(safe_zstd), "-o", str(out), "-f"],
                             capture_output=True)
-    if result.returncode != 0 or not Path(out).exists():
+    if result.returncode != 0 or not out.exists():
         raise RuntimeError(
             f"Bag is truncated/corrupt and cannot be recovered: {zstd[0].name}\n"
             f"The recording was likely interrupted during compression.\n"
             f"Future sessions use uncompressed recording to prevent this.")
-    return sqlite3.connect(out)
+    return sqlite3.connect(str(out))
 
 
 def topic_map(con):
@@ -126,7 +127,7 @@ def unpack_lidar(msg):
             try:
                 intensity = max(0.0, min(1.0,
                     struct.unpack("<f", msg.data[i + intensity_offset: i + intensity_offset + 4])[0] / 255.0))
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 pass
         points.append([x, y, z, intensity])
     return points
@@ -339,6 +340,11 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
     n_workers = min(len(per_scan_bags), 4, _os.cpu_count() or 4)
 
     def _run_one(bag_dir):
+        try:
+            _safe_data(bag_dir)
+        except ValueError as e:
+            print(f"  Skipping unsafe bag path: {e}")
+            return False
         cmd = [
             sys.executable, script,
             str(session_path),
@@ -364,7 +370,7 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
     try:
         import json as _j2
         _camera_hw = _j2.loads(_sess_cfg.read_text()).get('camera_hw', 'x5') if _sess_cfg.exists() else 'x5'
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
         pass
 
     if camera_mode == 'dual_fisheye':
@@ -405,7 +411,7 @@ def _reconstruct_stationary(session_path, per_scan_bags, camera_mode, lidar_wind
                     _hw_cfg = _y.safe_load(_hw_yaml.read_text()) if _hw_yaml.exists() else {}
                     _erp_w = str(_hw_cfg.get('erp_width', 11520))
                     _erp_h = str(_hw_cfg.get('erp_height', 5760))
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     _erp_w, _erp_h = '11520', '5760'
                 _env = _stitch_env.copy()
                 _env['INSTA360_ERP_WIDTH'] = _erp_w
@@ -447,7 +453,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
 
     try:
         con = open_db3(bag_dir)
-    except Exception as e:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
         print(f"  ✗ Could not open bag: {e}")
         # Mark this scan and all co-located scans as corrupt so they are
         # excluded from merge, COLMAP, and ICP — the live-capture PLY left
@@ -461,7 +467,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
             try:
                 centre_host_corrupt = float(_ct_f.read_text().strip().split()[0])
                 break
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 pass
         if centre_host_corrupt is not None:
             for _other in sorted(session_path.glob('fusion_scan_*')):
@@ -474,7 +480,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
                             (_other / '.corrupt_bag').write_text('co-located with corrupt bag')
                             print(f"  ✗ Marked {_other.name} as corrupt (co-located)")
                         break
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
         return False
 
@@ -505,13 +511,16 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
                 _diffs.append(_bag_ns / 1e9 - _hdr_t)
             if _diffs:
                 _measured = float(np.median(_diffs))
-                if abs(_measured) < 0.1:
-                    print(f"  Host→Livox offset: {_measured*1000:+.1f}ms "
-                          f"(within sync threshold — clocks aligned, not applied)")
+                _delivery_latency = float(np.percentile(_diffs, 5))
+                _clock_offset = _measured - _delivery_latency
+                if abs(_clock_offset) < 0.005:
+                    print(f"  Host\u2192Livox offset: {_measured*1000:+.1f}ms measured "
+                          f"({_delivery_latency*1000:.1f}ms delivery, clocks aligned, not applied)")
                 else:
-                    _host_to_livox_offset = _measured
-                    print(f"  Host→Livox offset: {_host_to_livox_offset*1000:+.1f}ms")
-    except Exception as _e:
+                    _host_to_livox_offset = _clock_offset
+                    print(f"  Host\u2192Livox offset: {_clock_offset*1000:+.1f}ms "
+                          f"(measured={_measured*1000:+.1f}ms, delivery={_delivery_latency*1000:.1f}ms)")
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as _e:
         print(f"  ⚠ Could not estimate host→Livox offset: {_e}")
 
     con.close()
@@ -529,7 +538,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
         try:
             centre_host = float(_ct_f.read_text().strip().split()[0])
             break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
             pass
 
     # OAK-1: fall back to capture_0.shutter_event (written by oak1_capture.py)
@@ -538,7 +547,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
         if _se.exists():
             try:
                 centre_host = float(_se.read_text().strip().split()[0])
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 pass
 
     if centre_host is not None:
@@ -579,7 +588,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
             T_cap[:3, :3] = R_cap
             T_cap[:3, 3] = t_cap
             T_capture_inv = np.linalg.inv(T_cap)
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
             pass
 
     seen = set()
@@ -634,7 +643,7 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
             try:
                 _other_ct = float(_ct_f.read_text().strip().split()[0])
                 break
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 pass
         if _other_ct is None or abs(_other_ct - centre_host) > 12.0:
             continue
@@ -749,7 +758,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         if imu_msgs:
             print(f"  IMU: {len(imu_msgs)} samples from {_imu_bag_dir.name}  "
                   f"(~{len(imu_msgs)/(imu_msgs[-1][0]-imu_msgs[0][0]):.0f}Hz)")
-    except Exception as e:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
         print(f"  ⚠ Could not load IMU data: {e} — gyro filter disabled")
 
     # Load IMU-derived clock offset if available (produced by imu_sync.py).
@@ -842,24 +851,29 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 _diffs.append(_bag_t - _hdr_t)
             if _diffs:
                 _measured = float(np.median(_diffs))
-                # bag_t - hdr_t = delivery_latency + clock_offset.
-                # When livox_time_sync has synced the MID360 clock to the host
-                # system clock, the measured difference is purely DDS/UDP
-                # delivery latency (~10-70ms), NOT a real clock domain offset.
-                # Applying it would shift scan centres away from the true shutter
-                # time and cause geometric misalignment in the merged cloud.
-                # Only apply when the offset exceeds 100ms — indicating the
-                # clocks are genuinely unsynchronised.
-                if abs(_measured) < 0.1:
+                # bag_t - hdr_t = DDS_delivery_latency + clock_offset.
+                # DDS delivery latency is consistent (~10-70ms) and appears
+                # even when clocks are perfectly synced. We estimate it as
+                # the minimum measured value (best-case delivery with zero
+                # queuing delay), then subtract it to isolate the clock offset.
+                # This avoids both hiding real offsets (old 100ms threshold)
+                # and over-correcting by applying pure delivery latency as
+                # a clock offset.
+                _delivery_latency = float(np.percentile(_diffs, 5))  # 5th pct = min latency
+                _clock_offset = _measured - _delivery_latency
+                if abs(_clock_offset) < 0.005:  # < 5ms = clocks aligned
                     _clocks_aligned = True
-                    print(f'  Host→Livox clock offset: {_measured*1000:+.1f}ms '
-                          f'(within sync threshold — clocks aligned, not applied)')
+                    print(f'  Host→Livox clock offset: {_measured*1000:+.1f}ms measured '
+                          f'({_delivery_latency*1000:.1f}ms delivery latency, '
+                          f'{_clock_offset*1000:+.1f}ms clock offset — clocks aligned, not applied)')
                 else:
-                    _host_to_livox_offset = _measured
-                    print(f'  Host→Livox clock offset: {_host_to_livox_offset*1000:+.1f}ms '
-                          f'(from {len(_diffs)} LiDAR frames)')
+                    _host_to_livox_offset = _clock_offset
+                    print(f'  Host→Livox clock offset: {_clock_offset*1000:+.1f}ms '
+                          f'(measured={_measured*1000:+.1f}ms, '
+                          f'delivery={_delivery_latency*1000:.1f}ms, '
+                          f'from {len(_diffs)} LiDAR frames)')
         _con_off.close()
-    except Exception as _e:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as _e:
         print(f'  ⚠ Could not estimate host→Livox offset: {_e}')
 
     if image_msgs_raw and odom_msgs:
@@ -996,14 +1010,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                     _rtc_t = _host_t - _host_to_livox_offset
                                 elif abs(_host_t - _rtc_t) < 2.0:
                                     _rtc_t = _host_t - _host_to_livox_offset
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                         else:
                             # No capture_time sidecar: RTC is host clock, convert to Livox clock
                             _rtc_t = _rtc_t - _host_to_livox_offset
                         if t_start <= _rtc_t <= t_end:
                             _rtc_centres.append((_rtc_t, None))
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
             if _rtc_centres:
                 _rtc_centres.sort(key=lambda x: x[0])
@@ -1041,7 +1055,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                             _lat = _host_t2 - _rtc_t2
                             if 0.0 <= _lat < 3.0:
                                 _latencies.append(_lat)
-                        except Exception:
+                        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                             pass
                 if _latencies:
                     _lat_arr = np.array(_latencies)
@@ -1073,7 +1087,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                             if t_start <= _livox_t <= t_end:
                                 _shot_centres.append((_livox_t, _ci))
                             _sd_lats.append(_t_after - _host_t)
-                        except Exception:
+                        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                             pass
                 if _sd_lats:
                     _lat_arr = np.array(_sd_lats)
@@ -1120,10 +1134,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 _val = struct.unpack_from('<d', bytes(_d), 4)[0]
                                 if _val > 1e9:
                                     _sd_lats.append(_bt_ns/1e9 - _val)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                     _con2.close()
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
                 if _sd_lats:
                     print(f"  SD write latency: {int(np.median(_sd_lats)*1000)}ms "
@@ -1161,7 +1175,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _ct = float(_parts[0]) - _host_to_livox_offset  # t_before = shutter
                         if t_start <= _ct <= t_end:
                             centres.append((_ct, None))
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
                 if centres:
                     centres.sort(key=lambda x: x[0])
@@ -1173,6 +1187,26 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     import shutil as _shutil
                     _shutil.rmtree(str(stale), ignore_errors=True)
                     print(f"  Removed stale {stale.name}")
+        if not centres:
+            # OAK-1 fallback: use capture_0.shutter_event files written by oak1_capture.py.
+            # These are the authoritative capture times for OAK-1 continuous mode —
+            # only scans where the OAK-1 actually fired get a shutter_event, so
+            # this correctly excludes scans after the OAK-1 quit.
+            _oak1_centres = []
+            for _se in sorted(session_path.glob('fusion_scan_*/capture_0.shutter_event')):
+                try:
+                    _host_t = float(_se.read_text().strip().split()[0])
+                    _livox_t = _host_t - _host_to_livox_offset
+                    if t_start <= _livox_t <= t_end:
+                        _oak1_centres.append((_livox_t, None))
+                except (OSError, ValueError):
+                    pass
+            if _oak1_centres:
+                _oak1_centres.sort(key=lambda x: x[0])
+                centres = _oak1_centres
+                print(f"  OAK-1: {len(centres)} scan centres from capture_0.shutter_event "
+                      f"(host\u2192Livox offset {_host_to_livox_offset*1000:+.1f}ms applied)")
+
         if not centres:
             # LiDAR-derived fallback
             t = t_start + lidar_window / 2.0
@@ -1279,7 +1313,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     T_cap[:3, :3] = R_cap
                     T_cap[:3, 3] = t_cap
                     T_capture_inv = np.linalg.inv(T_cap)
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
             seen = set()
             for frame_ts, msg in window_lidar:
@@ -1317,7 +1351,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     T_cap[:3, :3] = R_cap
                     T_cap[:3, 3] = t_cap
                     T_capture_inv = np.linalg.inv(T_cap)
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
             seen = set()
             for frame_ts, msg in window_lidar:
@@ -1413,14 +1447,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     _parts = _line.split()
                     if len(_parts) >= 2:
                         _sdk_cam_map[int(_parts[0])] = _parts[1]
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 pass
 
         def _read_existing_serial(sd):
             try:
                 parts = (sd / '.cam_index').read_text().strip().split()
                 return parts[1] if len(parts) >= 2 else ''
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                 return ''
 
         def _serial_for_idx(idx):
@@ -1447,7 +1481,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         (scan_dir / '.cam_index').write_text(_entry)
                         _cam_idx_written = True
                         break
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
         if not _cam_idx_written and not (scan_dir / '.cam_index').exists():
             (scan_dir / '.cam_index').write_text('0')
@@ -1467,7 +1501,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     if len(_parts) >= 2:
                         _t_after_host = float(_parts[1])
                     break
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
             if _t_after_host is not None:
                 _t_after_livox = _t_after_host - _host_to_livox_offset
@@ -1526,7 +1560,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     continue
             _prev_pos = _cur
             _prev_name = _sd.name
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
             pass
 
     # --- Promote OAK-1 continuous shots to fusion_scan_* dirs ---
@@ -1564,7 +1598,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             if _se.exists():
                 try:
                     _oak1_shutter_t = float(_se.read_text().strip().split()[0])
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     pass
             # Find closest X5 scan by shutter timestamp
             _best_x5 = None
@@ -1579,7 +1613,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                             _dt = abs(_ct - _oak1_shutter_t)
                             if _dt < _best_dt:
                                 _best_dt, _best_x5 = _dt, _sd
-                        except Exception:
+                        except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                             pass
                         break
             if _best_x5 is not None and _best_dt < 15.0:
@@ -1659,7 +1693,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 if _traj_file.exists():
                     try:
                         _scan_centre = float(_json.loads(_traj_file.read_text()).get("scan_info", {}).get("capture_time", 0))
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
                 best_insp, best_dt = None, float("inf")
                 # Search ALL .sdk_shot_* dirs and session-level .insp files for
@@ -1679,14 +1713,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 _ctp = _ct_f.read_text().strip().split()
                                 _ci = int(_ctp[2]) if len(_ctp) >= 3 else None
                                 _all_insps[str(_insp)] = (float(_ctp[0]), _ci)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                         else:
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
                                 _all_insps[str(_insp)] = (float(_time_mod.mktime(_cam_dt.timetuple())), None)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                 # From scan dirs (if previously promoted)
                 for _sd in sorted(session_path.glob('fusion_scan_*')):
@@ -1699,14 +1733,14 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                 _ctp = _ct_f.read_text().strip().split()
                                 _ci = int(_ctp[2]) if len(_ctp) >= 3 else None
                                 _all_insps[str(_insp)] = (float(_ctp[0]), _ci)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                         else:
                             _parts = _insp.stem.split('_')
                             try:
                                 _cam_dt = _dt_mod.datetime.strptime(_parts[1]+_parts[2], '%Y%m%d%H%M%S')
                                 _all_insps[str(_insp)] = (float(_time_mod.mktime(_cam_dt.timetuple())), None)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                 # Read this scan's cam_index for filtering
                 _scan_cam_idx = None
@@ -1714,7 +1748,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 if _cam_idx_f.exists():
                     try:
                         _scan_cam_idx = int(_cam_idx_f.read_text().strip().split()[0])
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
                 # Match: scan_centre is in Livox clock, capture_time is in host clock
                 # host_time = livox_time + host_to_livox_offset
@@ -1765,7 +1799,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                   f"{_stitch_env['INSTA360_ERP_WIDTH']}x{_stitch_env['INSTA360_ERP_HEIGHT']}")
                             if _slot_hw2 == 'x3':
                                 _stitch_cmd.append('--denoise')
-                    except Exception as _e:
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as _e:
                         pass  # fall back to inherited env
                     result = subprocess.run(
                         _stitch_cmd,
@@ -1815,11 +1849,11 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                     try:
                                         _ep = _ci_file.read_text().strip().split()
                                         _existing_serial = _ep[1] if len(_ep) >= 2 else ''
-                                    except Exception:
+                                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                         pass
                                     _entry = f"{_ctp[2]} {_existing_serial}" if _existing_serial else _ctp[2]
                                     _ci_file.write_text(_entry)
-                            except Exception:
+                            except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                                 pass
                     else:
                         print(f"  \u26a0 SDK stitch failed for {scan_dir.name}")
@@ -1843,7 +1877,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 try:
                     import json as _j2
                     _camera_hw = _j2.loads(_sess_cfg.read_text()).get("camera_hw", "x5")
-                except Exception:
+                except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                     _camera_hw = "x5"
             else:
                 _camera_hw = "x5"
@@ -1892,7 +1926,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                         _dt = abs(_ct - _oak1_shutter_t)
                         if _dt < _best_dt:
                             _best_dt, _best_x5 = _dt, _sd
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, struct.error, json.JSONDecodeError):
                         pass
                     break
             if _best_x5 is not None and _best_dt < 15.0:

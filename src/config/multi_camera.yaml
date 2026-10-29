@@ -1,101 +1,59 @@
-# Multi-camera configuration for alternating capture.
-#
-# When multiple cameras are active, the `settings` block below is applied
-# uniformly to ALL cameras, overriding any per-model defaults from
-# camera_models/*.yaml. This ensures consistent exposure, white balance,
-# and color temperature across mixed hardware (e.g. X5 + X3).
-#
-# ─── Finding Camera Serial Numbers ──────────────────────────────────────────
-# Serial numbers are REQUIRED for deterministic camera index assignment.
-# Without them, cameras may swap between cam_0/cam_1 on each session
-# depending on USB enumeration order.
-#
-# To discover serial numbers, run with cameras connected:
-#
-#   ~/atlas_ws/src/atlas-scanner/src/capture/sdk/build/insta360_capture_multi --discover
-#
-# Output example:
-#   Found 2 camera(s):
-#     [0] serial=XXXXXXXXXXXXXX  type=4  name=Insta360 X5
-#     [1] serial=XXXXXXXXXXXXXX  type=3  name=Insta360 ONE X2
-#
-# Copy the serial strings into the cam_0/cam_1 entries below.
-# cam_0 should be your primary/reference camera (best quality).
-# ─────────────────────────────────────────────────────────────────────────────
-
-# ─── Shared capture settings (applied to all cameras in multi-camera mode) ───
 settings:
-  # Exposure mode: 0=AUTO, 2=SHUTTER_PRIORITY, 4=ADAPTIVE
-  # AUTO is required for X5 timelapse; use AUTO for consistency across models.
   exposure_mode: 0
-  # White balance: 0=AUTO 1=2700K 2=4000K 3=5000K 4=6500K 5=7500K
-  # AUTO ensures all cameras produce similar color under the same lighting.
   white_balance: 0
-  # EV bias: 0 = no compensation
   ev_bias: 0
-
-# ─── Camera slots ────────────────────────────────────────────────────────────
-# Each camera entry maps a logical index to a physical device.
-#
-# Fields:
-#   serial:      Camera serial number (from --discover). REQUIRED for correct
-#                index assignment. Without it, cameras may swap indices between
-#                sessions depending on USB bus order.
-#   camera_hw:   Hardware model (x5, x3, onex2). Selects ERP resolution + default mask.
-#   mask_dual:   Per-camera mask filename (in config/masks/). Overrides the
-#                camera_hw default. Use when cameras are at different positions
-#                and see different parts of the scanner body.
-#   mask_single: Same as mask_dual but for single_fisheye mode.
-#   mask_calibration: Mask used during per-camera calibration sessions (in
-#                config/masks/). Typically blocks only the scanner body/LiDAR
-#                as seen from this camera's position — NOT the other cameras,
-#                since they are removed during single-camera calibration capture.
-#                Falls back to mask_dual if not specified.
-#   mounting_orientation: Euler XYZ angles (degrees) of T_camera_lidar for this
-#                camera as physically mounted on the rig. Used by physical_seed.py
-#                and the interactive seed viewer as the starting rotation when
-#                no prior calibration exists. Each camera body may be oriented
-#                slightly differently in its mount, so this must be set per-slot.
-#                Format: [roll_deg, pitch_deg, yaw_deg]
-#                Run the full calibration pipeline once to get the correct values,
-#                then copy them here so future re-seeds start coarsely aligned.
-#   seed_position: Physical camera position relative to LiDAR center (inches).
-#                Format: [forward_in, left_in, up_in]
-#                +forward = toward scanner front, +left = left side, +up = above LiDAR.
-#                Used to pre-fill the seed fields in the GUI calibration panel.
-#   calibration: Per-camera extrinsic calibration path (relative to config/).
-#                Falls back to calibrations/<camera_hw>/fusion_calibration.yaml.
-#
-# cam_0 = primary/reference camera. Its images are never color-corrected.
-# cam_1+ = secondary cameras. Color profiles are applied to match cam_0.
 cameras:
   cam_0:
-    serial: "XXXXXXXXXXXXXX"
+    serial: XXXXXXXXXXXXXX
     camera_hw: x5
     mask_dual: x5/lidar_mask_dual_x5_cam_left.png
     mask_calibration: x5/lidar_mask_dual_x5_calib_left.png
     calibration: calibrations/x5/left/fusion_calibration.yaml
-    mounting_orientation: [-178.721, 4.577, -61.085]
-    seed_position: [3.066, 4.265, -0.149]
+    mounting_orientation:
+    - -178.721
+    - 4.577
+    - -61.085
+    seed_position:
+    - 3.066
+    - 4.265
+    - -0.149
   cam_1:
-    serial: "XXXXXXXXXXXXXX"
+    serial: XXXXXXXXXXXXXX
     camera_hw: x3
     mask_dual: x3/lidar_mask_dual_x3_cam_right.png
     mask_calibration: x3/lidar_mask_dual_x3_calib_right.png
     calibration: calibrations/x3/right/fusion_calibration.yaml
-    mounting_orientation: [177.425, 0.438, -119.584]
-    seed_position: [-2.728, 4.359, -0.502]
+    mounting_orientation:
+    - 177.425
+    - 0.438
+    - -119.584
+    seed_position:
+    - -2.728
+    - 4.359
+    - -0.502
   cam_2:
-    serial: "XXXXXXXXXXXXXX"
+    serial: XXXXXXXXXXXXXX
     camera_hw: onex2
     mask_dual: onex2/lidar_mask_dual_onex2_cam_right.png
     mask_calibration: onex2/lidar_mask_dual_onex2_calib.png
     calibration: calibrations/onex2/right/fusion_calibration.yaml
-    mounting_orientation: [-178.712, 3.049, -98.348]
-    seed_position: [-2.366, 3.638, -0.625]
+    mounting_orientation:
+    - -178.712
+    - 3.049
+    - -98.348
+    seed_position:
+    - -2.366
+    - 3.638
+    - -0.625
   cam_3:
-    serial: "XXXXXXXXXXXXXXXXXX"
+    serial: XXXXXXXXXXXXXXXXXX
     camera_hw: oak1
     calibration: calibrations/oak1/center/fusion_calibration.yaml
-    mounting_orientation: [-6.000, -47.000, -86.000]
-    seed_position: [-3.886, 1.016, 0.241]
+    mounting_orientation:
+    - -1.471
+    - -41.488
+    - -88.331
+    seed_position:
+    - 5.635
+    - 0.179
+    - -3.163

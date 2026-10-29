@@ -31,8 +31,8 @@ _SRC = Path(__file__).resolve().parent.parent
 _CALIB_DIR = _SRC / 'config' / 'calibrations'
 INCHES = 0.0254
 
-R_HALF, R_SCALE_C, R_SCALE_F = 360, 1.0, 0.1   # coarse/fine deg per tick
-T_HALF, T_SCALE_C, T_SCALE_F = 480, 0.1, 0.01   # coarse/fine inches per tick
+R_HALF, R_SCALE_C, R_SCALE_F = 360, 0.1, 0.01   # coarse/fine deg per tick (offsets)
+T_HALF, T_SCALE_C, T_SCALE_F = 480, 0.05, 0.005  # coarse/fine inches per tick (offsets)
 
 
 def _load_calib(camera_hw, cam_index):
@@ -51,7 +51,7 @@ def _save_calib(c, slot_path, camera_hw):
     """Write calibration to the slot path, hw-level path, and active shared path.
     The slot path is resolved from multi_camera.yaml if available, so changes
     are picked up by the system regardless of which path it reads."""
-    txt = yaml.dump(c, default_flow_style=False, sort_keys=False)
+    txt = _safe_yaml_dump(c, default_flow_style=False, sort_keys=False)
     # Always write to the slot path passed in (from calibration_path())
     slot_path.parent.mkdir(parents=True, exist_ok=True)
     slot_path.write_text(txt)
@@ -207,18 +207,15 @@ def main():
     fine = [False]
 
     def _make_sliders(r_scale, t_scale):
-        cv2.createTrackbar('Roll  deg', WIN,
-                           _sp(np.degrees(calib['roll_offset']),  R_HALF, r_scale), R_HALF*2, lambda x:None)
-        cv2.createTrackbar('Pitch deg', WIN,
-                           _sp(np.degrees(calib['pitch_offset']), R_HALF, r_scale), R_HALF*2, lambda x:None)
-        cv2.createTrackbar('Yaw   deg', WIN,
-                           _sp(np.degrees(calib['yaw_offset']),   R_HALF, r_scale), R_HALF*2, lambda x:None)
-        cv2.createTrackbar('Fwd   in ', WIN,
-                           _sp(p0[0]/INCHES, T_HALF, t_scale), T_HALF*2, lambda x:None)
-        cv2.createTrackbar('Left  in ', WIN,
-                           _sp(p0[1]/INCHES, T_HALF, t_scale), T_HALF*2, lambda x:None)
-        cv2.createTrackbar('Up    in ', WIN,
-                           _sp(p0[2]/INCHES, T_HALF, t_scale), T_HALF*2, lambda x:None)
+        # Sliders represent OFFSETS (delta) from the loaded calibration value.
+        # Starting at R_HALF/T_HALF = zero offset, so saving without moving
+        # preserves the loaded value exactly (no rounding).
+        cv2.createTrackbar('Roll  deg', WIN,  R_HALF, R_HALF*2, lambda x:None)
+        cv2.createTrackbar('Pitch deg', WIN,  R_HALF, R_HALF*2, lambda x:None)
+        cv2.createTrackbar('Yaw   deg', WIN,  R_HALF, R_HALF*2, lambda x:None)
+        cv2.createTrackbar('Fwd   in ', WIN,  T_HALF, T_HALF*2, lambda x:None)
+        cv2.createTrackbar('Left  in ', WIN,  T_HALF, T_HALF*2, lambda x:None)
+        cv2.createTrackbar('Up    in ', WIN,  T_HALF, T_HALF*2, lambda x:None)
 
     _make_sliders(R_SCALE_C, T_SCALE_C)
 
@@ -237,12 +234,21 @@ def main():
         r_scale = R_SCALE_F if fine[0] else R_SCALE_C
         t_scale = T_SCALE_F if fine[0] else T_SCALE_C
 
-        roll  = _sv(cv2.getTrackbarPos('Roll  deg', WIN), R_HALF, r_scale)
-        pitch = _sv(cv2.getTrackbarPos('Pitch deg', WIN), R_HALF, r_scale)
-        yaw   = _sv(cv2.getTrackbarPos('Yaw   deg', WIN), R_HALF, r_scale)
-        fwd   = _sv(cv2.getTrackbarPos('Fwd   in ', WIN), T_HALF, t_scale)
-        left  = _sv(cv2.getTrackbarPos('Left  in ', WIN), T_HALF, t_scale)
-        up    = _sv(cv2.getTrackbarPos('Up    in ', WIN), T_HALF, t_scale)
+        # Sliders are offsets (delta) from the loaded calibration value
+        d_roll  = _sv(cv2.getTrackbarPos('Roll  deg', WIN), R_HALF, r_scale)
+        d_pitch = _sv(cv2.getTrackbarPos('Pitch deg', WIN), R_HALF, r_scale)
+        d_yaw   = _sv(cv2.getTrackbarPos('Yaw   deg', WIN), R_HALF, r_scale)
+        d_fwd   = _sv(cv2.getTrackbarPos('Fwd   in ', WIN), T_HALF, t_scale)
+        d_left  = _sv(cv2.getTrackbarPos('Left  in ', WIN), T_HALF, t_scale)
+        d_up    = _sv(cv2.getTrackbarPos('Up    in ', WIN), T_HALF, t_scale)
+
+        # Apply deltas to loaded values
+        roll  = np.degrees(calib['roll_offset'])  + d_roll
+        pitch = np.degrees(calib['pitch_offset']) + d_pitch
+        yaw   = np.degrees(calib['yaw_offset'])   + d_yaw
+        fwd   = p0[0]/INCHES + d_fwd
+        left  = p0[1]/INCHES + d_left
+        up    = p0[2]/INCHES + d_up
 
         Rm = R.from_euler('xyz', np.radians([roll, pitch, yaw])).as_matrix()
         pos = np.array([fwd, left, up]) * INCHES
@@ -252,12 +258,14 @@ def main():
         frame = _overlay(img_disp, u, v, depths)
 
         # HUD
-        mode_str = 'FINE (0.1deg/0.01in)' if fine[0] else 'COARSE (1deg/0.1in)'
-        _put(frame, f'Roll={roll:+.1f}  Pitch={pitch:+.1f}  Yaw={yaw:+.1f} deg  [{mode_str}]',
+        mode_str = 'FINE (0.01deg/0.005in)' if fine[0] else 'COARSE (0.1deg/0.05in)'
+        _put(frame, f'Roll={roll:+.2f}  Pitch={pitch:+.2f}  Yaw={yaw:+.2f} deg  [{mode_str}]',
              (10, 28), 0.6, (220, 220, 50))
-        _put(frame, f'Fwd={fwd:+.2f}"  Left={left:+.2f}"  Up={up:+.2f}"  '
-             f'Pts in frame: {len(u)}',
-             (10, 58), 0.6, (220, 220, 50))
+        _put(frame, f'Fwd={fwd:+.3f}"  Left={left:+.3f}"  Up={up:+.3f}"  '
+             f'(delta: R={d_roll:+.2f} P={d_pitch:+.2f} Y={d_yaw:+.2f}deg  '
+             f'F={d_fwd:+.3f} L={d_left:+.3f} U={d_up:+.3f}")  '
+             f'Pts: {len(u)}',
+             (10, 58), 0.5, (220, 220, 50))
         _put(frame, 'S=Save  Q=Quit  F=Fine/Coarse  |  dots: blue=far  red=close',
              (10, disp_h - 12), 0.5, (180, 180, 180))
 
@@ -267,20 +275,18 @@ def main():
         if key in (ord('q'), 27):
             break
         elif key == ord('f'):
-            # Toggle fine/coarse — read current values and re-create sliders
+            # Toggle fine/coarse — preserve current deltas in new scale
             fine[0] = not fine[0]
             new_r = R_SCALE_F if fine[0] else R_SCALE_C
             new_t = T_SCALE_F if fine[0] else T_SCALE_C
-            # Temporarily store current values
-            cur = dict(roll=roll, pitch=pitch, yaw=yaw, fwd=fwd, left=left, up=up)
             _make_sliders(new_r, new_t)
-            # Restore values in new scale
-            cv2.setTrackbarPos('Roll  deg', WIN, _sp(cur['roll'],  R_HALF, new_r))
-            cv2.setTrackbarPos('Pitch deg', WIN, _sp(cur['pitch'], R_HALF, new_r))
-            cv2.setTrackbarPos('Yaw   deg', WIN, _sp(cur['yaw'],   R_HALF, new_r))
-            cv2.setTrackbarPos('Fwd   in ', WIN, _sp(cur['fwd'],   T_HALF, new_t))
-            cv2.setTrackbarPos('Left  in ', WIN, _sp(cur['left'],  T_HALF, new_t))
-            cv2.setTrackbarPos('Up    in ', WIN, _sp(cur['up'],    T_HALF, new_t))
+            # Restore deltas in new scale
+            cv2.setTrackbarPos('Roll  deg', WIN, _sp(d_roll,  R_HALF, new_r))
+            cv2.setTrackbarPos('Pitch deg', WIN, _sp(d_pitch, R_HALF, new_r))
+            cv2.setTrackbarPos('Yaw   deg', WIN, _sp(d_yaw,   R_HALF, new_r))
+            cv2.setTrackbarPos('Fwd   in ', WIN, _sp(d_fwd,   T_HALF, new_t))
+            cv2.setTrackbarPos('Left  in ', WIN, _sp(d_left,  T_HALF, new_t))
+            cv2.setTrackbarPos('Up    in ', WIN, _sp(d_up,    T_HALF, new_t))
             print(f'  Switched to {"FINE" if fine[0] else "COARSE"} mode')
         elif key == ord('s'):
             c = {'roll_offset':  float(np.radians(roll)),

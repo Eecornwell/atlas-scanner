@@ -72,15 +72,14 @@ fi
 # Load ERP resolution and mask filenames from camera model YAML
 _hw_yaml="$_CAM_MODEL_DIR/${CAMERA_HW}.yaml"
 if [ -f "$_hw_yaml" ]; then
-    INSTA360_ERP_WIDTH=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_width',5760))")
-    INSTA360_ERP_HEIGHT=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('erp_height',2880))")
-    _LIDAR_MASK_DUAL=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_dual','onex2/lidar_mask_dual_sdk.png'))")
-    _LIDAR_MASK_SINGLE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('lidar_mask_single','onex2/lidar_mask_single.png'))")
-    _HW_DISPLAY=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); print(d.get('display_name',sys.argv[1]))" "$CAMERA_HW")
-    INSTA360_PHOTO_SIZE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('photo_size_enum'); print(v if v is not None else '')")
-    INSTA360_WB=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('white_balance'); print(v if v is not None else '')")
-    INSTA360_EXPOSURE_MODE=$(python3 -c "import yaml,sys; d=yaml.safe_load(open('$_hw_yaml')); v=d.get('exposure_mode'); print(v if v is not None else '')")
-else
+    INSTA360_ERP_WIDTH=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); print(d.get('erp_width',5760))")
+    INSTA360_ERP_HEIGHT=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); print(d.get('erp_height',2880))")
+    _LIDAR_MASK_DUAL=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); print(d.get('lidar_mask_dual','onex2/lidar_mask_dual_sdk.png'))")
+    _LIDAR_MASK_SINGLE=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); print(d.get('lidar_mask_single','onex2/lidar_mask_single.png'))")
+    _HW_DISPLAY=$(HW_YAML="$_hw_yaml" CAMERA_HW="$CAMERA_HW" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); print(d.get('display_name',os.environ['CAMERA_HW']))")
+    INSTA360_PHOTO_SIZE=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); v=d.get('photo_size_enum'); print(v if v is not None else '')")
+    INSTA360_WB=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); v=d.get('white_balance'); print(v if v is not None else '')")
+    INSTA360_EXPOSURE_MODE=$(HW_YAML="$_hw_yaml" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['HW_YAML'])); v=d.get('exposure_mode'); print(v if v is not None else '')")else
     echo "⚠ No camera model config at $_hw_yaml — using defaults"
     INSTA360_ERP_WIDTH=5760
     INSTA360_ERP_HEIGHT=2880
@@ -93,6 +92,7 @@ export INSTA360_ERP_WIDTH INSTA360_ERP_HEIGHT
 # Always done when multi_camera.yaml exists — the SDK ignores settings
 # for cameras that aren't connected.
 if [ -f "$SCRIPT_DIR/config/multi_camera.yaml" ]; then
+    _atlas_tmp=$(mktemp)
     _cam_photo_sizes=$(ATLAS_SRC="$SCRIPT_DIR" python3 -c "
 import yaml, pathlib, os
 src = os.environ['ATLAS_SRC']
@@ -122,10 +122,11 @@ for i in range(3):
     sub_modes.append(str(c.get('photo_sub_mode', 0)))
 print(','.join(sizes))
 import sys; print(','.join(sub_modes), file=sys.stderr); print(','.join(sizes_hdr), file=sys.stderr); print(','.join(ev_biases_hdr), file=sys.stderr)
-" 2>/tmp/_atlas_sub_modes_and_hdr)
-    _cam_sub_modes=$(sed -n '1p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
-    _cam_photo_sizes_hdr=$(sed -n '2p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
-    _cam_ev_biases_hdr=$(sed -n '3p' /tmp/_atlas_sub_modes_and_hdr 2>/dev/null)
+" 2>"$_atlas_tmp")
+    _cam_sub_modes=$(sed -n '1p' "$_atlas_tmp" 2>/dev/null)
+    _cam_photo_sizes_hdr=$(sed -n '2p' "$_atlas_tmp" 2>/dev/null)
+    _cam_ev_biases_hdr=$(sed -n '3p' "$_atlas_tmp" 2>/dev/null)
+    rm -f "$_atlas_tmp"
     [ -n "$_cam_photo_sizes" ] && export INSTA360_CAMERA_PHOTO_SIZES="$_cam_photo_sizes"
     [ -n "$_cam_sub_modes" ] && export INSTA360_CAMERA_PHOTO_SUB_MODES="$_cam_sub_modes"
     [ -n "$_cam_photo_sizes_hdr" ] && export INSTA360_CAMERA_PHOTO_SIZES_HDR="$_cam_photo_sizes_hdr"
@@ -156,9 +157,9 @@ fi
 # of their individual camera_models/*.yaml defaults (e.g. X5 + X3 mixed).
 _MULTI_CAM_YAML="$SCRIPT_DIR/config/multi_camera.yaml"
 if [ -f "$_MULTI_CAM_YAML" ]; then
-    _mc_exposure=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('exposure_mode'); print(v if v is not None else '')" 2>/dev/null)
-    _mc_wb=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('white_balance'); print(v if v is not None else '')" 2>/dev/null)
-    _mc_ev=$(python3 -c "import yaml; d=yaml.safe_load(open('$_MULTI_CAM_YAML')); s=d.get('settings',{}); v=s.get('ev_bias'); print(v if v is not None else '')" 2>/dev/null)
+    _mc_exposure=$(MC_YAML="$_MULTI_CAM_YAML" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['MC_YAML'])); s=d.get('settings',{}); v=s.get('exposure_mode'); print(v if v is not None else '')" 2>/dev/null)
+    _mc_wb=$(MC_YAML="$_MULTI_CAM_YAML" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['MC_YAML'])); s=d.get('settings',{}); v=s.get('white_balance'); print(v if v is not None else '')" 2>/dev/null)
+    _mc_ev=$(MC_YAML="$_MULTI_CAM_YAML" python3 -c "import yaml,os; d=yaml.safe_load(open(os.environ['MC_YAML'])); s=d.get('settings',{}); v=s.get('ev_bias'); print(v if v is not None else '')" 2>/dev/null)
     _detected_cams=$(lsusb -d 2e1a: 2>/dev/null | wc -l)
     _effective_cams=${NUM_CAMERAS:-$_detected_cams}
     if [ "${_effective_cams:-1}" -gt 1 ]; then
@@ -241,11 +242,22 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== Session log started: $(date) ==="
 echo "=== ATLAS Fusion Capture | camera=$CAMERA_MODE capture=$CAPTURE_MODE hw=$CAMERA_HW ==="
 # Write session metadata so post-processing tools know the camera hardware
-cat > "$SCAN_DIR/session_config.json" << _EOF
-{"camera_mode": "$CAMERA_MODE", "capture_mode": "$CAPTURE_MODE", "camera_hw": "$CAMERA_HW",
- "erp_width": $INSTA360_ERP_WIDTH, "erp_height": $INSTA360_ERP_HEIGHT,
- "num_cameras": ${_USE_CAMERAS:-1}}
-_EOF
+CAMERA_MODE="$CAMERA_MODE" CAPTURE_MODE="$CAPTURE_MODE" CAMERA_HW="$CAMERA_HW" \
+  INSTA360_ERP_WIDTH="$INSTA360_ERP_WIDTH" INSTA360_ERP_HEIGHT="$INSTA360_ERP_HEIGHT" \
+  _USE_CAMERAS="${_USE_CAMERAS:-1}" SCAN_DIR="$SCAN_DIR" \
+  python3 -c "
+import json, os
+data = {
+    'camera_mode':  os.environ['CAMERA_MODE'],
+    'capture_mode': os.environ['CAPTURE_MODE'],
+    'camera_hw':    os.environ['CAMERA_HW'],
+    'erp_width':    int(os.environ.get('INSTA360_ERP_WIDTH', 5760)),
+    'erp_height':   int(os.environ.get('INSTA360_ERP_HEIGHT', 2880)),
+    'num_cameras':  int(os.environ.get('_USE_CAMERAS', 1)),
+}
+with open(os.environ['SCAN_DIR'] + '/session_config.json', 'w') as f:
+    json.dump(data, f)
+"
 
 PIDS=()
 FUSION_READY="false"
@@ -1448,6 +1460,36 @@ if [ "$CAPTURE_MODE" = "continuous" ]; then
             sleep 0.5; _odom_wait=$((_odom_wait + 1))
         done
         [ $_odom_wait -ge 20 ] && echo "⚠ /rko_lio/odometry not confirmed — bag may lack odom"
+        # Wait for SLAM to initialize — odometry publishes immediately but poses
+        # are (0,0,0) until the first scan-to-map match succeeds (~3-8s).
+        # Poll until position norm > 0.01m OR timeout after 30s.
+        echo "Waiting for SLAM initialization (non-zero pose)..."
+        _slam_init_wait=0
+        while [ $_slam_init_wait -lt 60 ]; do
+            _pos_norm=$(python3 -c "
+import subprocess, re, sys
+try:
+    out = subprocess.check_output(
+        ['ros2', 'topic', 'echo', '--once', '--no-arr', '/rko_lio/odometry'],
+        timeout=2, stderr=subprocess.DEVNULL).decode()
+    x = re.search(r'x: ([\-0-9.e]+)', out)
+    y = re.search(r'y: ([\-0-9.e]+)', out)
+    z = re.search(r'z: ([\-0-9.e]+)', out)
+    if x and y and z:
+        norm = (float(x.group(1))**2 + float(y.group(1))**2 + float(z.group(1))**2)**0.5
+        print(f'{norm:.4f}')
+    else:
+        print('0')
+except Exception:
+    print('0')
+" 2>/dev/null || echo '0')
+            if python3 -c "import sys; sys.exit(0 if float('${_pos_norm:-0}') > 0.05 else 1)" 2>/dev/null; then
+                echo "✓ SLAM initialized (position norm=${_pos_norm}m)"
+                break
+            fi
+            sleep 0.5; _slam_init_wait=$((_slam_init_wait + 1))
+        done
+        [ $_slam_init_wait -ge 60 ] && echo "⚠ SLAM initialization timeout — first scans may have zero pose"
         # Brief settle so the first messages are in-flight before the recorder subscribes
         sleep 1
     fi

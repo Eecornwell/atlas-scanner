@@ -11,6 +11,12 @@
 import numpy as np
 import cv2
 import yaml
+import sys as _sys_cam
+_sys_cam.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+try:
+    from camera_hw import safe_yaml_dump as _safe_yaml_dump
+except ImportError:
+    def _safe_yaml_dump(d, **kw): return yaml.dump(d, **kw)
 import sys
 import json
 import os
@@ -42,7 +48,7 @@ def _resolve_calib_path() -> Path:
                     p = calibration_path(hw, int(cam_idx))
                     if p.exists():
                         return p
-        except Exception:
+        except (OSError, yaml.YAMLError, KeyError, TypeError, ImportError):
             pass
     return CALIB_PATH
 
@@ -52,16 +58,14 @@ _ALLOWED_OUTPUT = Path(os.path.expanduser('~/atlas_ws/output')).resolve()
 
 def _safe_output(p) -> Path:
     resolved = Path(p).resolve()
-    # Allow writes to ~/atlas_ws/output/ and ~/atlas_ws/data/ (scan dirs)
-    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents] and \
-       _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not (resolved.is_relative_to(_ALLOWED_OUTPUT) or resolved.is_relative_to(_ALLOWED_DATA)):
         raise ValueError(f"Path '{resolved}' is outside allowed output root '{_ALLOWED_OUTPUT}'")
     return resolved
 
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed data root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -69,9 +73,8 @@ def _safe_data(p) -> Path:
 def _safe_scan(p) -> Path:
     """Accept paths under either the data or output tree (scan dirs can be in either)."""
     resolved = Path(p).resolve()
-    for root in (_ALLOWED_DATA, _ALLOWED_OUTPUT):
-        if root in [resolved, *resolved.parents]:
-            return resolved
+    if resolved.is_relative_to(_ALLOWED_DATA) or resolved.is_relative_to(_ALLOWED_OUTPUT):
+        return resolved
     raise ValueError(f"Path '{resolved}' is outside allowed roots")
 
 
@@ -197,14 +200,14 @@ def main():
         if args.axis in ('roll', 'pitch', 'yaw'):
             key = f'manual_{args.axis}_adjustment'
             cfg[key] = float(cfg.get(key, 0.0)) + float(np.radians(args.apply))
-            with open(calib_path, 'w') as f:
-                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            with open(calib_path, 'w') as f_out:
+                _safe_yaml_dump(cfg, f_out, default_flow_style=False, sort_keys=False)
             print(f'\u2713 Applied {args.apply}\u00b0 to {key} -> {np.degrees(cfg[key]):.4f}\u00b0 total')
         else:
             key = f'{args.axis[1]}_offset'
             cfg[key] = float(cfg.get(key, 0.0)) + float(args.apply / 100.0)
-            with open(calib_path, 'w') as f:
-                yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+            with open(calib_path, 'w') as f_out:
+                _safe_yaml_dump(cfg, f_out, default_flow_style=False, sort_keys=False)
             print(f'\u2713 Applied {args.apply}cm to {key} -> {cfg[key]*100:.2f}cm total')
         return
 
@@ -374,6 +377,11 @@ def main():
     is_rot = args.axis in ('roll', 'pitch', 'yaw')
     unit = 'deg' if is_rot else 'cm'
     print(f'\nSweeping {args.axis} \u00b1{args.range}{unit} in {len(offsets)} steps...')
+
+    # Detect OAK-1 from scan_dir
+    is_oak1_sweep = args.scan_dir and any(
+        Path(args.scan_dir).glob('oak1_*_undistorted.png'))
+
     for off in offsets:
         dr  = np.radians(off) if args.axis == 'roll'  else 0.0
         dp  = np.radians(off) if args.axis == 'pitch' else 0.0
@@ -381,7 +389,49 @@ def main():
         dtx = off / 100.0     if args.axis == 'tx'    else 0.0
         dty = off / 100.0     if args.axis == 'ty'    else 0.0
         dtz = off / 100.0     if args.axis == 'tz'    else 0.0
-        grid = generate_grid(erp, pts, cfg, dr, dp, dy, dtx, dty, dtz, views)
+
+        if is_oak1_sweep:
+            # OAK-1: project directly onto the pinhole image (same as --verify)
+            T = build_T(cfg, dr, dp, dy, dtx, dty, dtz)
+            pts_h = np.hstack([pts, np.ones((len(pts), 1))])
+            pts_cam = (T @ pts_h.T).T[:, :3]
+            dist_arr = np.linalg.norm(pts_cam, axis=1)
+            mask = (dist_arr > 0.3) & (dist_arr < 10.0)
+            pts_cam, dist_arr = pts_cam[mask], dist_arr[mask]
+            _ci_path = scan_dir / 'camera_info.yaml'
+            _undist_yaml = next(scan_dir.glob('oak1_*_undistorted.yaml'), None)
+            if _undist_yaml:
+                import yaml as _y2
+                _ci = _y2.safe_load(_undist_yaml.read_text())
+            elif _ci_path.exists():
+                import yaml as _y2
+                _ci = _y2.safe_load(_ci_path.read_text())
+            else:
+                _ci = None
+            _H, _W = erp.shape[:2]
+            if _ci:
+                _sx, _sy = _W/_ci['width'], _H/_ci['height']
+                _fx = _ci['fx']*_sx; _fy = _ci['fy']*_sy
+                _cx = _ci['cx']*_sx; _cy = _ci['cy']*_sy
+            else:
+                _fx = _fy = 1549.0; _cx = _W/2.0; _cy = _H/2.0
+            front = pts_cam[:, 2] > 0.1
+            pf = pts_cam[front]; df = dist_arr[front]
+            u_p = (_fx * pf[:,0] / pf[:,2] + _cx).astype(int)
+            v_p = (_fy * pf[:,1] / pf[:,2] + _cy).astype(int)
+            valid = (u_p>=0)&(u_p<_W)&(v_p>=0)&(v_p<_H)
+            u_p, v_p, df = u_p[valid], v_p[valid], df[valid]
+            d_norm = np.clip((df-df.min())/(df.max()-df.min()+1e-6)*255,0,255).astype(np.uint8) if len(df) else np.array([], dtype=np.uint8)
+            colours = cv2.applyColorMap(d_norm.reshape(-1,1), cv2.COLORMAP_JET).reshape(-1,3) if len(df) else np.zeros((0,3), dtype=np.uint8)
+            overlay_img = erp.copy()
+            for i in range(len(u_p)):
+                cv2.circle(overlay_img,(u_p[i],v_p[i]),8,
+                           (int(colours[i,0]),int(colours[i,1]),int(colours[i,2])),-1)
+            grid = cv2.addWeighted(erp, 0.35, overlay_img, 0.65, 0)
+            grid = cv2.resize(grid, (1200, int(_H*1200/_W)))
+        else:
+            grid = generate_grid(erp, pts, cfg, dr, dp, dy, dtx, dty, dtz, views)
+
         label = f'{args.axis}_{off:+.2f}{unit}'
         cv2.putText(grid, label, (10, grid.shape[0] - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)

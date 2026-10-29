@@ -50,14 +50,14 @@ def main():
             bridge.destroy_node()
         except (AttributeError, rclpy.exceptions.InvalidHandle):
             pass
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f'Warning: unexpected error destroying node: {e}')
         try:
             if rclpy.ok():
                 rclpy.shutdown()
         except rclpy.exceptions.InvalidHandle:
             pass
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f'Warning: unexpected error during rclpy shutdown: {e}')
 
 if __name__ == '__main__':

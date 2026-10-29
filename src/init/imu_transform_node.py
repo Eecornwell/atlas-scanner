@@ -54,7 +54,7 @@ class IMUTransformNode(Node):
             # Publish transformed IMU
             self.imu_pub.publish(transformed_msg)
             
-        except Exception as e:
+        except (RuntimeError, TypeError, AttributeError) as e:
             # If no transform available, just republish with new frame
             msg.header.frame_id = self.output_frame
             self.imu_pub.publish(msg)

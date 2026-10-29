@@ -42,7 +42,7 @@ _ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -97,7 +97,7 @@ def _bag_stamps_raw(con, fragment) -> np.ndarray:
             sec  = struct.unpack_from('<i', bytes(data), 4)[0]
             nsec = struct.unpack_from('<I', bytes(data), 8)[0]
             stamps.append(sec + nsec / 1e9)
-        except Exception:
+        except (struct.error, TypeError, ValueError):
             pass
     return np.sort(np.array(stamps))
 
@@ -125,7 +125,7 @@ def _host_to_livox_offset(con) -> float:
             msg = deserialize_message(bytes(data), LidarType)
             hdr_t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             diffs.append(bag_ns / 1e9 - hdr_t)
-        except Exception:
+        except (KeyError, TypeError, AttributeError, ValueError):
             pass
     if not diffs:
         return 0.0
@@ -166,7 +166,7 @@ def read_shutter_events(session: Path) -> list[dict]:
             # Format: "t_before" (old) or "t_before t_after" (new).
             # t_before = TakePhoto() call entry = shutter fires.
             capture_time = float(ct_path.read_text().strip().split()[0])
-        except Exception:
+        except (OSError, ValueError, IndexError):
             continue
 
         insp_path = Path(str(ct_path).replace(".capture_time", ""))
@@ -197,7 +197,7 @@ def read_shutter_events(session: Path) -> list[dict]:
         try:
             _safe_data(se)
             shutter_t = float(se.read_text().strip())
-        except Exception:
+        except (OSError, ValueError):
             continue
 
         try:
@@ -214,7 +214,7 @@ def read_shutter_events(session: Path) -> list[dict]:
             if ct_p.exists():
                 try:
                     capture_time = float(ct_p.read_text().strip().split()[0])
-                except Exception:
+                except (OSError, ValueError, IndexError):
                     pass
 
         seen_scans.add(scan_name)
@@ -292,7 +292,7 @@ def validate(session_dir: str, lidar_window: float = 0.6, walk_speed: float = 0.
             con, tmp = open_db3(bd)
             bag_dir = bd
             break
-        except Exception as e:
+        except (OSError, FileNotFoundError, RuntimeError) as e:
             print(f"  ⚠ Skipping {bd.name}: {e}")
     if con is None:
         print("✗ No readable bag found")

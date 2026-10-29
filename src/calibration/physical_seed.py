@@ -29,6 +29,12 @@
 import argparse
 import numpy as np
 import yaml
+import sys as _sys_cam
+_sys_cam.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[1]))
+try:
+    from camera_hw import safe_yaml_dump as _safe_yaml_dump
+except ImportError:
+    def _safe_yaml_dump(d, **kw): return yaml.dump(d, **kw)
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
@@ -72,7 +78,7 @@ def _reference_orientation(camera_hw):
                 if slot.get('camera_hw') == camera_hw and slot.get('mounting_orientation'):
                     r, p, y = slot['mounting_orientation']
                     return float(r), float(p), float(y)
-        except Exception:
+        except (OSError, yaml.YAMLError, KeyError, TypeError):
             pass
     return _ORIENTATION_FALLBACK.get(camera_hw, _ORIENTATION_FALLBACK['x5'])
 
@@ -150,7 +156,7 @@ def main():
 
     out_path = _CALIB_DIR / args.camera_hw / 'fusion_calibration.yaml'
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(yaml.dump(calib, default_flow_style=False, sort_keys=False))
+    out_path.write_text(_safe_yaml_dump(calib, default_flow_style=False, sort_keys=False))
 
     if _cam_idx:
         try:
@@ -161,13 +167,13 @@ def main():
                 if calib_rel:
                     slot_path = _SRC / 'config' / calib_rel
                     slot_path.parent.mkdir(parents=True, exist_ok=True)
-                    slot_path.write_text(yaml.dump(calib, default_flow_style=False, sort_keys=False))
+                    slot_path.write_text(_safe_yaml_dump(calib, default_flow_style=False, sort_keys=False))
                     print(f'✓ Saved to slot path: {slot_path}')
-        except Exception as e:
+        except (OSError, yaml.YAMLError, KeyError, TypeError) as e:
             print(f'  (could not write slot path: {e})')
 
     active_path = _SRC / 'config' / 'fusion_calibration.yaml'
-    active_path.write_text(yaml.dump(calib, default_flow_style=False, sort_keys=False))
+    active_path.write_text(_safe_yaml_dump(calib, default_flow_style=False, sort_keys=False))
 
     r_deg, p_deg, y_deg = _reference_orientation(args.camera_hw)
     R_mat = R.from_euler('xyz', np.radians([r_deg, p_deg, y_deg])).as_matrix()

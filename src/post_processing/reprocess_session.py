@@ -22,7 +22,7 @@ _STITCH_BIN = Path(__file__).resolve().parents[1] / 'capture' / 'sdk' / 'build' 
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -56,7 +56,7 @@ def _stitch_scan(scan_dir: Path, camera_mode: str, erp_width: int, erp_height: i
                     hw_cfg = _y.safe_load(hw_yaml.read_text()) or {}
                     slot_w = hw_cfg.get('erp_width',  erp_width)
                     slot_h = hw_cfg.get('erp_height', erp_height)
-    except Exception:
+    except (OSError, KeyError, TypeError, ValueError):
         pass
     cmd = [str(_STITCH_BIN), str(insp), str(erp)]
     if camera_mode == 'single_fisheye':
@@ -98,7 +98,7 @@ def reprocess_session(session_dir, skip_coloring=False, skip_colmap=False):
             camera_hw   = cfg.get('camera_hw',   camera_hw)
             erp_width   = int(cfg.get('erp_width',  erp_width))
             erp_height  = int(cfg.get('erp_height', erp_height))
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
 
     if not skip_coloring:

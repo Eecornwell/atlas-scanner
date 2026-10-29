@@ -47,7 +47,7 @@ if _cam_idx:
                     YAML_PATH = _slot_path
                     _hw = _slot_cfg.get('camera_hw', 'onex2')
                     print(f'Using {_hw} calibration: {_slot_path}')
-    except Exception:
+    except (OSError, yaml.YAMLError, KeyError, TypeError, ImportError, json.JSONDecodeError):
         pass
 
 # Priority 2: per-hw calibration detected from output dataset
@@ -61,7 +61,7 @@ if YAML_PATH == Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_cali
             _scan_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
             if _scan_cfg.exists():
                 _hw = _json.loads(_scan_cfg.read_text()).get('camera_hw', 'onex2')
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             pass
     _hw_yaml = _src_root / 'config' / 'calibrations' / _hw / 'fusion_calibration.yaml'
     if _hw_yaml.exists():

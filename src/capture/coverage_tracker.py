@@ -218,7 +218,7 @@ def main():
         node.destroy_node()
         try:
             rclpy.shutdown()
-        except Exception:
+        except (RuntimeError, rclpy.exceptions.InvalidHandle):
             pass
 
 

@@ -26,7 +26,7 @@ _SELF = Path(__file__).resolve()
 
 def _safe(p: Path) -> Path:
     resolved = p.resolve()
-    if _ALLOWED_DATA.resolve() not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA.resolve()):
         raise ValueError(f"Path '{resolved}' escapes allowed root")
     return resolved
 
@@ -128,7 +128,7 @@ def _cmd_warmup(width: int, height: int, out_yaml: str):
         # Never call pipeline.stop() — crashes firmware on USB2. OS cleans up.
         # Use os._exit to skip Python/DepthAI destructor which hangs on USB2.
         os._exit(0)
-    except Exception as e:
+    except (RuntimeError, OSError, ImportError) as e:
         print(f"✗ Warmup error: {e}", flush=True)
         os._exit(1)
 
@@ -156,7 +156,7 @@ def _cmd_capture(width: int, height: int, out_png: str):
             os._exit(0)
         else:
             os._exit(1)
-    except Exception as e:
+    except (RuntimeError, OSError, ImportError) as e:
         print(f"✗ Capture error: {e}", flush=True)
         os._exit(1)
 
@@ -193,7 +193,7 @@ def _usb_reset_oak1():
                         return
                 print("⚠ Device did not re-enumerate", flush=True)
                 return
-    except Exception as e:
+    except (OSError, RuntimeError, ImportError) as e:
         print(f"⚠ USB reset failed: {e}", flush=True)
         time.sleep(3.0)
 
@@ -388,7 +388,7 @@ def main():
                 raise RuntimeError("No frames during stability soak")
             print(f"✓ Pipeline stable ({_frames_ok} frames, bright={_bright_ok})", flush=True)
             break
-        except Exception as _e:
+        except (RuntimeError, OSError) as _e:
             print(f"⚠ Pipeline start failed (attempt {_attempt+1}/3): {_e}", flush=True)
             # os._exit to bypass DepthAI destructor which crashes on bad XLink state.
             # Re-launch self as a fresh process for the next attempt.
@@ -488,20 +488,32 @@ def main():
                             _env.setdefault('XDG_RUNTIME_DIR', f'/run/user/{_uid}')
                             _env.setdefault('DBUS_SESSION_BUS_ADDRESS',
                                             f'unix:path=/run/user/{_uid}/bus')
-                            _sp.Popen(['paplay',
+                            _sp.Popen(['/usr/bin/paplay',
                                        '/usr/share/sounds/freedesktop/stereo/camera-shutter.oga'],
                                       stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, env=_env)
-                        except Exception:
+                        except (OSError, FileNotFoundError):
                             pass
                         frame = f.getCvFrame()
                         try:
-                            ts = f.getTimestampSystem()
-                            frame_ts = ts.total_seconds()
-                        except Exception:
+                            # Use getTimestamp(MIDDLE) which is synced to the
+                            # host clock and refers to the exposure midpoint —
+                            # the most accurate shutter time available.
+                            # Convert from device monotonic to host wall-clock
+                            # using the offset between dai.Clock.now() and time.time().
+                            import depthai as _dai
+                            _device_now = _dai.Clock.now().total_seconds()
+                            _host_now = time.time()
+                            _clock_offset = _host_now - _device_now
+                            _ts_device = f.getTimestamp(
+                                _dai.CameraExposureOffset.MIDDLE).total_seconds()
+                            frame_ts = _ts_device + _clock_offset
+                        except (AttributeError, OSError, Exception):
+                            # Fallback: use host time at frame receipt.
+                            # Less accurate but always available.
                             frame_ts = time.time()
                         break
                     time.sleep(0.02)
-            except Exception as _e:
+            except (RuntimeError, OSError) as _e:
                 print(f"⚠ Pipeline error: {_e} — reconnecting...", flush=True)
                 # Do NOT call pipeline.stop() — destructor crashes on bad XLink state
                 _usb_reset_oak1()
@@ -522,7 +534,7 @@ def main():
                         (scan_dir / '.oak1_trigger').unlink(missing_ok=True)
                         print("⚠ Discarded stale trigger after reconnect", flush=True)
                         time.sleep(0.1)  # brief pause in case main_multi writes another
-                except Exception as _e2:
+                except (RuntimeError, OSError) as _e2:
                     print(f"✗ Reconnect failed: {_e2}", flush=True)
 
             if frame is not None:
@@ -534,7 +546,7 @@ def main():
                 out_path = _safe(target_dir / f"oak1_{timestamp}.png")
                 cv2.imwrite(str(out_path), frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 print(f"✓ Saved: {out_path} "
-                      f"(raw_mean={raw_mean:.1f} frame_age={frame_age:.2f}s)", flush=True)
+                      f"(raw_mean={raw_mean:.1f} frame_age={frame_age*1000:.0f}ms)", flush=True)
                 _write_colmap_camera(info, target_dir, frame.shape[1], frame.shape[0])
                 undist_path = _safe(target_dir / f"oak1_{timestamp}_undistorted.png")
                 _undistort_and_save(frame, info, undist_path)
@@ -558,7 +570,7 @@ def main():
             # Idle — check pipeline is still alive by peeking at the queue
             try:
                 stream_q.tryGet()
-            except Exception as _e:
+            except (RuntimeError, OSError) as _e:
                 print(f"⚠ Pipeline dropped in idle: {_e} — reconnecting...", flush=True)
                 # Do NOT call pipeline.stop() — destructor crashes on bad XLink state
                 _usb_reset_oak1()
@@ -569,7 +581,7 @@ def main():
                     while time.time() - _t0 < 3.0:
                         stream_q.tryGet()
                         time.sleep(0.05)
-                except Exception as _e2:
+                except (RuntimeError, OSError) as _e2:
                     print(f"✗ Reconnect failed: {_e2}", flush=True)
 
         time.sleep(0.05)

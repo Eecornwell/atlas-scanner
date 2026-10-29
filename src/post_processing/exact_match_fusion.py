@@ -40,7 +40,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -190,7 +190,7 @@ def exact_match_calibration_tool(scan_dir):
                 # (e.g. cam_0=x5 for a single-camera oak1 session).
                 if _slot_hw and _ci_has_serial:
                     _hw = _slot_hw
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             pass
 
     # _is_perspective must be based on the SCAN's actual hw, not the session hw.
@@ -203,9 +203,9 @@ def exact_match_calibration_tool(scan_dir):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    roll  = config['roll_offset']
-    pitch = config['pitch_offset']
-    yaw   = config['yaw_offset']
+    roll  = config['roll_offset']  + config.get('manual_roll_adjustment',  0.0)
+    pitch = config['pitch_offset'] + config.get('manual_pitch_adjustment', 0.0)
+    yaw   = config['yaw_offset']   + config.get('manual_yaw_adjustment',   0.0)
     t_x   = config['x_offset']
     t_y   = config['y_offset']
     t_z   = config['z_offset']
@@ -267,10 +267,23 @@ def exact_match_calibration_tool(scan_dir):
         _cy = _ci['cy'] * _sy
         # Simple pinhole projection (zero distortion — using undistorted image)
         _front = points_camera[:, 2] > 0.1
+        # FOV cone filter: reject points outside the camera's actual field of view.
+        # Without this, points at large off-axis angles project to valid pixel
+        # coords but are heavily distorted and get wrong colors.
+        # Half-diagonal FOV from intrinsics: angle = atan2(half_diag_px, f)
+        _f_avg = (_fx + _fy) / 2.0
+        _half_w = img_width  / 2.0
+        _half_h = img_height / 2.0
+        _half_diag = np.sqrt(_half_w**2 + _half_h**2)
+        _max_half_fov = np.arctan2(_half_diag, _f_avg)  # radians
+        # Angle of each point from the optical axis (camera +Z)
+        _cos_angle = points_camera[:, 2] / np.maximum(np.linalg.norm(points_camera, axis=1), 1e-6)
+        _in_fov = _cos_angle >= np.cos(_max_half_fov)
+        _valid = _front & _in_fov
         u = np.full(len(points_camera), -1.0)
         v = np.full(len(points_camera), -1.0)
-        u[_front] = _fx * points_camera[_front, 0] / points_camera[_front, 2] + _cx
-        v[_front] = _fy * points_camera[_front, 1] / points_camera[_front, 2] + _cy
+        u[_valid] = _fx * points_camera[_valid, 0] / points_camera[_valid, 2] + _cx
+        v[_valid] = _fy * points_camera[_valid, 1] / points_camera[_valid, 2] + _cy
     else:
         # Equirectangular projection (fisheye cameras)
         bearing = points_camera / cam_depths[:, np.newaxis]

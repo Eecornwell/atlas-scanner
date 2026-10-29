@@ -54,7 +54,7 @@ def ply_to_e57(ply_path, e57_path):
         print(f"✓ Saved E57: {e57_path} ({len(points)} points)")
         return True
         
-    except Exception as e:
+    except (OSError, ImportError, RuntimeError, ValueError) as e:
         print(f"Error converting to E57: {e}")
         return False
 

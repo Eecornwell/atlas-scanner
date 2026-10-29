@@ -51,7 +51,7 @@ def load_camera_profile(camera_hw: str) -> dict:
         try:
             overrides = yaml.safe_load(hw_yaml.read_text()) or {}
             defaults.update({k: v for k, v in overrides.items() if v is not None})
-        except Exception:
+        except (OSError, yaml.YAMLError, KeyError, TypeError):
             pass
     defaults['camera_hw'] = camera_hw
     return defaults
@@ -63,7 +63,7 @@ def camera_hw_for_session(session_dir) -> str:
     if cfg.exists():
         try:
             return json.loads(cfg.read_text()).get('camera_hw', 'onex2')
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             pass
     return 'onex2'
 
@@ -122,8 +122,8 @@ def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
                 if cam_cfg.get('camera_hw', '') == camera_hw:
                     calib_rel = cam_cfg.get('calibration', '')
                     if calib_rel:
-                        slot_path = _SRC / 'config' / calib_rel
-                        if slot_path.exists():
+                        slot_path = (_SRC / 'config' / calib_rel).resolve()
+                        if slot_path.is_relative_to(_SRC / 'config') and slot_path.exists():
                             return slot_path
 
                 # Priority 1b: index matches but hw differs — find the slot
@@ -133,10 +133,10 @@ def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
                     if slot_cfg.get('camera_hw', '') == camera_hw:
                         calib_rel = slot_cfg.get('calibration', '')
                         if calib_rel:
-                            slot_path = _SRC / 'config' / calib_rel
-                            if slot_path.exists():
+                            slot_path = (_SRC / 'config' / calib_rel).resolve()
+                            if slot_path.is_relative_to(_SRC / 'config') and slot_path.exists():
                                 return slot_path
-            except Exception:
+            except (OSError, yaml.YAMLError, KeyError, TypeError):
                 pass
         # Priority 2: legacy per-hw/cam_N path
         p = _CALIB_DIR / camera_hw / f'cam_{cam_index}' / 'fusion_calibration.yaml'
@@ -148,6 +148,48 @@ def calibration_path(camera_hw: str, cam_index: int = None) -> Path:
         return p
     # Priority 4: active shared calibration
     return _SRC / 'config' / 'fusion_calibration.yaml'
+
+
+def load_calibration_transform(camera_hw: str, cam_index: int = None):
+    """Load T_camera_lidar as a 4x4 numpy array from the calibration YAML.
+
+    Always applies manual_*_adjustment on top of *_offset so that tweaks
+    made in tune_calibration.py are reflected everywhere — coloring,
+    COLMAP export, depth generation, and trajectory recording.
+
+    Returns (T_camera_lidar, calib_dict) where T_camera_lidar is (4,4) float64.
+    """
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    calib_path = calibration_path(camera_hw, cam_index)
+    calib = yaml.safe_load(calib_path.read_text())
+
+    roll  = calib['roll_offset']  + calib.get('manual_roll_adjustment',  0.0)
+    pitch = calib['pitch_offset'] + calib.get('manual_pitch_adjustment', 0.0)
+    yaw   = calib['yaw_offset']   + calib.get('manual_yaw_adjustment',   0.0)
+
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
+    T[:3, 3]  = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    return T, calib
+
+
+def _to_plain(obj):
+    """Recursively convert numpy scalars to plain Python types so yaml.dump
+    produces safe YAML that yaml.safe_load can read back without errors."""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_plain(v) for v in obj]
+    if hasattr(obj, 'item'):  # numpy scalar
+        return obj.item()
+    return obj
+
+
+def safe_yaml_dump(data, **kwargs) -> str:
+    """yaml.dump that converts numpy scalars to plain Python types first."""
+    return yaml.dump(_to_plain(data), **kwargs)
 
 
 def cam_index_for_scan(scan_dir) -> int:
@@ -178,7 +220,7 @@ def cam_index_for_scan(scan_dir) -> int:
                 for slot_key, cam_cfg in mc.get('cameras', {}).items():
                     if cam_cfg.get('serial', '') == serial:
                         return int(slot_key.split('_')[1])
-            except Exception:
+            except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError):
                 pass
         return sdk_index
     except (ValueError, OSError):

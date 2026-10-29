@@ -23,7 +23,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -41,7 +41,7 @@ def color_scan_fisheye(scan_dir, config_path=None, mask_path=None):
 
     fisheye_files = [
         f for f in glob.glob(os.path.join(str(safe_scan), 'fisheye_*.jpg'))
-        if _ALLOWED_DATA in [Path(f).resolve(), *Path(f).resolve().parents]
+        if Path(f).resolve().is_relative_to(_ALLOWED_DATA)
     ]
     if not fisheye_files:
         print(f"\u2717 No fisheye images found in {safe_scan}")

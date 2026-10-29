@@ -17,7 +17,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -33,7 +33,13 @@ def create_web_viewer(ply_file):
         
         points = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors) if pcd.has_colors() else None
-        
+
+        # Reject non-finite coordinates before building JS arrays
+        finite_mask = np.isfinite(points).all(axis=1)
+        points = points[finite_mask]
+        if colors is not None:
+            colors = colors[finite_mask]
+
         # Sample points for web display (limit for performance)
         max_points = min(len(points), 50000)
         if len(points) > max_points:
@@ -41,20 +47,20 @@ def create_web_viewer(ply_file):
             points = points[indices]
             if colors is not None:
                 colors = colors[indices]
-        
-        # Generate JavaScript arrays
-        positions_js = ','.join([f'{p[0]:.3f},{p[1]:.3f},{p[2]:.3f}' for p in points])
-        colors_js = ','.join([f'{c[0]:.3f},{c[1]:.3f},{c[2]:.3f}' for c in colors]) if colors is not None else None
-        
-        # Create persistent HTML file in the same directory as the PLY file
-        html_file = str(_safe_data(safe_ply.with_suffix('').parent /
-                                   (safe_ply.stem + '_viewer.html')))
+
+        # Generate JavaScript arrays — values are already finite floats, format
+        # with fixed precision to prevent any non-numeric representation.
+        positions_js = ','.join([f'{float(p[0]):.3f},{float(p[1]):.3f},{float(p[2]):.3f}' for p in points])
+        colors_js = ','.join([f'{float(c[0]):.3f},{float(c[1]):.3f},{float(c[2]):.3f}' for c in colors]) if colors is not None else None
+
+        # Create persistent HTML file — derive path from already-validated safe_ply
+        html_file = _safe_data(safe_ply.parent / (safe_ply.stem + '_viewer.html'))
         
         # Add timestamp to force browser refresh
         import time
         timestamp = int(time.time())
         
-        with open(_safe_data(html_file), 'w') as f:
+        with open(html_file, 'w') as f:
             html_content = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -142,7 +148,7 @@ def create_web_viewer(ply_file):
             f.write(html_content)
         
         # Try multiple methods to open browser
-        html_path = os.path.abspath(html_file)
+        html_path = str(html_file)
         file_url = f'file://{html_path}'
 
         # Propagate display/session env vars so snap-confined browsers can open windows
@@ -180,7 +186,7 @@ def create_web_viewer(ply_file):
         print("Please open this file manually in your browser")
         return False
         
-    except Exception as e:
+    except (OSError, ImportError, RuntimeError) as e:
         print(f"Error creating web viewer: {e}")
         return False
 

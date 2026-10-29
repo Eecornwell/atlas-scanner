@@ -25,7 +25,7 @@ _ALLOWED_SRC  = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
 def _safe_path(p, *roots) -> Path:
     resolved = Path(p).resolve()
     for root in roots:
-        if root in [resolved, *resolved.parents]:
+        if resolved.is_relative_to(root):
             return resolved
     raise ValueError(
         f"Path '{resolved}' is outside allowed roots")

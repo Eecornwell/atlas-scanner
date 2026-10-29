@@ -26,7 +26,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 def _safe_scan(p) -> Path:
     """Resolve p and raise ValueError if it escapes the allowed data root."""
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -129,7 +129,7 @@ class BufferedCameraCapture(Node):
     def image_raw_cb(self, msg):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-        except Exception as e:
+        except (RuntimeError, TypeError, AttributeError) as e:
             print(f"Error converting raw image: {e}")
             return
         with self.frame_lock:
@@ -156,7 +156,7 @@ class BufferedCameraCapture(Node):
                     os.path.join(self.output_dir, f'dual_fisheye_{timestamp}.png')))
                 cv2.imwrite(img_file, frame, [cv2.IMWRITE_PNG_COMPRESSION, 1])
                 print(f"✓ Saved fisheye frame: {img_file}")
-        except Exception as e:
+        except (OSError, cv2.error, RuntimeError) as e:
             print(f"Error saving image: {e}")
             self.save_complete = True
             return
@@ -249,7 +249,7 @@ class BufferedCameraCapture(Node):
             if closest_odom and 'world' in ply_file:
                 print(f'  - {ply_file} (world coordinates - use for mapping)')
 
-        except Exception as e:
+        except (OSError, RuntimeError, ValueError) as e:
             print(f'✗ LiDAR data save failed: {e}')
             import traceback
             traceback.print_exc()
@@ -265,7 +265,7 @@ class BufferedCameraCapture(Node):
             rgba_image = cv2.cvtColor(image, cv2.COLOR_BGR2BGRA)
             rgba_image[:, :, 3] = mask
             cv2.imwrite(output_file, rgba_image)
-        except Exception as e:
+        except (OSError, cv2.error) as e:
             print(f'Error creating masked image: {e}')
 
 
@@ -375,7 +375,7 @@ def main():
             node.destroy_subscription(node.lidar_sub)
         except (AttributeError, rclpy.exceptions.InvalidHandle):
             pass
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f'Warning: unexpected error destroying lidar subscription: {e}')
         executor.shutdown(timeout_sec=0.5)
         spin_thread.join(timeout=1.0)
@@ -384,7 +384,7 @@ def main():
             rclpy.shutdown(context=ctx)
         except rclpy.exceptions.InvalidHandle:
             pass
-        except Exception as e:
+        except (RuntimeError, OSError) as e:
             print(f'Warning: unexpected error during rclpy shutdown: {e}')
         time.sleep(2.0)  # allow FastDDS to release SHM port locks before process exits
 

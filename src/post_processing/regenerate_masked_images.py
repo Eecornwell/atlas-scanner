@@ -25,7 +25,7 @@ _MULTI_CAM_YAML = MASK_BASE / 'config' / 'multi_camera.yaml'
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -52,7 +52,7 @@ def _mask_for_cam(cam_idx: int, camera_mode: str) -> str | None:
         legacy = MASK_BASE / mask_name
         if legacy.exists():
             return str(legacy)
-    except Exception:
+    except (OSError, KeyError, TypeError):
         pass
     return None
 

@@ -36,7 +36,7 @@ _ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(
             f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
@@ -236,7 +236,7 @@ def estimate_imu_sync(session_dir: str, axis: str = "z",
             con = open_db3(bd)
             bag_dir = bd
             break
-        except Exception as e:
+        except (OSError, FileNotFoundError, RuntimeError) as e:
             print(f"  ⚠ Skipping {bd.name}: {e}")
     if con is None:
         print("✗ No readable bag found"); sys.exit(1)
@@ -248,7 +248,7 @@ def estimate_imu_sync(session_dir: str, axis: str = "z",
         try:
             imu_con = open_db3(imu_bag_dirs[0])
             imu_bag_dir = imu_bag_dirs[0]
-        except Exception:
+        except (OSError, FileNotFoundError, RuntimeError):
             imu_con = con
     else:
         imu_con = con

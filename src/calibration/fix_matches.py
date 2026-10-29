@@ -19,7 +19,7 @@ _ALLOWED_OUTPUT = Path(os.path.expanduser("~/atlas_ws/output")).resolve()
 def _safe_output(p) -> Path:
     """Resolve p and raise ValueError if it escapes the allowed output root."""
     resolved = Path(p).resolve()
-    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_OUTPUT):
         raise ValueError(
             f"Path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'"
         )

@@ -21,7 +21,7 @@ _ALLOWED_DATA = Path.home() / 'atlas_ws/data'
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA.resolve() not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA.resolve()):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -42,7 +42,7 @@ def _stitch_env_for_cam(cam_idx: int) -> dict:
                     hw_cfg = _y.safe_load(hw_yaml.read_text()) or {}
                     env['INSTA360_ERP_WIDTH']  = str(hw_cfg.get('erp_width',  5760))
                     env['INSTA360_ERP_HEIGHT'] = str(hw_cfg.get('erp_height', 2880))
-    except Exception:
+    except (OSError, KeyError, TypeError):
         pass
     return env
 
@@ -230,7 +230,7 @@ def _extract_erp_slice_for_oak1(erp_img: np.ndarray, oak1_shape: tuple, scan_dir
         result = cv2.resize(sampled, (ow, oh))
         return cv2.flip(result, -1)  # rotate 180°
 
-    except Exception:
+    except (OSError, ImportError, KeyError, TypeError, AttributeError, cv2.error):
         return None
 
 def calibrate_from_session(session_dir: str, reference_cam: int = 0):
@@ -327,7 +327,7 @@ def calibrate_from_session(session_dir: str, reference_cam: int = 0):
             slot_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '')
             if slot_hw:
                 return slot_hw
-        except Exception:
+        except (OSError, KeyError, TypeError):
             pass
         return camera_hw
 
@@ -439,7 +439,7 @@ def normalize_session(session_dir: str):
                 import yaml as _y
                 mc = _y.safe_load((_SRC / 'config' / 'multi_camera.yaml').read_text()) or {}
                 scan_hw = mc.get('cameras', {}).get(f'cam_{cam_idx}', {}).get('camera_hw', '') or camera_hw
-            except Exception:
+            except (OSError, KeyError, TypeError):
                 scan_hw = camera_hw
 
         profile = load_color_profile(scan_hw, cam_idx)

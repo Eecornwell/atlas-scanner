@@ -151,7 +151,29 @@ def main():
         sd = _json.load(open(first_sidecar))
         scan_path = _P(sd.get('scan_dir', ''))
         is_sdk = bool(list(scan_path.glob('*.insp'))) if scan_path.is_dir() else False
-        is_oak1_session = sd.get('camera_hw', '') == 'oak1'
+        cam_hw = sd.get('camera_hw', '')
+        # Fallback: read camera_hw from session_config.json if sidecar has empty string
+        if not cam_hw and scan_path.is_dir():
+            sess_cfg = scan_path.parent / 'session_config.json'
+            if sess_cfg.exists():
+                try:
+                    cam_hw = _json.load(open(sess_cfg)).get('camera_hw', '')
+                except (OSError, ValueError, KeyError):
+                    pass
+        # Fallback: detect OAK-1 by presence of oak1_*_undistorted.png in scan dir
+        if not cam_hw and scan_path.is_dir():
+            if list(scan_path.glob('oak1_*_undistorted.png')) or list(scan_path.glob('oak1_*.png')):
+                cam_hw = 'oak1'
+        # Fallback: detect OAK-1 from calib.json camera_model
+        if not cam_hw:
+            calib_json = _P(data_path) / 'calib.json'
+            if calib_json.exists():
+                try:
+                    if _json.load(open(calib_json)).get('camera', {}).get('camera_model') == 'plumb_bob':
+                        cam_hw = 'oak1'
+                except (OSError, ValueError, KeyError):
+                    pass
+        is_oak1_session = cam_hw == 'oak1'
     if is_sdk:
         print('Detected SDK stitch mode — using perspective crop matching')
     if is_oak1_session:
@@ -235,7 +257,7 @@ def main():
             if is_oak1_session:
                 seed_yaw_deg = 0.0
             print(f'Seed yaw offset: {seed_yaw_deg:.1f}° — biasing crop directions')
-    except Exception as e:
+    except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError) as e:
         print(f'Could not read seed yaw: {e}')
 
     # Perspective crop directions: sample full 360 at multiple pitches.

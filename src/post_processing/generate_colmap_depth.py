@@ -30,7 +30,7 @@ _ALLOWED_SRC  = Path(os.path.expanduser('~/atlas_ws/src')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -38,7 +38,7 @@ def _safe_data(p) -> Path:
 def _safe_src(p) -> Path:
     resolved = Path(p).resolve()
     for root in (_ALLOWED_SRC, _ALLOWED_DATA):
-        if root in [resolved, *resolved.parents]:
+        if resolved.is_relative_to(root):
             return resolved
     raise ValueError(f"Path '{resolved}' is outside allowed roots")
 
@@ -170,7 +170,7 @@ def _guided_depth_completion(sparse_depth_u16, rgb_guide):
         depth_m = depth_pred.squeeze().cpu().numpy()  # (H, W) float32, metres
         return np.clip(depth_m * 1000.0, 0, 65535).astype(np.uint16)
 
-    except (ImportError, Exception):
+    except (ImportError, RuntimeError, OSError, cv2.error):
         pass  # PromptDA not installed or failed — fall through to guided filter
 
     # ── Guided filter fallback ────────────────────────────────────────────────────────────────
@@ -320,10 +320,21 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
     if len(pts_cam) == 0:
         return np.zeros((h, w), dtype=np.uint16)
 
+    # FOV cone filter: reject points outside the camera's actual field of view.
+    # Without this, 360° LiDAR points from outside the FOV project into the
+    # image at wrong depths, causing the depth to read too close.
+    # Half-diagonal FOV from intrinsics: angle = atan2(half_diag_px, f_px)
+    _half_diag = np.sqrt((w / 2.0) ** 2 + (h / 2.0) ** 2)
+    _max_cos = f_px / np.sqrt(f_px ** 2 + _half_diag ** 2)
+    _cos_angle = pts_cam[:, 2] / np.maximum(np.linalg.norm(pts_cam, axis=1), 1e-6)
+    pts_cam = pts_cam[_cos_angle >= _max_cos]
+    if len(pts_cam) == 0:
+        return np.zeros((h, w), dtype=np.uint16)
+
     z  = pts_cam[:, 2]
     # Exact sub-pixel projection — do NOT round yet
     uf = pts_cam[:, 0] / z * f_px + cx
-    vf = pts_cam[:, 1] / z * f_px + cy
+    vf = pts_cam[:, 1] / z * f_px + cy  # f_px = fx = fy for square pixels
 
     in_bounds = (uf >= 0) & (uf < w) & (vf >= 0) & (vf < h)
     uf, vf, z = uf[in_bounds], vf[in_bounds], z[in_bounds]
@@ -356,23 +367,21 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
         bw01 = ((1 - du) *      dv )[mask]
         bw11 = (     du  *      dv )[mask]
         bilinear_r = [(0, 0, bw00), (1, 0, bw10), (0, 1, bw01), (1, 1, bw11)]
-        # Sigma covers the full splat radius so the Gaussian decays to ~1%
-        # at the edge. No hard disc cutoff — the weight tapers smoothly to
-        # zero, eliminating the jagged circle boundary entirely.
-        sigma = max(r / 2.0, 0.5)
-        extent = r + 1  # one extra pixel so the tail blends into neighbours
+        # Hard disc with strict z-test: only write if closer than existing.
+        # Gaussian splat caused far points to bleed into near-point areas
+        # (depth reads too close). Hard disc prevents this.
+        extent = r
 
         for dy in range(-extent, extent + 1):
             for dx in range(-extent, extent + 1):
-                # Pure Gaussian — no hard disc boundary check
-                gauss_w = float(np.exp(-(dx * dx + dy * dy) / (2 * sigma * sigma)))
-                if gauss_w < 0.01:   # skip negligible contributions
+                # Hard disc: skip pixels outside radius
+                if dx * dx + dy * dy > r * r:
                     continue
 
                 for bdu, bdv, bw in bilinear_r:
                     vj = np.clip(v0_r + dy + bdv, 0, h - 1)
                     uj = np.clip(u0_r + dx + bdu, 0, w - 1)
-                    tw = gauss_w * bw
+                    tw = bw  # no Gaussian weight — hard disc
 
                     existing = np.where(
                         weight_acc[vj, uj] > 0,
@@ -387,7 +396,22 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
     depth_f  = np.where(valid_w, depth_acc / np.maximum(weight_acc, 1e-9), 0.0)
     depth_mm = np.clip(depth_f * 1000.0, 0, 65535).astype(np.uint16)
 
-    depth_mm = _guided_depth_completion(depth_mm, rgb_guide)
+    # Occlusion cleanup: in each 3x3 window, if any pixel has depth more than
+    # 20% greater than the minimum in that window, it's likely a background
+    # point bleeding through a foreground gap. Replace it with the minimum.
+    # This removes far-surface bleed-through without filling real holes (zeros
+    # stay zero since min of zero and nonzero = zero).
+    if depth_mm.max() > 0:
+        import cv2 as _cv2
+        _min3 = _cv2.erode(depth_mm.astype(np.float32),
+                           np.ones((3, 3), np.uint8)).astype(np.uint16)
+        # Only replace pixels that are valid (nonzero) and more than 20% above local min
+        _local_min_nonzero = np.where(_min3 > 0, _min3, depth_mm)
+        _bleed = (depth_mm > 0) & (_min3 > 0) & (depth_mm > _local_min_nonzero * 1.20)
+        depth_mm[_bleed] = _min3[_bleed]
+
+    # Do NOT fill holes. Sparse correct depth is better than dense wrong depth
+    # for Gaussian splatting supervision.
     return depth_mm
 
 
@@ -398,16 +422,9 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
 def _load_T_camera_lidar(session_path=None):
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from camera_hw import camera_hw_for_session, calibration_path
-    hw         = camera_hw_for_session(session_path) if session_path else 'onex2'
-    calib_file = calibration_path(hw)
-    with open(calib_file) as f:
-        calib = yaml.safe_load(f)
-    T = np.eye(4)
-    T[:3, :3] = Rotation.from_euler(
-        'xyz', [calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']]
-    ).as_matrix()
-    T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    from camera_hw import camera_hw_for_session, calibration_path, load_calibration_transform
+    hw = camera_hw_for_session(session_path) if session_path else 'onex2'
+    T, _ = load_calibration_transform(hw)
     return T
 
 
@@ -419,9 +436,12 @@ R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float64)
 
 
 def _pano_index(name):
+    """Extract scan number from pano filename.
+    Filenames are now pano_NNN.png where NNN = fusion_scan_NNN folder number.
+    """
     try:
         return int(name.split('pano_')[1].split('.')[0])
-    except Exception:
+    except (IndexError, ValueError):
         return -1
 
 
@@ -455,12 +475,42 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
     depth_root = _safe_data(session / 'colmap' / 'depth_images')
     depth_root.mkdir(exist_ok=True)
 
+    # Delete any stale depth images whose size doesn't match the camera dimensions.
+    # These are left over from previous runs with different code (e.g. 1920x1920
+    # padding bug) and would be silently used by trainers expecting correct sizes.
+    for _stale in depth_root.rglob('*.png'):
+        try:
+            _img = cv2.imread(str(_stale), cv2.IMREAD_UNCHANGED)
+            if _img is None:
+                continue
+            _sh, _sw = _img.shape[:2]
+            # Find the camera for this image from images.bin
+            _rel = str(_stale.relative_to(depth_root))
+            _img_entry = next((v for v in images.values() if v['name'] == _rel), None)
+            if _img_entry:
+                _cam = cameras[_img_entry['camera_id']]
+                if _sh != _cam['h'] or _sw != _cam['w']:
+                    _stale.unlink()
+                    print(f'  Deleted stale depth {_stale.name} ({_sw}x{_sh} != {_cam["w"]}x{_cam["h"]})')
+        except (OSError, KeyError):
+            pass
+
     # Use the merged filtered point cloud from colmap/sparse/merged.ply.
-    # This is the full session cloud — filtered, colored, spatially coherent —
-    # giving dense uniform depth coverage vs the raw per-scan sensor_lidar.ply
-    # which has scan-line gaps and single-return noise.
+    # For OAK-1 sessions: always use per-scan sensor_lidar.ply transformed to
+    # world frame. The merged.ply only contains colored points from the OAK-1
+    # FOV (~40deg slice), leaving most scans with no depth coverage.
+    # For ERP sessions: use merged.ply for dense uniform coverage.
+    _is_oak1_session = False
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from camera_hw import camera_hw_for_session
+        _is_oak1_session = camera_hw_for_session(str(session)) == 'oak1'
+    except (ImportError, OSError):
+        pass
+
     merged_ply = session / 'colmap' / 'sparse' / 'merged.ply'
-    use_merged = merged_ply.exists()
+    use_merged = merged_ply.exists() and not _is_oak1_session
     if use_merged:
         print(f'  Using merged cloud: {merged_ply.name}')
         import open3d as _o3d
@@ -468,7 +518,10 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
         merged_pts_colmap = np.asarray(_pcd.points).astype(np.float64)
         print(f'  Merged cloud: {len(merged_pts_colmap)} points')
     else:
-        print('  ⚠ No merged.ply found, falling back to per-scan sensor_lidar.ply')
+        if _is_oak1_session:
+            print('  OAK-1: using per-scan sensor_lidar.ply for full 360° coverage')
+        else:
+            print('  ⚠ No merged.ply found, falling back to per-scan sensor_lidar.ply')
         merged_pts_colmap = None
 
     scan_dirs = {int(d.name.split('_')[-1]): d
@@ -503,7 +556,9 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
             if len(pts_sensor) == 0:
                 continue
             scan_dir = scan_dirs.get(pi)
-            traj_file = scan_dir / 'trajectory.json'
+            traj_file = scan_dir / 'trajectory_icp_refined.json'
+            if not traj_file.exists():
+                traj_file = scan_dir / 'trajectory.json'
             if not traj_file.exists():
                 continue
             with open(traj_file) as f:
@@ -521,9 +576,15 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
         for img in img_list:
             cam   = cameras[img['camera_id']]
             w, h  = cam['w'], cam['h']
-            f_px  = cam['params'][0]
-            cx    = cam['params'][1]
-            cy    = cam['params'][2]
+            f_px  = cam['params'][0]  # fx for all models
+            # PINHOLE (model=1): [fx, fy, cx, cy]
+            # SIMPLE_PINHOLE (model=0): [f, cx, cy]
+            if len(cam['params']) >= 4:  # PINHOLE
+                cx = cam['params'][2]
+                cy = cam['params'][3]
+            else:  # SIMPLE_PINHOLE
+                cx = cam['params'][1]
+                cy = cam['params'][2]
 
             # w2c from images.bin (BA-refined)
             qvec = img['qvec']   # [qw, qx, qy, qz]
@@ -531,20 +592,23 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
                 [qvec[1], qvec[2], qvec[3], qvec[0]]).as_matrix()
             t_w2c = img['tvec']
 
-            # Load the RGB tile before rendering so it can guide hole filling
-            rel           = img['name']                  # e.g. face_00/pano_001.png
-            rgb_tile_path = session / 'colmap' / 'images' / rel
-            rgb_guide     = cv2.imread(str(rgb_tile_path)) if rgb_tile_path.exists() else None
-
+            # OAK-1: use radius=1 (single pixel, no splatting) to avoid
+            # near-point area bias. Large splat radii cause near points to
+            # cover more pixels than far points, pulling mean depth too close.
+            rel = img['name']  # e.g. face_00/pano_001.png
+            _is_oak1_img = (w != h)  # OAK-1 is non-square (1920x1080)
+            _render_radius = 1 if _is_oak1_img else radius
             depth_img = _render_depth(pts_colmap, R_w2c, t_w2c, f_px, cx, cy, w, h,
-                                      radius=radius, rgb_guide=rgb_guide)
-            if w != canonical_size or h != canonical_size:
+                                      radius=_render_radius)
+            # Only pad/resize if this is an ERP tile that needs to match the
+            # canonical square size. OAK-1 pinhole images (w != h) are written
+            # at their native resolution — padding them to a square squashes
+            # depth vertically when the trainer resizes depth to match the image.
+            is_pinhole_nonsquare = (w != h)
+            if not is_pinhole_nonsquare and (w != canonical_size or h != canonical_size):
                 # Pad or crop to canonical_size x canonical_size by centering.
-                # OAK-1 (1920x1080) and small ERP tiles both get centered into
-                # the canonical square canvas with zero border.
                 canvas = np.zeros((canonical_size, canonical_size), dtype=np.uint16)
                 src_h, src_w = depth_img.shape[:2]
-                # Center crop if larger than canvas, else pad
                 if src_w > canonical_size:
                     x0 = (src_w - canonical_size) // 2
                     depth_img = depth_img[:, x0:x0 + canonical_size]

@@ -49,7 +49,7 @@ _ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -115,7 +115,7 @@ def bag_stamps(con: sqlite3.Connection, fragment: str) -> np.ndarray:
     for (data,) in rows:
         try:
             stamps.append(_header_stamp(bytes(data)))
-        except Exception:
+        except (struct.error, KeyError, TypeError, ValueError):
             pass
     return np.sort(np.array(stamps))
 
@@ -146,7 +146,7 @@ def bag_imu_gyro(con: sqlite3.Connection, fragment: str):
             times.append(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
             g = msg.angular_velocity
             gyros.append([g.x, g.y, g.z])
-        except Exception:
+        except (KeyError, TypeError, AttributeError, ValueError):
             pass
     return (np.array(times), np.array(gyros)) if times else (None, None)
 
@@ -271,7 +271,7 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
         try:
             con, tmp_db3 = open_db3(bag_dir)
             break
-        except Exception as e:
+        except (OSError, FileNotFoundError, RuntimeError) as e:
             print(f"  ⚠ Skipping {bag_dir.name}: {e}")
     if con is None:
         print("✗ No readable bag found"); sys.exit(1)
@@ -296,7 +296,7 @@ def benchmark(session_dir: str, walk_speed: float, out_path: str | None):
     if imu_bag_dirs:
         try:
             imu_con, imu_tmp = open_db3(imu_bag_dirs[0])
-        except Exception:
+        except (OSError, FileNotFoundError, RuntimeError):
             pass
     if imu_con is None:
         imu_con, imu_tmp = open_db3(bag_dir)

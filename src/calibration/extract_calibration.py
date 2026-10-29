@@ -114,7 +114,7 @@ def extract(camera_hw='onex2'):
                     _slot_path.parent.mkdir(parents=True, exist_ok=True)
                     _slot_path.write_text(text)
                     print(f'\u2713 Saved to slot path (cam_{_cam_idx}): {_slot_path}')
-        except Exception as _e:
+        except (OSError, yaml.YAMLError, KeyError, TypeError) as _e:
             print(f'  ⚠ Could not write slot path: {_e}')
 
     # Also update the shared active calibration

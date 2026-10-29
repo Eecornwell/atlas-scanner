@@ -20,7 +20,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -38,7 +38,7 @@ def blur_score(erp_path, target_width=320) -> float:
         target_h = int(target_width * h / w)
         small = cv2.resize(img, (target_width, target_h))
         return float(cv2.Laplacian(small, cv2.CV_64F).var())
-    except Exception:
+    except (ImportError, OSError, cv2.error, AttributeError):
         return 0.0
 
 
@@ -51,7 +51,7 @@ def motion_score(scan_dir) -> float:
             return None
         d = json.loads(traj.read_text())
         return d.get('scan_info', {}).get('motion_score')
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         return None
 
 

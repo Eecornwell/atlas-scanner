@@ -16,40 +16,45 @@ import os
 from pathlib import Path
 from scipy.spatial.transform import Rotation, Slerp
 
+_ALLOWED_DATA = Path.home().resolve() / 'atlas_ws' / 'data'
+
+
+def _safe_data(p) -> Path:
+    resolved = Path(p).resolve()
+    if not resolved.is_relative_to(_ALLOWED_DATA):
+        raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
+    return resolved
+
 CALIB_PATH = Path.home() / 'atlas_ws/src/atlas-scanner/src/config/fusion_calibration.yaml'
 
 def _load_camera_lidar_transform(cam_index=None):
     """Load T_camera_lidar from fusion_calibration.yaml and return T_lidar_camera (4x4).
-    
-    fusion_calibration.yaml stores T_camera_lidar (lidar->camera) as euler XYZ + translation.
-    Invert once to get T_lidar_camera (camera->lidar frame, i.e. camera position in lidar frame).
-    If cam_index is provided, tries per-camera calibration first.
+
+    Always applies manual_*_adjustment so tune_calibration.py tweaks affect
+    trajectory recording.
     """
-    calib_path = CALIB_PATH
-    if cam_index is not None:
-        # Try per-camera calibration
-        sys_path = Path.home() / 'atlas_ws/src/atlas-scanner/src'
-        sys.path.insert(0, str(sys_path))
-        try:
-            from camera_hw import calibration_path, camera_hw_for_session
-            # Default to x5 if we can't determine hw
-            per_cam = sys_path / 'config' / 'calibrations' / 'x5' / f'cam_{cam_index}' / 'fusion_calibration.yaml'
-            if per_cam.exists():
-                calib_path = per_cam
-        except ImportError:
-            pass
-    with open(calib_path) as f:
+    sys_path = Path.home() / 'atlas_ws/src/atlas-scanner/src'
+    sys.path.insert(0, str(sys_path))
+    try:
+        from camera_hw import load_calibration_transform, camera_hw_for_session
+        hw = 'x5'  # default
+        T_camera_lidar, _ = load_calibration_transform(hw, cam_index)
+        return np.linalg.inv(T_camera_lidar)
+    except (ImportError, OSError, Exception):
+        pass
+    # Fallback: read CALIB_PATH directly
+    with open(CALIB_PATH) as f:
         calib = yaml.safe_load(f)
-    roll = calib['roll_offset']
-    pitch = calib['pitch_offset']
-    yaw = calib['yaw_offset']
+    roll  = calib['roll_offset']  + calib.get('manual_roll_adjustment',  0.0)
+    pitch = calib['pitch_offset'] + calib.get('manual_pitch_adjustment', 0.0)
+    yaw   = calib['yaw_offset']   + calib.get('manual_yaw_adjustment',   0.0)
     tx = calib['x_offset']
     ty = calib['y_offset']
     tz = calib['z_offset']
     T_camera_lidar = np.eye(4)
     T_camera_lidar[:3, :3] = Rotation.from_euler('xyz', [roll, pitch, yaw]).as_matrix()
     T_camera_lidar[:3, 3] = [tx, ty, tz]
-    return np.linalg.inv(T_camera_lidar)  # T_lidar_camera: camera position in lidar frame
+    return np.linalg.inv(T_camera_lidar)
 
 class EnhancedTrajectoryRecorder(Node):
     def __init__(self, output_dir):
@@ -73,7 +78,7 @@ class EnhancedTrajectoryRecorder(Node):
                 'source': str(CALIB_PATH)
             }
             self.get_logger().info(f'Loaded camera-lidar calibration from {CALIB_PATH}')
-        except Exception as e:
+        except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError) as e:
             self.get_logger().warn(f'Failed to load calibration ({e}), using identity')
             self._T_lidar_camera = np.eye(4)
             self.camera_lidar_transform = {'translation': {'x': 0.0, 'y': 0.0, 'z': 0.0}}
@@ -188,10 +193,19 @@ class EnhancedTrajectoryRecorder(Node):
         T_ros = np.eye(4)
         T_ros[0:3, 0:3] = R_ros
         T_ros[0:3, 3] = [pos.x, pos.y, pos.z]
-        
-        # Store first pose as reference origin
-        if self.first_pose is None:
+
+        _pos_norm = (pos.x**2 + pos.y**2 + pos.z**2) ** 0.5
+
+        # Store first pose as reference origin — but only once SLAM has produced
+        # a non-zero pose. RKO-LIO publishes (0,0,0) for the first few seconds
+        # while the map is being built; using that as first_pose causes all
+        # subsequent relative poses to be wrong.
+        if self.first_pose is None and _pos_norm > 0.05:
             self.first_pose = T_ros.copy()
+            self.get_logger().info(f'First valid pose set (pos_norm={_pos_norm:.3f}m)')
+        elif self.first_pose is None:
+            # SLAM not yet converged — skip this message, don't record to trajectory
+            return
         
         # Calculate relative pose from first scan
         T_relative = np.linalg.inv(self.first_pose) @ T_ros
@@ -248,7 +262,7 @@ class EnhancedTrajectoryRecorder(Node):
                         # Remove trigger file
                         os.remove(trigger_file)
                         
-                    except Exception as e:
+                    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
                         self.get_logger().error(f'Error processing trigger file {filename}: {e}')
                         try:
                             os.remove(trigger_file)
@@ -357,13 +371,18 @@ class EnhancedTrajectoryRecorder(Node):
         }
         
         # Save trajectory only to the individual scan directory
-        scan_file = os.path.join(scan_dir, "trajectory.json")
+        try:
+            safe_scan_dir = _safe_data(scan_dir)
+        except ValueError as e:
+            self.get_logger().error(f'Unsafe scan_dir rejected: {e}')
+            return False
+        scan_file = safe_scan_dir / 'trajectory.json'
         try:
             with open(scan_file, 'w') as f:
                 json.dump(scan_data, f, indent=2)
             self.get_logger().info(f'Saved enhanced trajectory for {scan_name} to {scan_file}: {len(self.trajectory)} poses')
             return True
-        except Exception as e:
+        except OSError as e:
             self.get_logger().error(f'Failed to save trajectory: {e}')
             return False
     
@@ -407,5 +426,5 @@ if __name__ == '__main__':
             rclpy.shutdown()
         except rclpy.exceptions.InvalidHandle:
             pass
-        except Exception as e:
+        except (RuntimeError, rclpy.exceptions.InvalidHandle) as e:
             print(f'Warning: unexpected error during rclpy shutdown: {e}')

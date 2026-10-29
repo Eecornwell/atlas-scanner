@@ -25,7 +25,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -233,7 +233,7 @@ def _load_imu_from_bag(session_path):
             db3 = Path(out)
         try:
             all_samples.extend(_read_imu_db3(db3))
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             continue
 
     # Deduplicate by timestamp and sort
@@ -256,7 +256,7 @@ def _blur_score(erp_path) -> float:
             return 0.0
         small = _cv2.resize(img, (960, 480))
         return float(_cv2.Laplacian(small, _cv2.CV_64F).var())
-    except Exception:
+    except (ImportError, OSError, cv2.error, AttributeError):
         return 0.0
 
 
@@ -386,7 +386,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1)
     try:
         import json as _jcfg
         _capture_mode = _jcfg.loads(_sess_cfg.read_text()).get('capture_mode', 'continuous') if _sess_cfg.exists() else 'continuous'
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
         pass
     MIN_BASELINE_M = 0.02 if _capture_mode == 'stationary' else 0.10
 
@@ -394,7 +394,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1)
         ci_path = sd / '.cam_index'
         try:
             return int(ci_path.read_text().strip().split()[0])
-        except Exception:
+        except (OSError, ValueError, IndexError):
             return -1
 
     kept_indices = []
@@ -687,7 +687,7 @@ def register_pose_graph(session_dir, max_gyro=0.25, min_blur=None, iterations=1)
                     'orientation': {'x': float(q_cam[0]), 'y': float(q_cam[1]),
                                     'z': float(q_cam[2]), 'w': float(q_cam[3])}
                 }
-            except Exception as e:
+            except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError) as e:
                 print(f'  ⚠ Could not update camera_pose: {e}')
             traj_refined['scan_info'] = dict(traj_refined.get('scan_info', {}))
             traj_refined['scan_info']['icp_refined'] = True

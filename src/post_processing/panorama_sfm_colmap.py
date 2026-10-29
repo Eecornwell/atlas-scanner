@@ -28,7 +28,7 @@ _ALLOWED_SRC  = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -106,24 +106,17 @@ MIN_ERP_VISIBLE  = 0.10  # 10% of ERP pixels must be unmasked
 def _load_calibration(session_path=None):
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from camera_hw import camera_hw_for_session, calibration_path
+    from camera_hw import camera_hw_for_session, load_calibration_transform
     hw = camera_hw_for_session(session_path) if session_path else 'onex2'
-    calib_path = calibration_path(hw)
-    with open(calib_path) as f:
-        calib = yaml.safe_load(f)
-    T_camera_lidar = np.eye(4)
-    T_camera_lidar[:3, :3] = R.from_euler(
-        'xyz', [calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']]
-    ).as_matrix()
-    T_camera_lidar[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
-    return T_camera_lidar
+    T, _ = load_calibration_transform(hw)
+    return T
 
 
 def _load_calibration_for_scan(scan_dir, session_path):
     """Load per-camera T_camera_lidar for a specific scan using .cam_index."""
     import sys as _sys
     _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from camera_hw import (camera_hw_for_session, calibration_path,
+    from camera_hw import (camera_hw_for_session, load_calibration_transform,
                            cam_index_for_scan)
     session_hw = camera_hw_for_session(session_path)
     cam_idx = cam_index_for_scan(scan_dir)
@@ -137,20 +130,11 @@ def _load_calibration_for_scan(scan_dir, session_path):
     except OSError:
         pass
 
-    # In a multi-camera session, resolve hw from multi_camera.yaml by cam_idx
-    # so each camera slot gets its own calibration. In a single-camera session
-    # (e.g. OAK-1 only) the SDK always assigns cam_idx=0 regardless of physical
-    # slot, so the slot lookup would wrongly return cam_0 (X5). Skip the lookup
-    # when session_hw already identifies a specific single-camera hw.
     mc_path = Path(__file__).resolve().parent.parent / 'config' / 'multi_camera.yaml'
     if mc_path.exists():
         try:
             mc = yaml.safe_load(mc_path.read_text()) or {}
             cameras_mc = mc.get('cameras', {})
-            # Only use slot lookup when the session is genuinely multi-camera:
-            # check if any sibling scan dirs have a different cam_idx, meaning
-            # multiple cameras were active. In a single-camera session the SDK
-            # always assigns cam_idx=0 regardless of physical slot.
             sibling_indices = set()
             try:
                 for _sd in Path(scan_dir).parent.glob('fusion_scan_*'):
@@ -159,24 +143,17 @@ def _load_calibration_for_scan(scan_dir, session_path):
                         _parts = _ci.read_text().strip().split()
                         if _parts:
                             sibling_indices.add(int(_parts[0]))
-            except Exception:
+            except (OSError, ValueError, IndexError):
                 pass
             is_multi_cam_session = len(sibling_indices) > 1
             if is_multi_cam_session:
                 slot_hw = cameras_mc.get(f'cam_{cam_idx}', {}).get('camera_hw', '')
                 if slot_hw:
                     hw = slot_hw
-        except Exception:
+        except (OSError, KeyError, TypeError, ImportError):
             pass
 
-    calib_path = calibration_path(hw, cam_idx)
-    with open(calib_path) as f:
-        calib = yaml.safe_load(f)
-    T = np.eye(4)
-    T[:3, :3] = R.from_euler(
-        'xyz', [calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']]
-    ).as_matrix()
-    T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
+    T, _ = load_calibration_transform(hw, cam_idx)
     return T
 
 
@@ -250,7 +227,7 @@ def _find_erp_image(scan_dir):
         try:
             _mode = _json.loads(_sess_cfg.read_text()).get('camera_mode', 'dual_fisheye')
             _is_360 = (_mode != 'single_fisheye')
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             pass
 
     # Prefer unmasked ERP for RGB — no hard black edges from scanner body mask
@@ -486,11 +463,18 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
         if img_src is None:
             continue
 
-        # Load intrinsics
-        ci_path = scan_dir / 'camera_info.yaml'
-        if not ci_path.exists():
-            ci_path = session_path / 'camera_info.yaml'
-        if not ci_path.exists():
+        # Load intrinsics — prefer undistorted sidecar YAML (correct post-undistortion
+        # intrinsics) over camera_info.yaml (distorted intrinsics). Using distorted
+        # intrinsics with undistorted images causes a systematic pixel offset in depth.
+        ci_path = None
+        _undist_yaml = next((f for f in sorted(scan_dir.glob('oak1_*_undistorted.yaml'))), None)
+        if _undist_yaml:
+            ci_path = _undist_yaml
+        else:
+            ci_path = scan_dir / 'camera_info.yaml'
+            if not ci_path.exists():
+                ci_path = session_path / 'camera_info.yaml'
+        if not ci_path or not ci_path.exists():
             continue
         import yaml as _yaml
         ci = _yaml.safe_load(ci_path.read_text())
@@ -512,7 +496,11 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
 
-        fname = f"pano_{len(panoramas):03d}.png"
+        # Use scan folder number in filename so generate_colmap_depth.py can
+        # map pano_NNN back to fusion_scan_NNN without ambiguity when blurry
+        # scans are skipped (sequential numbering would misalign poses and depth).
+        scan_num = int(scan_dir.name.split('_')[-1])
+        fname = f"pano_{scan_num:03d}.png"
         dst = images_dir / fname
         import shutil as _shutil
         _shutil.copy2(str(img_src), str(dst))
@@ -576,7 +564,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         _hw = camera_hw_for_session(str(session_path))
         _profile = load_camera_profile(_hw)
         _is_oak1 = _profile.get('perspective', False)
-    except Exception:
+    except (OSError, ImportError, KeyError, TypeError):
         pass
 
     if _is_oak1:

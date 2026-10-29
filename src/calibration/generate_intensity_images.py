@@ -20,7 +20,7 @@ _ALLOWED_DATA   = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 def _safe_output(p) -> Path:
     """Resolve p and raise ValueError if it escapes the allowed output root."""
     resolved = Path(p).resolve()
-    if _ALLOWED_OUTPUT not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_OUTPUT):
         raise ValueError(
             f"Path '{resolved}' is outside the allowed output root '{_ALLOWED_OUTPUT}'"
         )
@@ -30,7 +30,7 @@ def _safe_output(p) -> Path:
 def _safe_data(p) -> Path:
     """Resolve p and raise ValueError if it escapes the allowed data root."""
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(
             f"Path '{resolved}' is outside the allowed data root '{_ALLOWED_DATA}'"
         )
@@ -69,7 +69,7 @@ def _load_T_cam_lidar():
                 _sess_cfg = Path(_src.get('scan_dir', '')) / '..' / 'session_config.json'
                 if _sess_cfg.exists():
                     _detected_hw = _j.loads(_sess_cfg.read_text()).get('camera_hw', '')
-        except Exception:
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             pass
 
     # Priority 1: per-camera-slot from multi_camera.yaml
@@ -99,7 +99,7 @@ def _load_T_cam_lidar():
                             ]).as_matrix()
                             T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
                             return T
-        except Exception:
+        except (OSError, yaml.YAMLError, KeyError, TypeError):
             pass
 
     # Priority 2: hw-level calibration
@@ -109,14 +109,6 @@ def _load_T_cam_lidar():
         if _hw_path.exists():
             calib_path = _hw_path
             print(f'  Using {_detected_hw} calibration: {_hw_path.name}')
-    with open(calib_path) as f:
-        calib = yaml.safe_load(f)
-    T = np.eye(4)
-    T[:3, :3] = Rotation.from_euler('xyz', [
-        calib['roll_offset'], calib['pitch_offset'], calib['yaw_offset']
-    ]).as_matrix()
-    T[:3, 3] = [calib['x_offset'], calib['y_offset'], calib['z_offset']]
-    return T
     with open(calib_path) as f:
         calib = yaml.safe_load(f)
     T = np.eye(4)
@@ -228,6 +220,25 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     is_oak1 = bool(_safe_scan_dir and
                    list(_safe_scan_dir.glob('oak1_*.png')) and
                    (_safe_scan_dir / 'camera_info.yaml').exists())
+    # Also detect via camera_hw in session_config.json or calib.json
+    if not is_oak1 and _safe_scan_dir:
+        try:
+            _sess_cfg = _safe_scan_dir.parent / 'session_config.json'
+            if _sess_cfg.exists():
+                import json as _j2
+                if _j2.loads(_sess_cfg.read_text()).get('camera_hw', '') == 'oak1':
+                    is_oak1 = True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if not is_oak1:
+        try:
+            import json as _j3
+            _calib_json = Path(os.path.expanduser('~/atlas_ws/output')) / 'calib.json'
+            if _calib_json.exists():
+                if _j3.loads(_calib_json.read_text()).get('camera', {}).get('camera_model') == 'plumb_bob':
+                    is_oak1 = True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     T_cam_lidar = _load_T_cam_lidar()
     # SDK stitch: full ERP, project at full resolution. Manual: halve to match strip content.
     # OAK-1: use the actual camera image size (auto-detected above from camera_image probe).
@@ -246,7 +257,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                     if _sd.get('scan_dir') == scan_dir:
                         is_world_frame = _sd.get('world_frame', False)
                         break
-                except: pass
+                except (OSError, json.JSONDecodeError, KeyError, AttributeError):
+                    pass
         origin, R_world_lidar = _load_trajectory_pose(_safe_scan_dir)
 
         if is_oak1:
@@ -377,7 +389,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
     # OAK-1: use intensity-only rendering. Range is anti-correlated with camera
     # brightness (close objects are bright in range but may be dark in camera),
     # so blending range in destroys the structural similarity SuperGlue needs.
-    blended_vals = (int_vals if is_oak1 else (0.5 * range_norm + 0.5 * int_vals)).astype(np.uint8)
+    # OAK-1: blend range + intensity, same as ERP cameras.
+    blended_vals = (0.5 * range_norm + 0.5 * int_vals).astype(np.uint8)
 
     blended = np.zeros((out_h, out_w), dtype=np.uint8)
     blended[v2, u2] = blended_vals
@@ -399,60 +412,37 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         blended[:, mid_start_inpaint:mid_end_inpaint] = 0
 
     # 1. Dilate sparse points to connect adjacent scan lines
-    pt_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # For OAK-1: use same dilation + inpainting as ERP cameras.
+    # NID (used by calibrate) needs a dense smooth image to find a gradient.
+    # SuperGlue is not used for OAK-1 so false-match concerns don't apply.
+    # Scale dilation kernel to achieve ~33% coverage before inpainting.
+    _n_pts = max(1, int(np.count_nonzero(blended)))
+    _target_coverage = 0.33
+    _r = np.sqrt(_target_coverage * out_w * out_h / (np.pi * _n_pts))
+    _k = max(3, int(round(_r * 2)) | 1)
+    if is_oak1:
+        pt_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k, _k))
+    else:
+        _k_erp = max(5, int(round(_r * 2.5)) | 1)
+        pt_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k_erp, _k_erp))
     blended_thick = cv2.dilate(blended, pt_kernel)
     if suppress_middle:
         blended_thick[:, mid_start_inpaint:mid_end_inpaint] = 0
 
-    # 2. Inpaint holes
+    # 2. Inpaint holes — fills gaps between LiDAR scan lines to create
+    # a dense image that NID can find a gradient in.
+    oak1_fov_mask = None
     hole_mask = (blended_thick == 0).astype(np.uint8)
     if suppress_middle:
         hole_mask[:, mid_start_inpaint:mid_end_inpaint] = 0
-    # OAK-1: restrict inpainting to a convex hull of the projected point density.
-    # A bounding box fails because the 360° lidar scan scatters points across the
-    # entire projected image, making the bbox cover the whole frame and allowing
-    # inpainting to flood regions with no real lidar data.
-    oak1_fov_mask = None
-    if is_oak1 and len(u2) > 0:
-        # Build a density grid: divide image into cells and keep only cells that
-        # have at least one real projected point. Then take the convex hull of
-        # those occupied cells to define the valid inpainting region.
-        cell = 20  # px per cell
-        density = np.zeros((out_h // cell + 1, out_w // cell + 1), dtype=np.uint8)
-        density[v2 // cell, u2 // cell] = 1
-        # Require a minimum density: cells with fewer than N points are noise
-        cell_counts = np.zeros_like(density, dtype=np.int32)
-        np.add.at(cell_counts, (v2 // cell, u2 // cell), 1)
-        density = (cell_counts >= 2).astype(np.uint8)
-        # Expand occupied cells back to pixel coords and compute convex hull
-        occ_rows, occ_cols = np.where(density)
-        if len(occ_rows) >= 3:
-            pts_hull = np.column_stack([
-                (occ_cols * cell + cell // 2).clip(0, out_w - 1),
-                (occ_rows * cell + cell // 2).clip(0, out_h - 1),
-            ]).astype(np.float32)
-            hull = cv2.convexHull(pts_hull)
-            oak1_fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
-            cv2.fillConvexPoly(oak1_fov_mask, hull.astype(np.int32), 1)
-            # Erode slightly so inpainting doesn't bleed past the hull boundary
-            oak1_fov_mask = cv2.erode(oak1_fov_mask,
-                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cell, cell)))
-        else:
-            # Fallback to bbox if too few occupied cells for a hull
-            oak1_fov_mask = np.zeros((out_h, out_w), dtype=np.uint8)
-            u_min, u_max = max(0, u2.min() - 20), min(out_w, u2.max() + 20)
-            v_min, v_max = max(0, v2.min() - 20), min(out_h, v2.max() + 20)
-            oak1_fov_mask[v_min:v_max, u_min:u_max] = 1
-        hole_mask = hole_mask * oak1_fov_mask
     filled = cv2.inpaint(blended_thick, hole_mask, inpaintRadius=12, flags=cv2.INPAINT_TELEA)
     if suppress_middle:
         filled[:, mid_start_inpaint:mid_end_inpaint] = 0
-    # OAK-1: zero everything outside the convex hull after inpainting
-    if is_oak1 and oak1_fov_mask is not None:
-        filled[oak1_fov_mask == 0] = 0
 
-    # 3. Erode slightly to pull back over-dilated edges
-    filled = cv2.erode(filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    # 3. Erode slightly to pull back over-dilated edges (skip for OAK-1 — dots are already small)
+    if not is_oak1:
+        _k_erode = max(3, (_k_erp - 2) | 1)
+        filled = cv2.erode(filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_k_erode, _k_erode)))
     if suppress_middle:
         filled[:, mid_start_inpaint:mid_end_inpaint] = 0
 
@@ -468,10 +458,17 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         intensity_image[:, mid_start_inpaint:mid_end_inpaint] = 0
         indices_image[:, mid_start_inpaint:mid_end_inpaint] = -1
 
+    # OAK-1: zero everything outside the actual projected region after CLAHE.
+    # CLAHE amplifies near-zero noise in empty regions to non-zero values.
+    # Use a dilated version of the original sparse projection as the valid mask.
+    if is_oak1 and oak1_fov_mask is not None:
+        intensity_image[oak1_fov_mask == 0] = 0
+        indices_image[oak1_fov_mask == 0] = -1
+    # For OAK-1 with no fov_mask: keep the full inpainted image.
+    # NID needs the full dense image to find a gradient.
+
     # Build a coverage mask from the actual projected points so that inpainted
-    # regions outside the lidar FOV are zeroed in both the lidar intensity image
-    # and the camera image before SuperGlue runs. This prevents keypoints from
-    # being detected in blurry/fake inpainted areas that have no real lidar data.
+    # regions outside the lidar FOV are zeroed. Currently unused (None).
     coverage_mask = None
     feather = None
 
@@ -502,6 +499,24 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
         if cam is not None:
             cam_out = cam if (is_dual or is_oak1) else remap_to_strips(cam)
             cam_gray = cv2.cvtColor(cam_out, cv2.COLOR_BGR2GRAY) if cam_out.ndim == 3 else cam_out
+            # OAK-1: apply the undistorted validity mask to exclude black corners
+            # left by undistortion. These corners have no valid image data and
+            # create false keypoints at their sharp edges.
+            if is_oak1 and _safe_scan_dir:
+                _undist_mask_path = next(
+                    (_safe_scan_dir.glob('oak1_*_undistorted_mask.png')), None)
+                if _undist_mask_path:
+                    _undist_mask = cv2.imread(str(_undist_mask_path), cv2.IMREAD_GRAYSCALE)
+                    if _undist_mask is not None:
+                        _undist_mask = cv2.resize(_undist_mask,
+                            (cam_gray.shape[1], cam_gray.shape[0]),
+                            interpolation=cv2.INTER_NEAREST)
+                        # Erode slightly to avoid keypoints on the mask boundary
+                        _erode_px = max(4, cam_gray.shape[1] // 200)
+                        _erode_k = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE, (_erode_px*2+1, _erode_px*2+1))
+                        _undist_mask = cv2.erode(_undist_mask, _erode_k)
+                        cam_gray = cv2.bitwise_and(cam_gray, cam_gray, mask=_undist_mask)
             # Per-camera calibration mask override via environment variable
             # Applied regardless of is_dual when explicitly set for calibration
             _env_mask = os.environ.get('ATLAS_CALIBRATION_MASK', '')
@@ -539,11 +554,14 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             cam_gray[max(0, cam_valid_row_limit - BOUNDARY_MARGIN):, :] = 0
             if feather is not None:
                 cam_gray = (cam_gray.astype(np.float32) * feather).clip(0, 255).astype(np.uint8)
-            # OAK-1: mask camera image to the lidar convex hull so SuperGlue
-            # only finds keypoints where both modalities have real data.
-            if is_oak1 and oak1_fov_mask is not None:
-                cam_gray[oak1_fov_mask == 0] = 0
-            # Write processed camera gray to a sidecar — never overwrite the source RGB
+            # Do NOT mask the camera image to the LiDAR projection region.
+            # Masking creates holes with sharp edges that generate false keypoints
+            # and destroys the continuous texture SuperGlue needs for matching.
+            # Write processed camera gray to a sidecar for diagnostics only.
+            # For OAK-1: also overwrite the root PNG with clean grayscale so
+            # SuperGlue sees two grayscale images (it only works on grayscale).
+            # Use the full-resolution undistorted grayscale with undistortion
+            # mask applied — no other masking or resizing.
             try:
                 cam_gray_path = str(_safe_output(
                     Path(camera_image).with_name(
@@ -552,23 +570,8 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
                 cam_gray_path = None
             if cam_gray_path:
                 cv2.imwrite(cam_gray_path, cam_gray)
-            # When a calibration mask is active, overwrite the root PNG so the
-            # calibration viewer (initial_guess_manual / calibrate) also shows
-            # the masked image rather than the original unmasked capture.
-            _env_mask_write = os.environ.get('ATLAS_CALIBRATION_MASK', '')
-            if _env_mask_write and os.path.isfile(_env_mask_write):
-                try:
-                    cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
-                except ValueError:
-                    pass
-            elif feather is not None:
-                try:
-                    cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
-                except ValueError:
-                    pass
-            elif is_oak1 and oak1_fov_mask is not None:
-                # OAK-1: overwrite root PNG with hull-masked camera gray so
-                # SuperGlue sees the same spatial region in both modalities.
+            if is_oak1:
+                # Write clean grayscale as root PNG for SuperGlue
                 try:
                     cv2.imwrite(str(_safe_output(camera_image)), cam_gray)
                 except ValueError:
@@ -593,18 +596,31 @@ def generate_intensity_image(ply_file, output_image, point_indices_image, camera
             intensity_image[_calib_mask < 128] = 0
             indices_image[_calib_mask < 128] = -1
 
-    # For OAK-1: apply CLAHE to boost LiDAR intensity contrast so SuperPoint
-    # can detect keypoints. Raw LiDAR intensities cluster near zero and lack
-    # the edge structure SuperPoint needs.
+    # For OAK-1: apply CLAHE then edge enhancement to both LiDAR and camera
+    # images. NID works on mutual information between image structures —
+    # enhancing edges in both images maximizes the structural signal that
+    # shifts predictably when the calibration changes.
     if is_oak1 and intensity_image.max() > 0:
         _clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
         intensity_image = _clahe.apply(intensity_image)
-    # OAK-1: zero the lidar intensity image outside the convex hull so SuperGlue
-    # only sees pixels where real lidar data exists.
-    if is_oak1 and oak1_fov_mask is not None:
-        intensity_image[oak1_fov_mask == 0] = 0
-        indices_image[oak1_fov_mask == 0] = -1
-
+        if oak1_fov_mask is not None:
+            intensity_image[oak1_fov_mask == 0] = 0
+            indices_image[oak1_fov_mask == 0] = -1
+        # Edge enhancement: unsharp mask boosts structural edges
+        # so NID gradient is dominated by geometry, not absolute brightness
+        _blur = cv2.GaussianBlur(intensity_image, (0, 0), 2.0)
+        intensity_image = cv2.addWeighted(intensity_image, 1.5, _blur, -0.5, 0)
+        # Also enhance the camera image the same way so both images
+        # emphasize the same structural features for NID
+        if camera_image is not None and os.path.exists(camera_image):
+            _cam_enhanced = cv2.imread(camera_image, cv2.IMREAD_GRAYSCALE)
+            if _cam_enhanced is not None:
+                _cam_blur = cv2.GaussianBlur(_cam_enhanced, (0, 0), 2.0)
+                _cam_enhanced = cv2.addWeighted(_cam_enhanced, 1.5, _cam_blur, -0.5, 0)
+                try:
+                    cv2.imwrite(str(_safe_output(camera_image)), _cam_enhanced)
+                except ValueError:
+                    pass
     cv2.imwrite(str(_safe_output(output_image)), intensity_image)
 
     # The indices image pixel (u,v) must map to the same 3D point as intensity pixel (u,v).

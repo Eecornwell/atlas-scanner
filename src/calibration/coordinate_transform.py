@@ -18,6 +18,13 @@ Key insight: T_camera_lidar = inverse(T_lidar_camera)
 import sys
 import json
 import yaml
+import sys as _sys
+_sys.path.insert(0, str(Path(os.path.expanduser('~/atlas_ws/src/atlas-scanner/src'))))
+try:
+    from camera_hw import safe_yaml_dump as _safe_yaml_dump
+except ImportError:
+    def _safe_yaml_dump(data, **kwargs):
+        return yaml.dump(data, **kwargs)
 import os
 import numpy as np
 from pathlib import Path
@@ -28,7 +35,7 @@ _ALLOWED_SRC = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
 
 def _safe_src(root_path: str, *parts) -> Path:
     resolved = Path(root_path).joinpath(*parts).resolve()
-    if _ALLOWED_SRC not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_SRC):
         raise ValueError(
             f"Path '{resolved}' is outside the allowed source root '{_ALLOWED_SRC}'"
         )
@@ -36,15 +43,21 @@ def _safe_src(root_path: str, *parts) -> Path:
 
 
 def _camera_hw_erp_dims(root_path, camera_hw):
-    """Return (erp_width, erp_height) from the camera model YAML."""
+    """Return (image_width, image_height) from the camera model YAML.
+    For ERP cameras returns erp_width/erp_height; for pinhole cameras
+    (oak1) returns image_width/image_height."""
     hw_yaml = Path(root_path) / 'config' / 'camera_models' / f'{camera_hw}.yaml'
     if hw_yaml.exists():
         try:
             cfg = yaml.safe_load(hw_yaml.read_text()) or {}
+            # Pinhole camera: use image_width/image_height directly
+            if cfg.get('perspective', False) or (camera_hw == 'oak1'):
+                return cfg.get('image_width', 1920), cfg.get('image_height', 1080)
+            # ERP camera: use erp_width/erp_height
             return cfg.get('erp_width', 5760), cfg.get('erp_height', 2880)
-        except Exception:
+        except (OSError, yaml.YAMLError, KeyError, TypeError):
             pass
-    defaults = {'onex2': (5760, 2880), 'x5': (7680, 3840)}
+    defaults = {'onex2': (5760, 2880), 'x5': (7680, 3840), 'oak1': (1920, 1080)}
     return defaults.get(camera_hw, (5760, 2880))
 
 
@@ -94,7 +107,7 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
             'skip_rate': 1,
         }
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+        config_path.write_text(_safe_yaml_dump(config, default_flow_style=False, sort_keys=False))
         print(f"  ✓ Wrote identity calibration to: {config_path}")
         return
     
@@ -142,7 +155,7 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
     if config_path.exists():
         try:
             existing_config = yaml.safe_load(config_path.read_text()) or {}
-        except Exception:
+        except (OSError, yaml.YAMLError):
             pass
     
     # SDK stitch always outputs at the camera model's native ERP resolution.
@@ -151,14 +164,21 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
     # this value is informational only.
     erp_width, erp_height = _camera_hw_erp_dims(root_path, camera_hw)
 
-    # Create config with DIRECT values (no complex transformations)
+    # Create config with DIRECT values (no complex transformations).
+    # Fold any existing manual_*_adjustment into the main offsets and reset
+    # them to zero — this ensures the saved values are the true effective
+    # calibration and manual tweaks are never silently dropped by loaders
+    # that only read *_offset.
+    _manual_roll  = existing_config.get('manual_roll_adjustment',  0.0)
+    _manual_pitch = existing_config.get('manual_pitch_adjustment', 0.0)
+    _manual_yaw   = existing_config.get('manual_yaw_adjustment',   0.0)
     config = {
-        'roll_offset': float(euler_xyz[0]),
-        'pitch_offset': float(euler_xyz[1]),
-        'yaw_offset': float(euler_xyz[2]),
-        'manual_roll_adjustment': existing_config.get('manual_roll_adjustment', 0.0),
-        'manual_pitch_adjustment': existing_config.get('manual_pitch_adjustment', 0.0),
-        'manual_yaw_adjustment': existing_config.get('manual_yaw_adjustment', 0.0),
+        'roll_offset':  float(euler_xyz[0]) + _manual_roll,
+        'pitch_offset': float(euler_xyz[1]) + _manual_pitch,
+        'yaw_offset':   float(euler_xyz[2]) + _manual_yaw,
+        'manual_roll_adjustment':  0.0,
+        'manual_pitch_adjustment': 0.0,
+        'manual_yaw_adjustment':   0.0,
         'azimuth_offset': existing_config.get('azimuth_offset', 0.0),
         'elevation_offset': existing_config.get('elevation_offset', 0.0),
         'x_offset': float(t_camera_lidar[0]),
@@ -172,17 +192,51 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
         'skip_rate': existing_config.get('skip_rate', 5)
     }
     
+    # Validate result against physical seed from multi_camera.yaml.
+    # If the forward component moves more than 2" from the seed, the optimizer
+    # diverged — keep the existing calibration instead of overwriting it.
+    _seed_ok = True
+    try:
+        import os as _os
+        _cam_idx_env = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
+        if _cam_idx_env and camera_hw == 'oak1':
+            _mc_path = Path(root_path) / 'config' / 'multi_camera.yaml'
+            if _mc_path.exists():
+                _mc = yaml.safe_load(_mc_path.read_text()) or {}
+                _slot = _mc.get('cameras', {}).get(f'cam_{_cam_idx_env}', {})
+                _seed_pos = _slot.get('seed_position')  # [fwd_in, left_in, up_in]
+                if _seed_pos and len(_seed_pos) == 3:
+                    _INCHES = 0.0254
+                    _R_new = R.from_euler('xyz', [config['roll_offset'],
+                                                   config['pitch_offset'],
+                                                   config['yaw_offset']]).as_matrix()
+                    _t_new = np.array([config['x_offset'], config['y_offset'], config['z_offset']])
+                    _pos_new = -_R_new.T @ _t_new
+                    _fwd_new = _pos_new[0] / _INCHES
+                    _fwd_seed = float(_seed_pos[0])
+                    _fwd_diff = abs(_fwd_new - _fwd_seed)
+                    print(f'\nCalibration validation: fwd={_fwd_new:+.2f}" (seed={_fwd_seed:+.2f}", diff={_fwd_diff:.2f}")')
+                    if _fwd_diff > 2.0:
+                        print(f'\u26a0 Forward component moved {_fwd_diff:.2f}" from seed (limit 2") — optimizer diverged.')
+                        print(f'  Keeping existing calibration. Re-run with better data.')
+                        _seed_ok = False
+    except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError):
+        pass
+
+    if not _seed_ok:
+        return
+
     # Save to shared config (active calibration) and per-model calibration file.
     # Only write to the hw-level path if no slot calibration exists for this
     # camera — the slot path (from multi_camera.yaml) is authoritative and must
     # not be overwritten by coordinate_transform.py which only knows camera_hw,
     # not which physical slot this camera occupies.
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    config_path.write_text(_safe_yaml_dump(config, default_flow_style=False, sort_keys=False))
 
     # Write to hw-level path.
     hw_config_path.parent.mkdir(parents=True, exist_ok=True)
-    hw_config_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    hw_config_path.write_text(_safe_yaml_dump(config, default_flow_style=False, sort_keys=False))
     print(f"\n\u2713 Saved calibration for {camera_hw} to: {hw_config_path}")
 
     # When ATLAS_CALIBRATION_CAM_INDEX is set, also write to the slot path so
@@ -198,9 +252,9 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
                 if _calib_rel:
                     _slot_path = Path(root_path) / 'config' / _calib_rel
                     _slot_path.parent.mkdir(parents=True, exist_ok=True)
-                    _slot_path.write_text(yaml.dump(config, default_flow_style=False, sort_keys=False))
+                    _slot_path.write_text(_safe_yaml_dump(config, default_flow_style=False, sort_keys=False))
                     print(f"\u2713 Saved to slot path (cam_{_cam_idx}): {_slot_path}")
-        except Exception as _e:
+        except (OSError, yaml.YAMLError, KeyError, TypeError) as _e:
             print(f"  \u26a0 Could not write slot path: {_e}")
 
     print(f"\u2713 Active calibration updated: {config_path}")

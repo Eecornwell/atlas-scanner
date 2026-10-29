@@ -218,7 +218,7 @@ class CoveragePanel:
             while self._running and rclpy.ok():
                 rclpy.spin_once(node, timeout_sec=0.1)
             node.destroy_node()
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
 
     # ── Poll (main thread, 2 Hz) ──────────────────────────────────────────────
@@ -247,7 +247,7 @@ class CoveragePanel:
                 # Only use if within 5s — guards against empty/stale history
                 if abs(closest[0] - shutter_t) < 5.0:
                     return closest[1]
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         return None
 
@@ -316,7 +316,7 @@ class CoveragePanel:
         if self._perimeter_item is not None:
             try:
                 self._canvas.delete(self._perimeter_item)
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 pass
         self._perimeter_item = self._canvas.create_polygon(
             coords, outline='#4a9eff', fill='', width=2, dash=(6, 4))
@@ -858,18 +858,18 @@ class FusionCaptureGUI:
             try:
                 import yaml as _y
                 mc = self.script_dir / 'config' / 'multi_camera.yaml'
-                if mc.exists():
+                if mc.exists() and mc.resolve().is_relative_to(self.script_dir.resolve()):
                     cfg = _y.safe_load(open(mc))
                     slot = cfg.get('cameras', {}).get(cam, {})
                     hw = slot.get('camera_hw', '?')
                     self._cal_hw_label.config(text=f"{cam} ({hw.upper()})")
                     pos = slot.get('seed_position')
-                    if pos and len(pos) == 3:
+                    if pos and len(pos) == 3 and hasattr(self, '_seed_fwd_var'):
                         self._seed_fwd_var.set(str(round(float(pos[0]), 3)))
                         self._seed_left_var.set(str(round(float(pos[1]), 3)))
                         self._seed_up_var.set(str(round(float(pos[2]), 3)))
                     return
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 pass
             self._cal_hw_label.config(text=cam)
         self._cal_cam_var.trace_add('write', _on_cal_cam_change)
@@ -878,11 +878,23 @@ class FusionCaptureGUI:
         def _update_cal_cam_slots(*_):
             hw = self.camera_hw_var.get()
             if hw == 'oak1':
-                slots = ['cam_0']
-                label = 'cam_0 (OAK-1)'
-                self._seed_fwd_var.set('3.0')
-                self._seed_left_var.set('0.0')
-                self._seed_up_var.set('0.0')
+                # Find the actual slot key for oak1 in multi_camera.yaml
+                _oak1_slot = 'cam_0'
+                try:
+                    import yaml as _y
+                    mc = self.script_dir / 'config' / 'multi_camera.yaml'
+                    if mc.exists() and mc.resolve().is_relative_to(self.script_dir.resolve()):
+                        cfg = _y.safe_load(open(mc))
+                        for sk, sv in cfg.get('cameras', {}).items():
+                            if sv.get('camera_hw', '') == 'oak1':
+                                _oak1_slot = sk
+                                break
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                    pass
+                slots = [_oak1_slot]
+                label = f'{_oak1_slot} (OAK-1)'
+                # Do NOT set seed fields here — _on_cal_cam_change reads them
+                # from multi_camera.yaml and is triggered by the set() below.
             elif hw in ('onex2', 'x3', 'x5'):
                 # read num_cameras to know how many slots are active
                 try:
@@ -897,6 +909,9 @@ class FusionCaptureGUI:
             self._cal_cam_combo.config(values=slots)
             if self._cal_cam_var.get() not in slots:
                 self._cal_cam_var.set(slots[0])
+            else:
+                # _cal_cam_var didn't change so trace won't fire — call directly
+                _on_cal_cam_change()
             self._cal_hw_label.config(text=label)
 
         self.camera_hw_var.trace_add('write', _update_cal_cam_slots)
@@ -1265,8 +1280,11 @@ class FusionCaptureGUI:
                         import re
                         m = re.search(r'synchronized_scans/(sync_fusion_[\w]+)', line)
                         if m:
-                            session_dir = self.script_dir / '../../..' / 'data' / 'synchronized_scans' / m.group(1)
-                            self.scan_dir = str(session_dir.resolve())
+                            _allowed_data = pathlib.Path.home() / 'atlas_ws' / 'data'
+                            session_dir = (_allowed_data / 'synchronized_scans' / m.group(1)).resolve()
+                            if not str(session_dir).startswith(str(_allowed_data.resolve())):
+                                continue
+                            self.scan_dir = str(session_dir)
                             self._pp_session_var.set(self.scan_dir)
                             _sd = self.scan_dir
                             self.root.after(0, lambda d=_sd: self._coverage_panel.set_scan_dir(d))
@@ -1308,7 +1326,7 @@ class FusionCaptureGUI:
                         "Failed to initialize sensors"
                     )):
                         self.root.after(0, lambda l=line: self.update_status(f"Error: {l}", "red"))
-                except Exception as e:
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
                     self.root.after(0, lambda e=e: self.log_message(f"Error reading output: {e}"))
                     break
 
@@ -1321,7 +1339,7 @@ class FusionCaptureGUI:
                         if not line:
                             continue
                         self.root.after(0, lambda l=line: self.log_message(l))
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 pass
 
             # Surface any error and reset buttons — only if stop_fusion hasn't
@@ -1333,7 +1351,7 @@ class FusionCaptureGUI:
                         f"Script exited with error (code {c}) — check log", "red"))
                 self.root.after(500, self._system_stopped)
                         
-        except Exception as ex:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as ex:
             error_msg = f"Error starting fusion: {ex}"
             self.root.after(0, lambda: self.log_message(error_msg))
             self.fusion_process = None
@@ -1388,7 +1406,7 @@ class FusionCaptureGUI:
         for child in self.rviz_frame.winfo_children():
             try:
                 child.destroy()
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 pass
 
     def _on_capture_mode_changed(self, *_):
@@ -1417,69 +1435,75 @@ class FusionCaptureGUI:
 
         _start_when_ready()
 
+    # Fixed X11 embed script — values passed as argv, never interpolated into code
+    _X11_EMBED_SCRIPT = (
+        "import ctypes, ctypes.util, sys\n"
+        "lib = ctypes.CDLL(ctypes.util.find_library('X11'))\n"
+        "vp = ctypes.c_void_p\n"
+        "lib.XOpenDisplay.restype = vp; lib.XOpenDisplay.argtypes = [ctypes.c_char_p]\n"
+        "lib.XCloseDisplay.argtypes = [vp]\n"
+        "lib.XSync.argtypes = [vp, ctypes.c_int]\n"
+        "lib.XReparentWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]\n"
+        "lib.XResizeWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]\n"
+        "lib.XMapWindow.argtypes = [vp, ctypes.c_ulong]\n"
+        "lib.XMoveWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]\n"
+        "lib.XSetErrorHandler.restype = vp\n"
+        "ok = [True]\n"
+        "CB = ctypes.CFUNCTYPE(ctypes.c_int, vp, vp)\n"
+        "cb = CB(lambda d, e: (ok.__setitem__(0, False), 0)[1])\n"
+        "lib.XSetErrorHandler(cb)\n"
+        "embed_wid, frame_id, w, h = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])\n"
+        "d = lib.XOpenDisplay(None)\n"
+        "if not d: sys.exit(2)\n"
+        "lib.XReparentWindow(d, embed_wid, frame_id, 0, 0)\n"
+        "lib.XMoveWindow(d, embed_wid, 0, 0)\n"
+        "lib.XResizeWindow(d, embed_wid, w, h)\n"
+        "lib.XMapWindow(d, embed_wid)\n"
+        "lib.XSync(d, False)\n"
+        "lib.XCloseDisplay(d)\n"
+        "print('ok' if ok[0] else 'x11err', flush=True)\n"
+        "sys.exit(0 if ok[0] else 4)\n"
+    )
+
     def _x11_embed(self, embed_wid_int, frame_id_int, w, h):
         """Reparent embed_wid into frame_id using xdotool + Xlib."""
-        import tempfile, os as _os
+        import os as _os
         # Unmap from WM first to avoid SIGSEGV on XReparentWindow
         subprocess.run(['xdotool', 'windowunmap', '--sync', str(embed_wid_int)],
                        capture_output=True, timeout=5)
-        code = f"""import ctypes, ctypes.util, sys
-lib = ctypes.CDLL(ctypes.util.find_library('X11'))
-vp = ctypes.c_void_p
-lib.XOpenDisplay.restype = vp; lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
-lib.XCloseDisplay.argtypes = [vp]
-lib.XSync.argtypes = [vp, ctypes.c_int]
-lib.XReparentWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
-lib.XResizeWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]
-lib.XMapWindow.argtypes = [vp, ctypes.c_ulong]
-lib.XMoveWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
-lib.XSetErrorHandler.restype = vp
-ok = [True]
-CB = ctypes.CFUNCTYPE(ctypes.c_int, vp, vp)
-cb = CB(lambda d, e: (ok.__setitem__(0, False), 0)[1])
-lib.XSetErrorHandler(cb)
-d = lib.XOpenDisplay(None)
-if not d: sys.exit(2)
-lib.XReparentWindow(d, {embed_wid_int}, {frame_id_int}, 0, 0)
-lib.XMoveWindow(d, {embed_wid_int}, 0, 0)
-lib.XResizeWindow(d, {embed_wid_int}, {w}, {h})
-lib.XMapWindow(d, {embed_wid_int})
-lib.XSync(d, False)
-lib.XCloseDisplay(d)
-print('ok' if ok[0] else 'x11err', flush=True)
-sys.exit(0 if ok[0] else 4)
-"""
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(code)
-            tmp = f.name
-        try:
-            env = _os.environ.copy()
-            env.setdefault('DISPLAY', ':0')
-            result = subprocess.run([sys.executable, tmp], env=env,
-                                    capture_output=True, timeout=10)
-            if result.returncode != 0:
-                self.root.after(0, lambda rc=result.returncode, out=result.stdout.strip():
-                    self.log_message(f"[embed] subprocess rc={rc} stdout={out}"))
-            return result.returncode == 0
-        finally:
-            _os.unlink(tmp)
+        # Pass integer values as argv — never interpolate into executable code
+        env = _os.environ.copy()
+        env.setdefault('DISPLAY', ':0')
+        result = subprocess.run(
+            [sys.executable, '-c', self._X11_EMBED_SCRIPT,
+             str(int(embed_wid_int)), str(int(frame_id_int)), str(int(w)), str(int(h))],
+            env=env, capture_output=True, timeout=10)
+        if result.returncode != 0:
+            self.root.after(0, lambda rc=result.returncode, out=result.stdout.strip():
+                self.log_message(f"[embed] subprocess rc={rc} stdout={out}"))
+        return result.returncode == 0
+
+    # Fixed X11 resize script — values passed as argv, never interpolated into code
+    _X11_RESIZE_SCRIPT = (
+        "import ctypes, ctypes.util, sys\n"
+        "lib = ctypes.CDLL(ctypes.util.find_library('X11')); vp = ctypes.c_void_p\n"
+        "lib.XOpenDisplay.restype = vp; lib.XOpenDisplay.argtypes = [ctypes.c_char_p]\n"
+        "lib.XCloseDisplay.argtypes = [vp]; lib.XFlush.argtypes = [vp]\n"
+        "lib.XResizeWindow.argtypes = [vp, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint]\n"
+        "wid, w, h = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])\n"
+        "d = lib.XOpenDisplay(None)\n"
+        "if not d: import sys; sys.exit(1)\n"
+        "lib.XResizeWindow(d, wid, w, h)\n"
+        "lib.XFlush(d); lib.XCloseDisplay(d)\n"
+    )
 
     def _x11_resize(self, wid_int, w, h):
-        script = (
-            "import ctypes, ctypes.util\n"
-            "lib=ctypes.CDLL(ctypes.util.find_library('X11'));vp=ctypes.c_void_p\n"
-            "lib.XOpenDisplay.restype=vp;lib.XOpenDisplay.argtypes=[ctypes.c_char_p]\n"
-            "lib.XCloseDisplay.argtypes=[vp];lib.XFlush.argtypes=[vp]\n"
-            "lib.XResizeWindow.argtypes=[vp,ctypes.c_ulong,ctypes.c_uint,ctypes.c_uint]\n"
-            f"d=lib.XOpenDisplay(None)\n"
-            "if not d: import sys;sys.exit(1)\n"
-            f"lib.XResizeWindow(d,{wid_int},{w},{h})\n"
-            "lib.XFlush(d);lib.XCloseDisplay(d)\n"
-        )
         env = os.environ.copy()
         env.setdefault('DISPLAY', ':0')
-        subprocess.Popen([sys.executable, '-c', script], env=env,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(
+            [sys.executable, '-c', self._X11_RESIZE_SCRIPT,
+             str(int(wid_int)), str(int(w)), str(int(h))],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _reparent_rviz(self, frame_id):
         """Poll for the RViz2 main window then reparent its Qt child into rviz_frame"""
@@ -1493,7 +1517,7 @@ sys.exit(0 if ok[0] else 4)
         try:
             btime = int(open('/proc/stat').read().split('btime')[1].split()[0])
             clk_tck = ctypes.CDLL(None).sysconf(2)  # _SC_CLK_TCK = 2
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             btime, clk_tck = None, None
 
         # Poll with a fast initial rate, backing off after the first 10 attempts
@@ -1528,7 +1552,7 @@ sys.exit(0 if ok[0] else 4)
                             pid_start_wall = btime + start_ticks / clk_tck
                             if pid_start_wall < search_start_wall - 300:
                                 continue  # process predates this session by more than 5 min
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                         continue
                 candidates.append(wid)
             if candidates:
@@ -1664,7 +1688,7 @@ sys.exit(0 if ok[0] else 4)
                 ]:
                     try:
                         found = sorted(scan_path.glob(pattern), key=lambda p: p.stat().st_mtime)
-                    except Exception:
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                         continue
                     if found:
                         images = found
@@ -1727,7 +1751,7 @@ sys.exit(0 if ok[0] else 4)
             if self.fusion_process and self.fusion_process.stdin:
                 self.fusion_process.stdin.write(b'\n')
                 self.fusion_process.stdin.flush()
-        except Exception as e:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
             self.log_message(f"Error triggering scan: {e}")
             self.capture_button.config(state="normal")
 
@@ -1760,7 +1784,7 @@ sys.exit(0 if ok[0] else 4)
                     (pathlib.Path(self.scan_dir) / '.quit_trigger').touch()
                 proc.stdin.write(b'q\n')
                 proc.stdin.flush()
-            except Exception as e:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
                 self.log_message(f"Error sending stop signal: {e}")
 
         def _wait_for_finish():
@@ -1810,7 +1834,7 @@ sys.exit(0 if ok[0] else 4)
                 import re as _re
                 subprocess.run(["pkill", "-9", "-f", _re.escape(process)], capture_output=True)
             self.log_message("✓ Processes cleaned up")
-        except Exception as e:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
             self.log_message(f"Warning: Could not clean up all processes: {e}")
     
     def _continuous_poll(self):
@@ -2223,10 +2247,7 @@ sys.exit(0 if ok[0] else 4)
         return str(self.script_dir)
 
     def _cal_hw(self):
-        """Return camera hardware for the selected calibration camera.
-        Uses the session hardware (camera_hw_var) as the authoritative source
-        when it matches a slot in multi_camera.yaml, otherwise reads from the
-        selected cam slot."""
+        """Return camera hardware for the selected calibration camera slot."""
         session_hw = self.camera_hw_var.get()
         cam = self._cal_cam_var.get()  # e.g. "cam_0"
         try:
@@ -2236,17 +2257,17 @@ sys.exit(0 if ok[0] else 4)
                 with open(mc_path) as f:
                     cfg = yaml.safe_load(f)
                 cameras = cfg.get('cameras', {})
-                # If session_hw exists as a camera_hw in any slot, use it
-                # directly — the dropdown slot index is irrelevant for
-                # single-hw sessions (e.g. oak1 shows cam_0 but is cam_3)
-                if any(v.get('camera_hw') == session_hw
-                       for v in cameras.values()):
+                # Primary: read hw directly from the selected calibration cam slot.
+                # This is authoritative — e.g. cam_0=oak1 even when the session
+                # Controls dropdown is set to x5.
+                slot_hw = cameras.get(cam, {}).get('camera_hw', '')
+                if slot_hw:
+                    return slot_hw
+                # Fallback: if session_hw matches any slot, use it
+                # (single-hw session where cam_0 dropdown maps to session hw)
+                if any(v.get('camera_hw') == session_hw for v in cameras.values()):
                     return session_hw
-                # Multi-camera session: use the selected slot's hw
-                hw = cameras.get(cam, {}).get('camera_hw', '')
-                if hw:
-                    return hw
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         return session_hw
 
@@ -2298,7 +2319,7 @@ sys.exit(0 if ok[0] else 4)
                 if mask_name:
                     mask_path = str(self.script_dir / 'config' / 'masks' / mask_name)
                     return mask_path
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         return None
 
@@ -2309,7 +2330,10 @@ sys.exit(0 if ok[0] else 4)
         self._cal_superglue('outdoor')
 
     def _cal_initial_guess(self):
-        """Dispatch to auto or manual based on the dropdown."""
+        """Dispatch to auto or manual based on the dropdown. Skipped for OAK-1."""
+        if self._cal_hw() == 'oak1':
+            self._cal_log_write('\n  Initial guess skipped for OAK-1 — using physical seed directly.\n')
+            return
         if self._cal_guess_var.get() == 'manual':
             self._cal_initial_guess_manual()
         else:
@@ -2333,15 +2357,22 @@ sys.exit(0 if ok[0] else 4)
         # The dropdown always shows cam_0 for single-hw sessions, but the
         # physical slot may be cam_3 (oak1). Scripts that read multi_camera.yaml
         # by slot index need the real index.
+        # First try: find slot by hw match. Then re-read hw from the resolved
+        # slot so the pipeline uses the calibration camera's actual hw rather
+        # than the main session dropdown (e.g. oak1 at cam_3 when the session
+        # dropdown is set to x5).
         actual_slot_idx = cam_idx
         try:
             import yaml as _yaml
             mc = _yaml.safe_load((self.script_dir / 'config' / 'multi_camera.yaml').read_text())
-            for slot_key, slot_cfg in mc.get('cameras', {}).items():
+            cameras = mc.get('cameras', {})
+            # Find the slot whose camera_hw matches hw (set from camera_hw_var / _cal_hw()).
+            # This correctly handles oak1 at cam_3 even when the dropdown shows cam_0.
+            for slot_key, slot_cfg in cameras.items():
                 if slot_cfg.get('camera_hw', '') == hw:
                     actual_slot_idx = slot_key.split('_')[1]
                     break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
 
         import threading as _th
@@ -2385,22 +2416,23 @@ sys.exit(0 if ok[0] else 4)
                 ("4. Seed from Current Calibration", [sys.executable,
                     str(self.script_dir / 'calibration' / 'seed_calib.py')]),
             ]
-            # OAK-1: DVL calibration pipeline is not suitable because:
-            # 1. SuperGlue cross-modal matching (LiDAR IR vs RGB) produces 0 matches
-            # 2. initial_guess_manual renders image on ERP sphere (radius=W/2pi=127m)
-            #    which dwarfs the LiDAR point cloud and makes point selection impossible
-            # OAK-1 uses panorama mode in find_matches_superglue_erp.py (direct pinhole
-            # image matching, no ERP reprojection) and initial_guess_auto (not manual).
+            # OAK-1: skip initial_guess_auto (gets too few inliers from sparse
+            # cross-modal matches). Skip initial_guess_manual too — the 3D
+            # viewer doesn't initialize to the camera's viewpoint so point
+            # picking is impractical. Go straight to calibrate from the seed.
             _skip_dvl = False
-            _oak1_force_auto = (hw == 'oak1')
+            _oak1_skip_initial_guess = (hw == 'oak1')
 
             if not _skip_dvl:
-                if _oak1_force_auto or guess != 'manual':
-                    steps.append(("5. Initial Guess (Auto)", [
-                        str(dvl / 'initial_guess_auto'), '--data_path', output]))
+                if not _oak1_skip_initial_guess:
+                    if guess != 'manual':
+                        steps.append(("5. Initial Guess (Auto)", [
+                            str(dvl / 'initial_guess_auto'), '--data_path', output]))
+                    else:
+                        steps.append(("5. Initial Guess (Manual — pick 3+ point pairs, then close window)", [
+                            str(dvl / 'initial_guess_manual'), '--data_path', output]))
                 else:
-                    steps.append(("5. Initial Guess (Manual — adjust pose then close window)", [
-                        str(dvl / 'initial_guess_manual'), '--data_path', output]))
+                    steps.append(("5. Initial Guess (Skipped — using seed for OAK-1)", None))
                 steps += [
                     ("6. Run Calibration", [str(dvl / 'calibrate'), '--data_path', output,
                         '--nid_bins', '32', '--nelder_mead_convergence_criteria', '1e-10']),
@@ -2410,6 +2442,10 @@ sys.exit(0 if ok[0] else 4)
                 ]
 
             for label, cmd in steps:
+                # None cmd = skipped step (e.g. initial_guess for OAK-1)
+                if cmd is None:
+                    self.root.after(0, self._cal_log_write, f'\n>> {label}\n   (skipped)\n')
+                    continue
                 safe_cmd = ' '.join(str(a) for a in cmd)
                 self.root.after(0, self._cal_log_write, f'\n>> {label}\n   {safe_cmd}\n')
                 if not sess and 'combine_scans' in safe_cmd:
@@ -2430,7 +2466,7 @@ sys.exit(0 if ok[0] else 4)
                     return
                 # Manual initial guess: stop here so the user can inspect the
                 # pose in the interactive window before running calibration.
-                if not _oak1_force_auto and guess == 'manual' and 'initial_guess_manual' in safe_cmd:
+                if 'initial_guess_manual' in safe_cmd:
                     self.root.after(0, self._cal_log_write,
                                     '\n⚠ Pipeline paused after manual initial guess.\n'
                                     '  Adjust the pose in the viewer window, then close it.\n'
@@ -2531,7 +2567,7 @@ sys.exit(0 if ok[0] else 4)
                 if sc.get('camera_hw', '') == hw:
                     actual_slot_idx = sk.split('_')[1]
                     break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         self._cal_run("Write Physical Seed", [
             sys.executable,
@@ -2618,7 +2654,7 @@ sys.exit(0 if ok[0] else 4)
                 if _sc.get("camera_hw", "") == hw:
                     actual_slot_idx = _sk.split("_")[1]
                     break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         try:
             fwd_in  = float(self._seed_fwd_var.get())
@@ -2656,7 +2692,7 @@ sys.exit(0 if ok[0] else 4)
                 if sc.get('camera_hw', '') == hw:
                     actual_slot_idx = sk.split('_')[1]
                     break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         self._cal_run("Apply Calibration", [
             sys.executable,
@@ -2681,7 +2717,7 @@ sys.exit(0 if ok[0] else 4)
                 if slot_cfg.get('camera_hw', '') == hw:
                     actual_slot_idx = slot_key.split('_')[1]
                     break
-        except Exception:
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
             pass
         if sess:
             import sys as _sys
@@ -2698,7 +2734,7 @@ sys.exit(0 if ok[0] else 4)
                 # where .cam_index has no serial and always returns 0).
                 if scan_dir is None and all_scans:
                     scan_dir = str(all_scans[-1])
-            except Exception:
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError):
                 scans = sorted(pathlib.Path(sess).glob('fusion_scan_*'))
                 if scans:
                     scan_dir = str(scans[-1])
@@ -2988,7 +3024,7 @@ def main():
         root.mainloop()
     except KeyboardInterrupt:
         app.stop_fusion()
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         logging.critical("Unhandled exception in mainloop:\n" + traceback.format_exc())
         raise
 

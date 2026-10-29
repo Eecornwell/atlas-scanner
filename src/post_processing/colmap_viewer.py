@@ -24,7 +24,7 @@ _ALLOWED_DATA = Path(os.path.expanduser('~/atlas_ws/data')).resolve()
 
 def _safe_data(p) -> Path:
     resolved = Path(p).resolve()
-    if _ALLOWED_DATA not in [resolved, *resolved.parents]:
+    if not resolved.is_relative_to(_ALLOWED_DATA):
         raise ValueError(f"Path '{resolved}' is outside allowed root '{_ALLOWED_DATA}'")
     return resolved
 
@@ -100,7 +100,7 @@ def _pano_index(name):
     """face_XX/pano_NNN.png -> NNN"""
     try:
         return int(name.split('pano_')[1].split('.')[0])
-    except Exception:
+    except (IndexError, ValueError):
         return -1
 
 
@@ -108,7 +108,7 @@ def _face_index(name):
     """face_XX/pano_NNN.png -> XX"""
     try:
         return int(name.split('face_')[1].split('/')[0])
-    except Exception:
+    except (IndexError, ValueError):
         return -1
 
 
@@ -186,7 +186,7 @@ def generate_html(sparse_dir, output_path, max_pts=200000):
                        else np.zeros((len(sfm_pts), 3), dtype=np.float32)
             if len(sfm_pts) > 0:
                 print(f'  SfM PLY: {len(sfm_pts)} points from {recon_ply.name}')
-        except Exception as _e:
+        except (ImportError, OSError, AttributeError) as _e:
             print(f'  ⚠ Could not load SfM PLY: {_e}')
 
     panoramas = build_panoramas(images, cameras)
