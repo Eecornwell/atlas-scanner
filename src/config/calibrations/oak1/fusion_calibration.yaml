@@ -9,9 +9,9 @@ elevation_offset: 0.0
 x_offset: -0.007167657643829946
 y_offset: 0.16035729959634173
 z_offset: -0.03457731224330091
-flip_x: 0.0
-flip_y: 0.0
-image_width: 1920.0
-image_height: 1080.0
-use_fisheye: 0.0
-skip_rate: 5.0
+flip_x: false
+flip_y: false
+image_width: 1920
+image_height: 1080
+use_fisheye: false
+skip_rate: 5

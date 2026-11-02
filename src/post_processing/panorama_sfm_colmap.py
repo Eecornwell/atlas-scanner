@@ -43,21 +43,12 @@ def _safe_src(p) -> Path:
 
 R_ROS2COLMAP = np.array([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=float)
 
-# cam_from_pano rotations matching panorama_sfm.py get_virtual_rotations().
-# 8 yaw steps at 45° intervals on the equatorial band for maximum feature quality.
-# Polar faces (ceiling/floor) are excluded — ERP pixel density is too low at the
-# poles for reliable SIFT feature extraction, and they suffer from heavy
-# interpolation blur when reprojected to perspective.
-# The stitch seam runs vertically at yaw=0°/360° (left/right ERP edges) in
-# dual_fisheye mode. Faces at yaw=0° and yaw=180° have the seam at their
-# horizontal edges (within the 90° FOV overlap), but the seam artifacts are
-# concentrated in a narrow band and empirically still yield better features
-# than the polar tiles. A dedicated seam mask is applied below to exclude the
-# affected pixel strip.
-# 6-face cubemap at 90° FOV matching the reference panorama_sfm.py.
-# 90° FOV maximises overlap between adjacent faces (each face shares a full
-# 90° edge with its neighbour), giving SIFT more co-visible area to match.
-# Standard cubemap faces: 4 equatorial + top + bottom.
+# Standard cubemap faces: 4 equatorial + top + bottom, 90° FOV.
+# cam_from_pano uses standard ERP convention:
+#   yaw=0   -> ERP center (u=W/2), forward
+#   yaw=+90 -> ERP right quarter (u=3W/4)
+#   pitch=+90 -> ERP top (v=0)
+# The Insta360 SDK ERP is a standard equirectangular — no axis correction needed.
 FACES = [
     {'name': 'front',   'pitch':   0, 'yaw':   0},
     {'name': 'right',   'pitch':   0, 'yaw':  90},
@@ -68,17 +59,6 @@ FACES = [
 ]
 FACES_CAM_FROM_PANO = [
     R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
-    for f in FACES
-]
-# The Insta360 SDK ERP has forward (+X) at the top (v=0) and floor (-Z) at
-# the center (v=H/2), equivalent to a standard ERP with the pole rotated by
-# R_y(-90°). To sample equatorial faces correctly we pre-compose R_y(+90°)
-# into each face rotation so the camera rays land on the actual horizon band
-# of the Insta360 ERP rather than the polar region.
-_R_INSTA_CORRECTION = R.from_euler('Y', 90, degrees=True).as_matrix()
-FACES_CAM_FROM_PANO = [
-    (R.from_euler('XY', [-f['pitch'], -f['yaw']], degrees=True).as_matrix()
-     @ _R_INSTA_CORRECTION)
     for f in FACES
 ]
 NUM_FACES = len(FACES)

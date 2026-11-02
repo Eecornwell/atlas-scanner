@@ -1783,6 +1783,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                     # than inheriting the primary camera's (session-level) dims.
                     _stitch_env = os.environ.copy()
                     try:
+                        import sys as _sys_ch
+                        _src_root = str(Path(__file__).resolve().parent.parent)
+                        if _src_root not in _sys_ch.path:
+                            _sys_ch.path.insert(0, _src_root)
                         from camera_hw import load_camera_profile, cam_index_for_scan
                         import yaml as _yaml2
                         _mc_path2 = str(Path(__file__).resolve().parents[1] / 'config' / 'multi_camera.yaml')
@@ -1799,7 +1803,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                                   f"{_stitch_env['INSTA360_ERP_WIDTH']}x{_stitch_env['INSTA360_ERP_HEIGHT']}")
                             if _slot_hw2 == 'x3':
                                 _stitch_cmd.append('--denoise')
-                    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as _e:
+                    except (OSError, ValueError, KeyError, TypeError, RuntimeError, ImportError) as _e:
                         pass  # fall back to inherited env
                     result = subprocess.run(
                         _stitch_cmd,

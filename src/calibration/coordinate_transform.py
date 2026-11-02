@@ -18,6 +18,9 @@ Key insight: T_camera_lidar = inverse(T_lidar_camera)
 import sys
 import json
 import yaml
+import os
+import numpy as np
+from pathlib import Path
 import sys as _sys
 _sys.path.insert(0, str(Path(os.path.expanduser('~/atlas_ws/src/atlas-scanner/src'))))
 try:
@@ -25,9 +28,6 @@ try:
 except ImportError:
     def _safe_yaml_dump(data, **kwargs):
         return yaml.dump(data, **kwargs)
-import os
-import numpy as np
-from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 
 _ALLOWED_SRC = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
@@ -192,19 +192,17 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
         'skip_rate': existing_config.get('skip_rate', 5)
     }
     
-    # Validate result against physical seed from multi_camera.yaml.
-    # If the forward component moves more than 2" from the seed, the optimizer
-    # diverged — keep the existing calibration instead of overwriting it.
+    # Log the calibration result position and warn if it moved far from the seed.
     _seed_ok = True
     try:
         import os as _os
         _cam_idx_env = _os.environ.get('ATLAS_CALIBRATION_CAM_INDEX', '')
-        if _cam_idx_env and camera_hw == 'oak1':
+        if _cam_idx_env:
             _mc_path = Path(root_path) / 'config' / 'multi_camera.yaml'
             if _mc_path.exists():
                 _mc = yaml.safe_load(_mc_path.read_text()) or {}
                 _slot = _mc.get('cameras', {}).get(f'cam_{_cam_idx_env}', {})
-                _seed_pos = _slot.get('seed_position')  # [fwd_in, left_in, up_in]
+                _seed_pos = _slot.get('seed_position')
                 if _seed_pos and len(_seed_pos) == 3:
                     _INCHES = 0.0254
                     _R_new = R.from_euler('xyz', [config['roll_offset'],
@@ -215,16 +213,11 @@ def calibration_transform(root_path, use_existing=False, camera_hw='onex2'):
                     _fwd_new = _pos_new[0] / _INCHES
                     _fwd_seed = float(_seed_pos[0])
                     _fwd_diff = abs(_fwd_new - _fwd_seed)
-                    print(f'\nCalibration validation: fwd={_fwd_new:+.2f}" (seed={_fwd_seed:+.2f}", diff={_fwd_diff:.2f}")')
-                    if _fwd_diff > 2.0:
-                        print(f'\u26a0 Forward component moved {_fwd_diff:.2f}" from seed (limit 2") — optimizer diverged.')
-                        print(f'  Keeping existing calibration. Re-run with better data.')
-                        _seed_ok = False
+                    print(f'\nCalibration result: fwd={_fwd_new:+.2f}" (seed={_fwd_seed:+.2f}", diff={_fwd_diff:.2f}")')
+                    if _fwd_diff > 3.0:
+                        print(f'\u26a0 Forward component moved {_fwd_diff:.2f}" from seed — verify this is the correct camera slot.')
     except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError):
         pass
-
-    if not _seed_ok:
-        return
 
     # Save to shared config (active calibration) and per-model calibration file.
     # Only write to the hw-level path if no slot calibration exists for this

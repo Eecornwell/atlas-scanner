@@ -1616,6 +1616,7 @@ class FusionCaptureGUI:
             self.capture_button.config(state="disabled")
             self.update_status("Continuous mode — press Stop when done", "green")
             self._seen_shutter_events = set()
+            self._continuous_poll_deadline = float('inf')  # reset on new session
             self.root.after(1000, self._continuous_poll)
         else:
             self.capture_button.config(state="normal")
@@ -1761,11 +1762,14 @@ class FusionCaptureGUI:
             return
 
         # Guard against accidental stop within 5s of system becoming ready
-        # (can happen from stray keyboard events during RViz embedding)
         _ready_time = getattr(self, '_system_ready_time', 0)
         if time.time() - _ready_time < 2.0:
             self.log_message("⚠ Ignoring stop request (system just became ready — wait 2s)")
             return
+
+        # Set deadline for _continuous_poll so it ignores shutter_event files
+        # written by reconstruct_from_bag.py after the session ends.
+        self._continuous_poll_deadline = time.time()
 
         # Log the call stack to help diagnose unexpected stops
         import traceback
@@ -1842,10 +1846,19 @@ class FusionCaptureGUI:
         if not self.is_running or not self._is_continuous_mode():
             return
         if hasattr(self, 'scan_dir') and self.scan_dir:
-            import pathlib
+            import pathlib, time
             seen = getattr(self, '_seen_shutter_events', set())
+            # _continuous_poll_deadline is set when stop_fusion() is called.
+            # Files written after that time are from reconstruct_from_bag.py
+            # post-processing and must not be counted.
+            deadline = getattr(self, '_continuous_poll_deadline', float('inf'))
             for se in pathlib.Path(self.scan_dir).glob('fusion_scan_*/capture_*.shutter_event'):
                 if str(se) not in seen:
+                    try:
+                        if se.stat().st_mtime > deadline:
+                            continue
+                    except OSError:
+                        continue
                     seen.add(str(se))
                     self.scan_count += 1
                     self.scan_count_label.config(text=str(self.scan_count))
