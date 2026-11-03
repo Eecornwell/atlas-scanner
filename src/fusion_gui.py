@@ -686,6 +686,9 @@ class FusionCaptureGUI:
         self.colmap_sfm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="  COLMAP full SfM (slow, poses-only default)",
                         variable=self.colmap_sfm_var).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
+        self.calibrate_rig_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="  Calibrate rig after COLMAP (correct extrinsic error)",
+                        variable=self.calibrate_rig_var).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -786,15 +789,19 @@ class FusionCaptureGUI:
         _pp_btn(7, 0, "Export COLMAP Model",          self._pp_colmap)
         _pp_btn(7, 1, "COLMAP Pose Quality",          self._pp_colmap_quality)
         _pp_btn(8, 0, "Generate Depth Images",        self._pp_colmap_depth)
+        _pp_btn(8, 1, "Calibrate Rig",                self._pp_calibrate_rig)
         ttk.Checkbutton(btn_frame, text="Full SfM matching (slow — poses-only default)",
                         variable=self.colmap_sfm_var).grid(
             row=9, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
+        ttk.Checkbutton(btn_frame, text="Calibrate rig after export (correct extrinsic error)",
+                        variable=self.calibrate_rig_var).grid(
+            row=10, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
         # ── Viewers ───────────────────────────────────────────────────────
-        _pp_sep(10, "Viewers")
-        _pp_btn(12, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
-        _pp_btn(12, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
-        _pp_btn(13, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
-        _pp_btn(13, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
+        _pp_sep(11, "Viewers")
+        _pp_btn(13, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(13, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(14, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(14, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -1137,6 +1144,7 @@ class FusionCaptureGUI:
             'icp':               self.icp_var.get(),
             'colmap':            self.colmap_var.get(),
             'colmap_sfm':        self.colmap_sfm_var.get(),
+            'calibrate_rig':     self.calibrate_rig_var.get(),
             'interval':          self.interval_var.get(),
         }
         # Start fusion process in separate thread
@@ -1246,6 +1254,7 @@ class FusionCaptureGUI:
             cmd += ['--interval', str(_interval)]
             cmd.append('--icp' if params['icp'] else '--no-icp')
             cmd.append('--colmap' if params['colmap'] else '--no-colmap')
+            cmd.append('--calibrate-rig' if params['calibrate_rig'] else '--no-calibrate-rig')
             self.fusion_process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
@@ -2164,6 +2173,16 @@ class FusionCaptureGUI:
                                            str(self.script_dir / 'post_processing/colmap_depth_overlay.py'),
                                            sess])
 
+    def _pp_calibrate_rig(self):
+        sess = self._pp_session()
+        if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        if not (pathlib.Path(sess) / 'colmap' / 'pose_source.json').exists():
+            self._pp_log_write("\n[!] No pose_source.json found \u2014 run Export COLMAP Model first.\n")
+            return
+        self._pp_run("Calibrate Rig", [sys.executable,
+                                       str(self.script_dir / 'post_processing/calibrate_rig.py'),
+                                       sess])
+
     def _pp_colmap_viewer(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
@@ -2979,6 +2998,7 @@ def main():
     default_camera_hw = 'onex2'
     default_outdoor = False
     default_interval = 5
+    default_calibrate_rig = False
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -3002,6 +3022,8 @@ def main():
             elif line.startswith('COLMAP_LIDAR_VOXEL_SIZE=') and '#' not in line.split('COLMAP_LIDAR_VOXEL_SIZE=')[0]:
                 try: default_colmap_lidar_voxel = float(line.split('=', 1)[1].split('#')[0].strip('"\' '))
                 except ValueError: pass
+            elif line.startswith('CALIBRATE_RIG=') and '#' not in line.split('CALIBRATE_RIG=')[0]:
+                default_calibrate_rig = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             if line.startswith('while'):
                 break  # stop before the CLI override block
     except OSError:
@@ -3029,6 +3051,7 @@ def main():
     app.camera_hw_var.set(default_camera_hw)
     app.outdoor_var.set(default_outdoor)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
+    app.calibrate_rig_var.set(default_calibrate_rig)
     app.interval_var.set(str(default_interval))
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)

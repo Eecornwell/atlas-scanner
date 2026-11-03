@@ -329,7 +329,8 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             continue
         C_col, R_c2w_col, R_c2w_ros = pose
 
-        fname = f"pano_{len(panoramas):03d}.png"
+        scan_num = int(scan_dir.name.split('_')[-1])
+        fname = f"pano_{scan_num:03d}.png"
         dst = images_dir / fname
 
         # Pad image to canonical square size, centering content
@@ -395,6 +396,7 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
 
         panoramas.append({
             'scan_dir': scan_dir,
+            'scan_num': scan_num,
             'erp_src': img_src,
             'center': C_col,
             'R_c2w': R_c2w_col,
@@ -579,7 +581,8 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         panoramas.append({'scan_dir': scan_dir, 'erp_src': erp_src,
                           'erp_mask_src': erp_mask_src,
                           'center': C_col, 'R_c2w': R_c2w_col, 'R_c2w_ros': R_c2w_ros,
-                          'is_360': is_360})
+                          'is_360': is_360,
+                          'scan_num': int(scan_dir.name.split('_')[-1])})
 
     active_faces = FACES_360 if session_is_360 else FACES_180
     if session_is_360 is None:
@@ -670,7 +673,11 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             (images_dir / _subfolder).mkdir(parents=True, exist_ok=True)
             (mask_dir / _subfolder).mkdir(parents=True, exist_ok=True)
 
-    for pano_idx, pano in enumerate(panoramas, start=1):
+    for pano in panoramas:
+        if 'scan_num' not in pano:
+            pano['scan_num'] = int(pano['scan_dir'].name.split('_')[-1])
+
+    for pano in panoramas:
         # Load RGB from unmasked source (JPG) to avoid hard mask edges causing
         # aliasing/stairstepping when reprojected to perspective tiles.
         erp_img = cv2.imread(str(pano['erp_src']), cv2.IMREAD_COLOR)
@@ -750,7 +757,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             elif feather_mask is not None:
                 tile_mask = feather_mask
 
-            fname = f"pano_{pano_idx:03d}.png"
+            fname = f"pano_{pano['scan_num']:03d}.png"
             _subfolder = f'face_{face_idx:02d}{_face_subfolder_suffix}'
 
             # Pad smaller tiles to the canonical size so all images in the
@@ -1035,104 +1042,403 @@ def write_init_model_bin(colmap_dir, panoramas):
     return sparse_dir
 
 
-def write_rig_bin(output_dir, db_path, panoramas):
-    """Write rigs.bin and frames.bin into the sparse model so bundle_adjuster
-    treats each panorama as a rigid rig body."""
-    conn = sqlite3.connect(str(db_path))
+def write_rig_bin(output_dir, db_path, panoramas, session_path=None):
+    """Write rigs.bin and frames.bin from images.bin poses.
 
-    # Read rig from DB
-    rig_row = conn.execute('SELECT rig_id, ref_sensor_id, ref_sensor_type FROM rigs LIMIT 1').fetchone()
-    if rig_row is None:
-        conn.close()
-        return
-    rig_id, ref_sensor_id, ref_sensor_type = rig_row
+    Each ERP face subfolder gets its own sensor (same intrinsics, distinct
+    camera_id cloned in cameras.bin) with sensor_from_rig computed from the
+    mean face-to-face rotation across all frames in images.bin.
+    OAK-1 sensor_from_rig is computed the same way from paired frames.
+    Frames are matched by camera-centre proximity (< 20 cm), not scan_num.
+    Unpaired OAK-1 images get OAK-1-only frames.
+    """
+    SENSOR_TYPE_CAMERA = 0
+    RIG_ID = 1
 
-    non_ref_sensors = conn.execute(
-        'SELECT sensor_id, sensor_type, sensor_from_rig FROM rig_sensors WHERE rig_id=?',
-        (rig_id,)
-    ).fetchall()
-
-    # Read frames and their image IDs
-    frames = conn.execute('SELECT frame_id, rig_id FROM frames ORDER BY frame_id').fetchall()
-    frame_data = {}
-    for frame_id, _ in frames:
-        data = conn.execute(
-            'SELECT sensor_type, sensor_id, data_id FROM frame_data WHERE frame_id=?',
-            (frame_id,)
-        ).fetchall()
-        frame_data[frame_id] = data
-
-    # Read image poses from images.bin to get rig_from_world for each frame
-    # Use the ref sensor image pose as the rig pose
-    img_poses = {}
+    # ── Read images.bin ───────────────────────────────────────────────────────────
+    img_name_to_id: dict[str, int] = {}
+    img_id_to_pose: dict[int, tuple] = {}   # w2c: (qw,qx,qy,qz,tx,ty,tz)
+    img_id_to_cam: dict[int, int] = {}
     with open(output_dir / 'images.bin', 'rb') as f:
         n = struct.unpack('Q', f.read(8))[0]
         for _ in range(n):
-            img_id = struct.unpack('I', f.read(4))[0]
+            iid = struct.unpack('I', f.read(4))[0]
             qw, qx, qy, qz = struct.unpack('dddd', f.read(32))
             tx, ty, tz = struct.unpack('ddd', f.read(24))
-            cam_id = struct.unpack('I', f.read(4))[0]
+            cid = struct.unpack('I', f.read(4))[0]
             name = b''
             while True:
                 c = f.read(1)
                 if c == b'\x00': break
                 name += c
-            n_pts = struct.unpack('Q', f.read(8))[0]
-            f.read(n_pts * 24)
-            img_poses[img_id] = (qw, qx, qy, qz, tx, ty, tz)
+            npts = struct.unpack('Q', f.read(8))[0]
+            f.read(npts * 24)
+            name_s = name.decode()
+            img_name_to_id[name_s] = iid
+            img_id_to_pose[iid] = (qw, qx, qy, qz, tx, ty, tz)
+            img_id_to_cam[iid] = cid
 
-    conn.close()
+    # ── Read cameras.bin ───────────────────────────────────────────────────────────
+    cameras_raw = []  # (cam_id, model, w, h, params_blob)
+    with open(output_dir / 'cameras.bin', 'rb') as f:
+        n = struct.unpack('Q', f.read(8))[0]
+        for _ in range(n):
+            cid = struct.unpack('I', f.read(4))[0]
+            model = struct.unpack('i', f.read(4))[0]
+            w, h = struct.unpack('QQ', f.read(16))
+            nparams = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8}.get(model, 0)
+            blob = f.read(8 * nparams)
+            cameras_raw.append((cid, model, w, h, blob))
 
-    SENSOR_TYPE_CAMERA = 0
+    # ── Identify subfolders and group images by pano number ─────────────────────
+    def _pano_num(name):
+        try: return int(name.split('pano_')[1].split('.')[0])
+        except (IndexError, ValueError): return -1
 
-    # rigs.bin: num_rigs, then for each rig:
-    # rig_id(u32), num_sensors(u32), ref_type(i32), ref_id(u32),
-    # then for each non-ref: type(i32), id(u32), has_pose(u8), [qw,qx,qy,qz,tx,ty,tz](7xf64)
+    erp_subfolders = sorted({n.split('/')[0] for n in img_name_to_id
+                              if not n.startswith('face_oak1/')})
+    has_oak1 = any(n.startswith('face_oak1/') for n in img_name_to_id)
+
+    if not erp_subfolders:
+        print('  ⚠ write_rig_bin: no ERP images found — skipping')
+        return
+
+    # Choose ref subfolder: prefer face_01 (single-fisheye) or face_00 (360)
+    def _face_idx(sf):
+        try: return int(sf.split('_')[1])
+        except (IndexError, ValueError): return -1
+
+    ref_subfolder = next(
+        (s for s in erp_subfolders if _face_idx(s) == REF_FACE
+         and ('_cam0' in s or '_cam' not in s)),
+        erp_subfolders[0]
+    )
+
+    # Group images by pano number
+    by_pano: dict[int, dict[str, int]] = {}  # pano_num -> {subfolder: img_id}
+    for name, iid in img_name_to_id.items():
+        sf = name.split('/')[0]
+        pn = _pano_num(name)
+        if pn < 0: continue
+        by_pano.setdefault(pn, {})[sf] = iid
+
+    # Camera centres (world frame): C = -R_w2c^T @ t_w2c
+    def _center(iid):
+        qw, qx, qy, qz, tx, ty, tz = img_id_to_pose[iid]
+        Rw2c = R.from_quat([qx, qy, qz, qw]).as_matrix()
+        return -Rw2c.T @ np.array([tx, ty, tz])
+
+    # ── Assign a unique camera_id to each ERP face subfolder ───────────────────
+    # All faces share the same intrinsics (cameras.bin cam_id=1) but COLMAP
+    # requires a distinct camera_id per rig sensor. Clone the ERP camera entry
+    # for each additional face subfolder and write an updated cameras.bin.
+    # Idempotent: if a previous run already assigned distinct cam_ids (visible
+    # in img_id_to_cam), reuse them instead of cloning again.
+    erp_cam_id_orig = img_id_to_cam[next(
+        iid for name, iid in img_name_to_id.items()
+        if name.split('/')[0] == ref_subfolder
+    )]
+    oak1_cam_id = img_id_to_cam[next(
+        iid for name, iid in img_name_to_id.items()
+        if name.startswith('face_oak1/')
+    )] if has_oak1 else None
+
+    # Build subfolder -> camera_id mapping, reusing existing distinct ids
+    existing_cam_ids = {c[0] for c in cameras_raw}
+    sf_to_cam_id: dict[str, int] = {ref_subfolder: erp_cam_id_orig}
+    next_cam_id = max(existing_cam_ids) + 1
+    clones_needed = []  # subfolders that still need a new camera entry
+    for sf in erp_subfolders:
+        if sf == ref_subfolder:
+            continue
+        # Check if images in this subfolder already have a distinct cam_id
+        existing_sf_cam = next(
+            (img_id_to_cam[iid] for name, iid in img_name_to_id.items()
+             if name.split('/')[0] == sf),
+            None
+        )
+        if existing_sf_cam is not None and existing_sf_cam != erp_cam_id_orig:
+            sf_to_cam_id[sf] = existing_sf_cam  # already distinct from a prior run
+        else:
+            sf_to_cam_id[sf] = next_cam_id
+            clones_needed.append(sf)
+            next_cam_id += 1
+    if has_oak1:
+        sf_to_cam_id['face_oak1'] = oak1_cam_id
+
+    # Write updated cameras.bin: original entries + any new clones needed
+    erp_cam_entry = next(c for c in cameras_raw if c[0] == erp_cam_id_orig)
+    new_cameras = list(cameras_raw)
+    for sf in clones_needed:
+        new_cid = sf_to_cam_id[sf]
+        new_cameras.append((new_cid, erp_cam_entry[1], erp_cam_entry[2],
+                             erp_cam_entry[3], erp_cam_entry[4]))
+    with open(output_dir / 'cameras.bin', 'wb') as f:
+        f.write(struct.pack('Q', len(new_cameras)))
+        for cid, model, w, h, blob in new_cameras:
+            f.write(struct.pack('I', cid))
+            f.write(struct.pack('i', model))
+            f.write(struct.pack('QQ', w, h))
+            f.write(blob)
+
+    # Update images.bin: reassign camera_id for non-ref face images
+    updated_images = {}
+    for name, iid in img_name_to_id.items():
+        sf = name.split('/')[0]
+        new_cid = sf_to_cam_id.get(sf, img_id_to_cam[iid])
+        pose = img_id_to_pose[iid]
+        updated_images[iid] = (name, pose, new_cid)
+    with open(output_dir / 'images.bin', 'wb') as f:
+        f.write(struct.pack('Q', len(updated_images)))
+        for iid, (name, (qw,qx,qy,qz,tx,ty,tz), cid) in sorted(updated_images.items()):
+            f.write(struct.pack('I', iid))
+            f.write(struct.pack('dddd', qw, qx, qy, qz))
+            f.write(struct.pack('ddd', tx, ty, tz))
+            f.write(struct.pack('I', cid))
+            f.write(name.encode('utf-8') + b'\x00')
+            f.write(struct.pack('Q', 0))  # no points2D
+
+    # ── Compute face-to-face rotations from images.bin (mean over all frames) ──
+    ref_sensor_id = sf_to_cam_id[ref_subfolder]
+    sensors = [(ref_sensor_id, True, None)]  # (cam_id, is_ref, sfr_7d_or_None)
+
+    for sf in erp_subfolders:
+        if sf == ref_subfolder:
+            continue
+        sid = sf_to_cam_id[sf]
+        rels = []
+        for pn, faces in by_pano.items():
+            if ref_subfolder not in faces or sf not in faces:
+                continue
+            ref_iid, sf_iid = faces[ref_subfolder], faces[sf]
+            qr = img_id_to_pose[ref_iid][:4]; qs = img_id_to_pose[sf_iid][:4]
+            Rr = R.from_quat([qr[1],qr[2],qr[3],qr[0]]).as_matrix()
+            Rs = R.from_quat([qs[1],qs[2],qs[3],qs[0]]).as_matrix()
+            rels.append(Rs @ Rr.T)
+        if not rels:
+            continue
+        Rm = R.from_matrix(np.array(rels)).mean().as_matrix()
+        qm = R.from_matrix(Rm).as_quat()  # xyzw
+        if qm[3] < 0: qm = -qm
+        sensors.append((sid, False, [qm[3], qm[0], qm[1], qm[2], 0.0, 0.0, 0.0]))
+
+    # ── OAK-1 sensor_from_rig: computed from paired frames in images.bin ───────
+    # Pair by shutter event timestamp from scan directories. Folder-number
+    # offset is unreliable because panoramas are spatially reordered before
+    # tiling, so pano_N (X5) and pano_N+offset (OAK-1) are not the same scan.
+    # Shutter timestamps are written by the capture pipeline and are the
+    # authoritative per-scan identity.
+    oak1_sensor_id = None
+    if has_oak1:
+        oak1_sensor_id = sf_to_cam_id['face_oak1']
+
+        # Build shutter-time -> pano_num maps from scan directories
+        _x5_by_time: dict[float, int] = {}
+        _oak1_by_time: dict[float, int] = {}
+        if session_path is not None:
+            for _sd in sorted(Path(session_path).glob('fusion_scan_*')):
+                _num = int(_sd.name.split('_')[-1])
+                _se = next(_sd.glob('capture_*.shutter_event'), None)
+                if _se is None:
+                    continue
+                try:
+                    _t = float(_se.read_text().strip().split()[0])
+                except (OSError, ValueError):
+                    continue
+                if next(_sd.glob('oak1_*_undistorted.png'), None):
+                    _oak1_by_time[_t] = _num
+                else:
+                    _x5_by_time[_t] = _num
+
+        # Fall back to camera-centre proximity when session_path unavailable
+        _use_proximity = not (_x5_by_time and _oak1_by_time)
+        if _use_proximity:
+            _x5_panos_sfr  = {pn: faces for pn, faces in by_pano.items() if ref_subfolder in faces}
+            _oak1_dict_sfr = {pn: faces for pn, faces in by_pano.items() if 'face_oak1' in faces}
+            _pairs_sfr = []
+            _used_oak1: set[int] = set()
+            for xpn in sorted(_x5_panos_sfr):
+                cx5 = _center(_x5_panos_sfr[xpn][ref_subfolder])
+                best_d, best_opn = float('inf'), None
+                for opn, ofaces in _oak1_dict_sfr.items():
+                    if opn in _used_oak1: continue
+                    d = np.linalg.norm(cx5 - _center(ofaces['face_oak1']))
+                    if d < best_d: best_d, best_opn = d, opn
+                if best_d <= 0.20 and best_opn is not None:
+                    _pairs_sfr.append((xpn, best_opn))
+                    _used_oak1.add(best_opn)
+        else:
+            # Match each X5 scan to the nearest OAK-1 by shutter time
+            _pairs_sfr = []
+            _used_oak1_t: set[float] = set()
+            for _xt, _xpn in sorted(_x5_by_time.items()):
+                best_dt, best_opn = float('inf'), None
+                for _ot, _opn in _oak1_by_time.items():
+                    if _ot in _used_oak1_t: continue
+                    dt = abs(_xt - _ot)
+                    if dt < best_dt: best_dt, best_opn = dt, _opn
+                if best_dt < 5.0 and best_opn is not None:
+                    _pairs_sfr.append((_xpn, best_opn))
+                    _used_oak1_t.add(next(t for t, p in _oak1_by_time.items() if p == best_opn))
+
+        sfr_Rs, sfr_ts = [], []
+        for xpn, opn in _pairs_sfr:
+            if ref_subfolder not in by_pano.get(xpn, {}): continue
+            if 'face_oak1' not in by_pano.get(opn, {}): continue
+            ref_iid = by_pano[xpn][ref_subfolder]
+            oak_iid = by_pano[opn]['face_oak1']
+            qr = img_id_to_pose[ref_iid][:4]; tr = np.array(img_id_to_pose[ref_iid][4:])
+            qo = img_id_to_pose[oak_iid][:4]; to = np.array(img_id_to_pose[oak_iid][4:])
+            Rr = R.from_quat([qr[1],qr[2],qr[3],qr[0]]).as_matrix()
+            Ro = R.from_quat([qo[1],qo[2],qo[3],qo[0]]).as_matrix()
+            S = Ro @ Rr.T
+            sfr_Rs.append(S)
+            sfr_ts.append(to - S @ tr)
+        if sfr_Rs:
+            S_mean = R.from_matrix(np.array(sfr_Rs)).mean().as_matrix()
+            t_mean = np.mean(sfr_ts, axis=0)
+            qm = R.from_matrix(S_mean).as_quat()
+            if qm[3] < 0: qm = -qm
+            sfr_oak1 = [qm[3], qm[0], qm[1], qm[2],
+                        float(t_mean[0]), float(t_mean[1]), float(t_mean[2])]
+            sensors.append((oak1_sensor_id, False, sfr_oak1))
+            angle = float(np.degrees(np.linalg.norm(R.from_matrix(S_mean).as_rotvec())))
+            print(f'  OAK-1 sensor_from_rig: {angle:.1f}°  '
+                  f't=[{t_mean[0]:.3f},{t_mean[1]:.3f},{t_mean[2]:.3f}]m  '
+                  f'from {len(sfr_Rs)} pairs ({"shutter-time" if not _use_proximity else "proximity"})')
+        else:
+            sensors.append((oak1_sensor_id, False, None))
+            print('  ⚠ OAK-1: no paired frames found — sensor_from_rig set to identity')
+
+    # ── Build frames ───────────────────────────────────────────────────────────────
+    x5_panos  = {pn: faces for pn, faces in by_pano.items() if ref_subfolder in faces}
+    oak1_dict = {pn: faces for pn, faces in by_pano.items() if 'face_oak1' in faces} if has_oak1 else {}
+
+    # Pair frames by shutter time (same logic as sfr pairing above)
+    paired_oak1: set[int] = set()
+    x5_to_oak1: dict[int, int] = {}
+    if has_oak1:
+        if not _use_proximity and _x5_by_time and _oak1_by_time:
+            _used_oak1_t2: set[float] = set()
+            for _xt, _xpn in sorted(_x5_by_time.items()):
+                best_dt, best_opn = float('inf'), None
+                for _ot, _opn in _oak1_by_time.items():
+                    if _ot in _used_oak1_t2: continue
+                    dt = abs(_xt - _ot)
+                    if dt < best_dt: best_dt, best_opn = dt, _opn
+                if best_dt < 5.0 and best_opn is not None:
+                    x5_to_oak1[_xpn] = best_opn
+                    paired_oak1.add(best_opn)
+                    _used_oak1_t2.add(next(t for t, p in _oak1_by_time.items() if p == best_opn))
+        else:
+            # Proximity fallback with uniqueness constraint
+            _used_oak1_p: set[int] = set()
+            for xpn in sorted(x5_panos):
+                cx5 = _center(x5_panos[xpn][ref_subfolder])
+                best_d, best_opn = float('inf'), None
+                for opn, ofaces in oak1_dict.items():
+                    if opn in _used_oak1_p: continue
+                    d = np.linalg.norm(cx5 - _center(ofaces['face_oak1']))
+                    if d < best_d: best_d, best_opn = d, opn
+                if best_d <= 0.20 and best_opn is not None:
+                    x5_to_oak1[xpn] = best_opn
+                    paired_oak1.add(best_opn)
+                    _used_oak1_p.add(best_opn)
+
+    frames = []  # (frame_id, pose_7d, [(sensor_id, img_id)])
+    frame_id = 1
+
+    # X5 frames (with optional OAK-1)
+    for pn in sorted(x5_panos):
+        faces = by_pano[pn]
+        ref_iid = faces.get(ref_subfolder)
+        if ref_iid is None:
+            continue
+        ref_pose = img_id_to_pose[ref_iid]
+        tiles = []
+        for sf in erp_subfolders:
+            iid = faces.get(sf)
+            if iid is not None:
+                tiles.append((sf_to_cam_id[sf], iid))
+        if oak1_sensor_id is not None and pn in x5_to_oak1:
+            oak_iid = oak1_dict[x5_to_oak1[pn]].get('face_oak1')
+            if oak_iid is not None:
+                tiles.append((oak1_sensor_id, oak_iid))
+        if tiles:
+            frames.append((frame_id, ref_pose, tiles))
+            frame_id += 1
+
+    # OAK-1-only frames for unpaired OAK-1 images
+    # Frame pose = rig pose = inv(S) applied to OAK-1 w2c:
+    #   R_rig = S^T · R_oak,  t_rig = S^T · (t_oak - t_S)
+    # where S = sensor_from_rig rotation, t_S = sensor_from_rig translation.
+    _sfr_oak1 = next((sfr for cid, is_ref, sfr in sensors
+                      if cid == oak1_sensor_id and sfr is not None), None)
+    n_oak1_only = 0
+    if oak1_sensor_id is not None:
+        for opn in sorted(oak1_dict):
+            if opn in paired_oak1:
+                continue
+            oak_iid = oak1_dict[opn].get('face_oak1')
+            if oak_iid is None:
+                continue
+            qw, qx, qy, qz, tx, ty, tz = img_id_to_pose[oak_iid]
+            if _sfr_oak1 is not None:
+                # Convert OAK-1 w2c to rig (X5 body) w2c
+                sqw, sqx, sqy, sqz = _sfr_oak1[:4]
+                st = np.array(_sfr_oak1[4:7])
+                S_R = R.from_quat([sqx, sqy, sqz, sqw]).as_matrix()  # sensor_from_rig rotation
+                R_oak = R.from_quat([qx, qy, qz, qw]).as_matrix()
+                t_oak = np.array([tx, ty, tz])
+                R_rig = S_R.T @ R_oak
+                t_rig = S_R.T @ (t_oak - st)
+                q_rig = R.from_matrix(R_rig).as_quat()  # xyzw
+                if q_rig[3] < 0: q_rig = -q_rig
+                rig_pose = (q_rig[3], q_rig[0], q_rig[1], q_rig[2],
+                            float(t_rig[0]), float(t_rig[1]), float(t_rig[2]))
+            else:
+                rig_pose = (qw, qx, qy, qz, tx, ty, tz)  # fallback: no sfr known
+            frames.append((frame_id, rig_pose, [(oak1_sensor_id, oak_iid)]))
+            frame_id += 1
+            n_oak1_only += 1
+
+    # ── Write rigs.bin ───────────────────────────────────────────────────────────────
+    non_ref = [(cid, sfr) for cid, is_ref, sfr in sensors if not is_ref]
     with open(output_dir / 'rigs.bin', 'wb') as f:
-        f.write(struct.pack('Q', 1))  # 1 rig
-        f.write(struct.pack('I', rig_id))
-        num_sensors = 1 + len(non_ref_sensors)  # ref + non-ref
-        f.write(struct.pack('I', num_sensors))
-        f.write(struct.pack('i', ref_sensor_type))
+        f.write(struct.pack('Q', 1))
+        f.write(struct.pack('I', RIG_ID))
+        f.write(struct.pack('I', len(sensors)))
+        f.write(struct.pack('i', SENSOR_TYPE_CAMERA))
         f.write(struct.pack('I', ref_sensor_id))
-        for sensor_id, sensor_type, sensor_from_rig_blob in non_ref_sensors:
-            f.write(struct.pack('i', sensor_type))
-            f.write(struct.pack('I', sensor_id))
-            if sensor_from_rig_blob:
+        for cid, sfr in non_ref:
+            f.write(struct.pack('i', SENSOR_TYPE_CAMERA))
+            f.write(struct.pack('I', cid))
+            if sfr is not None:
                 f.write(struct.pack('B', 1))
-                # blob is 7 doubles: qw,qx,qy,qz,tx,ty,tz
-                vals = struct.unpack('ddddddd', sensor_from_rig_blob)
-                for v in vals:
-                    f.write(struct.pack('d', v))
+                for v in sfr: f.write(struct.pack('d', v))
             else:
                 f.write(struct.pack('B', 0))
 
-    # frames.bin: num_frames(u64), then for each frame with pose:
-    # frame_id(u32), rig_id(u32), qw,qx,qy,qz,tx,ty,tz(7xf64),
-    # num_data(u32), then for each: sensor_type(i32), sensor_id(u32), data_id(u64)
-    # Frame pose = ref sensor image pose (rig_from_world)
-    frames_with_pose = []
-    for frame_id, _ in frames:
-        data = frame_data[frame_id]
-        ref_img_id = next((d[2] for d in data
-                           if d[0] == ref_sensor_type and d[1] == ref_sensor_id), None)
-        if ref_img_id and ref_img_id in img_poses:
-            frames_with_pose.append((frame_id, data, img_poses[ref_img_id]))
-
+    # ── Write frames.bin ───────────────────────────────────────────────────────────────
     with open(output_dir / 'frames.bin', 'wb') as f:
-        f.write(struct.pack('Q', len(frames_with_pose)))
-        for frame_id, data, (qw, qx, qy, qz, tx, ty, tz) in frames_with_pose:
-            f.write(struct.pack('I', frame_id))
-            f.write(struct.pack('I', rig_id))
-            for v in (qw, qx, qy, qz, tx, ty, tz):
-                f.write(struct.pack('d', v))
-            f.write(struct.pack('I', len(data)))
-            for sensor_type, sensor_id, data_id in data:
-                f.write(struct.pack('i', sensor_type))
-                f.write(struct.pack('I', sensor_id))
-                f.write(struct.pack('Q', data_id))
+        f.write(struct.pack('Q', len(frames)))
+        for fid, (qw, qx, qy, qz, tx, ty, tz), tiles in frames:
+            f.write(struct.pack('I', fid))
+            f.write(struct.pack('I', RIG_ID))
+            for v in (qw, qx, qy, qz, tx, ty, tz): f.write(struct.pack('d', v))
+            f.write(struct.pack('I', len(tiles)))
+            for sid, iid in tiles:
+                f.write(struct.pack('i', SENSOR_TYPE_CAMERA))
+                f.write(struct.pack('I', sid))
+                f.write(struct.pack('Q', iid))
 
-    print(f"  Wrote rigs.bin ({1} rig, {len(frames_with_pose)} frames)")
+    n_paired = sum(1 for _, _, tiles in frames
+                   if oak1_sensor_id and any(s == oak1_sensor_id for s, _ in tiles)
+                   and len(tiles) > 1)
+    print(f'  Wrote rigs.bin: 1 rig, {len(sensors)} sensors '
+          f'({len(frames)} frames: {len(x5_panos)} X5'
+          + (f', {n_paired} paired OAK-1, {n_oak1_only} OAK-1-only'
+             if oak1_sensor_id else '') + ')')
 
 
 def _filter_sfm_to_lidar_extents(sfm_pts, lidar_pts, padding=0.5):
@@ -1716,9 +2022,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
                 '--database_path', str(db_path),
                 '--rig_config_path', str(rig_config_path),
             ], check=True)
-            print("8. Writing rig into sparse model...")
-            write_rig_bin(output_dir, db_path, panoramas)
-            print("9. Running rig-aware bundle adjustment...")
+            print("8. Running rig-aware bundle adjustment...")
             subprocess.run([
                 'colmap', 'bundle_adjuster',
                 '--input_path', str(output_dir),
@@ -1733,7 +2037,15 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
 
         print(f"\n✓ Reconstruction complete: {output_dir}")
 
-    # ── Shared: PLY export + LiDAR merge + depth images + zip ────────────────
+    # ── Shared: pose_source marker (written before rig files so calibrate_rig.py
+    # can detect the session type even if rig writing fails)
+    with open(colmap_dir / 'pose_source.json', 'w') as _psf:
+        json.dump({'pose_source': 'lidar'}, _psf)
+
+    # ── Shared: PLY export ───────────────────────────────────────────────────────────
+    # model_converter must run before write_rig_bin: COLMAP 3.14 crashes when
+    # reading rigs.bin + frames.bin during PLY export (ReadImagesBinary hits
+    # _Map_base::at on the rig sensor map). Write rig files after PLY export.
     ply_out = colmap_dir / 'sparse' / 'reconstructed.ply'
     subprocess.run([
         'colmap', 'model_converter',
@@ -1743,6 +2055,10 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     ])
     if ply_out.exists():
         print(f"✓ Exported PLY: {ply_out}")
+
+    # Write rig files after model_converter
+    print("  Writing rig files (rigs.bin, frames.bin)...")
+    write_rig_bin(output_dir, db_path, panoramas, session_path=session_path)
 
     print("  Building per-scan LiDAR cloud for points3D...")
     import open3d as o3d

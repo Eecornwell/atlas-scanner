@@ -31,6 +31,7 @@ CLEAN_POINTCLOUD=false             # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metres (0 = skip)
 COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
 FILTER_BLURRY_FRAMES=true         # remove bottom 20% of scans by sharpness before merge/ICP/COLMAP
+CALIBRATE_RIG=false               # run calibrate_rig.py after COLMAP export to correct extrinsic error
 USE_AI_STITCH=false                # use AIFLOW stitching (better seam quality, requires model); false = OPTFLOW (best seam quality, no model needed)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -48,6 +49,8 @@ while [[ $# -gt 0 ]]; do
         --no-icp) ENABLE_ICP_ALIGNMENT=false; shift ;;
         --colmap) EXPORT_COLMAP=true; shift ;;
         --no-colmap) EXPORT_COLMAP=false; shift ;;
+        --calibrate-rig) CALIBRATE_RIG=true; shift ;;
+        --no-calibrate-rig) CALIBRATE_RIG=false; shift ;;
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
         --camera-hw) CAMERA_HW="$2"; shift 2 ;;
         --num-cameras) NUM_CAMERAS="$2"; shift 2 ;;
@@ -613,6 +616,10 @@ print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
             _colmap_args=""
             [ "${COLMAP_LIDAR_VOXEL_SIZE:-0}" != "0" ] && _colmap_args="--lidar-voxel-size ${COLMAP_LIDAR_VOXEL_SIZE}"
             python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" --no-bundle-adjustment $_colmap_args
+            if [ "$CALIBRATE_RIG" = "true" ]; then
+                echo "Running rig calibration (LiDAR-referenced extrinsic correction)..."
+                python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/calibrate_rig.py" "$SCAN_DIR"
+            fi
         fi
 
         echo "Complete. Scans saved in: $SCAN_DIR"
