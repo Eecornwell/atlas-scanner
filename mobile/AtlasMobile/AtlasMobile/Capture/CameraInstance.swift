@@ -4,7 +4,8 @@ import ImageIO
 import INSCameraSDK
 
 private let kHeartbeatInterval: TimeInterval = 0.5
-private let kClockSyncSamples: UInt = 10
+private let kClockSyncTotalSamples = 20
+private let kClockSyncBestCount = 3
 
 final class CameraInstance: NSObject, Identifiable {
     let id: String
@@ -31,7 +32,21 @@ final class CameraInstance: NSObject, Identifiable {
     private var _downloadCont: CheckedContinuation<
         Insta360DownloadResult?, Never
     >?
+    /// Identifies the download that owns _downloadCont, so a late
+    /// reply or timer from an earlier download cannot finish it.
+    private var _downloadGen: UInt64 = 0
+    /// Failed download attempts per URI; failures are re-queued until
+    /// maxDownloadAttempts.
+    private var _downloadAttempts: [String: Int] = [:]
+    private static let maxDownloadAttempts = 3
     private(set) var isPhotoModeSet = false
+
+    /// Shots captured but not yet downloaded.
+    var pendingDownloadCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _pendingURIs.count
+    }
 
     private(set) var isConnected: Bool {
         get {
@@ -201,7 +216,6 @@ final class CameraInstance: NSObject, Identifiable {
         await disconnect()
         for attempt in 1...maxRetries {
             if await connect() {
-                _ = await calibrateClockOffset()
                 await switchToPhotoMode()
                 await disableStabilization()
                 return true
@@ -217,54 +231,155 @@ final class CameraInstance: NSObject, Identifiable {
 
     // MARK: - Clock offset
 
+    // syncTimeMsToCamera SETS the camera clock each call.
+    // Sample 0 measures the original camera clock (pre-set).
+    // Samples 1–N measure how accurately each set landed
+    // (residual offset). We select the best by lowest RTT.
     func calibrateClockOffset() async -> ClockOffset {
+        let wallSec = Date().timeIntervalSince1970
+        let arkitSec = ProcessInfo.processInfo.systemUptime
         let fallback = ClockOffset(
-            offsetMs: 0, sampleCount: 0, stdDevMs: 0
+            offsetMs: 0, uncertaintyMs: 999,
+            sampleCount: 0, preSetSample: nil,
+            samples: [],
+            wallClockSec: wallSec,
+            arkitTimeSec: arkitSec
         )
+        onStatusUpdate?(
+            "[\(id)] clockSync: start"
+                + " \(kClockSyncTotalSamples) samples"
+                + " (main=\(Thread.isMainThread))"
+        )
+        var preSet: ClockSyncSample?
+        var postSetSamples: [ClockSyncSample] = []
+        for i in 0..<kClockSyncTotalSamples {
+            let sample = await singleSyncSample()
+            if let s = sample {
+                let tag = i == 0 ? " [pre-set]" : ""
+                onStatusUpdate?(String(
+                    format: "[\(id)] sync#%d:"
+                        + " off=%.1fms rtt=%.0fms%@",
+                    i, s.offsetMs, s.roundTripMs, tag
+                ))
+                if i == 0 {
+                    preSet = s
+                } else {
+                    postSetSamples.append(s)
+                }
+            } else {
+                onStatusUpdate?(
+                    "[\(id)] sync#\(i): failed"
+                )
+            }
+        }
+        let wallSecEnd = Date().timeIntervalSince1970
+        let arkitSecEnd = ProcessInfo.processInfo.systemUptime
+        let avgWall = (wallSec + wallSecEnd) / 2
+        let avgArkit = (arkitSec + arkitSecEnd) / 2
+        guard !postSetSamples.isEmpty else {
+            onStatusUpdate?(
+                "[\(id)] clockSync: 0 valid samples"
+            )
+            clockOffset = fallback
+            return fallback
+        }
+        let sorted = postSetSamples.sorted {
+            $0.roundTripMs < $1.roundTripMs
+        }
+        let best = Array(sorted.prefix(kClockSyncBestCount))
+        let avgOffset = best.map(\.offsetMs).reduce(
+            0, +
+        ) / Double(best.count)
+        let maxRtt = best.map(\.roundTripMs).max() ?? 0
+        let result = ClockOffset(
+            offsetMs: avgOffset,
+            uncertaintyMs: maxRtt / 2,
+            sampleCount: postSetSamples.count,
+            preSetSample: preSet,
+            samples: postSetSamples,
+            wallClockSec: avgWall,
+            arkitTimeSec: avgArkit
+        )
+        onStatusUpdate?(String(
+            format: "[\(id)] clockSync: done"
+                + " res=%.1fms ±%.0fms (%d samples)",
+            result.offsetMs, result.uncertaintyMs,
+            postSetSamples.count
+        ))
+        clockOffset = result
+        return result
+    }
 
-        return await withCheckedContinuation {
-            continuation in
-            lock.lock()
-            _clockCont = continuation
-            lock.unlock()
+    private func singleSyncSample()
+        async -> ClockSyncSample?
+    {
+        await withCheckedContinuation { cont in
+            let done = NSLock()
+            var didResume = false
 
-            func finish(_ value: ClockOffset) {
-                self.lock.lock()
-                let cont = self._clockCont
-                self._clockCont = nil
-                self.lock.unlock()
-                cont?.resume(returning: value)
+            func finish(_ result: ClockSyncSample?) {
+                done.lock()
+                defer { done.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                cont.resume(returning: result)
             }
 
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                self?.onStatusUpdate?(
+                    "[\(self?.id ?? "?")] syncTime:"
+                    + " sending…"
+                )
+                let sendMs = Date()
+                    .timeIntervalSince1970 * 1000
                 INSCameraManager.shared()
                     .commandManager
                     .syncTimeMsToCamera(
-                        withTryCount: kClockSyncSamples,
-                        dTimeMsMax: 200
-                    ) { [weak self] dTimeMs, error in
-                        let offset = error == nil
-                            ? ClockOffset(
-                                offsetMs: Double(dTimeMs),
-                                sampleCount: Int(
-                                    kClockSyncSamples
-                                ),
-                                stdDevMs: 0.0)
-                            : fallback
-                        self?.clockOffset = offset
-                        DispatchQueue.main.async {
-                            finish(offset)
+                        withTryCount: 1,
+                        dTimeMsMax: 500
+                    ) { dTimeMs, error in
+                        let recvMs = Date()
+                            .timeIntervalSince1970
+                            * 1000
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")]"
+                                + " syncTime err:"
+                                + " \(error)"
+                            )
+                            finish(nil)
+                        } else {
+                            let midMs = (sendMs + recvMs)
+                                / 2
+                            let camMs = midMs
+                                + Double(dTimeMs)
+                            finish(
+                                ClockSyncSample(
+                                    phoneSendMs: sendMs,
+                                    phoneRecvMs: recvMs,
+                                    cameraMs: camMs,
+                                    offsetMs: Double(
+                                        dTimeMs
+                                    )
+                                )
+                            )
                         }
                     }
             }
 
             DispatchQueue.main.asyncAfter(
-                deadline: .now() + 15
-            ) {
-                print(
-                    "[Insta360] clock calibration timeout"
-                )
-                finish(fallback)
+                deadline: .now() + 5
+            ) { [weak self] in
+                done.lock()
+                let alreadyDone = didResume
+                done.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")]"
+                        + " syncTime: timeout (5s)"
+                    )
+                }
+                finish(nil)
             }
         }
     }
@@ -988,17 +1103,20 @@ final class CameraInstance: NSObject, Identifiable {
     func downloadPending(
         into directory: URL
     ) async -> [Insta360DownloadResult] {
+        // Take the queue only while connected; otherwise leave it for a
+        // later pass instead of dropping the shots.
         lock.lock()
         let connected = _isConnected
-        let toDownload = _pendingURIs
-        _pendingURIs.removeAll()
+        let toDownload = connected ? _pendingURIs : []
+        if connected { _pendingURIs.removeAll() }
         lock.unlock()
 
-        guard connected, !toDownload.isEmpty else {
+        guard !toDownload.isEmpty else {
             return []
         }
 
         var results: [Insta360DownloadResult] = []
+        var failed: [(scanIndex: Int, uri: String)] = []
         for item in toDownload {
             if let r = await downloadOne(
                 scanIndex: item.scanIndex,
@@ -1006,7 +1124,29 @@ final class CameraInstance: NSObject, Identifiable {
                 into: directory
             ) {
                 results.append(r)
+            } else {
+                failed.append(item)
             }
+        }
+
+        // Put failures back so the next pass (the next shot, or the
+        // retry at session end) tries them again.
+        if !failed.isEmpty {
+            var requeued = 0
+            lock.lock()
+            for item in failed {
+                let n = (_downloadAttempts[item.uri] ?? 0) + 1
+                _downloadAttempts[item.uri] = n
+                if n < Self.maxDownloadAttempts {
+                    _pendingURIs.append(item)
+                    requeued += 1
+                }
+            }
+            lock.unlock()
+            onStatusUpdate?(
+                "[\(id)] \(failed.count) download(s) failed,"
+                + " \(requeued) re-queued"
+            )
         }
         return results
     }
@@ -1017,13 +1157,21 @@ final class CameraInstance: NSObject, Identifiable {
         clearURIs: Bool
     ) {
         let fallback = ClockOffset(
-            offsetMs: 0, sampleCount: 0, stdDevMs: 0
+            offsetMs: 0, uncertaintyMs: 999,
+            sampleCount: 0, preSetSample: nil,
+            samples: [],
+            wallClockSec: Date().timeIntervalSince1970,
+            arkitTimeSec: ProcessInfo.processInfo
+                .systemUptime
         )
 
         lock.lock()
         _isConnected = false
         _captureInFlight = false
-        if clearURIs { _pendingURIs.removeAll() }
+        if clearURIs {
+            _pendingURIs.removeAll()
+            _downloadAttempts.removeAll()
+        }
         let connectCont = _connectCont
         let clockCont = _clockCont
         let captureCont = _captureCont
@@ -1067,13 +1215,22 @@ final class CameraInstance: NSObject, Identifiable {
         return await withCheckedContinuation {
             continuation in
             lock.lock()
+            _downloadGen += 1
+            let gen = _downloadGen
             _downloadCont = continuation
             lock.unlock()
 
+            // Only this download may finish its continuation. Without
+            // the check, this download's 30 s timer (or a late reply)
+            // could finish the next download with nil.
             func finish(
                 _ value: Insta360DownloadResult?
             ) {
                 self.lock.lock()
+                guard gen == self._downloadGen else {
+                    self.lock.unlock()
+                    return
+                }
                 let cont = self._downloadCont
                 self._downloadCont = nil
                 self.lock.unlock()

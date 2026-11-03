@@ -588,7 +588,7 @@ struct CalibrationView: View {
             }
         }
 
-        Text("Build: 2026-10-27b")
+        Text("Build: 2026-10-31f")
             .font(.system(.caption2, design: .monospaced))
             .foregroundColor(.secondary.opacity(0.5))
     }
@@ -668,6 +668,12 @@ struct CalibrationView: View {
            Date().timeIntervalSince(last) < Self.captureCooldownSeconds {
             captureError = "Wait a moment between captures"
             return
+        }
+
+        // If a previous calibration already ran, clear
+        // stale frames so only fresh captures are used.
+        if case .done = calibManager.state {
+            calibManager.clearFrames()
         }
 
         isCapturingFrame = true

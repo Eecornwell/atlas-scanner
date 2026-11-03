@@ -10,6 +10,9 @@ final class ARKitCapture: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var trackingState: ARCamera.TrackingState = .notAvailable
     @Published var depthOverlayImage: UIImage?
+    @Published var speedMps: Double = 0
+    @Published var angularRateDps: Double = 0
+    @Published var smoothedAngularRateDps: Double = 0
 
     var showDepthOverlay = false
     var showMesh = false {
@@ -20,6 +23,9 @@ final class ARKitCapture: NSObject, ObservableObject {
     weak var trajectoryRecorder: TrajectoryRecorder?
 
     private var lastDepthUpdate: TimeInterval = 0
+    private var lastSpeedPose: simd_float4x4?
+    private var lastSpeedTimestamp: TimeInterval = 0
+    private var angularRateHistory: [(time: TimeInterval, dps: Double)] = []
 
     func start() {
         let config = ARWorldTrackingConfiguration()
@@ -77,8 +83,37 @@ final class ARKitCapture: NSObject, ObservableObject {
             capturedImage: frame.capturedImage,
             depthMap: depthMap,
             confidenceMap: confidenceMap,
-            smoothedDepthMap: smoothedDepth
+            smoothedDepthMap: smoothedDepth,
+            trackingState: Self.trackingLabel(
+                frame.camera.trackingState)
         )
+    }
+
+    /// Tracking state as saved in pose.json.
+    static func trackingLabel(
+        _ state: ARCamera.TrackingState
+    ) -> String {
+        switch state {
+        case .normal:
+            return "normal"
+        case .notAvailable:
+            return "notAvailable"
+        case .limited(let reason):
+            switch reason {
+            case .initializing:
+                return "limited:initializing"
+            case .excessiveMotion:
+                return "limited:excessiveMotion"
+            case .insufficientFeatures:
+                return "limited:insufficientFeatures"
+            case .relocalizing:
+                return "limited:relocalizing"
+            @unknown default:
+                return "limited:unknown"
+            }
+        @unknown default:
+            return "unknown"
+        }
     }
 }
 
@@ -94,6 +129,54 @@ extension ARKitCapture: ARSessionDelegate {
             timestamp: frame.timestamp,
             pose: frame.camera.transform
         )
+
+        let dt = frame.timestamp - lastSpeedTimestamp
+        if dt >= 0.2 {
+            if let prev = lastSpeedPose {
+                let cur = frame.camera.transform
+                let dx = cur.columns.3 - prev.columns.3
+                let dist = sqrt(dx.x * dx.x + dx.y * dx.y + dx.z * dx.z)
+                let speed = Double(dist) / dt
+
+                let R_prev = simd_float3x3(
+                    SIMD3(prev.columns.0.x, prev.columns.0.y, prev.columns.0.z),
+                    SIMD3(prev.columns.1.x, prev.columns.1.y, prev.columns.1.z),
+                    SIMD3(prev.columns.2.x, prev.columns.2.y, prev.columns.2.z)
+                )
+                let R_cur = simd_float3x3(
+                    SIMD3(cur.columns.0.x, cur.columns.0.y, cur.columns.0.z),
+                    SIMD3(cur.columns.1.x, cur.columns.1.y, cur.columns.1.z),
+                    SIMD3(cur.columns.2.x, cur.columns.2.y, cur.columns.2.z)
+                )
+                let R_delta = R_cur * R_prev.transpose
+                let q = simd_quatf(R_delta)
+                let angleRad = 2.0 * acos(min(abs(q.real), 1.0))
+                let rateDps = Double(angleRad) * 180.0
+                    / (.pi * dt)
+                let now = frame.timestamp
+                angularRateHistory.append(
+                    (time: now, dps: rateDps)
+                )
+                let cutoff = now - 0.5
+                angularRateHistory.removeAll {
+                    $0.time < cutoff
+                }
+                let smoothed = angularRateHistory
+                    .map(\.dps)
+                    .reduce(0, +)
+                    / Double(
+                        max(angularRateHistory.count, 1)
+                    )
+
+                DispatchQueue.main.async {
+                    self.speedMps = speed
+                    self.angularRateDps = rateDps
+                    self.smoothedAngularRateDps = smoothed
+                }
+            }
+            lastSpeedPose = frame.camera.transform
+            lastSpeedTimestamp = frame.timestamp
+        }
 
         let wantsOverlay = showDepthOverlay
         if wantsOverlay, frame.timestamp - lastDepthUpdate > 0.033 {

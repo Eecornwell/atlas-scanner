@@ -130,16 +130,41 @@ final class CalibrationManager: ObservableObject {
         let dRoll  = refined.roll  - seed.roll
         let dPitch = refined.pitch - seed.pitch
         let dYaw   = refined.yaw   - seed.yaw
+        let maxDelta = max(
+            abs(dRoll), abs(dPitch), abs(dYaw)
+        )
+        let nccVal = -bestCost
         print("[Calib] best frame \(bestIdx)/\(validCount):"
-            + " NCC=\(String(format: "%.4f", -bestCost))")
+            + " NCC=\(String(format: "%.4f", nccVal))")
         print("[Calib] seed  RPY=(\(seed.roll),"
             + "\(seed.pitch),\(seed.yaw))")
         print("[Calib] refined RPY=(\(refined.roll),"
             + "\(refined.pitch),\(refined.yaw))")
         print("[Calib] delta RPY=("
-            + "\(String(format: "%.2f", dRoll))°,"
-            + " \(String(format: "%.2f", dPitch))°,"
-            + " \(String(format: "%.2f", dYaw))°)")
+            + "\(String(format: "%.2f", dRoll))\u{00B0},"
+            + " \(String(format: "%.2f", dPitch))\u{00B0},"
+            + " \(String(format: "%.2f", dYaw))\u{00B0})")
+
+        if nccVal < 0.3 || maxDelta > 30 {
+            let reason: String
+            if nccVal < 0.3 {
+                reason = "NCC too low ("
+                    + String(format: "%.3f", nccVal)
+                    + " < 0.3)"
+            } else {
+                reason = "delta "
+                    + String(format: "%.1f", maxDelta)
+                    + "\u{00B0} > 30\u{00B0} limit"
+            }
+            print("[Calib] REJECTED: \(reason)"
+                + " — keeping seed")
+            optimizeError = "Calibration unreliable: "
+                + reason
+            state = .framesCollected(
+                calibrationFrames.count
+            )
+            return
+        }
 
         refinedRPY = SIMD3(
             Float(refined.roll),

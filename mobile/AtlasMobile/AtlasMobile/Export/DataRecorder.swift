@@ -21,7 +21,9 @@ final class DataRecorder {
     func saveScan(
         scanIndex: Int,
         arkitFrame: ARKitFrameData,
-        insta360Results: [Insta360CaptureResult]
+        insta360Results: [Insta360CaptureResult],
+        frameAgeMs: Double? = nil,
+        trajectoryDeltaMs: Double? = nil
     ) {
         let scanName = String(format: "scan_%03d", scanIndex)
         let scanDir = iphoneDir.appendingPathComponent(scanName)
@@ -51,7 +53,10 @@ final class DataRecorder {
                     commandTimestamp: result.commandTimestamp,
                     callbackTimestamp: result.callbackTimestamp
                 )
-            }
+            },
+            frameAgeMs: frameAgeMs,
+            trajectoryDeltaMs: trajectoryDeltaMs,
+            trackingState: arkitFrame.trackingState
         )
         if let poseJSON = try? encoder.encode(poseData) {
             try? poseJSON.write(to: scanDir.appendingPathComponent("pose.json"))
@@ -60,7 +65,9 @@ final class DataRecorder {
 
     func updateInsta360Captures(
         scanIndex: Int,
-        results: [Insta360CaptureResult]
+        results: [Insta360CaptureResult],
+        peakAngularRateDps: Double? = nil,
+        meanAngularRateDps: Double? = nil
     ) {
         guard !results.isEmpty else { return }
         let scanName = String(
@@ -76,12 +83,15 @@ final class DataRecorder {
             ScanPose.self, from: data
         ) else { return }
         pose.insta360Captures = results.map {
-            Insta360CaptureRef(
+            var ref = Insta360CaptureRef(
                 cameraId: $0.cameraId,
                 arkitTimestamp: $0.arkitTimestamp,
                 commandTimestamp: $0.commandTimestamp,
                 callbackTimestamp: $0.callbackTimestamp
             )
+            ref.peakAngularRateDps = peakAngularRateDps
+            ref.meanAngularRateDps = meanAngularRateDps
+            return ref
         }
         if let updated = try? encoder.encode(pose) {
             try? updated.write(to: poseURL)
@@ -179,6 +189,8 @@ final class DataRecorder {
             }
 
             let smoothedURL = scanDir.appendingPathComponent("depth_smoothed.bin")
+            let cmdTs = pose.insta360Captures.first?
+                .commandTimestamp
             return ScanExportData(
                 scanName: scanDir.lastPathComponent,
                 arkitPose: arkitPose,
@@ -188,7 +200,8 @@ final class DataRecorder {
                 depthBinURL: scanDir.appendingPathComponent("depth.bin"),
                 smoothedDepthBinURL: FileManager.default.fileExists(atPath: smoothedURL.path) ? smoothedURL : nil,
                 iphoneImageURL: scanDir.appendingPathComponent("rgb.jpg"),
-                insta360ImageURLs: insta360URLs
+                insta360ImageURLs: insta360URLs,
+                insta360CommandTimestamp: cmdTs
             )
         }
     }
@@ -279,6 +292,10 @@ struct ScanPose: Codable {
     let depthWidth: Int
     let depthHeight: Int
     var insta360Captures: [Insta360CaptureRef]
+    let frameAgeMs: Double?
+    let trajectoryDeltaMs: Double?
+    /// ARKit tracking state at capture; nil in older sessions.
+    let trackingState: String?
 
     enum CodingKeys: String, CodingKey {
         case timestamp
@@ -289,6 +306,9 @@ struct ScanPose: Codable {
         case depthWidth = "depth_width"
         case depthHeight = "depth_height"
         case insta360Captures = "insta360_captures"
+        case frameAgeMs = "frame_age_ms"
+        case trajectoryDeltaMs = "trajectory_delta_ms"
+        case trackingState = "tracking_state"
     }
 }
 
@@ -298,6 +318,8 @@ struct Insta360CaptureRef: Codable {
     let commandTimestamp: Double
     let callbackTimestamp: Double
     var exifTimestamp: Double?
+    var peakAngularRateDps: Double?
+    var meanAngularRateDps: Double?
 
     enum CodingKeys: String, CodingKey {
         case cameraId = "camera_id"
@@ -305,5 +327,7 @@ struct Insta360CaptureRef: Codable {
         case commandTimestamp = "command_timestamp"
         case callbackTimestamp = "callback_timestamp"
         case exifTimestamp = "exif_timestamp"
+        case peakAngularRateDps = "peak_angular_rate_dps"
+        case meanAngularRateDps = "mean_angular_rate_dps"
     }
 }

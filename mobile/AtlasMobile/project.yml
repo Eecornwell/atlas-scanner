@@ -43,6 +43,15 @@ targets:
         CODE_SIGNING_ALLOWED: "NO"
         DEVELOPMENT_TEAM: ""
     dependencies:
+      # opencv2 goes first. INSCoreMedia.framework (Insta360 SDK) contains
+      # and exports its own OpenCV 4.7.0, and the linker binds each symbol
+      # to the first library on the link line that defines it. With
+      # opencv2 listed after INSCoreMedia, part of the app's OpenCV 5 calls
+      # were bound to OpenCV 4.7 functions, which read cv::Mat at other
+      # offsets, and rig calibration crashed (SIGBUS in cv::Mat::setTo).
+      # RigCalibratorBridge.openCVLinkedFromApp checks this at run time.
+      - framework: Frameworks/opencv2.framework
+        embed: false
       - framework: Frameworks/INSCameraSDK.xcframework
         embed: true
       - framework: Frameworks/INSCameraServiceSDK.xcframework
@@ -51,8 +60,6 @@ targets:
         embed: true
       - framework: Frameworks/SSZipArchive.xcframework
         embed: true
-      - framework: Frameworks/opencv2.framework
-        embed: false
       - sdk: ARKit.framework
       - sdk: CoreML.framework
       - sdk: CoreVideo.framework

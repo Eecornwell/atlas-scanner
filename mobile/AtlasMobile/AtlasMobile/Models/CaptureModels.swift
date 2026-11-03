@@ -11,6 +11,9 @@ struct ARKitFrameData {
     let depthMap: CVPixelBuffer
     let confidenceMap: CVPixelBuffer
     let smoothedDepthMap: CVPixelBuffer?
+    /// ARKit tracking state when the frame was taken: "normal",
+    /// "limited:<reason>" or "notAvailable".
+    let trackingState: String
 }
 
 struct Insta360CaptureResult {
@@ -38,8 +41,20 @@ struct Insta360DownloadResult {
 
 struct ClockOffset {
     let offsetMs: Double
+    let uncertaintyMs: Double
     let sampleCount: Int
-    let stdDevMs: Double
+    let preSetSample: ClockSyncSample?
+    let samples: [ClockSyncSample]
+    let wallClockSec: Double
+    let arkitTimeSec: Double
+}
+
+struct ClockSyncSample {
+    let phoneSendMs: Double
+    let phoneRecvMs: Double
+    let cameraMs: Double
+    let offsetMs: Double
+    var roundTripMs: Double { phoneRecvMs - phoneSendMs }
 }
 
 struct PoseEntry: Codable {

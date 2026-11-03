@@ -13,8 +13,13 @@ final class ERPTileSlicer {
     /// Pre-computed cam-from-pano rotation matrices for each face.
     let faceRotations: [simd_float3x3]
 
-    /// Pre-computed (u, v) sampling maps per face, keyed by ERP dimensions.
-    private var samplingMaps: [(u: [Float], v: [Float])]?
+    /// Cached normalized rays (shared across all faces).
+    private var cachedRays: (px: [Float], py: [Float],
+                             pz: [Float])?
+
+    /// Single-face map cache (reused when same ERP dims).
+    private var cachedFaceMap: (u: [Float], v: [Float])?
+    private var cachedFaceIdx: Int = -1
     private var cachedW: Int = 0
     private var cachedH: Int = 0
 
@@ -22,6 +27,12 @@ final class ERPTileSlicer {
         self.tileSize = tileSize
         self.tileFovDeg = tileFovDeg
         self.faceRotations = Self.computeFaceRotations()
+    }
+
+    func clearCaches() {
+        cachedRays = nil
+        cachedFaceMap = nil
+        cachedFaceIdx = -1
     }
 
     // MARK: - Public
@@ -43,11 +54,14 @@ final class ERPTileSlicer {
     /// Slices a single face tile from an ERP image. Lower peak memory
     /// than `sliceTiles` when tiles are written to disk one at a time.
     func sliceTile(at faceIndex: Int, from erpImage: UIImage) -> UIImage? {
-        guard let cgErp = erpImage.cgImage else { return nil }
-        let maps = buildSamplingMaps(erpW: cgErp.width, erpH: cgErp.height)
-        guard faceIndex < maps.count else { return nil }
-        let map = maps[faceIndex]
-        guard let tile = remap(source: cgErp, uMap: map.u, vMap: map.v)
+        guard let cgErp = erpImage.cgImage,
+              faceIndex < faceRotations.count
+        else { return nil }
+        let map = buildFaceMap(
+            erpW: cgErp.width, erpH: cgErp.height,
+            faceIndex: faceIndex)
+        guard let tile = remap(
+            source: cgErp, uMap: map.u, vMap: map.v)
         else { return nil }
         return UIImage(cgImage: tile)
     }
@@ -87,80 +101,97 @@ final class ERPTileSlicer {
 
     // MARK: - Sampling map construction
 
-    private func buildSamplingMaps(erpW: Int, erpH: Int) -> [(u: [Float], v: [Float])] {
-        if let cached = samplingMaps, cachedW == erpW, cachedH == erpH {
-            return cached
-        }
+    private func ensureRays() -> (
+        px: [Float], py: [Float], pz: [Float]
+    ) {
+        if let r = cachedRays { return r }
 
         let n = tileSize * tileSize
         let (f, cx, cy) = tileIntrinsics()
-        let W = Float(erpW), H = Float(erpH)
 
-        // Pixel centre grid for the output tile
         var px = [Float](repeating: 0, count: n)
         var py = [Float](repeating: 0, count: n)
         for row in 0..<tileSize {
             for col in 0..<tileSize {
-                px[row * tileSize + col] = (Float(col) + 0.5 - cx) / f
-                py[row * tileSize + col] = (Float(row) + 0.5 - cy) / f
+                let idx = row * tileSize + col
+                px[idx] = (Float(col) + 0.5 - cx) / f
+                py[idx] = (Float(row) + 0.5 - cy) / f
             }
         }
-        // z = 1 for all rays
         var pz = [Float](repeating: 1.0, count: n)
 
-        // Normalise to unit sphere
         var norms = [Float](repeating: 0, count: n)
         for i in 0..<n {
-            norms[i] = sqrt(px[i]*px[i] + py[i]*py[i] + pz[i]*pz[i])
+            norms[i] = sqrt(
+                px[i] * px[i] + py[i] * py[i]
+                    + pz[i] * pz[i])
         }
-        vDSP_vdiv(norms, 1, px, 1, &px, 1, vDSP_Length(n))
-        vDSP_vdiv(norms, 1, py, 1, &py, 1, vDSP_Length(n))
-        vDSP_vdiv(norms, 1, pz, 1, &pz, 1, vDSP_Length(n))
+        vDSP_vdiv(
+            norms, 1, px, 1, &px, 1,
+            vDSP_Length(n))
+        vDSP_vdiv(
+            norms, 1, py, 1, &py, 1,
+            vDSP_Length(n))
+        vDSP_vdiv(
+            norms, 1, pz, 1, &pz, 1,
+            vDSP_Length(n))
 
-        var maps: [(u: [Float], v: [Float])] = []
+        let rays = (px: px, py: py, pz: pz)
+        cachedRays = rays
+        return rays
+    }
 
-        for R in faceRotations {
-            // R is cam_from_pano; transpose to get pano_from_cam.
-            // Matches Python: rays_pano = rays @ cam_from_pano (= cam_from_pano^T * ray)
-            let Rt = R.transpose
-            var rx = [Float](repeating: 0, count: n)
-            var ry = [Float](repeating: 0, count: n)
-            var rz = [Float](repeating: 0, count: n)
-
-            for i in 0..<n {
-                let ray = SIMD3<Float>(px[i], py[i], pz[i])
-                let rot = Rt * ray
-                rx[i] = rot.x
-                ry[i] = rot.y
-                rz[i] = rot.z
-            }
-
-            // Spherical → ERP pixel coordinates
-            // yaw   = atan2(rx, rz)
-            // pitch = -atan2(ry, sqrt(rx²+rz²))
-            // u_erp = W * (0.5 + yaw / 2π)
-            // v_erp = H * (0.5 - pitch / π)
-            var uMap = [Float](repeating: 0, count: n)
-            var vMap = [Float](repeating: 0, count: n)
-
-            for i in 0..<n {
-                let yaw   = atan2f(rx[i], rz[i])
-                let horiz = sqrt(rx[i]*rx[i] + rz[i]*rz[i])
-                let pitch = -atan2f(ry[i], horiz)
-                uMap[i] = W * (0.5 + yaw   / (2 * .pi)) - 0.5
-                vMap[i] = H * (0.5 - pitch / .pi)       - 0.5
-                // Wrap u horizontally
-                if uMap[i] < 0        { uMap[i] += W }
-                if uMap[i] >= W       { uMap[i] -= W }
-            }
-
-            maps.append((u: uMap, v: vMap))
+    private func buildFaceMap(
+        erpW: Int, erpH: Int, faceIndex: Int
+    ) -> (u: [Float], v: [Float]) {
+        if cachedFaceIdx == faceIndex,
+           cachedW == erpW, cachedH == erpH,
+           let m = cachedFaceMap
+        {
+            return m
         }
 
-        samplingMaps = maps
+        let rays = ensureRays()
+        let n = tileSize * tileSize
+        let W = Float(erpW), H = Float(erpH)
+        let R = faceRotations[faceIndex]
+        let Rt = R.transpose
+
+        var uMap = [Float](repeating: 0, count: n)
+        var vMap = [Float](repeating: 0, count: n)
+
+        for i in 0..<n {
+            let ray = SIMD3<Float>(
+                rays.px[i], rays.py[i], rays.pz[i])
+            let rot = Rt * ray
+            let yaw = atan2f(rot.x, rot.z)
+            let horiz = sqrt(
+                rot.x * rot.x + rot.z * rot.z)
+            let pitch = -atan2f(rot.y, horiz)
+            var u = W * (0.5 + yaw / (2 * .pi)) - 0.5
+            let v = H * (0.5 - pitch / .pi) - 0.5
+            if u < 0 { u += W }
+            if u >= W { u -= W }
+            uMap[i] = u
+            vMap[i] = v
+        }
+
+        let map = (u: uMap, v: vMap)
+        cachedFaceMap = map
+        cachedFaceIdx = faceIndex
         cachedW = erpW
         cachedH = erpH
-        return maps
+        return map
+    }
+
+    private func buildSamplingMaps(
+        erpW: Int, erpH: Int
+    ) -> [(u: [Float], v: [Float])] {
+        (0..<faceRotations.count).map {
+            buildFaceMap(
+                erpW: erpW, erpH: erpH,
+                faceIndex: $0)
+        }
     }
 
     // MARK: - Pre-extracted pixel path
@@ -198,11 +229,11 @@ final class ERPTileSlicer {
         at faceIndex: Int,
         srcPx: [UInt8], srcW: Int, srcH: Int
     ) -> UIImage? {
-        let maps = buildSamplingMaps(
-            erpW: srcW, erpH: srcH
-        )
-        guard faceIndex < maps.count else { return nil }
-        let map = maps[faceIndex]
+        guard faceIndex < faceRotations.count
+        else { return nil }
+        let map = buildFaceMap(
+            erpW: srcW, erpH: srcH,
+            faceIndex: faceIndex)
         guard let tile = remapPixels(
             srcPx: srcPx, srcW: srcW, srcH: srcH,
             uMap: map.u, vMap: map.v

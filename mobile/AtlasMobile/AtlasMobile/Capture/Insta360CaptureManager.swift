@@ -44,7 +44,10 @@ final class Insta360CaptureManager: ObservableObject {
                 return "timeout"
             }
             let sign = o.offsetMs >= 0 ? "+" : ""
-            return "\(sign)\(Int(o.offsetMs))ms"
+            return String(
+                format: "%@%dms ±%.0fms",
+                sign, Int(o.offsetMs), o.uncertaintyMs
+            )
         }
         return "sync: " + descriptions.joined(separator: ", ")
     }
@@ -133,7 +136,6 @@ final class Insta360CaptureManager: ObservableObject {
             await withTaskGroup(of: Void.self) { group in
                 for cam in connected {
                     group.addTask {
-                        _ = await cam.calibrateClockOffset()
                         await cam.switchToPhotoMode()
                         await cam.disableStabilization()
                     }
@@ -161,7 +163,6 @@ final class Insta360CaptureManager: ObservableObject {
                     return
                 }
                 for cam in connected {
-                    _ = await cam.calibrateClockOffset()
                     await cam.switchToPhotoMode()
                     await cam.disableStabilization()
                 }
@@ -190,6 +191,10 @@ final class Insta360CaptureManager: ObservableObject {
                     ? "pipeline primed — ready"
                     : "pipeline prime failed"
                     + " — proceeding"
+            )
+
+            self?.onLogMessage?(
+                "ready"
             )
         }
 
@@ -369,6 +374,12 @@ final class Insta360CaptureManager: ObservableObject {
 
     // MARK: - Download
 
+    /// Shots still queued for download across connected cameras.
+    func pendingDownloadCount() async -> Int {
+        let cameras = await MainActor.run { connectedCameras }
+        return cameras.reduce(0) { $0 + $1.pendingDownloadCount }
+    }
+
     func downloadAllPending(into sessionDirectory: URL) async -> [Insta360DownloadResult] {
         let cameras = await MainActor.run { connectedCameras }
         guard !cameras.isEmpty else { return [] }
@@ -385,32 +396,101 @@ final class Insta360CaptureManager: ObservableObject {
 
     // MARK: - Clock offset persistence
 
-    func saveClockOffsets(to sessionDirectory: URL) {
-        let samples = connectedCameras.compactMap { cam -> ClockOffsetSample? in
-            guard let offset = cam.clockOffset else { return nil }
-            return ClockOffsetSample(cameraId: cam.id, offsetMs: offset.offsetMs,
-                                     sampleCount: offset.sampleCount, stdDevMs: offset.stdDevMs)
+    func saveClockOffsets(
+        to sessionDirectory: URL,
+        phase: String = "start"
+    ) {
+        let entries = connectedCameras.compactMap {
+            cam -> ClockOffsetEntry? in
+            guard let o = cam.clockOffset else { return nil }
+            let preSetRaw: RawSyncSample? = o.preSetSample
+                .map {
+                    RawSyncSample(
+                        phoneSendMs: $0.phoneSendMs,
+                        phoneRecvMs: $0.phoneRecvMs,
+                        cameraMs: $0.cameraMs,
+                        offsetMs: $0.offsetMs,
+                        roundTripMs: $0.roundTripMs
+                    )
+                }
+            return ClockOffsetEntry(
+                cameraId: cam.id,
+                phase: phase,
+                offsetMs: o.offsetMs,
+                uncertaintyMs: o.uncertaintyMs,
+                sampleCount: o.sampleCount,
+                wallClockSec: o.wallClockSec,
+                arkitTimeSec: o.arkitTimeSec,
+                preSetSample: preSetRaw,
+                samples: o.samples.map {
+                    RawSyncSample(
+                        phoneSendMs: $0.phoneSendMs,
+                        phoneRecvMs: $0.phoneRecvMs,
+                        cameraMs: $0.cameraMs,
+                        offsetMs: $0.offsetMs,
+                        roundTripMs: $0.roundTripMs
+                    )
+                }
+            )
         }
-        let url = sessionDirectory
-            .appendingPathComponent("calibration/clock_offset_samples.json")
+        let url = sessionDirectory.appendingPathComponent(
+            "calibration/clock_offset_samples.json"
+        )
+        var existing: [ClockOffsetEntry] = []
+        if let data = try? Data(contentsOf: url),
+           let prev = try? JSONDecoder().decode(
+               [ClockOffsetEntry].self, from: data
+           )
+        {
+            existing = prev
+        }
+        existing.append(contentsOf: entries)
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(samples) {
+        encoder.outputFormatting = [
+            .prettyPrinted, .sortedKeys,
+        ]
+        if let data = try? encoder.encode(existing) {
             try? data.write(to: url)
         }
     }
 }
 
-private struct ClockOffsetSample: Codable {
+private struct ClockOffsetEntry: Codable {
     let cameraId: String
+    let phase: String
     let offsetMs: Double
+    let uncertaintyMs: Double
     let sampleCount: Int
-    let stdDevMs: Double
+    let wallClockSec: Double
+    let arkitTimeSec: Double
+    let preSetSample: RawSyncSample?
+    let samples: [RawSyncSample]
 
     enum CodingKeys: String, CodingKey {
         case cameraId = "camera_id"
+        case phase
         case offsetMs = "offset_ms"
+        case uncertaintyMs = "uncertainty_ms"
         case sampleCount = "sample_count"
-        case stdDevMs = "std_dev_ms"
+        case wallClockSec = "wall_clock_sec"
+        case arkitTimeSec = "arkit_time_sec"
+        case preSetSample = "pre_set_sample"
+        case samples
+    }
+}
+
+private struct RawSyncSample: Codable {
+    let phoneSendMs: Double
+    let phoneRecvMs: Double
+    let cameraMs: Double
+    let offsetMs: Double
+    let roundTripMs: Double
+
+    enum CodingKeys: String, CodingKey {
+        case phoneSendMs = "phone_send_ms"
+        case phoneRecvMs = "phone_recv_ms"
+        case cameraMs = "camera_ms"
+        case offsetMs = "offset_ms"
+        case roundTripMs = "round_trip_ms"
     }
 }

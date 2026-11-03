@@ -379,8 +379,6 @@ enum ExtrinsicOptimizer {
         let n = outW * outH
         guard n > 0 else { return (seed, 0) }
 
-        // Neutralize Insta360 stitch seam — replace with median gray
-        // so seam artifacts don't create false NCC signal.
         let seam = seamColumns(erpW: erpW)
         var cleanErp = erpGray
         if !seam.isEmpty {
@@ -393,7 +391,6 @@ enum ExtrinsicOptimizer {
             }
         }
 
-        // Precompute iPhone statistics for NCC
         var sumA: Float = 0
         var sumA2: Float = 0
         for v in iphoneGray {
@@ -402,14 +399,14 @@ enum ExtrinsicOptimizer {
             sumA2 += fv * fv
         }
         let meanA = sumA / Float(n)
-        let stdA = sqrt(max(0, sumA2 - Float(n) * meanA * meanA))
+        let stdA = sqrt(
+            max(0, sumA2 - Float(n) * meanA * meanA)
+        )
         guard stdA > 1 else { return (seed, 0) }
 
-        // Precompute ray directions (camera frame, don't change per eval).
-        // Flip 180° because iphoneGray comes from CIImage→CGImage which
-        // inverts Y, producing a landscape image that is 180° from the
-        // intrinsic convention.
-        var rays = [SIMD3<Float>](repeating: .zero, count: n)
+        var rays = [SIMD3<Float>](
+            repeating: .zero, count: n
+        )
         for row in 0..<outH {
             for col in 0..<outW {
                 let lCol = outW - 1 - col
@@ -424,70 +421,132 @@ enum ExtrinsicOptimizer {
 
         let eWf = Float(erpW), eHf = Float(erpH)
 
-        let startParams: [Float] = [
-            Float(seed.roll * .pi / 180),
-            Float(seed.pitch * .pi / 180),
-            Float(seed.yaw * .pi / 180),
+        let nccCost = { (params: [Float]) -> Float in
+            let r = params[0], p = params[1]
+            let y = params[2]
+            let cr = cos(r), sr = sin(r)
+            let cp = cos(p), sp = sin(p)
+            let cyw = cos(y), syw = sin(y)
+            let rSeed = simd_float3x3(rows: [
+                SIMD3(
+                    cyw * cp,
+                    cyw * sp * sr - syw * cr,
+                    cyw * sp * cr + syw * sr
+                ),
+                SIMD3(
+                    syw * cp,
+                    syw * sp * sr + cyw * cr,
+                    syw * sp * cr - cyw * sr
+                ),
+                SIMD3(-sp, cp * sr, cp * cr),
+            ])
+            let R = basisC * rSeed * basisD
+
+            var sumB: Float = 0
+            var sumB2: Float = 0
+            var sumAB: Float = 0
+
+            for i in 0..<n {
+                let rotated = R * rays[i]
+                let lat = -asin(
+                    max(-1, min(1, rotated.y))
+                )
+                let lon = atan2(rotated.x, rotated.z)
+
+                var uf = eWf * (0.5 + lon / (2 * .pi))
+                    - 0.5
+                let vf = eHf * (0.5 - lat / .pi)
+                    - 0.5
+                if uf < 0 { uf += eWf }
+                if uf >= eWf { uf -= eWf }
+
+                let u0 = Int(uf)
+                let v0 = max(
+                    0, min(erpH - 1, Int(vf))
+                )
+                let u1 = (u0 + 1) % erpW
+                let v1 = min(erpH - 1, v0 + 1)
+                let fu = uf - Float(u0)
+                let fv = vf - Float(v0)
+
+                let p00 = Float(
+                    cleanErp[v0 * erpW + u0]
+                )
+                let p10 = Float(
+                    cleanErp[v0 * erpW + u1]
+                )
+                let p01 = Float(
+                    cleanErp[v1 * erpW + u0]
+                )
+                let p11 = Float(
+                    cleanErp[v1 * erpW + u1]
+                )
+                let val = (p00 + (p10 - p00) * fu)
+                    * (1 - fv)
+                    + (p01 + (p11 - p01) * fu) * fv
+
+                sumB += val
+                sumB2 += val * val
+                sumAB += Float(iphoneGray[i]) * val
+            }
+
+            let meanB = sumB / Float(n)
+            let stdB = sqrt(
+                max(0, sumB2 - Float(n) * meanB * meanB)
+            )
+            guard stdB > 1 else { return Float(0) }
+            let ncc = (sumAB - Float(n) * meanA * meanB)
+                / (stdA * stdB)
+            return -ncc
+        }
+
+        // Coarse grid search: ±20° at 5° steps around seed.
+        // 9×9×9 = 729 NCC evaluations to find the right
+        // basin before Nelder-Mead refines.
+        let seedR = Float(seed.roll * .pi / 180)
+        let seedP = Float(seed.pitch * .pi / 180)
+        let seedY = Float(seed.yaw * .pi / 180)
+        let gridStep = Float(5.0 * .pi / 180)
+        let gridRange = 4 // ±20°
+
+        var bestGridCost = Float.infinity
+        var bestGridParams: [Float] = [
+            seedR, seedP, seedY,
         ]
 
-        let nm = nelderMead(
-            start: startParams,
-            steps: [0.02, 0.02, 0.02],
-            cost: { params in
-                let r = params[0], p = params[1], y = params[2]
-                let cr = cos(r), sr = sin(r)
-                let cp = cos(p), sp = sin(p)
-                let cy = cos(y), sy = sin(y)
-                let rSeed = simd_float3x3(rows: [
-                    SIMD3(cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr),
-                    SIMD3(sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr),
-                    SIMD3(-sp,   cp*sr,            cp*cr),
-                ])
-                let R = basisC * rSeed * basisD
-
-                var sumB: Float = 0
-                var sumB2: Float = 0
-                var sumAB: Float = 0
-
-                for i in 0..<n {
-                    let rotated = R * rays[i]
-                    let lat = -asin(max(-1, min(1, rotated.y)))
-                    let lon = atan2(rotated.x, rotated.z)
-
-                    var uf = eWf * (0.5 + lon / (2 * .pi)) - 0.5
-                    let vf = eHf * (0.5 - lat / .pi) - 0.5
-                    if uf < 0 { uf += eWf }
-                    if uf >= eWf { uf -= eWf }
-
-                    let u0 = Int(uf)
-                    let v0 = max(0, min(erpH - 1, Int(vf)))
-                    let u1 = (u0 + 1) % erpW
-                    let v1 = min(erpH - 1, v0 + 1)
-                    let fu = uf - Float(u0)
-                    let fv = vf - Float(v0)
-
-                    let p00 = Float(cleanErp[v0 * erpW + u0])
-                    let p10 = Float(cleanErp[v0 * erpW + u1])
-                    let p01 = Float(cleanErp[v1 * erpW + u0])
-                    let p11 = Float(cleanErp[v1 * erpW + u1])
-                    let val = (p00 + (p10 - p00) * fu)
-                        * (1 - fv)
-                        + (p01 + (p11 - p01) * fu) * fv
-
-                    sumB += val
-                    sumB2 += val * val
-                    sumAB += Float(iphoneGray[i]) * val
+        for ri in -gridRange...gridRange {
+            let r = seedR + Float(ri) * gridStep
+            for pi in -gridRange...gridRange {
+                let p = seedP + Float(pi) * gridStep
+                for yi in -gridRange...gridRange {
+                    let y = seedY + Float(yi) * gridStep
+                    let c = nccCost([r, p, y])
+                    if c < bestGridCost {
+                        bestGridCost = c
+                        bestGridParams = [r, p, y]
+                    }
                 }
+            }
+        }
 
-                let meanB = sumB / Float(n)
-                let stdB = sqrt(
-                    max(0, sumB2 - Float(n) * meanB * meanB)
-                )
-                guard stdB > 1 else { return Float(0) }
-                let ncc = (sumAB - Float(n) * meanA * meanB)
-                    / (stdA * stdB)
-                return -ncc
-            },
+        let gridNCC = -bestGridCost
+        let dR = (bestGridParams[0] - seedR) * 180 / .pi
+        let dP = (bestGridParams[1] - seedP) * 180 / .pi
+        let dY = (bestGridParams[2] - seedY) * 180 / .pi
+        print(
+            "[Calib] grid best NCC="
+            + String(format: "%.4f", gridNCC)
+            + " delta=(%.1f, %.1f, %.1f)"
+            + "° from seed"
+        )
+
+        // Refine from grid best with Nelder-Mead.
+        // Larger initial steps (3°) since the grid
+        // already found the right basin.
+        let nm = nelderMead(
+            start: bestGridParams,
+            steps: [0.05, 0.05, 0.05],
+            cost: nccCost,
             maxIter: maxIterations
         )
 
@@ -525,7 +584,8 @@ enum ExtrinsicOptimizer {
     //   ERP:    X=right, Y=down, Z=forward  (Insta360 pinhole / ERP projection)
     //
     // Full rotation:    R = basisC * R_seed * basisD
-    // Full translation: t = basisC * t_seed
+    // Full translation: t = basisC * (-x, y, z) of t_seed (see
+    //                   seedToCameraMatrix for the negated x)
     //
     // basisC maps seed-frame → ERP-frame directions.
     // Absorbs a 180° yaw so that seed yaw=0 aligns with the Insta360
@@ -579,7 +639,12 @@ enum ExtrinsicOptimizer {
         ])
 
         let rot = basisC * rSeed * basisD
-        let tSeed = SIMD3<Float>(Float(t.x), Float(t.y), Float(t.z))
+        // x is Forward in Camera Settings (the Insta360 in front of the
+        // iPhone camera). Used as is, a positive x put the Insta360 that
+        // far behind the iPhone camera, while y (Left) and z (Up) were
+        // placed as labelled (checked against the images of an exported
+        // session), so x is negated here.
+        let tSeed = SIMD3<Float>(-Float(t.x), Float(t.y), Float(t.z))
         let tErp = basisC * tSeed
 
         var M = simd_float4x4(1)

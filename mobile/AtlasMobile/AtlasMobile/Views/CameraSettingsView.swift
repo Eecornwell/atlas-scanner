@@ -269,6 +269,64 @@ private struct CameraFormView: View {
 
     private var unitLabel: String { useMetric ? "meters" : "inches" }
 
+    private static let coordNote =
+        "iPhone \u{2192} Insta360 offset. "
+        + "Hold phone upright with "
+        + "screen facing you:\n"
+        + "\u{2022} Forward = away from you "
+        + "(camera direction)\n"
+        + "\u{2022} Left = your left\n"
+        + "\u{2022} Up = toward sky\n"
+        + "Right-hand Z-up, rotations "
+        + "in ZYX order."
+
+    private var referenceNote: some View {
+        Section("Coordinate Reference") {
+            Text(Self.coordNote)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var positionSection: some View {
+        Section("Mount Position (\(unitLabel))") {
+            Picker("Units", selection: $useMetric) {
+                Text("Metric (m)").tag(true)
+                Text("Imperial (in)").tag(false)
+            }
+            .pickerStyle(.segmented)
+            NumberField(
+                "Forward / X (\(unitLabel))",
+                value: unitBinding($forwardM)
+            )
+            NumberField(
+                "Left / Y (\(unitLabel))",
+                value: unitBinding($leftM)
+            )
+            NumberField(
+                "Up / Z (\(unitLabel))",
+                value: unitBinding($upM)
+            )
+        }
+    }
+
+    private var rotationSection: some View {
+        Section("Mount Rotation (degrees)") {
+            NumberField(
+                "Roll (\u{00B0} about X)",
+                value: $rollDeg
+            )
+            NumberField(
+                "Pitch (\u{00B0} about Y)",
+                value: $pitchDeg
+            )
+            NumberField(
+                "Yaw (\u{00B0} about Z)",
+                value: $yawDeg
+            )
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -277,23 +335,9 @@ private struct CameraFormView: View {
                     TextField("Model (e.g. X5)", text: $model)
                     TextField("Serial Number", text: $serial)
                 }
-
-                Section("Mount Position (\(unitLabel))") {
-                    Picker("Units", selection: $useMetric) {
-                        Text("Metric (m)").tag(true)
-                        Text("Imperial (in)").tag(false)
-                    }
-                    .pickerStyle(.segmented)
-                    NumberField("Forward", value: unitBinding($forwardM))
-                    NumberField("Left", value: unitBinding($leftM))
-                    NumberField("Up", value: unitBinding($upM))
-                }
-
-                Section("Mount Rotation (degrees)") {
-                    NumberField("Roll", value: $rollDeg)
-                    NumberField("Pitch", value: $pitchDeg)
-                    NumberField("Yaw", value: $yawDeg)
-                }
+                referenceNote
+                positionSection
+                rotationSection
             }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)

@@ -1,6 +1,7 @@
 import Accelerate
 import Foundation
 import ImageIO
+import os
 import simd
 import ARKit
 import UIKit
@@ -62,9 +63,34 @@ final class COLMAPExporter {
         SIMD3<Float>(0,  0, -1),
     ])
 
+    /// Rig rotation correction from on-device RigCalibrator.
+    /// Set before export via `setRigCorrection(_:)`.
+    private static var rigCorrection = matrix_identity_float3x3
+
+    static func setRigCorrection(
+        _ correction: simd_float3x3
+    ) {
+        rigCorrection = correction
+    }
+
+    static func resetRigCorrection() {
+        rigCorrection = matrix_identity_float3x3
+    }
+
     static let tileSize = 2048
     static let tileFovDeg: Float = 65.0
     static let blurThreshold: Float = 300.0
+    /// X5 shots scoring below min(x5BlurThreshold, x5BlurMedianFraction
+    /// x session median) are dropped. 1000 dropped 9 of 13 sharp shots
+    /// of an open field (scores 560-820).
+    static let x5BlurThreshold: Float = 350.0
+    static let x5BlurMedianFraction: Float = 0.5
+    /// X5 shots whose recorded mean angular rate (over the 1.5 s after
+    /// the shutter command) exceeds this are dropped: their pose,
+    /// interpolated at command + x5ShutterDelay, is unreliable. Shots
+    /// in a 9-minute walk were mostly 0.6-2 deg/s; bad ones 3.2-7.7.
+    static let x5MaxMeanDps: Double = 3.0
+    static let x5ShutterDelay: Double = 1.0
 
     /// Seed extrinsic → ERP-from-ARKit 4x4 for composing with T_wc.inverse.
     static func erpFromARKit(_ ext: RigidTransform) -> simd_float4x4 {
@@ -74,7 +100,7 @@ final class COLMAPExporter {
             SIMD3(T.columns.1.x, T.columns.1.y, T.columns.1.z),
             SIMD3(T.columns.2.x, T.columns.2.y, T.columns.2.z)
         )
-        let Rc = R * cameraFromARKit
+        let Rc = R * rigCorrection * cameraFromARKit
         var M = simd_float4x4(1)
         M.columns.0 = SIMD4(Rc.columns.0, 0)
         M.columns.1 = SIMD4(Rc.columns.1, 0)
@@ -101,11 +127,28 @@ final class COLMAPExporter {
     // MARK: - Public
 
     /// Writes cameras.bin, images.bin, points3D.bin, rigs.bin, and frames.bin.
+    /// `onStage` receives a short description of each step, called on
+    /// the exporting thread.
     func export(
         scans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
-        cameraExportMode: CameraExportMode = .pinholeTiles
+        cameraExportMode: CameraExportMode = .pinholeTiles,
+        onStage: ((String) -> Void)? = nil
     ) throws {
+        let rcQ = simd_quatf(Self.rigCorrection)
+        let rcDeg = 2 * acos(min(abs(rcQ.real), 1.0))
+            * 180.0 / Float.pi
+        let s = 2.0 * 180.0 / Float.pi
+        print(String(
+            format: "[Export] rigCorrection: %.2f°"
+                + " rv=[%.3f, %.3f, %.3f]°"
+                + " q=[%.6f, %.6f, %.6f, %.6f]",
+            rcDeg,
+            rcQ.imag.x * s, rcQ.imag.y * s,
+            rcQ.imag.z * s,
+            rcQ.real, rcQ.imag.x,
+            rcQ.imag.y, rcQ.imag.z
+        ))
         try FileManager.default.createDirectory(
             at: sparseDir, withIntermediateDirectories: true)
 
@@ -119,29 +162,95 @@ final class COLMAPExporter {
         let iphoneCameraId: UInt32 = 1
         let faceCount = 8
 
+        onStage?("checking sharpness (\(Self.memorySummary()))")
+
+        // Score every image first, so the X5 limit can follow the
+        // session's median.
+        var iphoneScores: [Float?] = []
+        var x5Scores: [[String: Float]] = []
+        var x5Rates: [[String: Double]] = []
+        for scan in scans {
+            autoreleasepool {
+                iphoneScores.append(scan.iphoneImageURL.flatMap {
+                    Self.blurScore(imageURL: $0)
+                })
+                var shots: [String: Float] = [:]
+                for (camId, url) in scan.insta360ImageURLs {
+                    shots[camId] = Self.blurScore(imageURL: url)
+                }
+                x5Scores.append(shots)
+                x5Rates.append(
+                    scan.insta360ImageURLs.isEmpty
+                        ? [:]
+                        : x5MeanRates(scanName: scan.scanName))
+            }
+        }
+        // The score (Laplacian variance) measures fine texture, so it
+        // is low for sharp X5 shots of sky and grass as well as for
+        // blurred ones. Use a low fixed limit, lowered further for
+        // sessions whose shots all score low.
+        let allX5 = x5Scores.flatMap { $0.values }.sorted()
+        let x5Median = allX5.isEmpty ? 0 : allX5[allX5.count / 2]
+        let x5Limit = min(Self.x5BlurThreshold,
+                          Self.x5BlurMedianFraction * x5Median)
+        print(String(
+            format: "[Export] X5 blur limit %.0f"
+                + " (median %.0f over %ld shots)",
+            x5Limit, x5Median, allX5.count))
+
+        // A blurry iPhone frame drops the whole scan: the iPhone is
+        // the rig reference. A low-scoring X5 shot drops only that
+        // shot and keeps the scan's iPhone frame.
         var filteredScans: [ScanExportData] = []
         var skippedNames: [String] = []
-        for scan in scans {
-            let skipped: Bool = autoreleasepool {
-                if let url = scan.iphoneImageURL,
-                   let score = Self.blurScore(
-                       imageURL: url
-                   ),
-                   score < Self.blurThreshold
-                {
-                    let tag = String(
-                        format: "%.1f", score
-                    )
-                    skippedNames.append(
-                        "\(scan.scanName) (\(tag))"
-                    )
-                    return true
-                }
-                return false
+        var droppedX5: [String] = []
+        for (i, scan) in scans.enumerated() {
+            if let score = iphoneScores[i],
+               score < Self.blurThreshold
+            {
+                let tag = String(format: "%.1f", score)
+                skippedNames.append(
+                    "\(scan.scanName) iphone(\(tag))")
+                continue
             }
-            if !skipped {
+            var keptX5 = scan.insta360ImageURLs
+            for (camId, score) in x5Scores[i]
+            where score < x5Limit {
+                keptX5[camId] = nil
+                let tag = String(format: "%.1f", score)
+                droppedX5.append(
+                    "\(scan.scanName) x5-\(camId)(\(tag))")
+            }
+            for (camId, rate) in x5Rates[i]
+            where rate > Self.x5MaxMeanDps && keptX5[camId] != nil {
+                keptX5[camId] = nil
+                let tag = String(format: "%.1f deg/s", rate)
+                droppedX5.append(
+                    "\(scan.scanName) x5-\(camId)(\(tag))")
+            }
+            if keptX5.count == scan.insta360ImageURLs.count {
                 filteredScans.append(scan)
+            } else {
+                filteredScans.append(ScanExportData(
+                    scanName: scan.scanName,
+                    arkitPose: scan.arkitPose,
+                    intrinsics: scan.intrinsics,
+                    imageWidth: scan.imageWidth,
+                    imageHeight: scan.imageHeight,
+                    depthBinURL: scan.depthBinURL,
+                    smoothedDepthBinURL:
+                        scan.smoothedDepthBinURL,
+                    iphoneImageURL: scan.iphoneImageURL,
+                    insta360ImageURLs: keptX5,
+                    insta360CommandTimestamp:
+                        scan.insta360CommandTimestamp))
             }
+        }
+        if !droppedX5.isEmpty {
+            print(
+                "[Export] dropped \(droppedX5.count) X5 shots,"
+                + " kept their iPhone frames: "
+                + droppedX5.joined(separator: ", "))
         }
         if filteredScans.isEmpty {
             print(
@@ -244,6 +353,18 @@ final class COLMAPExporter {
             )
         }
 
+        let trajectory = loadTrajectory()
+        if let traj = trajectory {
+            print(
+                "[Export] trajectory loaded:"
+                + " \(traj.count) poses"
+            )
+        } else {
+            print("[Export] no trajectory — using"
+                + " scan poses for X5")
+        }
+
+        onStage?("writing sparse model (\(Self.memorySummary()))")
         do {
             let (imageEntries, allPoints) =
                 buildImageEntriesAndPoints(
@@ -252,6 +373,7 @@ final class COLMAPExporter {
                     iphoneCameraId: iphoneCameraId,
                     tileCameraIds: tileCameraIds,
                     fisheyeCameraIds: fisheyeCameraIds,
+                    trajectory: trajectory,
                     imgW: imgW_l, imgH: imgH_l,
                     fx: fx_l, fy: fy_l,
                     cx: cx_l, cy: cy_l
@@ -273,14 +395,18 @@ final class COLMAPExporter {
                     cameraConfig: cameraConfig,
                     iphoneCameraId: iphoneCameraId,
                     tileCameraIds: tileCameraIds,
-                    fisheyeCameraIds: fisheyeCameraIds
+                    fisheyeCameraIds: fisheyeCameraIds,
+                    trajectory: trajectory
                 )
             }
         }
         try copyImagesAndDepths(
             scans: filteredScans,
             cameraConfig: cameraConfig,
-            useFisheye: useFisheye
+            useFisheye: useFisheye,
+            iphoneW: imgW_p,
+            iphoneH: imgH_p,
+            onStage: onStage
         )
     }
 
@@ -346,6 +472,7 @@ final class COLMAPExporter {
         iphoneCameraId: UInt32,
         tileCameraIds: [Int: UInt32],
         fisheyeCameraIds: [(front: UInt32, back: UInt32)],
+        trajectory: [(timestamp: Double, pose: simd_float4x4)]?,
         imgW: Int, imgH: Int,
         fx: Float, fy: Float, cx: Float, cy: Float
     ) -> (entries: [ImageEntry], points: [ColoredPoint]) {
@@ -380,9 +507,21 @@ final class COLMAPExporter {
 
             // Insta360 entries — only for scans that have ERP images
             if !scan.insta360ImageURLs.isEmpty {
+                let x5Pose: simd_float4x4
+                if let cmdTs = scan.insta360CommandTimestamp,
+                   let traj = trajectory,
+                   let interpolated = Self.interpolateTrajectory(
+                       traj, at: cmdTs + Self.x5ShutterDelay
+                   )
+                {
+                    x5Pose = interpolated
+                } else {
+                    x5Pose = T_wc
+                }
+
                 for (camIdx, camCfg) in cameraConfig.cameras.enumerated() {
                     let T_insta_arkit = Self.erpFromARKit(camCfg.extrinsic)
-                    let T_iphone_world = T_wc.inverse
+                    let T_iphone_world = x5Pose.inverse
                     let T_insta_world = T_insta_arkit * T_iphone_world
 
                     let R_insta_w2c = simd_float3x3(
@@ -488,7 +627,8 @@ final class COLMAPExporter {
         }
 
         let pixels = Self.loadImageRGBA(
-            url: scan.iphoneImageURL
+            url: scan.iphoneImageURL,
+            maxWidth: 640
         )
 
         let scaleX = Float(lidarW) / Float(imgW)
@@ -527,10 +667,12 @@ final class COLMAPExporter {
                         p_arkit.z
                     )
 
+                let sampleW = pixels?.w ?? imgW
+                let sampleH = pixels?.h ?? imgH
                 let rgb = Self.sampleColor(
                     pixels: pixels,
                     lidarCol: col, lidarRow: row,
-                    imgW: imgW, imgH: imgH,
+                    imgW: sampleW, imgH: sampleH,
                     lidarW: lidarW, lidarH: lidarH
                 )
                 pts.append(ColoredPoint(
@@ -543,16 +685,62 @@ final class COLMAPExporter {
     }
 
     private static func loadImageRGBA(
-        url: URL?
+        url: URL?,
+        maxWidth: Int = 0
     ) -> (data: [UInt8], w: Int, h: Int)? {
         autoreleasepool {
             guard let url,
-                  let imgData = try? Data(
-                      contentsOf: url
-                  ),
-                  let uiImage = UIImage(data: imgData),
-                  let cg = uiImage.cgImage
+                  let source =
+                      CGImageSourceCreateWithURL(
+                          url as CFURL, nil)
             else { return nil }
+
+            let cg: CGImage
+            if maxWidth > 0 {
+                var opts: [CFString: Any] = [
+                    kCGImageSourceThumbnailMaxPixelSize:
+                        maxWidth,
+                    kCGImageSourceCreateThumbnailFromImageAlways:
+                        true,
+                    kCGImageSourceShouldCacheImmediately:
+                        true,
+                    kCGImageSourceShouldCache:
+                        false,
+                ]
+                if maxWidth < 1024 {
+                    opts[kCGImageSourceSubsampleFactor]
+                        = 4
+                } else if let props =
+                    CGImageSourceCopyPropertiesAtIndex(
+                        source, 0, nil
+                    ) as? [CFString: Any],
+                    let srcW = props[
+                        kCGImagePropertyPixelWidth
+                    ] as? Int,
+                    srcW > 8000
+                {
+                    opts[kCGImageSourceSubsampleFactor]
+                        = 2
+                }
+                guard let thumb =
+                    CGImageSourceCreateThumbnailAtIndex(
+                        source, 0,
+                        opts as CFDictionary)
+                else { return nil }
+                cg = thumb
+            } else {
+                guard let full =
+                    CGImageSourceCreateImageAtIndex(
+                        source, 0, [
+                            kCGImageSourceShouldCacheImmediately:
+                                true,
+                            kCGImageSourceShouldCache:
+                                false,
+                        ] as CFDictionary)
+                else { return nil }
+                cg = full
+            }
+
             let w = cg.width, h = cg.height
             guard w > 0, h > 0 else { return nil }
             var buf = [UInt8](
@@ -635,7 +823,10 @@ final class COLMAPExporter {
 
         var header = Data()
         header.appendLE(UInt64(points.count))
-        handle.write(header)
+        // write(contentsOf:) throws on I/O errors such as a full disk.
+        // The older write(_:) raises an Objective-C exception instead,
+        // which ends the app.
+        try handle.write(contentsOf: header)
 
         let batchSize = 1024
         for batchStart in Swift.stride(
@@ -660,7 +851,7 @@ final class COLMAPExporter {
                 chunk.appendLE(Double(0))
                 chunk.appendLE(UInt64(0))
             }
-            handle.write(chunk)
+            try handle.write(contentsOf: chunk)
         }
     }
 
@@ -708,6 +899,27 @@ final class COLMAPExporter {
                                 T_erp.columns.3.y,
                                 T_erp.columns.3.z)
 
+            if camIdx == 0 {
+                let T_raw = ExtrinsicOptimizer
+                    .seedToCameraMatrix(camCfg.extrinsic)
+                let R_raw = simd_float3x3(
+                    SIMD3(T_raw.columns.0.x, T_raw.columns.0.y, T_raw.columns.0.z),
+                    SIMD3(T_raw.columns.1.x, T_raw.columns.1.y, T_raw.columns.1.z),
+                    SIMD3(T_raw.columns.2.x, T_raw.columns.2.y, T_raw.columns.2.z)
+                )
+                let Rc_uncorr = R_raw * Self.cameraFromARKit
+                let S_old = Rc_uncorr * Self.arkitToColmap * rRotT
+                let S_new = R_insta * Self.arkitToColmap * rRotT
+                let delta = S_old.transpose * S_new
+                let dq = simd_quatf(delta)
+                print(String(
+                    format: "[Export] rigDelta:"
+                        + " %.2f° axis=[%.3f, %.3f, %.3f]",
+                    dq.angle * 180.0 / Float.pi,
+                    dq.axis.x, dq.axis.y, dq.axis.z
+                ))
+            }
+
             if !fisheyeCameraIds.isEmpty {
                 let ids = fisheyeCameraIds[camIdx]
 
@@ -754,21 +966,26 @@ final class COLMAPExporter {
 
     // MARK: - frames.bin
 
-    /// Writes frames.bin: one frame per rig scan (scans with Insta360 images).
-    /// Frame pose = iPhone image w2c (the rig reference sensor).
+    /// Writes frames.bin with separate frames for iPhone and X5.
+    /// The iPhone frame uses the scan-time pose; the X5 frame uses
+    /// the trajectory-interpolated pose at command + shutter delay,
+    /// so tools reading rig files get the corrected X5 position.
     private func writeFramesBin(
         scans: [ScanExportData],
         imageEntries: [ImageEntry],
         cameraConfig: MultiCameraConfig,
         iphoneCameraId: UInt32,
         tileCameraIds: [Int: UInt32],
-        fisheyeCameraIds: [(front: UInt32, back: UInt32)]
+        fisheyeCameraIds: [(front: UInt32, back: UInt32)],
+        trajectory: [(timestamp: Double, pose: simd_float4x4)]?
     ) throws {
         let rigId: UInt32 = 1
         let sensorTypeCamera: Int32 = 0
 
         let entryByName = Dictionary(
-            uniqueKeysWithValues: imageEntries.map { ($0.name, $0) }
+            uniqueKeysWithValues: imageEntries.map {
+                ($0.name, $0)
+            }
         )
 
         var data = Data()
@@ -777,44 +994,77 @@ final class COLMAPExporter {
         var frameCount: UInt64 = 0
 
         for scan in scans {
-            let (R_w2c_l, t_w2c_mat) = Self.arkitToColmapW2C(scan.arkitPose)
-            let t_w2c_l = SIMD3(
-                t_w2c_mat.columns.3.x,
-                t_w2c_mat.columns.3.y,
-                t_w2c_mat.columns.3.z
-            )
-            let R_w2c = Self.portraitRotation * R_w2c_l
-            let t_w2c = Self.portraitRotation * t_w2c_l
-            let q = Self.rotationToQuatWXYZ(R_w2c)
-
-            // Collect sensor observations, skipping
-            // any with image_id 0 (no capture).
-            var obs: [(Int32, UInt32, UInt64)] = []
-
+            // iPhone frame at scan time
             let iphoneName =
                 "face_iphone/\(scan.scanName).jpg"
             if let e = entryByName[iphoneName] {
-                obs.append((
-                    sensorTypeCamera,
-                    iphoneCameraId,
-                    UInt64(e.imageId)
-                ))
+                let (R_l, t_mat) = Self.arkitToColmapW2C(
+                    scan.arkitPose
+                )
+                let t_l = SIMD3(
+                    t_mat.columns.3.x,
+                    t_mat.columns.3.y,
+                    t_mat.columns.3.z
+                )
+                let R = Self.portraitRotation * R_l
+                let t = Self.portraitRotation * t_l
+                let q = Self.rotationToQuatWXYZ(R)
+
+                frameCount += 1
+                data.appendLE(UInt32(frameCount))
+                data.appendLE(rigId)
+                for v in q { data.appendLE(Double(v)) }
+                data.appendLE(Double(t.x))
+                data.appendLE(Double(t.y))
+                data.appendLE(Double(t.z))
+                data.appendLE(UInt32(1))
+                data.appendLE(sensorTypeCamera)
+                data.appendLE(iphoneCameraId)
+                data.appendLE(UInt64(e.imageId))
             }
 
+            // X5 frame at corrected pose
+            guard !scan.insta360ImageURLs.isEmpty
+            else { continue }
+
+            let x5Pose: simd_float4x4
+            if let cmdTs = scan.insta360CommandTimestamp,
+               let traj = trajectory,
+               let interp = Self.interpolateTrajectory(
+                   traj, at: cmdTs + Self.x5ShutterDelay
+               )
+            {
+                x5Pose = interp
+            } else {
+                x5Pose = scan.arkitPose
+            }
+
+            let (R_x5_l, t_x5_mat) =
+                Self.arkitToColmapW2C(x5Pose)
+            let t_x5_l = SIMD3(
+                t_x5_mat.columns.3.x,
+                t_x5_mat.columns.3.y,
+                t_x5_mat.columns.3.z
+            )
+            let R_x5 = Self.portraitRotation * R_x5_l
+            let t_x5 = Self.portraitRotation * t_x5_l
+            let q_x5 = Self.rotationToQuatWXYZ(R_x5)
+
+            var x5Obs: [(Int32, UInt32, UInt64)] = []
             if !fisheyeCameraIds.isEmpty {
                 for ids in fisheyeCameraIds {
-                    let fn =
-                        "fisheye_front/\(scan.scanName).jpg"
+                    let fn = "fisheye_front/"
+                        + "\(scan.scanName).jpg"
                     if let e = entryByName[fn] {
-                        obs.append((
+                        x5Obs.append((
                             sensorTypeCamera, ids.front,
                             UInt64(e.imageId)
                         ))
                     }
-                    let bn =
-                        "fisheye_back/\(scan.scanName).jpg"
+                    let bn = "fisheye_back/"
+                        + "\(scan.scanName).jpg"
                     if let e = entryByName[bn] {
-                        obs.append((
+                        x5Obs.append((
                             sensorTypeCamera, ids.back,
                             UInt64(e.imageId)
                         ))
@@ -823,11 +1073,15 @@ final class COLMAPExporter {
             } else {
                 for _ in cameraConfig.cameras {
                     for (faceIdx, camId) in tileCameraIds
-                        .sorted(by: { $0.key < $1.key })
+                        .sorted(by: {
+                            $0.key < $1.key
+                        })
                     {
-                        let tn = "face_\(String(format: "%02d", faceIdx))/\(scan.scanName).jpg"
+                        let tn = "face_"
+                            + "\(String(format: "%02d", faceIdx))"
+                            + "/\(scan.scanName).jpg"
                         if let e = entryByName[tn] {
-                            obs.append((
+                            x5Obs.append((
                                 sensorTypeCamera, camId,
                                 UInt64(e.imageId)
                             ))
@@ -836,18 +1090,17 @@ final class COLMAPExporter {
                 }
             }
 
-            guard !obs.isEmpty else { continue }
+            guard !x5Obs.isEmpty else { continue }
 
             frameCount += 1
             data.appendLE(UInt32(frameCount))
             data.appendLE(rigId)
-            for v in q { data.appendLE(Double(v)) }
-            data.appendLE(Double(t_w2c.x))
-            data.appendLE(Double(t_w2c.y))
-            data.appendLE(Double(t_w2c.z))
-
-            data.appendLE(UInt32(obs.count))
-            for (sType, camId, imgId) in obs {
+            for v in q_x5 { data.appendLE(Double(v)) }
+            data.appendLE(Double(t_x5.x))
+            data.appendLE(Double(t_x5.y))
+            data.appendLE(Double(t_x5.z))
+            data.appendLE(UInt32(x5Obs.count))
+            for (sType, camId, imgId) in x5Obs {
                 data.appendLE(sType)
                 data.appendLE(camId)
                 data.appendLE(imgId)
@@ -860,7 +1113,11 @@ final class COLMAPExporter {
             countOffset..<countOffset + 8, with: countBytes
         )
 
-        try data.write(to: sparseDir.appendingPathComponent("frames.bin"))
+        try data.write(
+            to: sparseDir.appendingPathComponent(
+                "frames.bin"
+            )
+        )
     }
 
     // MARK: - Copy images & depths
@@ -868,7 +1125,10 @@ final class COLMAPExporter {
     private func copyImagesAndDepths(
         scans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
-        useFisheye: Bool
+        useFisheye: Bool,
+        iphoneW: Int,
+        iphoneH: Int,
+        onStage: ((String) -> Void)? = nil
     ) throws {
         let fm = FileManager.default
         let iphoneFaceDir = imagesDir.appendingPathComponent("face_iphone")
@@ -888,39 +1148,45 @@ final class COLMAPExporter {
             print("[Export] no color profile — exporting uncorrected")
         }
 
-        // Build mask pixel cache AND precomputed tiles
-        // in one pass, then release UIImages immediately
-        // so ~50 MB per camera doesn't persist through
-        // the 50+ scan loop.
-        var maskPixelCache: [String: [UInt8]] = [:]
+        print("[Export] mem before masks: "
+            + "\(Self.memoryMB())MB")
+        onStage?("loading masks (\(Self.memorySummary()))")
+
+        // Build precomputed mask tiles. Load each mask
+        // one at a time to cap peak memory, and
+        // downsample if wider than 4096.
         var precomputedMaskTiles: [String: [Int: Data]] = [:]
-        for (camId, mask) in loadAllCameraMasks() {
+        for (camId, maskURL) in loadAllCameraMaskURLs() {
             autoreleasepool {
-                let inv = Self.invertMask(mask)
-                guard let mPx =
-                    Self.extractERPPixels(inv)
-                else { return }
-                maskPixelCache[camId] = mPx.px
+                let mPx: (px: [UInt8], w: Int, h: Int)?
+                    = Self.loadMaskPixels(url: maskURL,
+                                          maxWidth: 4096)
+                guard let mp = mPx else { return }
 
                 var tiles: [Int: Data] = [:]
                 if useFisheye {
                     let feSize = Self.fisheyeSize
                     for isFront in [true, false] {
                         autoreleasepool {
+                            // The saved mask is result.maskPx: the
+                            // image circle combined with maskPx.
+                            // erpPx only feeds result.imagePx,
+                            // which is unused here.
                             guard var result =
                                 Self.reprojectERPtoFisheye(
-                                    erpPx: mPx.px,
-                                    erpW: mPx.w,
-                                    erpH: mPx.h,
-                                    maskPx: nil,
+                                    erpPx: mp.px,
+                                    erpW: mp.w,
+                                    erpH: mp.h,
+                                    maskPx: mp.px,
                                     fisheyeSize: feSize,
                                     isFrontLens: isFront
                                 ),
-                                let png = Self.pngDataFromPixels(
-                                    &result.maskPx,
-                                    width: feSize,
-                                    height: feSize
-                                )
+                                let png =
+                                    Self.pngDataFromPixels(
+                                        &result.maskPx,
+                                        width: feSize,
+                                        height: feSize
+                                    )
                             else { return }
                             tiles[isFront ? 0 : 1] = png
                         }
@@ -929,7 +1195,10 @@ final class COLMAPExporter {
                     for faceIdx in 0..<8 {
                         autoreleasepool {
                             if let tile = slicer.sliceTile(
-                                at: faceIdx, from: inv
+                                at: faceIdx,
+                                srcPx: mp.px,
+                                srcW: mp.w,
+                                srcH: mp.h
                             ),
                                 let png = tile.pngData()
                             {
@@ -940,6 +1209,21 @@ final class COLMAPExporter {
                 }
                 precomputedMaskTiles[camId] = tiles
             }
+        }
+        slicer.clearCaches()
+
+        print("[Export] mem after masks: "
+            + "\(Self.memoryMB())MB")
+
+        let hasInsta360 = scans.contains {
+            !$0.insta360ImageURLs.isEmpty
+        }
+        let iphoneMaskDir = masksDir
+            .appendingPathComponent("face_iphone")
+        if hasInsta360 {
+            try fm.createDirectory(
+                at: iphoneMaskDir,
+                withIntermediateDirectories: true)
         }
 
         if useFisheye {
@@ -953,13 +1237,42 @@ final class COLMAPExporter {
             try fm.createDirectory(at: backMaskDir, withIntermediateDirectories: true)
         }
 
+        var scanIdx = 0
         for scan in scans { autoreleasepool {
-            // iPhone RGB
+            let mem = Self.memoryMB()
+            let mode = useFisheye ? "fisheye" : "tiles"
+            print("[Export] scan \(scanIdx)"
+                + "/\(scans.count)"
+                + " \(scan.scanName)"
+                + " mem=\(mem)MB \(mode)")
+            onStage?("scan \(scanIdx + 1)/\(scans.count)"
+                + " iPhone (\(Self.memorySummary()))")
+
+            // Do not post didReceiveMemoryWarningNotification here.
+            // NotificationCenter runs observers on the posting thread,
+            // so UIKit, SwiftUI and SDK observers would run on this
+            // background export thread. Real memory warnings come
+            // from the system on the main thread.
+            if scanIdx > 0, scanIdx % 10 == 0 {
+                URLCache.shared.removeAllCachedResponses()
+                print("[Export] cache flush at scan"
+                    + " \(scanIdx) mem=\(mem)MB")
+            }
+            scanIdx += 1
+            // iPhone RGB + mask
             if let src = scan.iphoneImageURL, fm.fileExists(atPath: src.path) {
                 let dst = iphoneFaceDir.appendingPathComponent(
                     "\(scan.scanName).jpg"
                 )
                 try? fm.copyItem(at: src, to: dst)
+
+                if hasInsta360 {
+                    Self.writeWhiteMask(
+                        to: iphoneMaskDir.appendingPathComponent(
+                            "\(scan.scanName).png"),
+                        width: iphoneW,
+                        height: iphoneH)
+                }
             }
 
             // Smoothed depth
@@ -971,6 +1284,10 @@ final class COLMAPExporter {
             }
 
             // Insta360 images
+            if !scan.insta360ImageURLs.isEmpty {
+                onStage?("scan \(scanIdx)/\(scans.count)"
+                    + " 360 image (\(Self.memorySummary()))")
+            }
             for (camId, erpURL) in scan.insta360ImageURLs {
                 let camTiles = precomputedMaskTiles[camId]
 
@@ -1042,28 +1359,6 @@ final class COLMAPExporter {
                         )
                     }
 
-                    autoreleasepool {
-                        let dbgDir = imagesDir
-                            .appendingPathComponent(
-                                "debug_erp"
-                            )
-                        try? fm.createDirectory(
-                            at: dbgDir,
-                            withIntermediateDirectories:
-                                true
-                        )
-                        Self.writeJPEGFromPixels(
-                            &px.px,
-                            width: px.w, height: px.h,
-                            quality: 0.85,
-                            to: dbgDir
-                                .appendingPathComponent(
-                                    "\(scan.scanName)"
-                                    + "_\(camId).jpg"
-                                )
-                        )
-                    }
-
                     if let cp = colorProfile {
                         ColorProfileCalibrator.applyInPlace(
                             cp, pixels: &px.px
@@ -1073,121 +1368,351 @@ final class COLMAPExporter {
                 }
 
                 if useFisheye {
-                    guard let erp = buildERPPixels()
-                    else { continue }
-                    let maskData: [UInt8]? =
-                        maskPixelCache[camId]
                     let feSize = Self.fisheyeSize
-                    for isFront in [true, false] {
-                        autoreleasepool {
-                            let subdir = isFront
-                                ? "fisheye_front"
-                                : "fisheye_back"
-                            guard var result =
-                                Self.reprojectERPtoFisheye(
-                                    erpPx: erp.px,
-                                    erpW: erp.w,
-                                    erpH: erp.h,
-                                    maskPx: maskData,
-                                    fisheyeSize: feSize,
-                                    isFrontLens: isFront
-                                ) else { return }
+                    let model = cameraConfig.cameras
+                        .first { $0.id == camId }?
+                        .model ?? ""
+                    let roll = DualFisheyeStitcher
+                        .rollCorrection(forModel: model)
 
-                            let imgDst = imagesDir
-                                .appendingPathComponent(subdir)
-                                .appendingPathComponent(
-                                    "\(scan.scanName).jpg"
-                                )
-                            Self.writeJPEGFromPixels(
-                                &result.imagePx,
-                                width: feSize,
-                                height: feSize,
-                                quality: 0.92,
-                                to: imgDst
-                            )
+                    // Check if source is dual-fisheye
+                    let isDual: Bool = autoreleasepool {
+                        guard let source =
+                            CGImageSourceCreateWithURL(
+                                erpURL as CFURL, nil),
+                            let props =
+                                CGImageSourceCopyPropertiesAtIndex(
+                                    source, 0, nil
+                                ) as? [CFString: Any],
+                            let w = props[
+                                kCGImagePropertyPixelWidth
+                            ] as? Int,
+                            let h = props[
+                                kCGImagePropertyPixelHeight
+                            ] as? Int
+                        else { return false }
+                        let ratio = Float(w) / Float(h)
+                        return ratio > 1.8 && ratio < 2.2
+                    }
 
-                            let mskDst = masksDir
-                                .appendingPathComponent(subdir)
-                                .appendingPathComponent(
-                                    "\(scan.scanName).png"
-                                )
-                            if let png = camTiles?[
-                                isFront ? 0 : 1
-                            ] {
-                                try? png.write(to: mskDst)
-                            } else if let png =
-                                Self.pngDataFromPixels(
-                                    &result.maskPx,
+                    if isDual {
+                        // Direct dual-fisheye → fisheye
+                        // skips ~52 MB ERP intermediate
+                        let srcPx: (px: [UInt8],
+                                     w: Int, h: Int)? =
+                            autoreleasepool {
+                                DualFisheyeStitcher
+                                    .loadPixels(
+                                        url: erpURL,
+                                        maxWidth: 4096)
+                            }
+                        guard let src = srcPx
+                        else { continue }
+
+                        for isFront in [true, false] {
+                            autoreleasepool {
+                                let subdir = isFront
+                                    ? "fisheye_front"
+                                    : "fisheye_back"
+                                guard var fisheyePx =
+                                    DualFisheyeStitcher
+                                        .reprojectToFisheye(
+                                            srcPx: src.px,
+                                            srcW: src.w,
+                                            srcH: src.h,
+                                            fisheyeSize: feSize,
+                                            fisheyeHalfFovRad:
+                                                Self.fisheyeHalfFovRad,
+                                            fisheyeRadiusFrac:
+                                                Self.fisheyeRadiusFrac,
+                                            isFrontLens: isFront,
+                                            rollDeg: roll)
+                                else { return }
+
+                                if let cp = colorProfile {
+                                    ColorProfileCalibrator
+                                        .applyInPlace(
+                                            cp,
+                                            pixels:
+                                                &fisheyePx)
+                                }
+
+                                let imgDst = imagesDir
+                                    .appendingPathComponent(
+                                        subdir)
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".jpg")
+                                Self.writeJPEGFromPixels(
+                                    &fisheyePx,
                                     width: feSize,
-                                    height: feSize
-                                )
-                            {
-                                try? png.write(to: mskDst)
+                                    height: feSize,
+                                    quality: 0.92,
+                                    to: imgDst)
+
+                                let mskDst = masksDir
+                                    .appendingPathComponent(
+                                        subdir)
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".png")
+                                if let png = camTiles?[
+                                    isFront ? 0 : 1]
+                                {
+                                    try? png.write(
+                                        to: mskDst)
+                                }
+                            }
+                        }
+                    } else {
+                        // Pre-stitched ERP fallback
+                        guard let erp = buildERPPixels()
+                        else { continue }
+                        for isFront in [true, false] {
+                            autoreleasepool {
+                                let subdir = isFront
+                                    ? "fisheye_front"
+                                    : "fisheye_back"
+                                guard var result =
+                                    Self.reprojectERPtoFisheye(
+                                        erpPx: erp.px,
+                                        erpW: erp.w,
+                                        erpH: erp.h,
+                                        maskPx: nil,
+                                        fisheyeSize: feSize,
+                                        isFrontLens: isFront
+                                    ) else { return }
+
+                                let imgDst = imagesDir
+                                    .appendingPathComponent(
+                                        subdir)
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".jpg")
+                                Self.writeJPEGFromPixels(
+                                    &result.imagePx,
+                                    width: feSize,
+                                    height: feSize,
+                                    quality: 0.92,
+                                    to: imgDst)
+
+                                let mskDst = masksDir
+                                    .appendingPathComponent(
+                                        subdir)
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".png")
+                                if let png = camTiles?[
+                                    isFront ? 0 : 1]
+                                {
+                                    try? png.write(
+                                        to: mskDst)
+                                } else if let png =
+                                    Self.pngDataFromPixels(
+                                        &result.maskPx,
+                                        width: feSize,
+                                        height: feSize)
+                                {
+                                    try? png.write(
+                                        to: mskDst)
+                                }
                             }
                         }
                     }
                 } else {
-                    guard let erp = buildERPPixels()
-                    else { continue }
-                    for faceIdx in 0..<8 {
+                    // Detect dual-fisheye vs pre-stitched
+                    let srcInfo: (isDual: Bool,
+                                  w: Int, h: Int)? =
                         autoreleasepool {
-                            let faceDir = imagesDir
-                                .appendingPathComponent(
-                                    String(
-                                        format: "face_%02d",
-                                        faceIdx
-                                    )
-                                )
-                            try? fm.createDirectory(
-                                at: faceDir,
-                                withIntermediateDirectories:
-                                    true
-                            )
-                            let dst = faceDir
-                                .appendingPathComponent(
-                                    "\(scan.scanName).jpg"
-                                )
-                            if let tile = slicer.sliceTile(
-                                at: faceIdx,
-                                srcPx: erp.px,
-                                srcW: erp.w,
-                                srcH: erp.h
-                            ),
-                                let jpegData =
-                                    tile.jpegData(
-                                        compressionQuality:
-                                            0.92
-                                    )
-                            {
-                                try? jpegData.write(to: dst)
-                            }
+                            guard let source =
+                                CGImageSourceCreateWithURL(
+                                    erpURL as CFURL, nil),
+                                let props =
+                                    CGImageSourceCopyPropertiesAtIndex(
+                                        source, 0, nil
+                                    ) as? [CFString: Any],
+                                let w = props[
+                                    kCGImagePropertyPixelWidth
+                                ] as? Int,
+                                let h = props[
+                                    kCGImagePropertyPixelHeight
+                                ] as? Int
+                            else { return nil }
+                            let ratio = Float(w) / Float(h)
+                            let isDual = ratio > 1.8
+                                && ratio < 2.2
+                            return (isDual, w, h)
+                        }
+                    guard let info = srcInfo
+                    else { continue }
 
-                            let maskFaceDir = masksDir
-                                .appendingPathComponent(
-                                    String(
-                                        format: "face_%02d",
-                                        faceIdx
-                                    )
-                                )
-                            try? fm.createDirectory(
-                                at: maskFaceDir,
-                                withIntermediateDirectories:
-                                    true
-                            )
-                            let mskDst = maskFaceDir
-                                .appendingPathComponent(
-                                    "\(scan.scanName).png"
-                                )
-                            if let png =
-                                camTiles?[faceIdx]
-                            {
-                                try? png.write(to: mskDst)
-                            } else {
-                                Self.writeWhiteMask(
-                                    to: mskDst,
-                                    width: slicer.tileSize,
-                                    height: slicer.tileSize
-                                )
+                    if info.isDual {
+                        // Direct tile from dual-fisheye —
+                        // no 134 MB ERP intermediate.
+                        // loadPixels uses subsample for
+                        // >8000 px sources (~71 MB vs ~283 MB)
+                        let srcMax = max(
+                            3072,
+                            Self.tileSize * 8 / 2 + 1024)
+                        let srcPx: (px: [UInt8],
+                                    w: Int, h: Int)? =
+                            autoreleasepool {
+                                DualFisheyeStitcher
+                                    .loadPixels(
+                                        url: erpURL,
+                                        maxWidth: srcMax)
+                            }
+                        guard let src = srcPx
+                        else { continue }
+
+                        let model = cameraConfig.cameras
+                            .first { $0.id == camId }?
+                            .model ?? ""
+                        let roll = DualFisheyeStitcher
+                            .rollCorrection(
+                                forModel: model)
+                        let faceRots =
+                            ERPTileSlicer
+                                .computeFaceRotations()
+                        let ts = slicer.tileSize
+                        let fov = slicer.tileFovDeg
+
+                        for faceIdx in 0..<8 {
+                            autoreleasepool {
+                                let faceDir = imagesDir
+                                    .appendingPathComponent(
+                                        String(
+                                            format:
+                                                "face_%02d",
+                                            faceIdx))
+                                try? fm.createDirectory(
+                                    at: faceDir,
+                                    withIntermediateDirectories:
+                                        true)
+                                let dst = faceDir
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".jpg")
+
+                                if var tilePx =
+                                    DualFisheyeStitcher
+                                        .sliceTileFromDualFisheye(
+                                            srcPx: src.px,
+                                            srcW: src.w,
+                                            srcH: src.h,
+                                            tileSize: ts,
+                                            faceRotation:
+                                                faceRots[
+                                                    faceIdx],
+                                            tileFovDeg: fov,
+                                            rollDeg: roll)
+                                {
+                                    if let cp =
+                                        colorProfile
+                                    {
+                                        ColorProfileCalibrator
+                                            .applyInPlace(
+                                                cp,
+                                                pixels:
+                                                    &tilePx)
+                                    }
+                                    Self.writeJPEGFromPixels(
+                                        &tilePx,
+                                        width: ts,
+                                        height: ts,
+                                        quality: 0.92,
+                                        to: dst)
+                                }
+
+                                let maskFaceDir = masksDir
+                                    .appendingPathComponent(
+                                        String(
+                                            format:
+                                                "face_%02d",
+                                            faceIdx))
+                                try? fm.createDirectory(
+                                    at: maskFaceDir,
+                                    withIntermediateDirectories:
+                                        true)
+                                let mskDst = maskFaceDir
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".png")
+                                if let png =
+                                    camTiles?[faceIdx]
+                                {
+                                    try? png.write(
+                                        to: mskDst)
+                                } else {
+                                    Self.writeWhiteMask(
+                                        to: mskDst,
+                                        width: ts,
+                                        height: ts)
+                                }
+                            }
+                        }
+                    } else {
+                        // Pre-stitched ERP — use remap
+                        guard let erp = buildERPPixels()
+                        else { continue }
+                        for faceIdx in 0..<8 {
+                            autoreleasepool {
+                                let faceDir = imagesDir
+                                    .appendingPathComponent(
+                                        String(
+                                            format:
+                                                "face_%02d",
+                                            faceIdx))
+                                try? fm.createDirectory(
+                                    at: faceDir,
+                                    withIntermediateDirectories:
+                                        true)
+                                let dst = faceDir
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".jpg")
+                                if let tile =
+                                    slicer.sliceTile(
+                                        at: faceIdx,
+                                        srcPx: erp.px,
+                                        srcW: erp.w,
+                                        srcH: erp.h),
+                                    let jpegData =
+                                        tile.jpegData(
+                                            compressionQuality:
+                                                0.92)
+                                {
+                                    try? jpegData.write(
+                                        to: dst)
+                                }
+
+                                let maskFaceDir = masksDir
+                                    .appendingPathComponent(
+                                        String(
+                                            format:
+                                                "face_%02d",
+                                            faceIdx))
+                                try? fm.createDirectory(
+                                    at: maskFaceDir,
+                                    withIntermediateDirectories:
+                                        true)
+                                let mskDst = maskFaceDir
+                                    .appendingPathComponent(
+                                        "\(scan.scanName)"
+                                        + ".png")
+                                if let png =
+                                    camTiles?[faceIdx]
+                                {
+                                    try? png.write(
+                                        to: mskDst)
+                                } else {
+                                    Self.writeWhiteMask(
+                                        to: mskDst,
+                                        width:
+                                            slicer.tileSize,
+                                        height:
+                                            slicer.tileSize)
+                                }
                             }
                         }
                     }
@@ -1196,19 +1721,78 @@ final class COLMAPExporter {
         } }
     }
 
-    /// All-white mask (COLMAP: white=valid).
+    /// Memory footprint in MB (phys_footprint), the figure iOS compares
+    /// with its per-app limit. resident_size also counts file-backed
+    /// pages that do not count toward that limit.
+    private static func memoryMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>
+                .size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(
+            to: &info
+        ) {
+            $0.withMemoryRebound(
+                to: integer_t.self,
+                capacity: Int(count)
+            ) {
+                task_info(
+                    mach_task_self_,
+                    task_flavor_t(TASK_VM_INFO),
+                    $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint / (1024 * 1024))
+    }
+
+    /// Mean angular rate (deg/s) recorded for each X5 shot of a scan,
+    /// read from its pose.json. Empty when none was recorded.
+    private func x5MeanRates(scanName: String) -> [String: Double] {
+        let url = sessionDirectory.appendingPathComponent(
+            "raw/iphone/\(scanName)/pose.json")
+        guard let data = try? Data(contentsOf: url),
+              let pose = try? JSONDecoder().decode(
+                ScanPose.self, from: data)
+        else { return [:] }
+        var rates: [String: Double] = [:]
+        for c in pose.insta360Captures {
+            if let m = c.meanAngularRateDps {
+                rates[c.cameraId] = m
+            }
+        }
+        return rates
+    }
+
+    /// Footprint and the headroom left before iOS ends the app.
+    static func memorySummary() -> String {
+        let leftMB = os_proc_available_memory() / (1024 * 1024)
+        return "\(memoryMB()) MB used, \(leftMB) MB left"
+    }
+
+    /// All-white mask (COLMAP: white=valid), width×height pixels.
     private static func writeWhiteMask(
         to url: URL, width: Int, height: Int
     ) {
-        let renderer = UIGraphicsImageRenderer(
-            size: CGSize(width: width, height: height)
-        )
-        let img = renderer.image { _ in
-            UIColor.white.setFill()
-            UIRectFill(CGRect(x: 0, y: 0, width: width, height: height))
-        }
-        if let data = img.pngData() {
-            try? data.write(to: url)
+        autoreleasepool {
+            // One pixel per point, 8 bits per channel. The default
+            // format uses the screen scale (3x) and can pick a 16-bit
+            // wide-colour buffer, so each mask came out 3x the size of
+            // its image and took 100 MB or more to render.
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.preferredRange = .standard
+            let renderer = UIGraphicsImageRenderer(
+                size: CGSize(width: width, height: height),
+                format: format
+            )
+            let img = renderer.image { _ in
+                UIColor.white.setFill()
+                UIRectFill(CGRect(x: 0, y: 0, width: width, height: height))
+            }
+            if let data = img.pngData() {
+                try? data.write(to: url)
+            }
         }
     }
 
@@ -1326,6 +1910,99 @@ final class COLMAPExporter {
             }
         }
         return result
+    }
+
+    private func loadAllCameraMaskURLs() -> [String: URL] {
+        guard let dir = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+        ).first?.appendingPathComponent(
+            "atlas_sessions/masks")
+        else { return [:] }
+        var result: [String: URL] = [:]
+        if let files = try? FileManager.default
+            .contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: nil)
+        {
+            for file in files
+            where file.pathExtension == "png" {
+                let camId = file
+                    .deletingPathExtension()
+                    .lastPathComponent
+                result[camId] = file
+            }
+        }
+        return result
+    }
+
+    private static func loadMaskPixels(
+        url: URL, maxWidth: Int
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        guard let source =
+            CGImageSourceCreateWithURL(
+                url as CFURL, nil),
+            let props =
+                CGImageSourceCopyPropertiesAtIndex(
+                    source, 0, nil
+                ) as? [CFString: Any],
+            let srcW = props[
+                kCGImagePropertyPixelWidth
+            ] as? Int
+        else { return nil }
+
+        var opts: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize:
+                maxWidth,
+            kCGImageSourceCreateThumbnailFromImageAlways:
+                true,
+            kCGImageSourceShouldCacheImmediately:
+                true,
+            kCGImageSourceShouldCache:
+                false,
+        ]
+        if srcW > 8000 {
+            opts[kCGImageSourceSubsampleFactor] = 2
+        }
+        guard let cg =
+            CGImageSourceCreateThumbnailAtIndex(
+                source, 0,
+                opts as CFDictionary)
+        else { return nil }
+
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0 else { return nil }
+
+        // Invert mask (white = masked → black) and
+        // extract top-down RGBA pixels in one pass.
+        // Draw with the identity CTM: it already puts the
+        // image's top row first, the layout ERPTileSlicer
+        // and reprojectERPtoFisheye read (as in
+        // DualFisheyeStitcher.extractPixels). A flipped CTM
+        // here loaded the mask upside down.
+        var px = [UInt8](
+            repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(
+            data: &px, width: w, height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: w * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo
+                .noneSkipLast.rawValue
+        ) else { return nil }
+        ctx.draw(
+            cg,
+            in: CGRect(
+                x: 0, y: 0,
+                width: w, height: h))
+
+        for i in stride(from: 0, to: px.count,
+                         by: 4) {
+            px[i] = 255 - px[i]
+            px[i + 1] = 255 - px[i + 1]
+            px[i + 2] = 255 - px[i + 2]
+        }
+
+        return (px, w, h)
     }
 
     // MARK: - ERP → Fisheye reprojection
@@ -1466,17 +2143,35 @@ final class COLMAPExporter {
     static func blurScore(
         imageURL: URL
     ) -> Float? {
-        guard
-            let imgData = try? Data(
-                contentsOf: imageURL
-            ),
-            let uiImage = UIImage(data: imgData),
-            let cgImage = uiImage.cgImage
+        guard let source =
+            CGImageSourceCreateWithURL(
+                imageURL as CFURL, nil),
+            let cgImage =
+                CGImageSourceCreateThumbnailAtIndex(
+                    source, 0, [
+                        kCGImageSourceThumbnailMaxPixelSize:
+                            640,
+                        kCGImageSourceCreateThumbnailFromImageAlways:
+                            true,
+                        kCGImageSourceShouldCacheImmediately:
+                            true,
+                        kCGImageSourceShouldCache:
+                            false,
+                        kCGImageSourceSubsampleFactor: 4,
+                    ] as CFDictionary)
         else { return nil }
 
         let srcW = cgImage.width
         let srcH = cgImage.height
         guard srcW > 0, srcH > 0 else { return nil }
+
+        let targetW = 320
+        let targetH = Int(
+            Float(targetW) * Float(srcH)
+                / Float(srcW)
+        )
+        guard targetW > 2, targetH > 2
+        else { return nil }
 
         let grayCount = srcW * srcH
         let grayPtr = UnsafeMutablePointer<UInt8>
@@ -1501,14 +2196,6 @@ final class COLMAPExporter {
                 width: srcW, height: srcH
             )
         )
-
-        let targetW = 320
-        let targetH = Int(
-            Float(targetW) * Float(srcH)
-                / Float(srcW)
-        )
-        guard targetW > 2, targetH > 2
-        else { return nil }
 
         let resCount = targetW * targetH
         let resPtr = UnsafeMutablePointer<UInt8>
@@ -1589,7 +2276,8 @@ final class COLMAPExporter {
     func triangulate(
         scans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
-        cameraExportMode: CameraExportMode = .pinholeTiles
+        cameraExportMode: CameraExportMode = .pinholeTiles,
+        trajectory: [(timestamp: Double, pose: simd_float4x4)]? = nil
     ) throws {
         guard let first = scans.first, scans.count >= 2 else {
             print("[Triangulate] need ≥2 scans")
@@ -1760,7 +2448,8 @@ final class COLMAPExporter {
             scans: scans,
             cameraConfig: cameraConfig,
             obsMap: obsMap,
-            cameraExportMode: cameraExportMode
+            cameraExportMode: cameraExportMode,
+            trajectory: trajectory
         )
 
         print("[Triangulate] done — \(nPts) points "
@@ -1804,7 +2493,8 @@ final class COLMAPExporter {
         scans: [ScanExportData],
         cameraConfig: MultiCameraConfig,
         obsMap: [UInt32: [(Float, Float, UInt64)]],
-        cameraExportMode: CameraExportMode
+        cameraExportMode: CameraExportMode,
+        trajectory: [(timestamp: Double, pose: simd_float4x4)]? = nil
     ) throws {
         let faceRotations = Self.computeFaceRotations()
         let iphoneCameraId: UInt32 = 1
@@ -1860,12 +2550,24 @@ final class COLMAPExporter {
             imageId += 1
 
             if !scan.insta360ImageURLs.isEmpty {
+                let x5Pose: simd_float4x4
+                if let cmdTs = scan.insta360CommandTimestamp,
+                   let traj = trajectory,
+                   let interpolated = Self.interpolateTrajectory(
+                       traj, at: cmdTs + Self.x5ShutterDelay
+                   )
+                {
+                    x5Pose = interpolated
+                } else {
+                    x5Pose = T_wc
+                }
+
                 for (camIdx, camCfg) in cameraConfig.cameras.enumerated() {
                     let T_insta_arkit = Self.erpFromARKit(
                         camCfg.extrinsic
                     )
                     let T_insta_world =
-                        T_insta_arkit * T_wc.inverse
+                        T_insta_arkit * x5Pose.inverse
                     let R_iw = simd_float3x3(
                         SIMD3(T_insta_world.columns.0.x,
                               T_insta_world.columns.0.y,
@@ -2005,6 +2707,61 @@ final class COLMAPExporter {
             return simd_float3x3(faceQuat)
         }
     }
+
+    // MARK: - Trajectory interpolation
+
+    private func loadTrajectory()
+        -> [(timestamp: Double, pose: simd_float4x4)]?
+    {
+        Self.loadTrajectory(sessionDirectory: sessionDirectory)
+    }
+
+    static func loadTrajectory(sessionDirectory: URL)
+        -> [(timestamp: Double, pose: simd_float4x4)]?
+    {
+        let url = sessionDirectory
+            .appendingPathComponent("raw/trajectory.json")
+        guard let data = try? Data(contentsOf: url),
+              let traj = try? JSONDecoder().decode(
+                  TrajectoryData.self, from: data
+              )
+        else { return nil }
+        return traj.poses.compactMap { entry in
+            let T = entry.transform
+            guard T.count == 4,
+                  T.allSatisfy({ $0.count == 4 })
+            else { return nil }
+            let pose = simd_float4x4(columns: (
+                SIMD4(T[0][0], T[0][1], T[0][2], T[0][3]),
+                SIMD4(T[1][0], T[1][1], T[1][2], T[1][3]),
+                SIMD4(T[2][0], T[2][1], T[2][2], T[2][3]),
+                SIMD4(T[3][0], T[3][1], T[3][2], T[3][3])
+            ))
+            return (timestamp: entry.timestamp, pose: pose)
+        }
+    }
+
+    static func interpolateTrajectory(
+        _ trajectory: [(timestamp: Double, pose: simd_float4x4)],
+        at timestamp: Double
+    ) -> simd_float4x4? {
+        guard trajectory.count >= 2
+        else { return trajectory.first?.pose }
+        guard let afterIdx = trajectory.firstIndex(
+            where: { $0.timestamp >= timestamp }
+        ) else { return trajectory.last?.pose }
+        guard afterIdx > 0
+        else { return trajectory.first?.pose }
+        let before = trajectory[afterIdx - 1]
+        let after = trajectory[afterIdx]
+        let t = Float(
+            (timestamp - before.timestamp)
+                / (after.timestamp - before.timestamp)
+        )
+        return PoseInterpolation.interpolate(
+            from: before.pose, to: after.pose, t: t
+        )
+    }
 }
 
 // MARK: - Supporting types
@@ -2019,6 +2776,7 @@ struct ScanExportData {
     let smoothedDepthBinURL: URL?
     let iphoneImageURL: URL?
     let insta360ImageURLs: [String: URL]  // cameraId → ERP path
+    let insta360CommandTimestamp: Double?  // systemUptime when X5 capture was issued
 }
 
 private struct ImageEntry {
@@ -2070,5 +2828,213 @@ private extension Data {
     mutating func appendLE(_ value: Int32) {
         var v = value.littleEndian
         append(Data(bytes: &v, count: 4))
+    }
+}
+
+// MARK: - ARKit tracking check
+
+/// Flags ARKit position jumps (tracking corrections) and scans taken
+/// while tracking was limited, so a session whose ARKit poses need
+/// replacing by SfM can be spotted on the phone.
+enum ARKitTrackingCheck {
+    struct Jump: Codable {
+        /// Seconds since the first trajectory pose.
+        let time: Double
+        let jumpCm: Float
+        let nearestScan: String
+    }
+
+    struct LimitedScan: Codable {
+        let scan: String
+        let state: String
+    }
+
+    struct Result: Codable {
+        let jumps: [Jump]
+        let limitedScans: [LimitedScan]
+        let summary: String
+
+        var hasIssues: Bool {
+            !jumps.isEmpty || !limitedScans.isEmpty
+        }
+    }
+
+    /// A step over 5 cm between consecutive 60 Hz poses (over 3 m/s)
+    /// is a tracking correction, not walking: in a 9-minute walk the
+    /// 99.9th-percentile step was 2.4 cm.
+    static let minJumpM: Float = 0.05
+    static let minJumpSpeed: Float = 3.0
+
+    static func run(
+        sessionDirectory: URL,
+        trajectory: [(timestamp: Double, pose: simd_float4x4)]?
+    ) -> Result {
+        // Scan times and tracking states come from each pose.json.
+        var scanTimes: [(t: Double, name: String)] = []
+        var limited: [LimitedScan] = []
+        let iphoneDir = sessionDirectory
+            .appendingPathComponent("raw/iphone")
+        let dirs = ((try? FileManager.default.contentsOfDirectory(
+            at: iphoneDir, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent.hasPrefix("scan_") }
+            .sorted { $0.path < $1.path }
+        for dir in dirs {
+            guard let data = try? Data(contentsOf:
+                    dir.appendingPathComponent("pose.json")),
+                  let pose = try? JSONDecoder().decode(
+                    ScanPose.self, from: data)
+            else { continue }
+            let name = dir.lastPathComponent
+            scanTimes.append((t: pose.timestamp, name: name))
+            if let state = pose.trackingState, state != "normal" {
+                limited.append(LimitedScan(scan: name, state: state))
+            }
+        }
+
+        var jumps: [Jump] = []
+        if let traj = trajectory, traj.count >= 2 {
+            let t0 = traj[0].timestamp
+            for i in 1..<traj.count {
+                let dt = Float(traj[i].timestamp
+                    - traj[i - 1].timestamp)
+                guard dt > 0 else { continue }
+                let a = traj[i - 1].pose.columns.3
+                let b = traj[i].pose.columns.3
+                let step = simd_length(SIMD3<Float>(
+                    b.x - a.x, b.y - a.y, b.z - a.z))
+                guard step > minJumpM, step / dt > minJumpSpeed
+                else { continue }
+                let t = traj[i].timestamp
+                let nearest = scanTimes.min {
+                    abs($0.t - t) < abs($1.t - t)
+                }?.name ?? "?"
+                jumps.append(Jump(
+                    time: t - t0, jumpCm: step * 100,
+                    nearestScan: nearest))
+            }
+        }
+
+        var parts: [String] = []
+        if !jumps.isEmpty {
+            let maxCm = Int((jumps.map(\.jumpCm).max() ?? 0).rounded())
+            var seen = Set<String>()
+            let scans = jumps.map(\.nearestScan)
+                .filter { seen.insert($0).inserted }
+            let list = scans.prefix(8).joined(separator: ", ")
+                + (scans.count > 8 ? ", …" : "")
+            parts.append("\(jumps.count) position jumps"
+                + " (up to \(maxCm) cm) near \(list)")
+        }
+        if !limited.isEmpty {
+            let list = limited.prefix(8).map(\.scan)
+                .joined(separator: ", ")
+                + (limited.count > 8 ? ", …" : "")
+            parts.append("tracking limited at \(limited.count)"
+                + " scans: \(list)")
+        }
+        let summary = parts.isEmpty
+            ? "No ARKit position jumps found"
+            : parts.joined(separator: "; ")
+        return Result(
+            jumps: jumps, limitedScans: limited, summary: summary)
+    }
+
+    /// Writes the result to <session>/arkit_check.json for the
+    /// processing pipeline.
+    static func save(_ result: Result, in sessionDirectory: URL) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        if let data = try? encoder.encode(result) {
+            try? data.write(to: sessionDirectory
+                .appendingPathComponent("arkit_check.json"))
+        }
+    }
+}
+
+// MARK: - Export trace
+
+/// Progress lines of the current export, written to
+/// <session>/export_trace.log and flushed to disk one by one. iOS leaves
+/// no crash report for some ways the app can end, so the last line
+/// still says which step the export was in. The export screen shows
+/// the last lines when an export did not finish.
+enum ExportTrace {
+    static let fileName = "export_trace.log"
+    private static let endMarker = "export ended: "
+    private static let lock = NSLock()
+    private static var handle: FileHandle?
+    private static var start = Date()
+
+    /// Starts the trace of a new export, replacing the previous one, and
+    /// starts writing crash details (signal, stack, uncaught exceptions)
+    /// into it.
+    static func begin(sessionDirectory: URL, _ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        RigCalibratorBridge.stopCrashCapture()
+        try? handle?.close()
+        let url = sessionDirectory.appendingPathComponent(fileName)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        handle = try? FileHandle(forWritingTo: url)
+        start = Date()
+        write(line)
+        if let fd = handle?.fileDescriptor {
+            let env = RigCalibratorBridge.installCrashCapture(fileDescriptor: fd)
+            for envLine in env.split(separator: "\n") {
+                write(String(envLine))
+            }
+        }
+    }
+
+    /// Adds a line while an export is running; does nothing otherwise.
+    static func note(_ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        write(line)
+    }
+
+    /// Writes the last line of the export and closes the trace.
+    static func finish(_ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        write(endMarker + line)
+        RigCalibratorBridge.stopCrashCapture()
+        try? handle?.close()
+        handle = nil
+    }
+
+    /// Lines of the session's trace when its export did not finish, i.e.
+    /// the app ended during it; nil otherwise. When a crash was captured
+    /// ("!!! " lines), the `count` lines before it and its first lines;
+    /// otherwise the last `count` lines.
+    static func unfinished(
+        sessionDirectory: URL, count: Int = 4
+    ) -> [String]? {
+        let url = sessionDirectory.appendingPathComponent(fileName)
+        guard let text = try? String(contentsOf: url, encoding: .utf8)
+        else { return nil }
+        let lines = text.split(separator: "\n").map(String.init)
+        guard let last = lines.last, !last.contains(endMarker)
+        else { return nil }
+        if let crash = lines.firstIndex(where: { $0.hasPrefix("!!! ") }) {
+            let lo = max(0, crash - count)
+            let hi = min(lines.count, crash + 8)
+            return Array(lines[lo..<hi])
+        }
+        return Array(lines.suffix(count))
+    }
+
+    /// Caller holds `lock`. Each line gets the elapsed time and, unless
+    /// it already has them, the memory numbers, so a memory kill shows
+    /// up as falling headroom.
+    private static func write(_ line: String) {
+        guard let h = handle else { return }
+        let t = String(format: "%6.1fs ",
+                       Date().timeIntervalSince(start))
+        let mem = line.contains("MB left")
+            ? "" : " (\(COLMAPExporter.memorySummary()))"
+        try? h.write(contentsOf: Data((t + line + mem + "\n").utf8))
+        try? h.synchronize()
     }
 }

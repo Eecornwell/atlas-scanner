@@ -1,3 +1,4 @@
+import Darwin
 import SwiftUI
 import INSCameraSDK
 import INSCameraServiceSDK
@@ -50,6 +51,11 @@ struct AtlasMobileApp: App {
     @StateObject private var sessionManager = CaptureSessionManager()
 
     init() {
+        // A write to a socket the Insta360 camera has already closed
+        // raises SIGPIPE. Its default action ends the app without a
+        // crash report. Ignoring it makes the write return an EPIPE
+        // error to the caller instead.
+        signal(SIGPIPE, SIG_IGN)
         UserDefaults.standard.register(defaults: [
             "multiCameraExport": true,
         ])

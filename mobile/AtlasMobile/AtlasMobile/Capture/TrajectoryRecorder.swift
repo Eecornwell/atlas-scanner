@@ -7,13 +7,17 @@ import simd
 final class TrajectoryRecorder {
     private var poses: [(timestamp: Double, pose: simd_float4x4)] = []
     private let lock = NSLock()
-    private var lastRecordedTs: Double = 0
 
     func recordPose(timestamp: Double, pose: simd_float4x4) {
         lock.lock()
-        if timestamp - lastRecordedTs >= 0.1 {
-            poses.append((timestamp: timestamp, pose: pose))
-            lastRecordedTs = timestamp
+        if let prev = poses.last?.timestamp,
+           timestamp - prev < 1e-6
+        {
+            // skip near-duplicate timestamp
+        } else {
+            poses.append(
+                (timestamp: timestamp, pose: pose)
+            )
         }
         lock.unlock()
     }
@@ -36,6 +40,24 @@ final class TrajectoryRecorder {
         let t = Float((timestamp - before.timestamp) / (after.timestamp - before.timestamp))
 
         return PoseInterpolation.interpolate(from: before.pose, to: after.pose, t: t)
+    }
+
+    func nearestTimestamp(to target: Double) -> Double? {
+        lock.lock()
+        let snapshot = poses
+        lock.unlock()
+        guard !snapshot.isEmpty else { return nil }
+        var lo = 0, hi = snapshot.count - 1
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if snapshot[mid].timestamp < target { lo = mid + 1 }
+            else { hi = mid }
+        }
+        if lo == 0 { return snapshot[0].timestamp }
+        let before = snapshot[lo - 1].timestamp
+        let after = snapshot[lo].timestamp
+        return (target - before) <= (after - target)
+            ? before : after
     }
 
     func export() -> TrajectoryData {

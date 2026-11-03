@@ -1,4 +1,5 @@
 import ImageIO
+import simd
 import SwiftUI
 
 /// Presented after endSession() — lets the user choose how to process the session.
@@ -14,6 +15,15 @@ struct SessionExportView: View {
     @State private var isComplete = false
     @State private var isZipping = false
     @State private var shareItem: ShareableURL?
+    @State private var rigCalResult: RigCalibrator.Result?
+    @State private var arkitCheck: ARKitTrackingCheck.Result?
+    /// Rig calibration on the phone before a COLMAP export. Off by
+    /// default: exports ended the app at "Calibrating rig" and the
+    /// cause is not confirmed (see export_trace.log).
+    @AppStorage("onDeviceRigCalibration") private var onDeviceRigCalibration = false
+    /// Last lines of this session's export trace when the app ended
+    /// during its last export; nil otherwise.
+    @State private var lastTrace: [String]?
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -80,6 +90,63 @@ struct SessionExportView: View {
                     }
                 }
 
+                if selectedMode == .colmapOnly {
+                    Section("Rig Calibration on Phone") {
+                        Toggle("Calibrate rig before export",
+                               isOn: $onDeviceRigCalibration)
+                        Text("Experimental. Off: the export uses the rig "
+                             + "extrinsics as they are.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                // Where the previous export was when the app ended
+                if let trace = lastTrace, !isRunning, !isComplete {
+                    Section("Last Export Stopped") {
+                        Text("The app ended during the last export."
+                             + " Its last steps were:")
+                            .font(.caption)
+                        ForEach(Array(trace.enumerated()), id: \.offset) {
+                            _, line in
+                            Text(line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                        Button("Share log") {
+                            shareItem = ShareableURL(
+                                url: sessionDirectory
+                                    .appendingPathComponent(
+                                        ExportTrace.fileName))
+                        }
+                    }
+                }
+
+                // Rig calibration result
+                if let cal = rigCalResult {
+                    Section("Rig Calibration") {
+                        rigCalSection(cal)
+                    }
+                }
+
+                // ARKit tracking check (also saved as arkit_check.json)
+                if let check = arkitCheck {
+                    Section("ARKit Tracking") {
+                        HStack {
+                            Circle()
+                                .fill(check.hasIssues
+                                      ? Color.orange : Color.green)
+                                .frame(width: 10, height: 10)
+                            Text(check.hasIssues
+                                 ? "Check poses" : "OK")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        Text(check.summary)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
                 // Progress
                 if isRunning || isComplete {
                     Section("Progress") {
@@ -121,10 +188,54 @@ struct SessionExportView: View {
                 }
             }
             .task { await postProcessor.loadModels() }
+            .onAppear {
+                lastTrace = ExportTrace.unfinished(
+                    sessionDirectory: sessionDirectory)
+            }
             .onChange(of: multiCameraExport) { _ in
                 isComplete = false
             }
         }
+    }
+
+    // MARK: - Rig calibration section
+
+    @ViewBuilder
+    private func rigCalSection(
+        _ cal: RigCalibrator.Result
+    ) -> some View {
+        let color: Color = {
+            switch cal.status {
+            case .applied: return .green
+            case .flagged: return .orange
+            case .skipped: return .secondary
+            }
+        }()
+        HStack {
+            Circle().fill(color).frame(width: 10, height: 10)
+            Text(cal.status.rawValue.capitalized)
+                .font(.subheadline.weight(.semibold))
+        }
+        if cal.facesTotal > 0 {
+            Text(String(format:
+                "Faces: %d / %d used",
+                cal.facesUsed, cal.facesTotal))
+                .font(.system(.caption, design: .monospaced))
+        }
+        if cal.correctionAngleDeg > 0 {
+            Text(String(format:
+                "Correction: %.2f° / %.1f cm",
+                cal.correctionAngleDeg,
+                cal.correctionShiftCm))
+                .font(.system(.caption, design: .monospaced))
+            Text(String(format:
+                "Error: %.2f° → %.2f°",
+                cal.errorBeforeDeg, cal.errorAfterDeg))
+                .font(.system(.caption, design: .monospaced))
+        }
+        Text(cal.reason)
+            .font(.caption2)
+            .foregroundColor(.secondary)
     }
 
     // MARK: - Progress section
@@ -193,33 +304,108 @@ struct SessionExportView: View {
     }
 
     private func runCOLMAPExport() async {
-        postProcessor.progress = ExportProgress(
-            stage: "Building COLMAP model…",
-            current: 0, total: 1
-        )
-
         let dir = sessionDirectory
         let useMulti = UserDefaults.standard.bool(
             forKey: "multiCameraExport"
         )
-        print("[Export] mode: \(useMulti ? "nativeFisheye" : "pinholeTiles")")
+        let calibrateRig = UserDefaults.standard.bool(
+            forKey: "onDeviceRigCalibration"
+        )
+        postProcessor.progress = ExportProgress(
+            stage: calibrateRig
+                ? "Calibrating rig…" : "Checking ARKit tracking…",
+            current: 0, total: 1
+        )
+        let modeStr = useMulti
+            ? "nativeFisheye" : "pinholeTiles"
+        print("[Export] mode: \(modeStr)")
+        ExportTrace.begin(
+            sessionDirectory: dir,
+            "export started: \(modeStr), rig calibration "
+                + (calibrateRig ? "on" : "off"))
         do {
+            // Phase 1: rig calibration
+            let (cal, check) = await Task.detached(
+                priority: .userInitiated
+            ) { () async -> (RigCalibrator.Result,
+                             ARKitTrackingCheck.Result) in
+                let fm = FileManager.default
+                let rec = DataRecorder(
+                    sessionDirectory: dir)
+                let scans = rec.buildExportData(
+                    sessionDirectory: dir)
+                let cfg = MultiCameraConfig
+                    .loadFromDeviceOrBundle()
+                let traj = COLMAPExporter
+                    .loadTrajectory(
+                        sessionDirectory: dir)
+                let withX5 = scans.filter {
+                    !$0.insta360ImageURLs.isEmpty
+                }.count
+                ExportTrace.note(
+                    "loaded \(scans.count) scans (\(withX5) with"
+                        + " a 360 image), trajectory"
+                        + " \(traj?.count ?? 0) poses")
+                let docs = fm.urls(
+                    for: .documentDirectory,
+                    in: .userDomainMask).first
+                let mDir = docs?
+                    .appendingPathComponent(
+                        "atlas_sessions/masks")
+
+                let arkit = ARKitTrackingCheck.run(
+                    sessionDirectory: dir, trajectory: traj)
+                ARKitTrackingCheck.save(arkit, in: dir)
+                print("[Export] ARKit check: \(arkit.summary)")
+                ExportTrace.note("ARKit check: \(arkit.summary)")
+
+                let result = calibrateRig
+                    ? RigCalibrator.calibrate(
+                        scans: scans,
+                        cameraConfig: cfg,
+                        trajectory: traj,
+                        maskDir: mDir)
+                    : RigCalibrator.skip(
+                        "turned off in export settings")
+                print("[Export] calibration done: "
+                    + "\(result.status.rawValue)")
+                ExportTrace.note("rig calibration done: "
+                    + "\(result.status.rawValue)")
+                return (result, arkit)
+            }.value
+
+            rigCalResult = cal
+            arkitCheck = check
+            if cal.status == .applied {
+                COLMAPExporter.setRigCorrection(
+                    cal.rigCorrectionForExport)
+            } else {
+                COLMAPExporter.resetRigCorrection()
+            }
+
+            // Phase 2: COLMAP export
+            postProcessor.progress = ExportProgress(
+                stage: "Building COLMAP model…",
+                current: 0, total: 1)
+            ExportTrace.note("building COLMAP model")
+            let pp = postProcessor
+
             try await Task.detached(
                 priority: .userInitiated
             ) {
                 let fm = FileManager.default
                 let colmapDir = dir
                     .appendingPathComponent("colmap")
-                if fm.fileExists(atPath: colmapDir.path) {
+                if fm.fileExists(
+                    atPath: colmapDir.path)
+                {
                     try? fm.removeItem(at: colmapDir)
                 }
 
-                let recorder = DataRecorder(
-                    sessionDirectory: dir
-                )
-                let scans = recorder.buildExportData(
-                    sessionDirectory: dir
-                )
+                let rec = DataRecorder(
+                    sessionDirectory: dir)
+                let scans = rec.buildExportData(
+                    sessionDirectory: dir)
                 guard !scans.isEmpty else {
                     throw NSError(
                         domain: "Export",
@@ -228,29 +414,44 @@ struct SessionExportView: View {
                             NSLocalizedDescriptionKey:
                                 "No scans with valid"
                                 + " pose data found."
-                        ]
-                    )
+                        ])
                 }
-                let config = MultiCameraConfig
+                let cfg = MultiCameraConfig
                     .loadFromDeviceOrBundle()
                 let mode: CameraExportMode = useMulti
                     ? .nativeFisheye
                     : .pinholeTiles
                 let exporter = COLMAPExporter(
-                    sessionDirectory: dir
-                )
+                    sessionDirectory: dir)
                 try exporter.export(
                     scans: scans,
-                    cameraConfig: config,
-                    cameraExportMode: mode
-                )
+                    cameraConfig: cfg,
+                    cameraExportMode: mode,
+                    onStage: { stage in
+                        // Show the current step, so the screen says
+                        // where the export was if it stops. The trace
+                        // keeps it after the app has ended.
+                        ExportTrace.note(stage)
+                        Task { @MainActor in
+                            guard !pp.progress.isComplete,
+                                  pp.progress.error == nil
+                            else { return }
+                            pp.progress.stage =
+                                "Building COLMAP model: \(stage)"
+                        }
+                    })
             }.value
+
+            COLMAPExporter.resetRigCorrection()
+            ExportTrace.finish("COLMAP model ready")
             postProcessor.progress = ExportProgress(
                 stage: "COLMAP model ready",
                 current: 1, total: 1,
                 isComplete: true
             )
         } catch {
+            ExportTrace.finish(
+                "failed: \(error.localizedDescription)")
             postProcessor.progress = ExportProgress(
                 stage: "COLMAP export failed",
                 error: error.localizedDescription
@@ -260,6 +461,7 @@ struct SessionExportView: View {
 
     private func runExport() async {
         isRunning = true
+        lastTrace = nil
 
         switch selectedMode {
         case .colmapOnly:

@@ -34,114 +34,206 @@ struct CaptureOverlayView: View {
 
             VStack {
                 VStack(spacing: 6) {
-                    HStack {
+                    // ── Status row: tracking, disk, scan count ──
+                    HStack(spacing: 6) {
                         TrackingStateBadge(
                             state: sessionManager.trackingState
                         )
 
                         Spacer()
 
+                        DiskSpaceBadge(
+                            freeGB: sessionManager.freeSpaceGB
+                        )
+
                         Text("Scans: \(sessionManager.scanCount)")
-                            .font(.system(.headline, design: .monospaced))
+                            .font(.system(
+                                .headline,
+                                design: .monospaced
+                            ))
                             .padding(.horizontal, 12)
                             .padding(.vertical, 6)
                             .background(.ultraThinMaterial)
                             .cornerRadius(8)
                     }
 
-                    if let status = sessionManager.cameraStatus {
-                        HStack {
-                            Label(status, systemImage: cameraIcon)
-                                .font(.caption.weight(.medium))
-                                .foregroundColor(cameraStatusColor)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.ultraThinMaterial)
-                                .cornerRadius(8)
-
-                            if showRetryButton {
-                                Button {
-                                    sessionManager.retryInsta360Connection()
-                                } label: {
-                                    Label("Retry", systemImage: "arrow.clockwise")
-                                        .font(.caption.weight(.medium))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 6)
-                                        .background(.ultraThinMaterial)
-                                        .cornerRadius(8)
-                                }
+                    // ── Warnings row: speed + motion side by side ──
+                    let showSpeed =
+                        sessionManager.speedMps > 0.5
+                    let showMotion =
+                        sessionManager.connectedCameraCount > 0
+                    if showSpeed || showMotion {
+                        HStack(spacing: 6) {
+                            if showSpeed {
+                                SpeedWarningBadge(
+                                    speedMps: sessionManager
+                                        .speedMps
+                                )
                             }
-
-                            Spacer()
-
-                            if !sessionManager.connectionLog.isEmpty {
-                                Button {
-                                    showConnectionLog.toggle()
-                                } label: {
-                                    Image(systemName: "doc.text.magnifyingglass")
-                                        .font(.caption)
-                                        .foregroundColor(.white)
-                                        .padding(6)
-                                        .background(.ultraThinMaterial)
-                                        .clipShape(Circle())
-                                }
+                            if showMotion {
+                                X5MotionBadge(
+                                    angularRateDps: sessionManager
+                                        .smoothedAngularRateDps,
+                                    holdSteady: sessionManager
+                                        .x5HoldSteady
+                                )
                             }
                         }
                     }
 
-                    if !sessionManager.isPipelineReady
-                        && !sessionManager
-                            .connectedCamerasList.isEmpty
-                    {
+                    // ── Camera status row ──
+                    if let status = sessionManager.cameraStatus {
                         HStack(spacing: 6) {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                            Text("360\u{00B0} camera warming up\u{2026}")
-                                .font(.caption.weight(.medium))
-                                .foregroundColor(.orange)
+                            Label(
+                                status,
+                                systemImage: cameraIcon
+                            )
+                            .font(.caption.weight(.medium))
+                            .foregroundColor(cameraStatusColor)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.ultraThinMaterial)
+                            .cornerRadius(8)
+
+                            if showRetryButton {
+                                Button {
+                                    sessionManager
+                                        .retryInsta360Connection()
+                                } label: {
+                                    Label(
+                                        "Retry",
+                                        systemImage:
+                                            "arrow.clockwise"
+                                    )
+                                    .font(
+                                        .caption.weight(.medium)
+                                    )
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        .ultraThinMaterial
+                                    )
+                                    .cornerRadius(8)
+                                }
+                            }
+
+                            if !sessionManager.isPipelineReady
+                                && !sessionManager
+                                    .connectedCamerasList
+                                    .isEmpty
+                            {
+                                HStack(spacing: 4) {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                    Text("Warming up\u{2026}")
+                                        .font(
+                                            .caption
+                                                .weight(.medium)
+                                        )
+                                        .foregroundColor(.orange)
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(.ultraThinMaterial)
+                                .cornerRadius(8)
+                            }
+
+                            Spacer()
+
+                            if !sessionManager.connectionLog
+                                .isEmpty
+                            {
+                                Button {
+                                    showConnectionLog.toggle()
+                                } label: {
+                                    Image(
+                                        systemName:
+                                            "doc.text"
+                                            + ".magnifyingglass"
+                                    )
+                                    .font(.caption)
+                                    .foregroundColor(.white)
+                                    .padding(6)
+                                    .background(
+                                        .ultraThinMaterial
+                                    )
+                                    .clipShape(Circle())
+                                }
+                            }
                         }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(8)
-                        .frame(
-                            maxWidth: .infinity,
-                            alignment: .leading
-                        )
                     }
 
                     if showConnectionLog {
                         VStack(spacing: 4) {
                             HStack {
                                 Text("Connection Log")
-                                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.7))
+                                    .font(.system(
+                                        size: 10,
+                                        weight: .bold,
+                                        design: .monospaced
+                                    ))
+                                    .foregroundColor(
+                                        .white.opacity(0.7)
+                                    )
                                 Spacer()
                                 Button {
-                                    UIPasteboard.general.string = sessionManager
-                                        .connectionLog.joined(separator: "\n")
+                                    UIPasteboard
+                                        .general.string =
+                                        sessionManager
+                                        .connectionLog
+                                        .joined(
+                                            separator: "\n"
+                                        )
                                 } label: {
-                                    Label("Copy", systemImage: "doc.on.doc")
-                                        .font(.system(size: 10, weight: .medium))
-                                        .foregroundColor(.white)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(.white.opacity(0.2))
-                                        .cornerRadius(4)
+                                    Label(
+                                        "Copy",
+                                        systemImage:
+                                            "doc.on.doc"
+                                    )
+                                    .font(.system(
+                                        size: 10,
+                                        weight: .medium
+                                    ))
+                                    .foregroundColor(.white)
+                                    .padding(
+                                        .horizontal, 8
+                                    )
+                                    .padding(.vertical, 4)
+                                    .background(
+                                        .white.opacity(0.2)
+                                    )
+                                    .cornerRadius(4)
                                 }
                             }
                             ScrollView {
-                                VStack(alignment: .leading, spacing: 2) {
+                                VStack(
+                                    alignment: .leading,
+                                    spacing: 2
+                                ) {
                                     ForEach(
-                                        Array(sessionManager.connectionLog.suffix(50).enumerated()),
+                                        Array(
+                                            sessionManager
+                                                .connectionLog
+                                                .suffix(50)
+                                                .enumerated()
+                                        ),
                                         id: \.offset
                                     ) { _, line in
                                         Text(line)
-                                            .font(.system(size: 10, design: .monospaced))
-                                            .foregroundColor(.white)
+                                            .font(.system(
+                                                size: 10,
+                                                design:
+                                                    .monospaced
+                                            ))
+                                            .foregroundColor(
+                                                .white
+                                            )
                                     }
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(
+                                    maxWidth: .infinity,
+                                    alignment: .leading
+                                )
                             }
                         }
                         .frame(maxHeight: 200)
@@ -508,6 +600,81 @@ private struct TrackingStateBadge: View {
         @unknown default:
             return "Unknown"
         }
+    }
+}
+
+private struct DiskSpaceBadge: View {
+    let freeGB: Double
+
+    var body: some View {
+        let color: Color = freeGB < 1 ? .red
+            : freeGB < 5 ? .yellow : .white
+        Text(String(format: "%.1f GB", freeGB))
+            .font(.system(.caption, design: .monospaced))
+            .fontWeight(.medium)
+            .foregroundColor(color)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+            .background(.ultraThinMaterial)
+            .cornerRadius(8)
+    }
+}
+
+private struct SpeedWarningBadge: View {
+    let speedMps: Double
+
+    var body: some View {
+        let severity: Color = speedMps > 1.0 ? .red : .yellow
+        HStack(spacing: 4) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+            Text("Slow down")
+                .font(.caption.weight(.bold))
+        }
+        .foregroundColor(severity)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(severity.opacity(0.15))
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
+    }
+}
+
+private struct X5MotionBadge: View {
+    let angularRateDps: Double
+    let holdSteady: Bool
+
+    private var icon: String {
+        holdSteady ? "hand.raised.fill"
+            : angularRateDps < 2.0
+                ? "checkmark.circle.fill"
+                : "hand.raised.fill"
+    }
+
+    private var label: String {
+        holdSteady ? "Hold still"
+            : angularRateDps < 2.0
+                ? "X5 ready" : "Hold steady"
+    }
+
+    private var color: Color {
+        holdSteady ? .yellow
+            : angularRateDps < 2.0 ? .green : .orange
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.caption2)
+            Text(label)
+                .font(.caption.weight(.bold))
+        }
+        .foregroundColor(color)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.15))
+        .background(.ultraThinMaterial)
+        .cornerRadius(8)
     }
 }
 

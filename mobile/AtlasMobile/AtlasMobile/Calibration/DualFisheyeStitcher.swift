@@ -1,5 +1,6 @@
 import UIKit
 import ImageIO
+import simd
 
 /// Converts Insta360 dual-fisheye images to equirectangular (ERP).
 ///
@@ -156,6 +157,8 @@ enum DualFisheyeStitcher {
                 true,
             kCGImageSourceShouldCacheImmediately:
                 true,
+            kCGImageSourceShouldCache:
+                false,
         ]
         // Hint JPEG decoder to use 1/2 subsample for
         // large images (X5 72MP = 9504 wide), avoiding
@@ -213,6 +216,21 @@ enum DualFisheyeStitcher {
         ), let cg = ctx.makeImage()
         else { return nil }
         return UIImage(cgImage: cg)
+    }
+
+    /// Load dual-fisheye pixels at reduced resolution via
+    /// CGImageSource thumbnailing.
+    static func loadPixels(
+        url: URL, maxWidth: Int
+    ) -> (px: [UInt8], w: Int, h: Int)? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL, nil),
+            let cg = downsampleSource(
+                source, maxWidth: maxWidth,
+                subsample: true)
+        else { return nil }
+        guard let r = extractPixels(cg) else { return nil }
+        return (px: r.d, w: r.w, h: r.h)
     }
 
     private static func stitchFromPixels(
@@ -350,6 +368,260 @@ enum DualFisheyeStitcher {
         }
 
         return (out, outW, outH)
+    }
+
+    // MARK: - Direct tile from dual-fisheye
+
+    static func sliceTileFromDualFisheye(
+        srcPx: [UInt8], srcW: Int, srcH: Int,
+        tileSize: Int,
+        faceRotation: simd_float3x3,
+        tileFovDeg: Float,
+        rollDeg: Float
+    ) -> [UInt8]? {
+        let halfW = srcW / 2
+        let radius = Float(srcH) * 0.47
+        let halfFov: Float = 100 * .pi / 180
+        let focal = radius / halfFov
+
+        let fCx = Float(halfW) * 0.5
+        let fCy = Float(srcH) * 0.5
+        let bCx = Float(halfW) + Float(halfW) * 0.5
+        let bCy = Float(srcH) * 0.5
+
+        let blendLo: Float = 85 * .pi / 180
+        let blendHi: Float = 95 * .pi / 180
+        let srcStride = srcW * 4
+
+        let rollRad = rollDeg * .pi / 180
+        let cosR = cos(rollRad), sinR = sin(rollRad)
+        let applyRoll = abs(rollDeg) > 0.1
+
+        let tileF = Float(tileSize)
+            / (2.0 * tan(tileFovDeg * .pi / 360.0))
+        let tileCtr = Float(tileSize) / 2.0
+
+        let Rt = faceRotation.transpose
+        let n = tileSize * tileSize
+        var out = [UInt8](
+            repeating: 0, count: n * 4)
+
+        for row in 0..<tileSize {
+            for col in 0..<tileSize {
+                let rx = (Float(col) + 0.5 - tileCtr) / tileF
+                let ry = (Float(row) + 0.5 - tileCtr) / tileF
+                let rz: Float = 1.0
+                let norm = sqrt(rx * rx + ry * ry + rz * rz)
+                let ray = SIMD3<Float>(
+                    rx / norm, ry / norm, rz / norm)
+                let pano = Rt * ray
+
+                var bx = pano.x
+                var by = pano.y
+                let bz = pano.z
+
+                if applyRoll {
+                    let bx0 = bx
+                    bx = bx0 * cosR - by * sinR
+                    by = bx0 * sinR + by * cosR
+                }
+
+                let rxy = sqrt(bx * bx + by * by)
+                let tF = atan2(rxy, bz)
+                let tB = atan2(rxy, -bz)
+
+                let idx = (row * tileSize + col) * 4
+                let r: Float, g: Float, b: Float
+
+                if tF < blendLo {
+                    (r, g, b) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: focal, rad: radius,
+                        mirror: false)
+                } else if tB < blendLo {
+                    (r, g, b) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: focal, rad: radius,
+                        mirror: true)
+                } else {
+                    let wF = max(0, blendHi - tF)
+                    let wB = max(0, blendHi - tB)
+                    let sum = wF + wB
+                    let aF = sum > 0 ? wF / sum : 0.5
+                    let (fr, fg, fb) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: focal, rad: radius,
+                        mirror: false)
+                    let (br2, bg2, bb2) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: focal, rad: radius,
+                        mirror: true)
+                    r = aF * fr + (1 - aF) * br2
+                    g = aF * fg + (1 - aF) * bg2
+                    b = aF * fb + (1 - aF) * bb2
+                }
+
+                out[idx] = UInt8(clamping: Int(r))
+                out[idx + 1] = UInt8(clamping: Int(g))
+                out[idx + 2] = UInt8(clamping: Int(b))
+                out[idx + 3] = 255
+            }
+        }
+        return out
+    }
+
+    /// Reproject dual-fisheye source directly to an equidistant
+    /// fisheye image (front or back lens), skipping the ERP intermediate.
+    /// Same sampleLens logic as sliceTileFromDualFisheye but with
+    /// equidistant fisheye output grid instead of perspective tile grid.
+    static func reprojectToFisheye(
+        srcPx: [UInt8], srcW: Int, srcH: Int,
+        fisheyeSize: Int,
+        fisheyeHalfFovRad: Float,
+        fisheyeRadiusFrac: Float,
+        isFrontLens: Bool,
+        rollDeg: Float
+    ) -> [UInt8]? {
+        let halfW = srcW / 2
+        let srcRadius = Float(srcH) * 0.47
+        let srcHalfFov: Float = 100 * .pi / 180
+        let srcFocal = srcRadius / srcHalfFov
+
+        let fCx = Float(halfW) * 0.5
+        let fCy = Float(srcH) * 0.5
+        let bCx = Float(halfW) + Float(halfW) * 0.5
+        let bCy = Float(srcH) * 0.5
+
+        let blendLo: Float = 85 * .pi / 180
+        let blendHi: Float = 95 * .pi / 180
+        let srcStride = srcW * 4
+
+        let rollRad = rollDeg * .pi / 180
+        let cosR = cos(rollRad), sinR = sin(rollRad)
+        let applyRoll = abs(rollDeg) > 0.1
+
+        let S = fisheyeSize
+        let outRadius = Float(S) * fisheyeRadiusFrac
+        let outFocal = outRadius / fisheyeHalfFovRad
+        let cx = Float(S) / 2.0
+        let cy = Float(S) / 2.0
+
+        let zSign: Float = isFrontLens ? 1.0 : -1.0
+        let xSign: Float = isFrontLens ? 1.0 : -1.0
+
+        var out = [UInt8](repeating: 0, count: S * S * 4)
+
+        for v in 0..<S {
+            for u in 0..<S {
+                let dx = Float(u) - cx
+                let dy = Float(v) - cy
+                let r = sqrtf(dx * dx + dy * dy)
+                let idx = (v * S + u) * 4
+
+                guard r < outRadius else { continue }
+
+                if r < 0.001 {
+                    let lCx = isFrontLens ? fCx : bCx
+                    let lCy = isFrontLens ? fCy : bCy
+                    let ix = Int(lCx), iy = Int(lCy)
+                    guard ix >= 0, ix < srcW,
+                          iy >= 0, iy < srcH
+                    else { continue }
+                    let off = iy * srcStride + ix * 4
+                    out[idx] = srcPx[off]
+                    out[idx + 1] = srcPx[off + 1]
+                    out[idx + 2] = srcPx[off + 2]
+                    out[idx + 3] = 255
+                    continue
+                }
+
+                let theta = r / outFocal
+                let sinT = sinf(theta)
+                let cosT = cosf(theta)
+
+                var bx = xSign * sinT * dx / r
+                var by = sinT * dy / r
+                let bz = zSign * cosT
+
+                if applyRoll {
+                    let bx0 = bx
+                    bx = bx0 * cosR - by * sinR
+                    by = bx0 * sinR + by * cosR
+                }
+
+                let rxy = sqrtf(bx * bx + by * by)
+                let tF = atan2(rxy, bz)
+                let tB = atan2(rxy, -bz)
+
+                let rv: Float, gv: Float, bv: Float
+
+                if tF < blendLo {
+                    (rv, gv, bv) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: srcFocal, rad: srcRadius,
+                        mirror: false)
+                } else if tB < blendLo {
+                    (rv, gv, bv) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: srcFocal, rad: srcRadius,
+                        mirror: true)
+                } else {
+                    let wF = max(0, blendHi - tF)
+                    let wB = max(0, blendHi - tB)
+                    let sum = wF + wB
+                    let aF = sum > 0 ? wF / sum : 0.5
+                    let (fr, fg, fb) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tF,
+                        cx: fCx, cy: fCy,
+                        f: srcFocal, rad: srcRadius,
+                        mirror: false)
+                    let (br2, bg2, bb2) = sampleLens(
+                        src: srcPx, stride: srcStride,
+                        srcW: srcW, srcH: srcH,
+                        bx: bx, by: by, rxy: rxy,
+                        theta: tB,
+                        cx: bCx, cy: bCy,
+                        f: srcFocal, rad: srcRadius,
+                        mirror: true)
+                    rv = aF * fr + (1 - aF) * br2
+                    gv = aF * fg + (1 - aF) * bg2
+                    bv = aF * fb + (1 - aF) * bb2
+                }
+
+                out[idx] = UInt8(clamping: Int(rv))
+                out[idx + 1] = UInt8(clamping: Int(gv))
+                out[idx + 2] = UInt8(clamping: Int(bv))
+                out[idx + 3] = 255
+            }
+        }
+        return out
     }
 
     // MARK: - Private

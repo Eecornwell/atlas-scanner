@@ -52,7 +52,14 @@ final class CaptureSessionManager: ObservableObject {
     @Published private(set) var isEndingSession = false
     @Published var teardownStage: String = ""
     @Published var captureTiming: String = ""
+    @Published var speedMps: Double = 0
+    @Published var angularRateDps: Double = 0
+    @Published var smoothedAngularRateDps: Double = 0
+    @Published var freeSpaceGB: Double = 0
+    @Published var x5HoldSteady = false
+    private var x5HoldTask: Task<Void, Never>?
     private var connectTask: Task<Void, Never>?
+    private var diskSpaceTimer: Timer?
 
     init() {
         arkitCapture.$trackingState
@@ -61,6 +68,46 @@ final class CaptureSessionManager: ObservableObject {
         arkitCapture.$depthOverlayImage
             .receive(on: DispatchQueue.main)
             .assign(to: &$depthOverlayImage)
+        arkitCapture.$speedMps
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$speedMps)
+        arkitCapture.$angularRateDps
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$angularRateDps)
+        arkitCapture.$smoothedAngularRateDps
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$smoothedAngularRateDps)
+        updateFreeSpace()
+    }
+
+    private func startX5HoldWindow() {
+        x5HoldSteady = true
+        x5HoldTask?.cancel()
+        x5HoldTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1.5))
+            if !Task.isCancelled {
+                x5HoldSteady = false
+            }
+        }
+    }
+
+    private func recordMotionWindow(
+        scanIndex: Int,
+        startTime: TimeInterval
+    ) async -> (peakDps: Double, meanDps: Double) {
+        var peak: Double = 0
+        var samples: [Double] = []
+        let endTime = startTime + 1.5
+        while ProcessInfo.processInfo.systemUptime < endTime {
+            let rate = angularRateDps
+            peak = max(peak, rate)
+            samples.append(rate)
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        let mean = samples.isEmpty
+            ? 0
+            : samples.reduce(0, +) / Double(samples.count)
+        return (peakDps: peak, meanDps: mean)
     }
 
     private func logMessage(_ msg: String) {
@@ -69,6 +116,26 @@ final class CaptureSessionManager: ObservableObject {
             connectionLog.removeFirst(
                 connectionLog.count - 100
             )
+        }
+    }
+
+    private func updateFreeSpace() {
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        if let vals = try? home.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ), let bytes = vals.volumeAvailableCapacityForImportantUsage {
+            freeSpaceGB = Double(bytes) / 1_073_741_824
+        }
+    }
+
+    private func startDiskSpaceMonitor() {
+        updateFreeSpace()
+        diskSpaceTimer = Timer.scheduledTimer(
+            withTimeInterval: 5, repeats: true
+        ) { [weak self] _ in
+            DispatchQueue.main.async {
+                self?.updateFreeSpace()
+            }
         }
     }
 
@@ -148,6 +215,7 @@ final class CaptureSessionManager: ObservableObject {
         isSessionActive = true
         isReadyToCapture = true
         scanCount = 0
+        startDiskSpaceMonitor()
 
         setupDisconnectHandler()
 
@@ -185,21 +253,45 @@ final class CaptureSessionManager: ObservableObject {
         guard isSessionActive, isReadyToCapture, !isEndingSession else { return }
 
         isReadyToCapture = false
-        defer { isReadyToCapture = true }
+        scanInProgress = true
+        defer {
+            isReadyToCapture = true
+            scanInProgress = false
+        }
 
         let t0 = ContinuousClock.now
 
         guard let arkitFrame = arkitCapture.captureCurrentFrame() else {
             return
         }
+        let frameAge = CACurrentMediaTime()
+            - arkitFrame.timestamp
+        let nearestTrajTs = trajectoryRecorder?
+            .nearestTimestamp(to: arkitFrame.timestamp)
 
         let currentScan = scanCount
         scanCount += 1
         let fast = isAutoCapturing
 
-        trajectoryRecorder?.recordPose(
-            timestamp: arkitFrame.timestamp,
-            pose: arkitFrame.pose
+        let frameAgeMs = frameAge * 1000
+        let trajDeltaMs: Double? = nearestTrajTs.map {
+            (arkitFrame.timestamp - $0) * 1000
+        }
+        let trajDelta: String
+        if let td = trajDeltaMs {
+            trajDelta = String(
+                format: "trajΔ=%.1fms", td
+            )
+        } else {
+            trajDelta = "trajΔ=n/a"
+        }
+        logMessage(
+            String(
+                format: "scan#%d age=%.1fms %@",
+                currentScan,
+                frameAgeMs,
+                trajDelta
+            )
         )
 
         if !fast {
@@ -218,20 +310,36 @@ final class CaptureSessionManager: ObservableObject {
         if fast {
             let activeCams = enabledCameras
             var sent360 = false
+            let motionOk = smoothedAngularRateDps < 2.0
             if !isInsta360Busy, !activeCams.isEmpty,
-               isAutoCapturing
+               isAutoCapturing, motionOk
             {
                 isInsta360Busy = true
                 insta360CommandCount += 1
                 let cmdNum = insta360CommandCount
                 sent360 = true
+                startX5HoldWindow()
                 let manager = insta360Manager
                 let scan = currentScan
                 let cams = activeCams
                 insta360BackgroundTask?.cancel()
                 insta360BackgroundTask = Task { [weak self] in
+                    // Busy until this shot has also downloaded, so the
+                    // next shot cannot start a second download on the
+                    // same camera while this one runs (they share one
+                    // download continuation in CameraInstance).
+                    defer { self?.isInsta360Busy = false }
+                    let cmdTime = ProcessInfo.processInfo
+                        .systemUptime
                     let captureStart = ContinuousClock.now
                     let arkitTs = CACurrentMediaTime()
+                    let motionTask = Task {
+                        @MainActor [weak self] in
+                        await self?.recordMotionWindow(
+                            scanIndex: scan,
+                            startTime: cmdTime
+                        )
+                    }
                     let captureResults = await manager
                         .captureWith(
                             cameras: cams,
@@ -247,20 +355,30 @@ final class CaptureSessionManager: ObservableObject {
                             capComp.attoseconds
                                 / 1_000_000_000_000_000
                         )
-                    self?.logMessage(
-                        "360#\(cmdNum) scan#\(scan)"
-                        + " ack=\(captureMs)ms"
-                    )
+                    let motion = await motionTask.value
+                    self?.logMessage(String(
+                        format: "360#%d scan#%d"
+                            + " ack=%dms"
+                            + " peak=%.1f°/s"
+                            + " mean=%.1f°/s",
+                        cmdNum, scan, captureMs,
+                        motion?.peakDps ?? 0,
+                        motion?.meanDps ?? 0
+                    ))
                     self?.dataRecorder?
                         .updateInsta360Captures(
                             scanIndex: scan,
-                            results: captureResults
+                            results: captureResults,
+                            peakAngularRateDps:
+                                motion?.peakDps,
+                            meanAngularRateDps:
+                                motion?.meanDps
                         )
-                    self?.isInsta360Busy = false
                     guard let self,
                           let dir = self.sessionDirectory
                     else { return }
-                    guard !Task.isCancelled else { return }
+                    // No cancellation check here: once the shutter has
+                    // fired, the photo should be downloaded.
                     let downloads =
                         await manager.downloadAllPending(
                             into: dir
@@ -273,11 +391,19 @@ final class CaptureSessionManager: ObservableObject {
                             "[360] dl=\(downloads.count)"
                             + " \(fname)"
                         )
-                        self.dataRecorder?
-                            .updateExposureTimestamps(
-                                scanIndex: scan,
-                                downloads: downloads
-                            )
+                        // A retried download can belong to an earlier
+                        // scan, so record each under its own scan.
+                        let byScan = Dictionary(
+                            grouping: downloads,
+                            by: \.scanIndex
+                        )
+                        for (s, dls) in byScan {
+                            self.dataRecorder?
+                                .updateExposureTimestamps(
+                                    scanIndex: s,
+                                    downloads: dls
+                                )
+                        }
                         await self.updateInstaPreview(
                             from: downloads
                         )
@@ -291,7 +417,9 @@ final class CaptureSessionManager: ObservableObject {
             dataRecorder?.saveScan(
                 scanIndex: currentScan,
                 arkitFrame: arkitFrame,
-                insta360Results: []
+                insta360Results: [],
+                frameAgeMs: frameAgeMs,
+                trajectoryDeltaMs: trajDeltaMs
             )
 
             let t1 = ContinuousClock.now
@@ -307,8 +435,41 @@ final class CaptureSessionManager: ObservableObject {
                 + " \(ms(t1 - t0))ms\(i360tag)"
         } else {
             let insta360Results: [Insta360CaptureResult]
+            var manualMotion: (peakDps: Double, meanDps: Double)?
             let manualCams = enabledCameras
             if !manualCams.isEmpty {
+                if smoothedAngularRateDps >= 2.0 {
+                    logMessage("waiting for steady…")
+                    x5HoldSteady = true
+                    let waitStart = ContinuousClock.now
+                    while smoothedAngularRateDps >= 2.0 {
+                        let elapsed = ContinuousClock.now
+                            - waitStart
+                        if elapsed > .seconds(2) { break }
+                        try? await Task.sleep(
+                            for: .milliseconds(50)
+                        )
+                    }
+                    if smoothedAngularRateDps < 2.0 {
+                        logMessage("steady — firing X5")
+                    } else {
+                        logMessage(String(
+                            format: "timeout at %.0f°/s"
+                                + " — firing X5",
+                            smoothedAngularRateDps
+                        ))
+                    }
+                }
+                startX5HoldWindow()
+                let cmdTime = ProcessInfo.processInfo
+                    .systemUptime
+                let motionTask = Task {
+                    @MainActor [weak self] in
+                    await self?.recordMotionWindow(
+                        scanIndex: currentScan,
+                        startTime: cmdTime
+                    )
+                }
                 insta360Results = await insta360Manager
                     .captureWith(
                         cameras: manualCams,
@@ -316,6 +477,17 @@ final class CaptureSessionManager: ObservableObject {
                         scanIndex: currentScan,
                         timeout: 30
                     )
+                let motion = await motionTask.value
+                    ?? (peakDps: 0, meanDps: 0)
+                manualMotion = motion
+                logMessage(String(
+                    format: "X5 scan#%d"
+                        + " peak=%.1f°/s"
+                        + " mean=%.1f°/s",
+                    currentScan,
+                    motion.peakDps,
+                    motion.meanDps
+                ))
             } else {
                 insta360Results = []
             }
@@ -323,8 +495,21 @@ final class CaptureSessionManager: ObservableObject {
             dataRecorder?.saveScan(
                 scanIndex: currentScan,
                 arkitFrame: arkitFrame,
-                insta360Results: insta360Results
+                insta360Results: insta360Results,
+                frameAgeMs: frameAgeMs,
+                trajectoryDeltaMs: trajDeltaMs
             )
+            // updateInsta360Captures edits pose.json, so it has to run
+            // after saveScan writes the file. Called before, it found
+            // no file and the shot's motion values were lost.
+            if let m = manualMotion {
+                dataRecorder?.updateInsta360Captures(
+                    scanIndex: currentScan,
+                    results: insta360Results,
+                    peakAngularRateDps: m.peakDps,
+                    meanAngularRateDps: m.meanDps
+                )
+            }
 
             let t1 = ContinuousClock.now
             func ms(_ d: Duration) -> Int {
@@ -341,6 +526,13 @@ final class CaptureSessionManager: ObservableObject {
                 let downloads = await insta360Manager.downloadAllPending(
                     into: dir
                 )
+                // Record each shot's EXIF time, as the auto path does.
+                let byScan = Dictionary(
+                    grouping: downloads, by: \.scanIndex)
+                for (s, dls) in byScan {
+                    dataRecorder?.updateExposureTimestamps(
+                        scanIndex: s, downloads: dls)
+                }
                 await updateInstaPreview(from: downloads)
             }
         }
@@ -391,6 +583,8 @@ final class CaptureSessionManager: ObservableObject {
 
     private static let autoCaptureCooldown: UInt64 = 2_500_000_000
     private var isInsta360Busy = false
+    /// True while captureScan() runs, so teardown can wait for it.
+    private var scanInProgress = false
     private var insta360CommandCount = 0
 
     func startAutoCapture() {
@@ -419,26 +613,42 @@ final class CaptureSessionManager: ObservableObject {
         )
         isAutoCapturing = false
 
-        let bgTask = insta360BackgroundTask
-        insta360BackgroundTask = nil
-        bgTask?.cancel()
-
         let task = autoCaptureTask
         autoCaptureTask = nil
         task?.cancel()
         _ = await task?.value
+
+        // Let an X5 shot that is already in flight finish and download.
+        // Cancelling it made attemptTakePicture ignore the camera's
+        // reply, so the session's last shot was never queued or
+        // downloaded. Its capture and download have their own timeouts.
+        let bgTask = insta360BackgroundTask
+        insta360BackgroundTask = nil
+        if bgTask != nil {
+            logMessage("STOP: waiting for the last X5 shot")
+        }
         _ = await bgTask?.value
+
+        // A manual scan can also be waiting for the X5's reply;
+        // clearCaptureState() below would drop it. Wait up to 40 s.
+        var waits = 0
+        while scanInProgress, waits < 400 {
+            try? await Task.sleep(for: .milliseconds(100))
+            waits += 1
+        }
 
         await insta360Manager.clearCaptureState()
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "11e"
+    private static let buildTag = "11h"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }
         isEndingSession = true
         isReadyToCapture = false
+        diskSpaceTimer?.invalidate()
+        diskSpaceTimer = nil
 
         defer {
             teardownStage = "done"
@@ -460,11 +670,21 @@ final class CaptureSessionManager: ObservableObject {
 
         teardownStage = "3-downloading"
         if let dir {
-            insta360Manager.saveClockOffsets(to: dir)
-            let downloads =
+            insta360Manager.saveClockOffsets(
+                to: dir, phase: "start"
+            )
+            var downloads =
                 await insta360Manager.downloadAllPending(
                     into: dir
                 )
+            // Failed downloads are put back in the queue. The camera
+            // may still be saving the last shot, so wait and retry once.
+            if await insta360Manager.pendingDownloadCount() > 0 {
+                logMessage("retrying X5 downloads")
+                try? await Task.sleep(for: .seconds(3))
+                downloads += await insta360Manager
+                    .downloadAllPending(into: dir)
+            }
             let byScan = Dictionary(
                 grouping: downloads,
                 by: \.scanIndex
@@ -790,9 +1010,7 @@ final class CaptureSessionManager: ObservableObject {
         }
     }
 
-    private nonisolated static let thumbContext = CIContext(
-        options: [.useSoftwareRenderer: true]
-    )
+    private nonisolated static let thumbContext = CIContext()
 
     nonisolated static func makeThumbnail(
         from buffer: CVPixelBuffer
