@@ -126,6 +126,81 @@ final class COLMAPExporter {
 
     // MARK: - Public
 
+    /// The export holds one Insta360 camera: image names such as
+    /// face_00/scan_001.jpg, the tile camera ids and the rig carry no
+    /// camera id. Keeps the camera entry with the most 360 images in the
+    /// session and leaves out other cameras' images. With two entries in
+    /// Camera Settings the export wrote every 360 image name twice (a
+    /// crash in writeFramesBin), and rig calibration used the first
+    /// entry's mount position whichever camera took the photos.
+    static func singleInsta360Camera(
+        scans: [ScanExportData],
+        config: MultiCameraConfig
+    ) -> (scans: [ScanExportData],
+          config: MultiCameraConfig,
+          note: String) {
+        var counts: [String: Int] = [:]
+        for scan in scans {
+            for id in scan.insta360ImageURLs.keys {
+                counts[id, default: 0] += 1
+            }
+        }
+        // Most images first; ties go to the earlier entry.
+        let order = config.cameras.map(\.id)
+        let keepId = counts.keys.min { a, b in
+            let na = counts[a] ?? 0
+            let nb = counts[b] ?? 0
+            if na != nb { return na > nb }
+            let ia = order.firstIndex(of: a) ?? Int.max
+            let ib = order.firstIndex(of: b) ?? Int.max
+            return ia != ib ? ia < ib : a < b
+        }
+        guard var entry = config.cameras.first(where: {
+            $0.id == keepId
+        }) ?? config.cameras.first(where: \.enabled)
+            ?? config.cameras.first
+        else {
+            return (scans, config, "no camera entries")
+        }
+        // The shots exist, so export and calibrate them even if the
+        // entry was switched off after the session.
+        entry.enabled = true
+
+        var leftOut = 0
+        let kept = scans.map { scan -> ScanExportData in
+            let urls = scan.insta360ImageURLs.filter {
+                $0.key == keepId
+            }
+            guard urls.count != scan.insta360ImageURLs.count
+            else { return scan }
+            leftOut += scan.insta360ImageURLs.count - urls.count
+            return ScanExportData(
+                scanName: scan.scanName,
+                arkitPose: scan.arkitPose,
+                intrinsics: scan.intrinsics,
+                imageWidth: scan.imageWidth,
+                imageHeight: scan.imageHeight,
+                depthBinURL: scan.depthBinURL,
+                smoothedDepthBinURL: scan.smoothedDepthBinURL,
+                iphoneImageURL: scan.iphoneImageURL,
+                insta360ImageURLs: urls,
+                insta360CommandTimestamp:
+                    scan.insta360CommandTimestamp)
+        }
+        var note = "360 camera: \(entry.id) (\(entry.model))"
+        if let keepId {
+            note += ", \(counts[keepId] ?? 0) images"
+            if keepId != entry.id { note += " in raw/\(keepId)" }
+        }
+        if leftOut > 0 {
+            note += "; left out \(leftOut) images of other cameras"
+        }
+        return (kept,
+                MultiCameraConfig(cameras: [entry],
+                                  iphone: config.iphone),
+                note)
+    }
+
     /// Writes cameras.bin, images.bin, points3D.bin, rigs.bin, and frames.bin.
     /// `onStage` receives a short description of each step, called on
     /// the exporting thread.

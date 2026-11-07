@@ -117,6 +117,28 @@ final class CaptureSessionManager: ObservableObject {
                 connectionLog.count - 100
             )
         }
+        appendToCaptureLog(msg)
+    }
+
+    /// Keeps every status line in the session folder (capture_log.txt):
+    /// the on-screen log holds only the last 100 lines and is cleared at
+    /// the next session. Lines start with systemUptime, the clock of the
+    /// command timestamps in pose.json.
+    private func appendToCaptureLog(_ msg: String) {
+        guard let dir = sessionDirectory else { return }
+        let stamp = String(
+            format: "%10.3f ",
+            ProcessInfo.processInfo.systemUptime)
+        guard let data = (stamp + msg + "\n").data(using: .utf8)
+        else { return }
+        let url = dir.appendingPathComponent("capture_log.txt")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        } else {
+            try? data.write(to: url)
+        }
     }
 
     private func updateFreeSpace() {
@@ -340,12 +362,15 @@ final class CaptureSessionManager: ObservableObject {
                             startTime: cmdTime
                         )
                     }
+                    // 60 s, not 30: a reply that arrives after the
+                    // timeout is dropped and its photo never downloaded.
+                    // The longer wait leaves room for 120 MP X6 photos.
                     let captureResults = await manager
                         .captureWith(
                             cameras: cams,
                             arkitTimestamp: arkitTs,
                             scanIndex: scan,
-                            timeout: 30,
+                            timeout: 60,
                             retryOnFailure: false
                         )
                     let capComp = (ContinuousClock.now

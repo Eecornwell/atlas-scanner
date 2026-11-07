@@ -332,10 +332,13 @@ struct SessionExportView: View {
                 let fm = FileManager.default
                 let rec = DataRecorder(
                     sessionDirectory: dir)
-                let scans = rec.buildExportData(
-                    sessionDirectory: dir)
-                let cfg = MultiCameraConfig
-                    .loadFromDeviceOrBundle()
+                let one = COLMAPExporter.singleInsta360Camera(
+                    scans: rec.buildExportData(
+                        sessionDirectory: dir),
+                    config: MultiCameraConfig
+                        .loadFromDeviceOrBundle())
+                let scans = one.scans
+                let cfg = one.config
                 let traj = COLMAPExporter
                     .loadTrajectory(
                         sessionDirectory: dir)
@@ -346,6 +349,7 @@ struct SessionExportView: View {
                     "loaded \(scans.count) scans (\(withX5) with"
                         + " a 360 image), trajectory"
                         + " \(traj?.count ?? 0) poses")
+                ExportTrace.note(one.note)
                 let docs = fm.urls(
                     for: .documentDirectory,
                     in: .userDomainMask).first
@@ -404,8 +408,13 @@ struct SessionExportView: View {
 
                 let rec = DataRecorder(
                     sessionDirectory: dir)
-                let scans = rec.buildExportData(
-                    sessionDirectory: dir)
+                // The same single camera the rig calibration used.
+                let one = COLMAPExporter.singleInsta360Camera(
+                    scans: rec.buildExportData(
+                        sessionDirectory: dir),
+                    config: MultiCameraConfig
+                        .loadFromDeviceOrBundle())
+                let scans = one.scans
                 guard !scans.isEmpty else {
                     throw NSError(
                         domain: "Export",
@@ -416,8 +425,7 @@ struct SessionExportView: View {
                                 + " pose data found."
                         ])
                 }
-                let cfg = MultiCameraConfig
-                    .loadFromDeviceOrBundle()
+                let cfg = one.config
                 let mode: CameraExportMode = useMulti
                     ? .nativeFisheye
                     : .pinholeTiles

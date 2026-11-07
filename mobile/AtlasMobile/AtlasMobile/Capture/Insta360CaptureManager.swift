@@ -92,8 +92,17 @@ final class Insta360CaptureManager: ObservableObject {
             .loadFromDeviceOrBundle()
         let enabledCameras = freshConfig.cameras
             .filter(\.enabled)
-        let instances = enabledCameras
-            .map { CameraInstance(config: $0) }
+        // The SDK connects to one camera (INSCameraManager.socket()),
+        // so use one camera entry for it. An instance per enabled entry
+        // sent every command, takePicture included, once per entry to
+        // the same camera.
+        guard let entry = await entryForConnectedCamera(
+            enabledCameras)
+        else {
+            onLogMessage?("no enabled camera in Camera Settings")
+            return
+        }
+        let instances = [CameraInstance(config: entry)]
         for instance in instances {
             instance.onStatusUpdate = { [weak self] msg in
                 self?.onLogMessage?(msg)
@@ -212,34 +221,69 @@ final class Insta360CaptureManager: ObservableObject {
         }
         try? await Task.sleep(for: .seconds(2))
 
-        let connectedIds = Set(await MainActor.run { connectedCameras.map(\.id) })
-        let missing = cameraConfig.cameras.filter { $0.enabled && !connectedIds.contains($0.id) }
-        guard !missing.isEmpty else { return }
+        // One SDK connection carries one camera, so retry only when no
+        // camera is connected, with the entry that matches the camera.
+        let anyConnected = await MainActor.run {
+            !connectedCameras.isEmpty
+        }
+        guard !anyConnected,
+              let entry = await entryForConnectedCamera(
+                  cameraConfig.cameras.filter(\.enabled))
+        else { return }
 
-        let reconnected: [CameraInstance] = await withTaskGroup(of: CameraInstance?.self) { group in
-            for config in missing {
-                group.addTask { [weak self] in
-                    let instance = CameraInstance(config: config)
-                    instance.onStatusUpdate = { msg in
-                        self?.onLogMessage?(msg)
-                    }
-                    return await instance.reconnect() ? instance : nil
-                }
-            }
-            var result: [CameraInstance] = []
-            for await cam in group {
-                if let cam { result.append(cam) }
-            }
-            return result
+        let instance = CameraInstance(config: entry)
+        instance.onStatusUpdate = { [weak self] msg in
+            self?.onLogMessage?(msg)
+        }
+        guard await instance.reconnect() else { return }
+        let camId = instance.id
+        instance.onDisconnect = { [weak self] in
+            self?.handleDisconnect(cameraId: camId)
         }
 
-        for cam in reconnected {
-            cam.onDisconnect = { [weak self] in
-                self?.handleDisconnect(cameraId: cam.id)
-            }
-        }
+        await MainActor.run { connectedCameras.append(instance) }
+    }
 
-        await MainActor.run { connectedCameras.append(contentsOf: reconnected) }
+    /// Camera entry for the camera the SDK is connected to: the enabled
+    /// entry whose serial number matches, else the first enabled entry.
+    private func entryForConnectedCamera(
+        _ entries: [CameraConfig]
+    ) async -> CameraConfig? {
+        guard let first = entries.first else { return nil }
+        var serial = ""
+        var name = ""
+        // Device info can arrive just after the socket connects. Wait
+        // for it (up to 3 s) only when there is an entry to choose.
+        for _ in 0..<12 {
+            let info = await MainActor.run { () -> (String, String) in
+                let cam = INSCameraManager.socket().currentCamera
+                return (cam?.serialNumber ?? "", cam?.name ?? "")
+            }
+            serial = info.0
+            name = info.1
+            if !serial.isEmpty || entries.count == 1 { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        let key = Self.normalizedSerial(serial)
+        let match: CameraConfig? = key.isEmpty
+            ? nil
+            : entries.first(where: {
+                Self.normalizedSerial($0.serial) == key
+            })
+        let entry = match ?? first
+        var msg = "camera \(name.isEmpty ? "?" : name)"
+            + " serial \(serial.isEmpty ? "?" : serial)"
+            + " -> \(entry.id) (\(entry.model))"
+        if match == nil, entries.count > 1 {
+            msg += ", no entry has this serial: using the first"
+        }
+        onLogMessage?(msg)
+        return entry
+    }
+
+    private static func normalizedSerial(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
     }
 
     private func waitForSDKConnected(

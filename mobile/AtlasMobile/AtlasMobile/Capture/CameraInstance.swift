@@ -2,6 +2,7 @@ import CoreMedia
 import Foundation
 import ImageIO
 import INSCameraSDK
+import INSCoreMedia
 
 private let kHeartbeatInterval: TimeInterval = 0.5
 private let kClockSyncTotalSamples = 20
@@ -39,6 +40,14 @@ final class CameraInstance: NSObject, Identifiable {
     /// maxDownloadAttempts.
     private var _downloadAttempts: [String: Int] = [:]
     private static let maxDownloadAttempts = 3
+    /// systemUptime of the running download's last progress callback.
+    private var _downloadProgressAt: Double = 0
+    /// A 120 MP X6 photo has 1.7 times the pixels of a 72 MP X5 photo, so
+    /// a fixed limit could stop a download that is still receiving data.
+    /// A download is given up after this long without progress...
+    private static let downloadStallSeconds: Double = 30
+    /// ...or after this long in total.
+    private static let downloadMaxSeconds: Double = 180
     private(set) var isPhotoModeSet = false
 
     /// Shots captured but not yet downloaded.
@@ -816,7 +825,53 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
+    /// The X6 (SDK name C9) keeps its sensor in low power after a Wi-Fi
+    /// connection until the app reports live view. The SDK sample sends
+    /// setAppAccessFileState(.liveView) on connect, for C9 only.
+    private func wakeX6IfNeeded() async {
+        let isX6 = await MainActor.run {
+            INSCameraManager.socket().currentCamera?.name
+                == kInsta360CameraNameC9
+        }
+        guard isX6 else { return }
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>)
+                in
+            let resumed = NSLock()
+            var didResume = false
+
+            func finish() {
+                resumed.lock()
+                defer { resumed.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                INSCameraManager.shared()
+                    .commandManager
+                    .setAppAccessFileState(.liveView) {
+                        [weak self] error in
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] "
+                            + "X6 live view: "
+                            + (error.map { "\($0)" } ?? "ok")
+                        )
+                        finish()
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 5
+            ) {
+                finish()
+            }
+        }
+    }
+
     func switchToPhotoMode() async {
+        await wakeX6IfNeeded()
         let skipActivation = await checkSensorIsAll()
 
         await withCheckedContinuation {
@@ -835,7 +890,13 @@ final class CameraInstance: NSObject, Identifiable {
 
             DispatchQueue.main.async { [weak self] in
                 let opts = INSCameraOptions()
-                opts.photoSubMode = 6
+                // A normal 360 photo is photo sub mode 0
+                // (INSPhotoSubModeSingle), as the desktop capture sets
+                // (PHOTO_SINGLE). The 6 used before is the function mode
+                // of a normal photo in the SDK sample's mode table; as a
+                // photo sub mode it means InstaPano HDR, a mode the X6
+                // doesn't have.
+                opts.photoSubMode = 0
                 opts.focusSensor = .all
                 opts.expectOutputType = .default
                 let types: [NSNumber] = [
@@ -1029,16 +1090,16 @@ final class CameraInstance: NSObject, Identifiable {
                         ) { error, photoInfo in
                             let cbTs = ProcessInfo
                                 .processInfo.systemUptime
-                            let uri = photoInfo?.uri
-                            self.onStatusUpdate?(
-                                "[\(self.id)] cb:"
-                                + " gen=\(gen)"
-                                + " uri="
-                                + "\(uri ?? "nil")"
-                                + (error.map {
-                                    " err=\($0)"
-                                } ?? "")
-                            )
+                            let uri = Self.photoURI(photoInfo)
+                            let hdr = photoInfo?.hdrUris?.count ?? 0
+                            let burst = photoInfo?.burstUris?.count
+                                ?? 0
+                            var note = "[\(self.id)] cb: gen=\(gen)"
+                                + " uri=\(uri ?? "nil")"
+                            if hdr > 0 { note += " hdr=\(hdr)" }
+                            if burst > 0 { note += " burst=\(burst)" }
+                            if let error { note += " err=\(error)" }
+                            self.onStatusUpdate?(note)
                             self.lock.lock()
                             guard gen
                                 == self._captureGen
@@ -1096,6 +1157,20 @@ final class CameraInstance: NSObject, Identifiable {
             self.lock.unlock()
             cont?.resume(returning: nil)
         }
+    }
+
+    /// Photo URI from a takePicture reply. A single shot fills `uri`;
+    /// HDR or AEB shots fill `hdrUris` and bursts fill `burstUris`, which
+    /// the SDK sample also reads. The SDK documents HDR order as
+    /// [EV0, -EV, +EV], so the first HDR URI is the normal exposure.
+    private static func photoURI(
+        _ info: INSCameraPhotoInfo?
+    ) -> String? {
+        if let u = info?.uri, !u.isEmpty { return u }
+        if let u = info?.hdrUris?.first(where: { !$0.isEmpty }) {
+            return u
+        }
+        return info?.burstUris?.first(where: { !$0.isEmpty })
     }
 
     // MARK: - Download
@@ -1212,69 +1287,124 @@ final class CameraInstance: NSObject, Identifiable {
         try? FileManager.default.removeItem(at: destURL)
 
         let cameraId = self.id
+        let started = ProcessInfo.processInfo.systemUptime
         return await withCheckedContinuation {
             continuation in
             lock.lock()
             _downloadGen += 1
             let gen = _downloadGen
             _downloadCont = continuation
+            _downloadProgressAt = started
             lock.unlock()
 
             // Only this download may finish its continuation. Without
-            // the check, this download's 30 s timer (or a late reply)
-            // could finish the next download with nil.
+            // the check, this download's timeout (or a late reply)
+            // could finish the next download with nil. Returns whether
+            // this call finished it, so a check that runs after the
+            // download ended is not logged as a timeout.
             func finish(
                 _ value: Insta360DownloadResult?
-            ) {
+            ) -> Bool {
                 self.lock.lock()
-                guard gen == self._downloadGen else {
+                guard gen == self._downloadGen,
+                      let cont = self._downloadCont
+                else {
                     self.lock.unlock()
-                    return
+                    return false
                 }
-                let cont = self._downloadCont
                 self._downloadCont = nil
                 self.lock.unlock()
-                cont?.resume(returning: value)
+                cont.resume(returning: value)
+                return true
             }
 
             DispatchQueue.main.async {
                 INSCameraHTTPManager.socket().fetchResource(
                     withURI: uri,
                     toLocalFile: destURL,
-                    progress: { _ in }
+                    progress: { _ in
+                        let now = ProcessInfo.processInfo
+                            .systemUptime
+                        self.lock.lock()
+                        if gen == self._downloadGen {
+                            self._downloadProgressAt = now
+                        }
+                        self.lock.unlock()
+                    }
                 ) { error in
                     DispatchQueue.main.async {
                         if let error {
-                            print(
-                                "[Insta360] download "
-                                    + "failed: \(error)"
-                            )
-                            finish(nil)
+                            if finish(nil) {
+                                self.onStatusUpdate?(
+                                    "[\(cameraId)] download failed:"
+                                    + " \(uri): \(error)"
+                                )
+                            }
                             return
                         }
                         let exifTs = Self
                             .extractExifTimestamp(
                                 from: destURL
                             )
-                        finish(Insta360DownloadResult(
+                        let done = finish(Insta360DownloadResult(
                             cameraId: cameraId,
                             scanIndex: scanIndex,
                             localURL: destURL,
                             mediaType: .equirectangular,
                             exifTimestamp: exifTs
                         ))
+                        if done {
+                            let bytes = (try? FileManager.default
+                                .attributesOfItem(
+                                    atPath: destURL.path
+                                )[.size] as? Int) ?? 0
+                            let detail = String(
+                                format: "%.1f MB, %.1f s",
+                                Double(bytes) / 1_048_576,
+                                ProcessInfo.processInfo
+                                    .systemUptime - started)
+                            self.onStatusUpdate?(
+                                "[\(cameraId)] downloaded"
+                                + " \(destURL.lastPathComponent)"
+                                + " (\(detail))"
+                            )
+                        }
                     }
                 }
             }
 
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 30
-            ) {
-                print(
-                    "[Insta360] download timeout (30s)"
-                )
-                finish(nil)
+            // Checks every 5 s; gives up after downloadStallSeconds
+            // without progress or downloadMaxSeconds in total.
+            func watchDownload() {
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + 5
+                ) {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    self.lock.lock()
+                    let pending = gen == self._downloadGen
+                        && self._downloadCont != nil
+                    let idle = now - self._downloadProgressAt
+                    self.lock.unlock()
+                    guard pending else { return }
+                    let total = now - started
+                    if idle < Self.downloadStallSeconds,
+                       total < Self.downloadMaxSeconds
+                    {
+                        watchDownload()
+                        return
+                    }
+                    if finish(nil) {
+                        self.onStatusUpdate?(
+                            "[\(cameraId)] download timeout"
+                            + String(
+                                format: " (%.0f s, %.0f s without data)",
+                                total, idle)
+                            + ": \(uri)"
+                        )
+                    }
+                }
             }
+            watchDownload()
         }
     }
 
