@@ -370,8 +370,7 @@ final class CaptureSessionManager: ObservableObject {
                             cameras: cams,
                             arkitTimestamp: arkitTs,
                             scanIndex: scan,
-                            timeout: 60,
-                            retryOnFailure: false
+                            timeout: 60
                         )
                     let capComp = (ContinuousClock.now
                         - captureStart).components
@@ -495,12 +494,15 @@ final class CaptureSessionManager: ObservableObject {
                         startTime: cmdTime
                     )
                 }
+                // 60 s, as in auto capture: the X6 can send the photo
+                // URI in a push well after the takePicture reply, and a
+                // push after the timeout is dropped.
                 insta360Results = await insta360Manager
                     .captureWith(
                         cameras: manualCams,
                         arkitTimestamp: arkitFrame.timestamp,
                         scanIndex: currentScan,
-                        timeout: 30
+                        timeout: 60
                     )
                 let motion = await motionTask.value
                     ?? (peakDps: 0, meanDps: 0)
@@ -666,7 +668,7 @@ final class CaptureSessionManager: ObservableObject {
         logMessage("STOP: task done")
     }
 
-    private static let buildTag = "11h"
+    private static let buildTag = "12h"
 
     func endSession() async {
         guard isSessionActive, !isEndingSession else { return }

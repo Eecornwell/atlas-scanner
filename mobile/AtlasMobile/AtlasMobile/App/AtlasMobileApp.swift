@@ -1,5 +1,6 @@
 import Darwin
 import SwiftUI
+import UIKit
 import INSCameraSDK
 import INSCameraServiceSDK
 
@@ -46,8 +47,27 @@ final class SDKLogForwarder: NSObject, INSCameraSDKLoggerProtocol {
     }
 }
 
+/// Launch setup from the SDK sample's AppDelegate
+/// (INSCameraSDKSample-bluetooth/common/AppDelegate.swift), plus the
+/// app-wide connection monitor that does what the sample's
+/// RootViewController does on every connection.
+final class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions launchOptions:
+            [UIApplication.LaunchOptionsKey: Any]?
+    ) -> Bool {
+        INSCameraManager.shared().setup()
+        INSCameraManager.socket().autoReconnect = true
+        INSCameraManager.shared().autoReconnect = true
+        Insta360ConnectionMonitor.shared.start()
+        return true
+    }
+}
+
 @main
 struct AtlasMobileApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var sessionManager = CaptureSessionManager()
 
     init() {
@@ -68,8 +88,10 @@ struct AtlasMobileApp: App {
             ContentView()
                 .environmentObject(sessionManager)
                 .onAppear {
+                    // The sample calls socket().setup() when the user
+                    // taps "Connect Wi-Fi Mode"; this app connects at
+                    // launch. autoReconnect is set in AppDelegate.
                     let socket = INSCameraManager.socket()
-                    socket.autoReconnect = true
                     if socket.cameraState != .connected {
                         socket.setup()
                     }

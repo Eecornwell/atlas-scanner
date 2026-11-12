@@ -13,6 +13,9 @@ settings:
     FRAMEWORK_SEARCH_PATHS: $(inherited) $(SRCROOT)/Frameworks
     SWIFT_OBJC_BRIDGING_HEADER: AtlasMobile/AtlasMobile-Bridging-Header.h
     USER_HEADER_SEARCH_PATHS: "$(SRCROOT)/AtlasMobile/Calibration $(SRCROOT)/AtlasMobile/Export"
+    # Required by the Insta360 iOS SDK guide (Getting started, step 2);
+    # the SDK sample project sets it too.
+    GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) TO_B_SDK=1"
 
 targets:
   AtlasMobile:
@@ -29,6 +32,16 @@ targets:
         NSLocalNetworkUsageDescription: "ATLAS Mobile connects to Insta360 cameras over the local network."
         NSBonjourServices:
           - "_insta360._tcp"
+        # Same ATS block as the Insta360 SDK 1.11.3 sample app. The
+        # localhost exception covers the SDK's USB/Lightning HTTP tunnel.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            localhost:
+              NSExceptionAllowsInsecureHTTPLoads: true
+        # INSCameraServiceSDK links CoreBluetooth. The SDK sample declares
+        # this key; without it iOS ends the app if the SDK starts Bluetooth.
+        NSBluetoothAlwaysUsageDescription: "ATLAS Mobile uses Bluetooth to control Insta360 cameras."
         UIRequiredDeviceCapabilities:
           - arkit
           - lidar

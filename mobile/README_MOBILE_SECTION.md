@@ -265,7 +265,7 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
     - iPhone 14 Pro or later (LiDAR required, simulator not supported)
     - Apple Developer account (for device deployment)
     - Insta360 X5 (or supported model) for integration testing
-    - Insta360 iOS SDK zip (`iOS-SDK-1.10.4.zip`) from the [Insta360 Developer Portal](https://www.insta360.com/developer) or `s3://<BUCKET>/code/iOS-SDK-1.10.4.zip`
+    - Insta360 iOS SDK 1.11.3 zip (`iOS-SDK-V1.11.3.zip`) from the [Insta360 Developer Portal](https://www.insta360.com/developer) or `s3://<BUCKET>/code/iOS-SDK-V1.11.3.zip`
     - OpenCV iOS framework from [GitHub releases](https://github.com/opencv/opencv/releases)
 
 2. **Clone and checkout**
@@ -282,12 +282,17 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
     ```bash
     mkdir -p Frameworks
 
-    # Insta360 SDK
-    unzip ~/Downloads/iOS-SDK-1.10.4.zip -d /tmp/iOS-SDK-1.10.4/
-    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCameraSDK.xcframework Frameworks/
-    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCameraServiceSDK.xcframework Frameworks/
-    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/INSCoreMedia.xcframework Frameworks/
-    cp -R /tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/SSZipArchive.xcframework Frameworks/
+    # Insta360 SDK 1.11.3 (setup_ios.sh --sdk-dir ~/Downloads/iOS-SDK-V1.11.3.zip does the same)
+    unzip ~/Downloads/iOS-SDK-V1.11.3.zip -d /tmp/iOS-SDK-V1.11.3/
+    SDK_FW=/tmp/iOS-SDK-V1.11.3/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks
+    # Remove older SDK frameworks first: cp -R into an existing .xcframework merges the folders.
+    rm -rf Frameworks/INSCameraSDK.xcframework Frameworks/INSCameraServiceSDK.xcframework \
+      Frameworks/INSCoreMedia.xcframework Frameworks/SSZipArchive.xcframework
+    cp -R $SDK_FW/INSCameraSDK.xcframework Frameworks/
+    cp -R $SDK_FW/INSCameraServiceSDK.xcframework Frameworks/
+    cp -R $SDK_FW/INSCoreMedia.xcframework Frameworks/
+    cp -R $SDK_FW/SSZipArchive.xcframework Frameworks/
+    echo 1.11.3 > Frameworks/.insta360-sdk-version   # setup_ios.sh checks this
 
     # OpenCV
     curl -L -o /tmp/opencv-ios.zip https://github.com/opencv/opencv/releases/download/5.0.0/opencv-5.0.0-ios-framework.zip
@@ -339,6 +344,12 @@ Source masks are in sensor-native resolution (ERP for Insta360, pinhole for iPho
             NSLocalNetworkUsageDescription: "ATLAS Mobile connects to Insta360 cameras over the local network."
             NSBonjourServices:
               - "_insta360._tcp"
+            NSAppTransportSecurity:
+              NSAllowsLocalNetworking: true
+              NSExceptionDomains:
+                localhost:
+                  NSExceptionAllowsInsecureHTTPLoads: true
+            NSBluetoothAlwaysUsageDescription: "ATLAS Mobile uses Bluetooth to control Insta360 cameras."
             UIRequiredDeviceCapabilities:
               - arkit
               - lidar
@@ -517,15 +528,18 @@ If you don't have a Mac, you can build on an EC2 Mac Dedicated Host. **Expect ~$
 
     Copy the Insta360 SDK frameworks. Upload the SDK zip to S3 or transfer via SCP:
     ```bash
-    # Download SDK from S3
-    aws s3 cp s3://<BUCKET>/iOS-SDK-1.10.4.zip /tmp/
-    cd /tmp && unzip iOS-SDK-1.10.4.zip -d iOS-SDK-1.10.4/
+    # Download SDK 1.11.3 from S3
+    aws s3 cp s3://<BUCKET>/code/iOS-SDK-V1.11.3.zip /tmp/
+    unzip /tmp/iOS-SDK-V1.11.3.zip -d /tmp/iOS-SDK-V1.11.3/
 
-    SDK_FW=/tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks
+    SDK_FW=/tmp/iOS-SDK-V1.11.3/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks
+    rm -rf Frameworks/INSCameraSDK.xcframework Frameworks/INSCameraServiceSDK.xcframework \
+      Frameworks/INSCoreMedia.xcframework Frameworks/SSZipArchive.xcframework
     cp -R $SDK_FW/INSCameraSDK.xcframework Frameworks/
     cp -R $SDK_FW/INSCameraServiceSDK.xcframework Frameworks/
     cp -R $SDK_FW/INSCoreMedia.xcframework Frameworks/
     cp -R $SDK_FW/SSZipArchive.xcframework Frameworks/
+    echo 1.11.3 > Frameworks/.insta360-sdk-version
 
     # OpenCV
     curl -L -o /tmp/opencv-ios.zip \
