@@ -7,12 +7,13 @@ set -euo pipefail
 #
 # Usage:
 #   bash setup_ios.sh --bucket <s3-bucket> --team <team-id> --profile <profile-name>
+#   bash setup_ios.sh --sdk-dir ~/Downloads/iOS-SDK-V1.11.3   # SDK already on this Mac
 #
 # All flags are optional and fall back to environment variables, then defaults.
 #
 # Prerequisites:
 #   - macOS with Xcode 16.2+ installed and xcode-select configured
-#   - AWS CLI (for Insta360 SDK download from S3)
+#   - AWS CLI (for the Insta360 SDK download from S3, unless --sdk-dir is given)
 #   - curl, unzip
 
 # ── Parse arguments ────────────────────────────────────────────────
@@ -25,20 +26,29 @@ Options:
   --bucket NAME      S3 bucket for Insta360 SDK   (env: ATLAS_S3_BUCKET, default: gaussian-splatting)
   --team ID          Apple Developer Team ID       (env: ATLAS_TEAM_ID, default: Z89R76ZA8G)
   --profile NAME     Provisioning profile name     (env: ATLAS_PROFILE, default: AtlasMobile Ad Hoc)
+  --sdk-dir PATH     Insta360 SDK folder or .zip on this Mac, used instead of S3 (env: ATLAS_SDK_DIR)
+  --sdk-zip NAME     SDK zip name in s3://<bucket>/code/ (env: ATLAS_SDK_ZIP, default: iOS-SDK-V${SDK_VERSION}.zip)
   -h, --help         Show this help
 EOF
     exit 0
 }
 
+# Insta360 iOS SDK version to install (the version of the SDK package).
+SDK_VERSION="1.11.3"
+
 S3_BUCKET="${ATLAS_S3_BUCKET:-gaussian-splatting}"
 TEAM_ID="${ATLAS_TEAM_ID:-}"
 PROFILE_NAME="${ATLAS_PROFILE:-AtlasMobile Ad Hoc}"
+SDK_DIR="${ATLAS_SDK_DIR:-}"
+SDK_ZIP="${ATLAS_SDK_ZIP:-iOS-SDK-V${SDK_VERSION}.zip}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --bucket)   S3_BUCKET="$2"; shift 2 ;;
         --team)     TEAM_ID="$2"; shift 2 ;;
         --profile)  PROFILE_NAME="$2"; shift 2 ;;
+        --sdk-dir)  SDK_DIR="$2"; shift 2 ;;
+        --sdk-zip)  SDK_ZIP="$2"; shift 2 ;;
         -h|--help)  usage ;;
         *)          echo "Unknown option: $1"; usage ;;
     esac
@@ -55,6 +65,7 @@ echo "Config:"
 echo "  S3 bucket : $S3_BUCKET"
 echo "  Team ID   : $TEAM_ID"
 echo "  Profile   : $PROFILE_NAME"
+echo "  SDK       : $SDK_VERSION (${SDK_DIR:-s3://${S3_BUCKET}/code/${SDK_ZIP}})"
 echo ""
 
 # ── 1. Install XcodeGen if missing ──────────────────────────────────
@@ -74,22 +85,54 @@ fi
 
 mkdir -p "$FRAMEWORKS_DIR"
 
-# Insta360 SDK
-if [ ! -d "$FRAMEWORKS_DIR/INSCameraSDK.xcframework" ]; then
-    echo "Downloading Insta360 SDK from S3..."
-    aws s3 cp "s3://${S3_BUCKET}/code/iOS-SDK-1.10.4.zip" /tmp/iOS-SDK-1.10.4.zip
-    unzip -o /tmp/iOS-SDK-1.10.4.zip -d /tmp/iOS-SDK-1.10.4/
+# Insta360 SDK. Each framework reports its own version (SDK 1.11.3 ships
+# INSCameraServiceSDK 0.2500.19), so the installed SDK version is kept in
+# a marker file. A missing or different marker, as with frameworks copied
+# from SDK 1.10.4, replaces the four SDK frameworks.
+SDK_MARKER="$FRAMEWORKS_DIR/.insta360-sdk-version"
+SDK_FRAMEWORKS=(INSCameraSDK INSCameraServiceSDK INSCoreMedia SSZipArchive)
+INSTALLED_SDK="$(cat "$SDK_MARKER" 2>/dev/null || true)"
+if [ "$INSTALLED_SDK" != "$SDK_VERSION" ]; then
+    echo "Installing Insta360 SDK $SDK_VERSION (installed: ${INSTALLED_SDK:-unknown})..."
+    SDK_TMP="$(mktemp -d /tmp/insta360-sdk.XXXXXX)"
+    if [ -n "$SDK_DIR" ] && [ -d "$SDK_DIR" ]; then
+        SDK_ROOT="$SDK_DIR"
+    elif [ -n "$SDK_DIR" ] && [ -f "$SDK_DIR" ]; then
+        unzip -q -o "$SDK_DIR" -d "$SDK_TMP"
+        SDK_ROOT="$SDK_TMP"
+    elif [ -n "$SDK_DIR" ]; then
+        echo "Error: --sdk-dir $SDK_DIR does not exist." >&2
+        exit 1
+    else
+        echo "Downloading s3://${S3_BUCKET}/code/${SDK_ZIP}..."
+        aws s3 cp "s3://${S3_BUCKET}/code/${SDK_ZIP}" "$SDK_TMP/sdk.zip"
+        unzip -q -o "$SDK_TMP/sdk.zip" -d "$SDK_TMP"
+        SDK_ROOT="$SDK_TMP"
+    fi
 
-    SDK_FW="/tmp/iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks"
-    cp -R "$SDK_FW/INSCameraSDK.xcframework"        "$FRAMEWORKS_DIR/"
-    cp -R "$SDK_FW/INSCameraServiceSDK.xcframework"  "$FRAMEWORKS_DIR/"
-    cp -R "$SDK_FW/INSCoreMedia.xcframework"          "$FRAMEWORKS_DIR/"
-    cp -R "$SDK_FW/SSZipArchive.xcframework"           "$FRAMEWORKS_DIR/"
+    # The SDK sample app's Frameworks folder, wherever the zip put it.
+    if [ -d "$SDK_ROOT/INSCameraSDK.xcframework" ]; then
+        SDK_FW="$SDK_ROOT"
+    else
+        SDK_FW="$(find "$SDK_ROOT" -type d -path '*/INSCameraSDKSample-bluetooth/Frameworks' \
+            -not -path '*/__MACOSX/*' -print -quit)"
+    fi
+    for fw in "${SDK_FRAMEWORKS[@]}"; do
+        if [ -z "$SDK_FW" ] || [ ! -d "$SDK_FW/$fw.xcframework" ]; then
+            echo "Error: $fw.xcframework not found under $SDK_ROOT." >&2
+            exit 1
+        fi
+    done
 
-    rm -rf /tmp/iOS-SDK-1.10.4 /tmp/iOS-SDK-1.10.4.zip
-    echo "Insta360 SDK frameworks installed."
+    for fw in "${SDK_FRAMEWORKS[@]}"; do
+        rm -rf "$FRAMEWORKS_DIR/$fw.xcframework"
+        cp -R "$SDK_FW/$fw.xcframework" "$FRAMEWORKS_DIR/"
+    done
+    echo "$SDK_VERSION" > "$SDK_MARKER"
+    rm -rf "$SDK_TMP"
+    echo "Insta360 SDK $SDK_VERSION frameworks installed from $SDK_FW."
 else
-    echo "Insta360 SDK frameworks already present."
+    echo "Insta360 SDK $SDK_VERSION frameworks already present."
 fi
 
 # OpenCV

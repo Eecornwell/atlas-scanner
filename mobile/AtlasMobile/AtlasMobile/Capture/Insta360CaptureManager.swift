@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import INSCameraSDK
+import INSCoreMedia
 
 /// Manages connections and capture for multiple Insta360 cameras.
 final class Insta360CaptureManager: ObservableObject {
@@ -61,8 +62,17 @@ final class Insta360CaptureManager: ObservableObject {
         }
         defer { Task { @MainActor in self.isConnecting = false } }
 
+        onLogMessage?(Self.sdkVersionSummary())
         let needsSetup = await MainActor.run {
             () -> Bool in
+            Insta360ConnectionMonitor.shared.onLogMessage = {
+                [weak self] msg in
+                self?.onLogMessage?(msg)
+            }
+            Insta360LivePreview.shared.onLogMessage = {
+                [weak self] msg in
+                self?.onLogMessage?(msg)
+            }
             let socket = INSCameraManager.socket()
             for cam in connectedCameras {
                 cam.onDisconnect = nil
@@ -81,7 +91,7 @@ final class Insta360CaptureManager: ObservableObject {
             if !ok {
                 onLogMessage?(
                     "SDK not connected after 20s"
-                    + " — is USB plugged in?"
+                    + " — is the iPhone on the camera's Wi-Fi?"
                 )
                 return
             }
@@ -130,6 +140,8 @@ final class Insta360CaptureManager: ObservableObject {
         }
         await MainActor.run { connectedCameras = connected }
 
+        // The camera may still be booting: wait until a getOptions read
+        // works, as the sample's page reads options before anything else.
         var commandsReady = false
         if let first = connected.first {
             commandsReady = await first.waitForCommandReady(
@@ -141,12 +153,14 @@ final class Insta360CaptureManager: ObservableObject {
             )
         }
 
+        // The original app's camera settings: single photo mode on both
+        // sensors, FlowState and horizon leveling off. Sent before the
+        // live preview starts, so the preview uses the sensors they set.
         if commandsReady {
             await withTaskGroup(of: Void.self) { group in
                 for cam in connected {
                     group.addTask {
-                        await cam.switchToPhotoMode()
-                        await cam.disableStabilization()
+                        await cam.applyCameraSettings()
                     }
                 }
             }
@@ -155,6 +169,9 @@ final class Insta360CaptureManager: ObservableObject {
             )
         }
 
+        // Then start the live preview, as the sample's take-picture page
+        // does when it opens. No warmup photo: the sample takes none.
+        // Shots wait for this task.
         warmupTask = Task { [weak self] in
             guard let first = connected.first
             else { return }
@@ -172,41 +189,32 @@ final class Insta360CaptureManager: ObservableObject {
                     return
                 }
                 for cam in connected {
-                    await cam.switchToPhotoMode()
-                    await cam.disableStabilization()
+                    await cam.applyCameraSettings()
                 }
                 self?.onLogMessage?(
                     "camera configured (deferred)"
                 )
             }
-
-            self?.stopInFlightCapture()
-            var primed = await first.warmupCapture()
-            if !primed {
-                self?.stopInFlightCapture()
-                self?.onLogMessage?(
-                    "warmup busy — retry in 3s…"
-                )
-                try? await Task.sleep(
-                    for: .seconds(3)
-                )
-                primed = await first.warmupCapture()
-            }
-            await MainActor.run {
-                self?.isPipelineReady = true
-            }
-            self?.onLogMessage?(
-                primed
-                    ? "pipeline primed — ready"
-                    : "pipeline prime failed"
-                    + " — proceeding"
-            )
-
-            self?.onLogMessage?(
-                "ready"
-            )
+            guard !Task.isCancelled else { return }
+            await self?.startLivePreview()
         }
+    }
 
+    /// Starts the live preview, then lets shots through.
+    private func startLivePreview() async {
+        // Shows where photos are saved (X6: internal or SD card).
+        let cameras = await MainActor.run { connectedCameras }
+        for cam in cameras {
+            await cam.logStorageStatus()
+        }
+        onLogMessage?("starting live preview…")
+        let running = await Insta360LivePreview.shared.start()
+        onLogMessage?(
+            running
+                ? "ready"
+                : "ready (live preview did not start)"
+        )
+        await MainActor.run { isPipelineReady = true }
     }
 
     func retryConnection() async {
@@ -242,6 +250,7 @@ final class Insta360CaptureManager: ObservableObject {
         }
 
         await MainActor.run { connectedCameras.append(instance) }
+        await startLivePreview()
     }
 
     /// Camera entry for the camera the SDK is connected to: the enabled
@@ -286,6 +295,30 @@ final class Insta360CaptureManager: ObservableObject {
             .uppercased()
     }
 
+    /// Versions of the linked Insta360 frameworks, read the way the SDK
+    /// sample's root screen reads them. SDK package 1.11.3 ships
+    /// INSCameraSDK 1.9.0 (482), INSCameraServiceSDK 0.2500.19 (108)
+    /// and INSCoreMedia 2.878.4 (2384). None of them reports "1.11.3".
+    static func sdkVersionSummary() -> String {
+        func version(_ bundle: Bundle) -> String {
+            let info = bundle.infoDictionary
+            let short = info?["CFBundleShortVersionString"]
+                as? String ?? "?"
+            let build = info?["CFBundleVersion"] as? String ?? "?"
+            return "\(short) (\(build))"
+        }
+        let service = version(Bundle(for: INSCameraManager.self))
+        var summary = "Insta360 SDK: INSCameraSDK "
+            + version(Bundle(for: INSCameraMediaSession.self))
+            + ", INSCameraServiceSDK \(service)"
+            + ", INSCoreMedia "
+            + version(Bundle(for: INSExtraMetadata.self))
+        if service != "0.2500.19 (108)" {
+            summary += " (not the SDK 1.11.3 frameworks)"
+        }
+        return summary
+    }
+
     private func waitForSDKConnected(
         maxWait: Double
     ) async -> Bool {
@@ -319,7 +352,7 @@ final class Insta360CaptureManager: ObservableObject {
     func disconnect() async {
         warmupTask?.cancel()
         warmupTask = nil
-        stopInFlightCapture()
+        await Insta360LivePreview.shared.stop()
         let cameras = await MainActor.run {
             let current = connectedCameras
             connectedCameras = []
@@ -341,21 +374,9 @@ final class Insta360CaptureManager: ObservableObject {
         }
     }
 
-    func stopInFlightCapture() {
-        DispatchQueue.main.async {
-            let socket = INSCameraManager.socket()
-            guard socket.cameraState == .connected else {
-                return
-            }
-            INSCameraManager.shared()
-                .commandManager
-                .stopTakePicture { _ in }
-        }
-    }
-
     func awaitWarmup() async {
         if let task = warmupTask {
-            onLogMessage?("awaiting pipeline warmup…")
+            onLogMessage?("waiting for the live preview to start…")
             await task.value
             warmupTask = nil
         }
@@ -387,8 +408,7 @@ final class Insta360CaptureManager: ObservableObject {
     func captureWith(
         cameras: [CameraInstance],
         arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8,
-        skipPreChecks: Bool = false,
-        retryOnFailure: Bool = true
+        skipPreChecks: Bool = false
     ) async -> [Insta360CaptureResult] {
         guard !cameras.isEmpty, !Task.isCancelled else { return [] }
 
@@ -403,8 +423,7 @@ final class Insta360CaptureManager: ObservableObject {
                         arkitTimestamp: arkitTimestamp,
                         scanIndex: scanIndex,
                         timeout: timeout,
-                        skipPreChecks: skipPreChecks,
-                        retryOnFailure: retryOnFailure
+                        skipPreChecks: skipPreChecks
                     )
                 }
             }

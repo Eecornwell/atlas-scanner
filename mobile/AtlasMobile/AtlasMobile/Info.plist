@@ -24,6 +24,21 @@
 	<array>
 		<string>_insta360._tcp</string>
 	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>ATLAS Mobile uses Bluetooth to control Insta360 cameras.</string>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
 		<string>arkit</string>

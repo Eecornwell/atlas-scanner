@@ -4,7 +4,6 @@ import ImageIO
 import INSCameraSDK
 import INSCoreMedia
 
-private let kHeartbeatInterval: TimeInterval = 0.5
 private let kClockSyncTotalSamples = 20
 private let kClockSyncBestCount = 3
 
@@ -48,7 +47,28 @@ final class CameraInstance: NSObject, Identifiable {
     private static let downloadStallSeconds: Double = 30
     /// ...or after this long in total.
     private static let downloadMaxSeconds: Double = 180
+    /// Gets the photo URI from an INSCameraTakePictureResponse push
+    /// while a takePicture is in flight. Returns false if that shot has
+    /// already ended. New X6 (C9) firmware sends the URI in this push
+    /// instead of the takePicture completion; see the SDK sample's
+    /// CameraConfigByJsonController.takePictureResponseNotification.
+    /// The push carries no request ID, so it goes to the shot in flight.
+    private var _photoWaiter: ((String, Double) -> Bool)?
+    /// When the in-flight takePicture's completion arrived without a URI.
+    private var _captureReplyTs: Double?
+    /// The camera's photo list read just before the next takePicture
+    /// (prepareShot). A shot whose URI comes in neither the reply nor
+    /// the push finds its photo as the new entry in a later list.
+    private var _photoListBeforeShot: Set<String>?
+    /// setAppid and PureShot have been sent on this connection.
+    /// Cleared when the connection drops, so a reconnect sends them again.
+    private var isPureShotSet = false
+    /// The app's own photo mode settings were accepted on this connection
+    /// (switchToPhotoMode). Cleared when the connection drops.
     private(set) var isPhotoModeSet = false
+    /// The camera settings run in progress (applyCameraSettings). A shot
+    /// taken meanwhile waits for it instead of sending the settings twice.
+    private var settingsTask: Task<Void, Never>?
 
     /// Shots captured but not yet downloaded.
     var pendingDownloadCount: Int {
@@ -70,9 +90,10 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    private var heartbeatTimer: Timer?
     private var kvoToken: NSKeyValueObservation?
     private var disconnectToken: NSKeyValueObservation?
+    private var photoPushObserver: NSObjectProtocol?
+    private var takePictureStateObserver: NSObjectProtocol?
 
     init(config: CameraConfig) {
         self.id = config.id
@@ -83,15 +104,19 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     deinit {
-        stopHeartbeat()
+        stopPhotoPushObserver()
     }
 
     // MARK: - Connection
+
+    // The heartbeat runs in Insta360ConnectionMonitor for as long as
+    // the socket is connected, as in the SDK sample, not per instance.
 
     func connect() async -> Bool {
         onStatusUpdate?(
             "[\(id)] Waiting for SDK connection..."
         )
+        startPhotoPushObserver()
 
         return await withCheckedContinuation { continuation in
             lock.lock()
@@ -124,7 +149,6 @@ final class CameraInstance: NSObject, Identifiable {
                         "[\(self.id)] Already connected!"
                     )
                     self.isConnected = true
-                    self.startHeartbeat()
                     self.monitorConnection()
                     finish(true)
                     return
@@ -154,7 +178,6 @@ final class CameraInstance: NSObject, Identifiable {
                         if state == .connected {
                             self.kvoToken = nil
                             self.isConnected = true
-                            self.startHeartbeat()
                             self.monitorConnection()
                             self.onStatusUpdate?(
                                 "[\(self.id)] Connected!"
@@ -197,7 +220,7 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     func disconnect() async {
-        stopHeartbeat()
+        stopPhotoPushObserver()
         kvoToken = nil
         disconnectToken = nil
         onDisconnect = nil
@@ -216,17 +239,25 @@ final class CameraInstance: NSObject, Identifiable {
         _captureGen += 1
         let cont = _captureCont
         _captureCont = nil
+        _photoWaiter = nil
         _captureInFlight = false
         lock.unlock()
         cont?.resume(returning: nil)
     }
 
     func reconnect(maxRetries: Int = 3) async -> Bool {
+        // disconnect() clears the callbacks. Keep them, or this
+        // instance logs nothing after Retry.
+        let statusUpdate = onStatusUpdate
+        let disconnectHandler = onDisconnect
         await disconnect()
+        onStatusUpdate = statusUpdate
+        onDisconnect = disconnectHandler
         for attempt in 1...maxRetries {
+            // As in the original app. Insta360CaptureManager starts the
+            // live preview afterwards, once the settings are in place.
             if await connect() {
-                await switchToPhotoMode()
-                await disableStabilization()
+                await applyCameraSettings()
                 return true
             }
             if attempt < maxRetries {
@@ -395,12 +426,22 @@ final class CameraInstance: NSObject, Identifiable {
 
     // MARK: - Capture
 
+    // A shot follows the SDK sample's take-picture page
+    // (CameraConfigByJsonController.swift, opened with "Record new"):
+    // its live preview runs, and "X5 Take Picture" sends setAppid, then
+    // PureShot, then takePicture. On top of that, the camera has the
+    // original app's own settings (applyCameraSettings) and takePicture
+    // carries the original app's exposure value (takePictureOptions);
+    // the sample sends neither. Like the sample, no warmup photo is taken.
+
+    /// Everything a shot does before takePicture. Calibration calls this
+    /// first and then fires with skipPreChecks, so takePicture follows
+    /// the ARKit frame closely.
     func prepareForCapture() async -> Bool {
         guard await ensureSDKConnected() else {
             return false
         }
-        _ = await warmUpCommandChannel()
-        await ensurePhotoMode()
+        await prepareShot()
         return true
     }
 
@@ -408,8 +449,7 @@ final class CameraInstance: NSObject, Identifiable {
         arkitTimestamp: Double,
         scanIndex: Int,
         timeout: Double = 45,
-        skipPreChecks: Bool = false,
-        retryOnFailure: Bool = true
+        skipPreChecks: Bool = false
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -433,38 +473,21 @@ final class CameraInstance: NSObject, Identifiable {
             guard await ensureSDKConnected() else {
                 return nil
             }
+            await prepareShot()
         }
 
-        if !skipPreChecks {
-            _ = await warmUpCommandChannel()
-            await ensurePhotoMode()
-        }
+        lock.lock()
+        let photoListBefore = _photoListBeforeShot
+        _photoListBeforeShot = nil
+        lock.unlock()
 
+        // One takePicture per shot, as the sample sends one per press.
+        // The old retry after a missed reply took a second photo.
         let commandTs = ProcessInfo.processInfo.systemUptime
-        var captureResult: (
-            uri: String, callbackTimestamp: Double
-        )?
-        captureResult = await attemptTakePicture(
-            timeout: timeout
+        let captureResult = await attemptTakePicture(
+            timeout: timeout,
+            photoListBefore: photoListBefore
         )
-
-        if captureResult == nil, retryOnFailure {
-            onStatusUpdate?(
-                "[\(id)] attempt 1 failed"
-                + " — waiting 15s for camera"
-            )
-            try? await Task.sleep(
-                for: .seconds(15)
-            )
-            let recovered = await waitForCommandReady(
-                maxWait: 75
-            )
-            if recovered, !Task.isCancelled {
-                captureResult = await attemptTakePicture(
-                    timeout: timeout
-                )
-            }
-        }
 
         if let uri = captureResult?.uri {
             lock.lock()
@@ -523,250 +546,96 @@ final class CameraInstance: NSObject, Identifiable {
         return await waitForConnected(maxWait: 10)
     }
 
-    private func waitForCameraReady(
-        maxWait: Double = 10
-    ) async -> Bool {
-        let start = Date()
-        while Date().timeIntervalSince(start) < maxWait {
-            guard !Task.isCancelled else { return false }
-            let ready = await withCheckedContinuation {
-                (cont: CheckedContinuation<Bool, Never>) in
-                DispatchQueue.main.async {
-                    INSCameraManager.shared()
-                        .commandManager
-                        .getCurrentCaptureStatus {
-                            error, status in
-                            if let error {
-                                self.onStatusUpdate?(
-                                    "[\(self.id)] status"
-                                    + " err: \(error)"
-                                )
-                                cont.resume(returning: false)
-                                return
-                            }
-                            let state = status?.state
-                                ?? .notCapture
-                            if state == .notCapture {
-                                cont.resume(returning: true)
-                            } else {
-                                self.onStatusUpdate?(
-                                    "[\(self.id)] camera"
-                                    + " state="
-                                    + "\(state.rawValue)"
-                                    + " — waiting"
-                                )
-                                cont.resume(returning: false)
-                            }
-                        }
-                }
-            }
-            if ready { return true }
-            try? await Task.sleep(for: .seconds(1))
-        }
-        onStatusUpdate?(
-            "[\(id)] camera not ready after"
-            + " \(Int(maxWait))s"
-        )
-        return false
-    }
-
-    func waitForCommandReady(
-        maxWait: Double = 60
-    ) async -> Bool {
-        let start = Date()
-        while Date().timeIntervalSince(start) < maxWait {
-            let ok = await warmUpCommandChannel(
-                timeout: 5
-            )
-            if ok { return true }
-            let elapsed = Int(
-                Date().timeIntervalSince(start)
-            )
-            onStatusUpdate?(
-                "[\(id)] commands not ready"
-                + " (\(elapsed)s) — retrying"
-            )
-            try? await Task.sleep(for: .seconds(1))
-        }
-        return false
-    }
-
-    func warmUpCommandChannel(
-        timeout: Double = 15
-    ) async -> Bool {
-        await withCheckedContinuation {
-            (cont: CheckedContinuation<Bool, Never>)
-                in
-            let done = NSLock()
-            var didResume = false
-
-            func finish(_ result: Bool) {
-                done.lock()
-                defer { done.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                cont.resume(returning: result)
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                let types: [NSNumber] = [
-                    NSNumber(
-                        value: INSCameraOptionsType
-                            .storageState.rawValue
-                    ),
-                ]
-                INSCameraManager.shared()
-                    .commandManager
-                    .getOptionsWithTypes(
-                        types
-                    ) { error, _, _ in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")]"
-                                + " warmup: "
-                                + "\(error)"
-                            )
-                        } else {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")]"
-                                + " warmup OK"
-                            )
-                        }
-                        finish(error == nil)
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + timeout
-            ) { [weak self] in
-                done.lock()
-                let alreadyDone = didResume
-                done.unlock()
-                if !alreadyDone {
-                    self?.onStatusUpdate?(
-                        "[\(self?.id ?? "?")]"
-                        + " warmup timeout"
-                        + " (\(Int(timeout))s)"
-                    )
-                }
-                finish(false)
-            }
-        }
-    }
-
-    private var _stopCont: CheckedContinuation<
-        Void, Never
-    >?
-
-    private func stopCurrentCapture() async {
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            self.lock.lock()
-            self._stopCont = continuation
-            self.lock.unlock()
-
-            func finish() {
-                self.lock.lock()
-                let cont = self._stopCont
-                self._stopCont = nil
-                self.lock.unlock()
-                cont?.resume()
-            }
-
-            DispatchQueue.main.async {
-                INSCameraManager.shared()
-                    .commandManager
-                    .stopTakePicture { [weak self] error in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "stopCapture: \(error)"
-                            )
-                        }
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 3
-            ) {
-                finish()
-            }
-        }
-    }
-
-    func warmupCapture(
-        timeout: Double = 15
-    ) async -> Bool {
-        _ = await warmUpCommandChannel(timeout: 8)
+    /// Brings the camera to where the sample's page is when its button
+    /// sends takePicture: the live preview runs, and setAppid and PureShot
+    /// have just been sent.
+    private func prepareShot() async {
+        // The original app's camera settings: waits for them if they're
+        // still being sent at connect, and resends them if they failed.
         await ensurePhotoMode()
-        onStatusUpdate?(
-            "[\(id)] priming pipeline…"
-        )
-        return await withCheckedContinuation {
-            (cont: CheckedContinuation<Bool, Never>)
-                in
-            let done = NSLock()
-            var didResume = false
-
-            func finish(_ ok: Bool) {
-                done.lock()
-                defer { done.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                cont.resume(returning: ok)
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                let opts = INSTakePictureOptions()
-                opts.mode = .normal
-                let exp = INSCameraExposureOptions()
-                exp.program = 3
-                exp.shutterSpeed = CMTime(
-                    value: 120, timescale: 1
+        // Doesn't wait for the preview to restart after the last shot:
+        // the stream restarts on its own, and waiting delayed every shot.
+        // The sample keeps it running while you take pictures.
+        let previewRunning = await MainActor.run {
+            Insta360LivePreview.shared.isRunning
+        }
+        if !previewRunning {
+            onStatusUpdate?(
+                "[\(id)] live preview restarting — not waiting for it"
+            )
+        }
+        // setAppid and PureShot once per connection, not before every
+        // shot as the sample does. Sent again only if they failed.
+        if !isPureShotSet {
+            isPureShotSet = await setAppIdAndPureShot()
+            if !isPureShotSet {
+                // The sample's plain "Take Picture" button sends
+                // takePicture without them.
+                onStatusUpdate?(
+                    "[\(id)] taking the photo without setAppid/PureShot"
                 )
-                opts.currenExposureOptions = exp
-                INSCameraManager.shared()
-                    .commandManager
-                    .takePicture(
-                        with: opts
-                    ) { [weak self] error,
-                        photoInfo in
-                        if let error {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "warmupCapture: "
-                                + "\(error)"
-                            )
-                        } else {
-                            self?.onStatusUpdate?(
-                                "[\(self?.id ?? "?")] "
-                                + "warmupCapture OK"
-                            )
-                        }
-                        finish(error == nil)
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + timeout
-            ) { [weak self] in
-                done.lock()
-                let alreadyDone = didResume
-                done.unlock()
-                if !alreadyDone {
-                    self?.onStatusUpdate?(
-                        "[\(self?.id ?? "?")] "
-                        + "warmupCapture timeout"
-                        + " (\(Int(timeout))s)"
-                    )
-                }
-                finish(false)
             }
         }
+        // Read last, so the list is as close to the shot as possible.
+        let list = await fetchPhotoURIs()
+        lock.lock()
+        _photoListBeforeShot = list
+        lock.unlock()
+        onStatusUpdate?(
+            "[\(id)] photo list before shot: "
+            + (list.map { "\($0.count) photos" } ?? "read failed")
+        )
     }
 
+    // MARK: - The original app's camera settings
+
+    // Restored from the original app (Eecornwell/atlas-scanner, mobile
+    // branch, CameraInstance.swift): single photo mode on both sensors,
+    // then FlowState and horizon leveling off. Insta360CaptureManager
+    // sends them when the camera connects, before the live preview starts,
+    // so the preview uses the sensors they set. Before a shot they're sent
+    // again only if they failed (ensurePhotoMode), as in the original.
+
+    /// Sends switchToPhotoMode, then disableStabilization. A call while a
+    /// run is in progress waits for that run instead of starting another.
+    func applyCameraSettings() async {
+        lock.lock()
+        let task: Task<Void, Never>
+        if let running = settingsTask {
+            task = running
+        } else {
+            task = Task { [weak self] in
+                await self?.switchToPhotoMode()
+                await self?.disableStabilization()
+            }
+            settingsTask = task
+        }
+        lock.unlock()
+        await task.value
+        lock.lock()
+        if settingsTask == task { settingsTask = nil }
+        lock.unlock()
+    }
+
+    /// Before a shot: waits for a settings run still in progress, or, if
+    /// the photo mode settings failed on this connection, checks that the
+    /// camera answers and sends them again.
+    func ensurePhotoMode() async {
+        lock.lock()
+        let running = settingsTask
+        lock.unlock()
+        if let running {
+            await running.value
+            return
+        }
+        guard !isPhotoModeSet else { return }
+        let ready = await warmUpCommandChannel()
+        guard ready else { return }
+        await applyCameraSettings()
+    }
+
+    /// Whether both sensors are already active, so switchToPhotoMode can
+    /// skip activating them.
     private func checkSensorIsAll() async -> Bool {
         await withCheckedContinuation {
             (cont: CheckedContinuation<Bool, Never>) in
@@ -825,53 +694,14 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// The X6 (SDK name C9) keeps its sensor in low power after a Wi-Fi
-    /// connection until the app reports live view. The SDK sample sends
-    /// setAppAccessFileState(.liveView) on connect, for C9 only.
-    private func wakeX6IfNeeded() async {
-        let isX6 = await MainActor.run {
-            INSCameraManager.socket().currentCamera?.name
-                == kInsta360CameraNameC9
-        }
-        guard isX6 else { return }
-        await withCheckedContinuation {
-            (continuation: CheckedContinuation<Void, Never>)
-                in
-            let resumed = NSLock()
-            var didResume = false
-
-            func finish() {
-                resumed.lock()
-                defer { resumed.unlock() }
-                guard !didResume else { return }
-                didResume = true
-                continuation.resume()
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                INSCameraManager.shared()
-                    .commandManager
-                    .setAppAccessFileState(.liveView) {
-                        [weak self] error in
-                        self?.onStatusUpdate?(
-                            "[\(self?.id ?? "?")] "
-                            + "X6 live view: "
-                            + (error.map { "\($0)" } ?? "ok")
-                        )
-                        finish()
-                    }
-            }
-
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + 5
-            ) {
-                finish()
-            }
-        }
-    }
-
+    /// Single photo mode (photo sub mode 0) with both sensors focused, the
+    /// default output type, and both sensors active. The original also
+    /// sent the X6 wake call setAppAccessFileState(.liveView) first. It's
+    /// left out: Insta360ConnectionMonitor sends it on every connection,
+    /// and the API doc says the same call locks the X6's screen while the
+    /// live preview stream runs, as it can when ensurePhotoMode resends
+    /// these settings.
     func switchToPhotoMode() async {
-        await wakeX6IfNeeded()
         let skipActivation = await checkSensorIsAll()
 
         await withCheckedContinuation {
@@ -988,6 +818,7 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
+    /// Turns off FlowState (in-camera stabilization) and horizon leveling.
     func disableStabilization() async {
         await withCheckedContinuation {
             (continuation: CheckedContinuation<Void, Never>)
@@ -1050,20 +881,393 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    func ensurePhotoMode() async {
-        guard !isPhotoModeSet else { return }
-        let ready = await warmUpCommandChannel()
-        guard ready else { return }
-        await switchToPhotoMode()
-        await disableStabilization()
+    // MARK: - Storage and photo list (API doc, X6 dual storage)
+
+    /// The X6 (SDK name C9) has internal storage and an SD card. The API
+    /// doc reads them separately and lists files with
+    /// hasInternalAndSDStorage = true.
+    private static func isDualStorageCamera() -> Bool {
+        INSCameraManager.shared().currentCamera?.name
+            == kInsta360CameraNameC9
+    }
+
+    private static func cardStateText(
+        _ state: INSCameraCardState
+    ) -> String {
+        switch state {
+        case .normal: return "Normal"
+        case .noCard: return "NoCard"
+        case .noSpace: return "NoSpace"
+        case .invalidFormat: return "InvalidFormat"
+        case .writeProtectCard: return "WriteProtectCard"
+        case .unknownError: return "UnknownError"
+        @unknown default: return "state \(state.rawValue)"
+        }
+    }
+
+    private static func locationText(
+        _ location: INSStorageCardLocation
+    ) -> String {
+        switch location {
+        case .camera: return "camera"
+        case .reader: return "reader"
+        case .inner: return "internal"
+        case .SD: return "SD card"
+        @unknown default: return "location \(location.rawValue)"
+        }
+    }
+
+    private static func storageText(
+        _ status: INSCameraStorageStatus?
+    ) -> String {
+        guard let s = status else { return "none" }
+        let gb = Double(1024 * 1024 * 1024)
+        return Self.cardStateText(s.cardState)
+            + String(
+                format: " %.1f of %.1f GB free",
+                Double(s.freeSpace) / gb, Double(s.totalSpace) / gb
+            )
+    }
+
+    /// Logs the storage the camera captures to, as the API doc's
+    /// "X6 special handling" reads it: the SD card is the
+    /// cardLocation == .SD item of storageStateList, internal storage is
+    /// cameraStorageStatus. storageStatus is the main storage, the one
+    /// photos are written to (sample comment, RootViewController+Sections).
+    func logStorageStatus() async {
+        let text = await withCheckedContinuation {
+            (cont: CheckedContinuation<String, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            func finish(_ value: String) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                if first { cont.resume(returning: value) }
+            }
+
+            DispatchQueue.main.async {
+                let dual = Self.isDualStorageCamera()
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType.storageState.rawValue
+                    ),
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .storageStateList.rawValue
+                    ),
+                ]
+                INSCameraManager.shared().commandManager
+                    .getOptionsWithTypes(types) { error, options, _ in
+                        guard let options else {
+                            finish(
+                                "storage read failed: "
+                                + (error.map { "\($0)" } ?? "no options")
+                            )
+                            return
+                        }
+                        let list = options.storageStateList
+                            as? [INSCameraStorageStatus] ?? []
+                        let main = options.storageStatus.map {
+                            Self.locationText($0.cardLocation)
+                        } ?? "?"
+                        if dual {
+                            let sd = list.first { $0.cardLocation == .SD }
+                            let inner = options.cameraStorageStatus
+                                ?? list.first { $0.cardLocation == .inner }
+                            finish(
+                                "storage: photos go to \(main);"
+                                + " internal \(Self.storageText(inner));"
+                                + " SD card \(Self.storageText(sd))"
+                            )
+                        } else {
+                            finish(
+                                "storage: SD card "
+                                + Self.storageText(options.storageStatus)
+                            )
+                        }
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                finish("storage read timeout")
+            }
+        }
+        onStatusUpdate?("[\(id)] \(text)")
+    }
+
+    /// URIs of every photo on the camera, from fetchPhotoList as the API
+    /// doc's "Get File List" does it. On the X6 the list covers both
+    /// storages: SD card photos are in sdResources (/DCIM/Camera01/...),
+    /// internal ones in cameraResources (/storage_internal/DCIM/...).
+    /// Nil if the list can't be read.
+    private func fetchPhotoURIs() async -> Set<String>? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Set<String>?, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            func finish(_ value: Set<String>?) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                if first { cont.resume(returning: value) }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let dual = Self.isDualStorageCamera()
+                let options = INSGetFileListOptions()
+                options.type = .sdAndCamera
+                options.hasInternalAndSDStorage = dual
+                INSCameraManager.shared().commandManager.fetchPhotoList(
+                    with: options
+                ) { error, res in
+                    var list: [INSCameraBaseFileInfo] = []
+                    if dual {
+                        if let sd = res?.sdResources {
+                            list.append(contentsOf: sd)
+                        }
+                        if let cam = res?.cameraResources {
+                            list.append(contentsOf: cam)
+                        }
+                    } else {
+                        list = res?.cameraResources ?? []
+                    }
+                    if list.isEmpty, let error {
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] photo list: \(error)"
+                        )
+                        finish(nil)
+                        return
+                    }
+                    finish(Set(list.map { $0.uri }.filter { !$0.isEmpty }))
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                finish(nil)
+            }
+        }
+    }
+
+    /// The new photo among `uris`: a .insp or .jpg file if there is one
+    /// (PureShot writes no DNG, but a DNG would come with the photo), and
+    /// of those the last by name, which is the newest (the camera names
+    /// files by date and time; the SDK sample sorts its list this way).
+    private static func newestPhoto(_ uris: Set<String>) -> String? {
+        let images = uris.filter {
+            let ext = ($0 as NSString).pathExtension.lowercased()
+            return ext == "insp" || ext == "jpg" || ext == "jpeg"
+        }
+        return (images.isEmpty ? uris : images).max()
+    }
+
+    func waitForCommandReady(
+        maxWait: Double = 60
+    ) async -> Bool {
+        let start = Date()
+        while Date().timeIntervalSince(start) < maxWait {
+            let ok = await warmUpCommandChannel(
+                timeout: 5
+            )
+            if ok { return true }
+            let elapsed = Int(
+                Date().timeIntervalSince(start)
+            )
+            onStatusUpdate?(
+                "[\(id)] commands not ready"
+                + " (\(elapsed)s) — retrying"
+            )
+            try? await Task.sleep(for: .seconds(1))
+        }
+        return false
+    }
+
+    func warmUpCommandChannel(
+        timeout: Double = 15
+    ) async -> Bool {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<Bool, Never>)
+                in
+            let done = NSLock()
+            var didResume = false
+
+            func finish(_ result: Bool) {
+                done.lock()
+                defer { done.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                cont.resume(returning: result)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .storageState.rawValue
+                    ),
+                ]
+                INSCameraManager.shared()
+                    .commandManager
+                    .getOptionsWithTypes(
+                        types
+                    ) { error, _, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")]"
+                                + " command check: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")]"
+                                + " command check OK"
+                            )
+                        }
+                        finish(error == nil)
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + timeout
+            ) { [weak self] in
+                done.lock()
+                let alreadyDone = didResume
+                done.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")]"
+                        + " command check timeout"
+                        + " (\(Int(timeout))s)"
+                    )
+                }
+                finish(false)
+            }
+        }
+    }
+
+    /// Sends what the SDK sample's "X5 Take Picture" sends before every
+    /// takePicture (CameraConfigByJsonController.swift): setAppid, then
+    /// raw capture type PureShot (3) for function mode 8 (HDR_IMAGE),
+    /// option type 25. The sample's comment: the camera accepts photo
+    /// settings only after setAppid, and without it the photo still
+    /// includes a DNG. Returns whether both succeeded.
+    private func setAppIdAndPureShot() async -> Bool {
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Bool, Never>)
+                in
+            let resumed = NSLock()
+            var didResume = false
+
+            func finish(_ ok: Bool) {
+                resumed.lock()
+                defer { resumed.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume(returning: ok)
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let commands = INSCameraManager.shared()
+                    .commandManager
+                commands.setAppidCompletion { [weak self] error in
+                    if let error {
+                        self?.onStatusUpdate?(
+                            "[\(self?.id ?? "?")] "
+                            + "setAppid err: \(error)"
+                        )
+                        finish(false)
+                        return
+                    }
+                    let photo = INSPhotographyOptions()
+                    photo.rawCaptureType = UInt8(
+                        INSCameraRawCaptureType.pureshot.rawValue
+                    )
+                    let types: [NSNumber] = [
+                        NSNumber(
+                            value: INSPhotographyOptionsType
+                                .rawCaptureType.rawValue
+                        ),
+                    ]
+                    commands.setPhotographyOptions(
+                        photo,
+                        for: INSCameraFunctionMode(functionMode: 8),
+                        types: types
+                    ) { [weak self] error, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "PureShot err: \(error)"
+                            )
+                            finish(false)
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "setAppid + PureShot set"
+                            )
+                            finish(true)
+                        }
+                    }
+                }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 15
+            ) { [weak self] in
+                resumed.lock()
+                let alreadyDone = didResume
+                resumed.unlock()
+                if !alreadyDone {
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] "
+                        + "setAppid/PureShot timeout"
+                    )
+                }
+                finish(false)
+            }
+        }
     }
 
     private typealias CaptureAck = (
         uri: String, callbackTimestamp: Double
     )
 
+    /// takePicture options. Raw capture type PureShot and countDown 0 are
+    /// what the SDK sample's "X5 Take Picture" sets. Mode .normal and the
+    /// exposure value are the original app's (commit 9007db5): program 3
+    /// with a 120 s shutter in currenExposureOptions. The SDK header says
+    /// that field is "used to calculate timeout": it tells the SDK how long
+    /// the shot can take, so the SDK waits long enough for the reply. It
+    /// doesn't set the camera's exposure; that is setPhotographyOptions
+    /// with stillExposure (API doc, Exposure Mode), which isn't sent.
+    private static func takePictureOptions() -> INSTakePictureOptions {
+        let opts = INSTakePictureOptions()
+        opts.mode = .normal
+        opts.rawCaptureType = .pureshot
+        opts.countDown = 0
+        let exp = INSCameraExposureOptions()
+        exp.program = 3
+        exp.shutterSpeed = CMTime(
+            value: 120, timescale: 1
+        )
+        opts.currenExposureOptions = exp
+        return opts
+    }
+
+    /// Sends one takePicture and waits for its photo URI. Old firmware
+    /// returns the URI in the takePicture completion. New X6 (C9)
+    /// firmware returns it in an INSCameraTakePictureResponse push
+    /// instead (handlePhotoPush); the API doc and SDK sample handle both.
+    /// If the reply has no URI, this also checks the camera's photo list
+    /// for the new photo (findNewPhoto), so a push that never comes
+    /// doesn't lose the shot. `photoListBefore` is the list before the
+    /// shot; without it only the reply and the push count.
     private func attemptTakePicture(
-        timeout: Double
+        timeout: Double,
+        photoListBefore: Set<String>? = nil
     ) async -> CaptureAck? {
         return await withTaskCancellationHandler {
             await withCheckedContinuation {
@@ -1072,21 +1276,47 @@ final class CameraInstance: NSObject, Identifiable {
                 self._captureGen += 1
                 let gen = self._captureGen
                 self._captureCont = continuation
+                self._captureReplyTs = nil
+                self.lock.unlock()
+
+                // Ends this attempt once. Returns false if it had
+                // already ended (timeout, cancel, clearCaptureState).
+                func finish(_ ack: CaptureAck?) -> Bool {
+                    self.lock.lock()
+                    guard gen == self._captureGen,
+                          let cont = self._captureCont
+                    else {
+                        self.lock.unlock()
+                        return false
+                    }
+                    self._captureCont = nil
+                    self._photoWaiter = nil
+                    self.lock.unlock()
+                    cont.resume(returning: ack)
+                    return true
+                }
+
+                // The push's time stands in for the reply time only if
+                // the completion hasn't arrived yet.
+                self.lock.lock()
+                self._photoWaiter = { uri, pushTs in
+                    self.lock.lock()
+                    let replyTs = self._captureReplyTs
+                    self.lock.unlock()
+                    return finish(
+                        CaptureAck(
+                            uri: uri,
+                            callbackTimestamp: replyTs ?? pushTs
+                        )
+                    )
+                }
                 self.lock.unlock()
 
                 DispatchQueue.main.async {
-                    let opts = INSTakePictureOptions()
-                    opts.mode = .normal
-                    let exp = INSCameraExposureOptions()
-                    exp.program = 3
-                    exp.shutterSpeed = CMTime(
-                        value: 120, timescale: 1
-                    )
-                    opts.currenExposureOptions = exp
                     INSCameraManager.shared()
                         .commandManager
                         .takePicture(
-                            with: opts
+                            with: Self.takePictureOptions()
                         ) { error, photoInfo in
                             let cbTs = ProcessInfo
                                 .processInfo.systemUptime
@@ -1094,38 +1324,46 @@ final class CameraInstance: NSObject, Identifiable {
                             let hdr = photoInfo?.hdrUris?.count ?? 0
                             let burst = photoInfo?.burstUris?.count
                                 ?? 0
-                            var note = "[\(self.id)] cb: gen=\(gen)"
+                            var note = "[\(self.id)] cb:"
+                                + " gen=\(gen)"
                                 + " uri=\(uri ?? "nil")"
                             if hdr > 0 { note += " hdr=\(hdr)" }
                             if burst > 0 { note += " burst=\(burst)" }
-                            if let error { note += " err=\(error)" }
-                            self.onStatusUpdate?(note)
-                            self.lock.lock()
-                            guard gen
-                                == self._captureGen
-                            else {
-                                self.lock.unlock()
-                                return
+                            if let error {
+                                note += " err=\(error)"
+                            } else if uri == nil {
+                                note += " (waiting for photo push)"
                             }
-                            let cont =
-                                self._captureCont
-                            self._captureCont = nil
-                            self.lock.unlock()
-                            if let uri,
-                               !uri.isEmpty,
-                               error == nil
-                            {
-                                cont?.resume(
-                                    returning: CaptureAck(
+                            self.onStatusUpdate?(note)
+                            if error != nil {
+                                _ = finish(nil)
+                            } else if let uri {
+                                _ = finish(
+                                    CaptureAck(
                                         uri: uri,
-                                        callbackTimestamp:
-                                            cbTs
+                                        callbackTimestamp: cbTs
                                     )
                                 )
                             } else {
-                                cont?.resume(
-                                    returning: nil
-                                )
+                                // No URI and no error: the URI comes in
+                                // a push, or the photo shows up in the
+                                // photo list. Wait for either until the
+                                // timeout.
+                                self.lock.lock()
+                                if gen == self._captureGen {
+                                    self._captureReplyTs = cbTs
+                                }
+                                self.lock.unlock()
+                                if let before = photoListBefore {
+                                    Task { [weak self] in
+                                        await self?.findNewPhoto(
+                                            gen: gen,
+                                            before: before,
+                                            replyTs: cbTs,
+                                            finish: finish
+                                        )
+                                    }
+                                }
                             }
                         }
                 }
@@ -1133,20 +1371,13 @@ final class CameraInstance: NSObject, Identifiable {
                 DispatchQueue.main.asyncAfter(
                     deadline: .now() + timeout
                 ) {
-                    self.lock.lock()
-                    guard gen == self._captureGen else {
-                        self.lock.unlock()
-                        return
+                    if finish(nil) {
+                        self.onStatusUpdate?(
+                            "[\(self.id)] takePicture"
+                            + " timeout"
+                            + " (\(Int(timeout))s)"
+                        )
                     }
-                    let cont = self._captureCont
-                    self._captureCont = nil
-                    self.lock.unlock()
-                    self.onStatusUpdate?(
-                        "[\(self.id)] takePicture"
-                        + " timeout"
-                        + " (\(Int(timeout))s)"
-                    )
-                    cont?.resume(returning: nil)
                 }
             }
         } onCancel: {
@@ -1154,8 +1385,45 @@ final class CameraInstance: NSObject, Identifiable {
             self._captureGen += 1
             let cont = self._captureCont
             self._captureCont = nil
+            self._photoWaiter = nil
             self.lock.unlock()
             cont?.resume(returning: nil)
+        }
+    }
+
+    /// Reads the photo list every second until it has a photo that wasn't
+    /// there before the shot, then ends the shot with it. Stops when the
+    /// shot ends another way (push, timeout, cancel) or a newer shot
+    /// starts.
+    private func findNewPhoto(
+        gen: UInt64,
+        before: Set<String>,
+        replyTs: Double,
+        finish: @escaping (CaptureAck?) -> Bool
+    ) async {
+        var reads = 0
+        while true {
+            // 1 s, not 2: in the logs the photo appeared on the 2nd or
+            // 3rd read, so a shorter interval finds it sooner.
+            try? await Task.sleep(for: .seconds(1))
+            // Is this shot still waiting?
+            lock.lock()
+            let waiting = gen == _captureGen && _captureCont != nil
+            lock.unlock()
+            guard waiting else { return }
+
+            reads += 1
+            guard let now = await fetchPhotoURIs() else { continue }
+            let added = now.subtracting(before)
+            guard let uri = Self.newestPhoto(added) else { continue }
+            if finish(CaptureAck(uri: uri, callbackTimestamp: replyTs)) {
+                onStatusUpdate?(
+                    "[\(id)] new photo in photo list (read \(reads)):"
+                    + " \(uri)"
+                    + (added.count > 1 ? " (\(added.count) new files)" : "")
+                )
+            }
+            return
         }
     }
 
@@ -1171,6 +1439,68 @@ final class CameraInstance: NSObject, Identifiable {
             return u
         }
         return info?.burstUris?.first(where: { !$0.isEmpty })
+    }
+
+    // MARK: - Photo URI push
+
+    /// Observes on NotificationCenter.default, as the SDK sample does.
+    /// Also logs INSCameraTakePictureStateUpdate, which the sample's root
+    /// page observes, to show how far a shot got if no URI arrives.
+    private func startPhotoPushObserver() {
+        if photoPushObserver == nil {
+            photoPushObserver = NotificationCenter.default.addObserver(
+                forName: .INSCameraTakePictureResponse,
+                object: nil,
+                queue: nil
+            ) { [weak self] note in
+                self?.handlePhotoPush(note)
+            }
+        }
+        if takePictureStateObserver == nil {
+            takePictureStateObserver = NotificationCenter.default
+                .addObserver(
+                    forName: .INSCameraTakePictureStateUpdate,
+                    object: nil,
+                    queue: nil
+                ) { [weak self] note in
+                    let state = note.userInfo?["state"]
+                        .map { "\($0)" } ?? "?"
+                    self?.onStatusUpdate?(
+                        "[\(self?.id ?? "?")] take picture state: \(state)"
+                    )
+                }
+        }
+    }
+
+    private func stopPhotoPushObserver() {
+        for token in [photoPushObserver, takePictureStateObserver] {
+            if let token {
+                NotificationCenter.default.removeObserver(token)
+            }
+        }
+        photoPushObserver = nil
+        takePictureStateObserver = nil
+    }
+
+    /// userInfo["photo"] is an INSCameraPhotoInfo. The push goes to the
+    /// takePicture in flight; with none in flight it is ignored (for
+    /// example a photo taken with the camera's own button).
+    private func handlePhotoPush(_ note: Notification) {
+        let info = note.userInfo?["photo"] as? INSCameraPhotoInfo
+        guard let uri = Self.photoURI(info) else {
+            onStatusUpdate?("[\(id)] photo push without a URI")
+            return
+        }
+        lock.lock()
+        let waiter = _photoWaiter
+        lock.unlock()
+        let used = waiter?(
+            uri, ProcessInfo.processInfo.systemUptime
+        ) ?? false
+        onStatusUpdate?(
+            "[\(id)] photo push: uri=\(uri)"
+            + (used ? "" : " (no shot waiting, ignored)")
+        )
     }
 
     // MARK: - Download
@@ -1243,6 +1573,8 @@ final class CameraInstance: NSObject, Identifiable {
         lock.lock()
         _isConnected = false
         _captureInFlight = false
+        _photoWaiter = nil
+        _captureReplyTs = nil
         if clearURIs {
             _pendingURIs.removeAll()
             _downloadAttempts.removeAll()
@@ -1251,19 +1583,21 @@ final class CameraInstance: NSObject, Identifiable {
         let clockCont = _clockCont
         let captureCont = _captureCont
         let downloadCont = _downloadCont
-        let stopCont = _stopCont
         _connectCont = nil
         _clockCont = nil
         _captureCont = nil
         _downloadCont = nil
-        _stopCont = nil
         lock.unlock()
 
         connectCont?.resume(returning: false)
         clockCont?.resume(returning: fallback)
         captureCont?.resume(returning: nil)
         downloadCont?.resume(returning: nil)
-        stopCont?.resume()
+
+        // A new connection needs the camera settings, setAppid and
+        // PureShot again.
+        isPureShotSet = false
+        isPhotoModeSet = false
     }
 
     private func downloadOne(
@@ -1318,8 +1652,10 @@ final class CameraInstance: NSObject, Identifiable {
                 return true
             }
 
+            // The SDK sample downloads every file through the command
+            // manager and never uses INSCameraHTTPManager.
             DispatchQueue.main.async {
-                INSCameraHTTPManager.socket().fetchResource(
+                INSCameraManager.shared().commandManager.fetchResource(
                     withURI: uri,
                     toLocalFile: destURL,
                     progress: { _ in
@@ -1363,10 +1699,15 @@ final class CameraInstance: NSObject, Identifiable {
                                 Double(bytes) / 1_048_576,
                                 ProcessInfo.processInfo
                                     .systemUptime - started)
+                            // X6 internal storage paths start with
+                            // /storage_internal/, SD card paths with
+                            // /DCIM/ (API doc, Get File List).
+                            let from = uri.hasPrefix("/storage_internal/")
+                                ? "internal" : "SD card"
                             self.onStatusUpdate?(
                                 "[\(cameraId)] downloaded"
                                 + " \(destURL.lastPathComponent)"
-                                + " (\(detail))"
+                                + " (\(detail)) from \(from): \(uri)"
                             )
                         }
                     }
@@ -1408,24 +1749,6 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    private func startHeartbeat() {
-        heartbeatTimer = Timer.scheduledTimer(
-            withTimeInterval: kHeartbeatInterval,
-            repeats: true
-        ) { [weak self] _ in
-            guard self?.isConnected == true else {
-                return
-            }
-            INSCameraManager.shared().commandManager
-                .sendHeartbeats(with: nil)
-        }
-    }
-
-    private func stopHeartbeat() {
-        heartbeatTimer?.invalidate()
-        heartbeatTimer = nil
-    }
-
     private static let disconnectStates:
         Set<INSCameraState> = [
             .connectFailed, .noConnection,
@@ -1448,7 +1771,6 @@ final class CameraInstance: NSObject, Identifiable {
                         "[Insta360] disconnect detected:"
                             + " \(Self.stateName(state))"
                     )
-                    self.stopHeartbeat()
                     self.disconnectToken = nil
                     self.resumeAllContinuations(
                         clearURIs: false

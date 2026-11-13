@@ -9,7 +9,7 @@
 | iPhone | 14 Pro or later | LiDAR required — simulator not supported |
 | Apple Developer account | Any tier | Free tier works for personal device testing |
 | Insta360 X5 (or X4/X3/ONE RS) | Any firmware | For Phase 2+ testing |
-| iOS SDK zip | `iOS-SDK-1.10.4.zip` | From Insta360 Developer Portal |
+| iOS SDK zip | `iOS-SDK-V1.11.3.zip` (SDK 1.11.3) | From Insta360 Developer Portal |
 
 ---
 
@@ -90,23 +90,28 @@ In **Build Settings**, set:
 
 ## 2b. Embed the Insta360 SDK
 
-The SDK ships as `.xcframework` bundles inside `iOS-SDK-1.10.4.zip`.
+The SDK ships as `.xcframework` bundles inside `iOS-SDK-V1.11.3.zip`.
 
 ### Extract
 
 ```bash
 cd ~/Downloads
-unzip iOS-SDK-1.10.4.zip -d iOS-SDK-1.10.4/
+unzip iOS-SDK-V1.11.3.zip -d iOS-SDK-V1.11.3/
 ```
 
 The frameworks are at:
 ```
-iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/
+iOS-SDK-V1.11.3/iOS_v1.11.3/INSCameraSDKSample-bluetooth/Frameworks/
   INSCameraSDK.xcframework
   INSCameraServiceSDK.xcframework
-  SSZipArchive.xcframework
+  INSCoreMedia.xcframework    # INSCameraSDK links it
+  SSZipArchive.xcframework    # INSCoreMedia links it
   Eureka.xcframework          # sample app only — not needed
+  SnapKit.xcframework         # sample app only — not needed
+  effect-sdk.xcframework      # not linked by the SDK — not needed
 ```
+
+The bundles report their own versions, not 1.11.3: INSCameraSDK 1.9.0 (482), INSCameraServiceSDK 0.2500.19 (108), INSCoreMedia 2.878.4 (2384). The app logs these when it connects.
 
 ### Add to Xcode
 
@@ -115,8 +120,9 @@ iOS-SDK-1.10.4/iOS_v1.10.4/INSCameraSDKSample-bluetooth/Frameworks/
 3. Navigate to the extracted `Frameworks/` directory and add:
    - `INSCameraSDK.xcframework`
    - `INSCameraServiceSDK.xcframework`
+   - `INSCoreMedia.xcframework`
    - `SSZipArchive.xcframework`
-4. Set all three to **Embed & Sign**
+4. Set all four to **Embed & Sign**
 
 ---
 
@@ -129,6 +135,8 @@ Add these keys to `Info.plist` (Xcode → target → Info tab, or edit the file 
 | `NSCameraUsageDescription` | String | `Atlas Mobile uses the camera for 3D scene capture` |
 | `NSLocalNetworkUsageDescription` | String | `Atlas Mobile connects to Insta360 cameras via WiFi Direct` |
 | `NSBonjourServices` | Array | `_http._tcp` |
+| `NSAppTransportSecurity` | Dictionary | `NSAllowsLocalNetworking` = YES, plus `NSExceptionDomains` → `localhost` → `NSExceptionAllowsInsecureHTTPLoads` = YES (same as the SDK sample) |
+| `NSBluetoothAlwaysUsageDescription` | String | `ATLAS Mobile uses Bluetooth to control Insta360 cameras.` (INSCameraServiceSDK links CoreBluetooth) |
 | `UIRequiredDeviceCapabilities` | Array | `arkit`, `lidar-depth-camera` |
 
 The `lidar-depth-camera` capability ensures the app is only installable on LiDAR-equipped devices and prevents ARKit from silently falling back to estimated depth.

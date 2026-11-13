@@ -6,6 +6,7 @@ struct CaptureOverlayView: View {
     @State private var showFlash = false
     @State private var showCalibration = false
     @State private var showConnectionLog = false
+    @ObservedObject private var livePreview = Insta360LivePreview.shared
 
     var body: some View {
         ZStack {
@@ -246,6 +247,16 @@ struct CaptureOverlayView: View {
                 .padding(.top, 8)
 
                 Spacer()
+
+                // Insta360 live preview, as on the SDK sample's
+                // take-picture page
+                if !sessionManager.connectedCamerasList.isEmpty {
+                    HStack {
+                        Insta360PreviewTile(preview: livePreview)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 24)
+                }
 
                 // Bottom: thumbnails + capture button + controls
                 HStack(alignment: .bottom) {
