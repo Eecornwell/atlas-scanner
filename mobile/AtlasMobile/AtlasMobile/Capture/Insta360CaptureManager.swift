@@ -154,8 +154,9 @@ final class Insta360CaptureManager: ObservableObject {
         }
 
         // The original app's camera settings: single photo mode on both
-        // sensors, FlowState and horizon leveling off. Sent before the
-        // live preview starts, so the preview uses the sensors they set.
+        // sensors, FlowState and horizon leveling off, then in-camera
+        // stitching off. Sent before the X6 live preview starts, so the
+        // preview uses the sensors they set.
         if commandsReady {
             await withTaskGroup(of: Void.self) { group in
                 for cam in connected {
@@ -169,9 +170,9 @@ final class Insta360CaptureManager: ObservableObject {
             )
         }
 
-        // Then start the live preview, as the sample's take-picture page
-        // does when it opens. No warmup photo: the sample takes none.
-        // Shots wait for this task.
+        // Then, on the X6, start the live preview, as the sample's
+        // take-picture page does when it opens (startLivePreview). No
+        // warmup photo: the sample takes none. Shots wait for this task.
         warmupTask = Task { [weak self] in
             guard let first = connected.first
             else { return }
@@ -200,21 +201,47 @@ final class Insta360CaptureManager: ObservableObject {
         }
     }
 
-    /// Starts the live preview, then lets shots through.
+    /// Starts the live preview if the camera is an X6, then lets shots
+    /// through. Other cameras get no preview: it was added for the X6,
+    /// and on the X5 it would only add a video stream to every shot.
     private func startLivePreview() async {
         // Shows where photos are saved (X6: internal or SD card).
         let cameras = await MainActor.run { connectedCameras }
         for cam in cameras {
             await cam.logStorageStatus()
         }
-        onLogMessage?("starting live preview…")
-        let running = await Insta360LivePreview.shared.start()
-        onLogMessage?(
-            running
-                ? "ready"
-                : "ready (live preview did not start)"
-        )
+        let name = await Self.connectedCameraName()
+        if name == kInsta360CameraNameC9 {
+            onLogMessage?("starting live preview…")
+            let running = await Insta360LivePreview.shared.start()
+            onLogMessage?(
+                running
+                    ? "ready"
+                    : "ready (live preview did not start)"
+            )
+        } else {
+            // Stops a preview left from an earlier X6 connection.
+            await Insta360LivePreview.shared.stop()
+            onLogMessage?(
+                "ready (live preview is for the X6 only; camera "
+                + (name.isEmpty ? "?" : name) + ")"
+            )
+        }
         await MainActor.run { isPipelineReady = true }
+    }
+
+    /// The SDK's name of the connected camera (kInsta360CameraNameC9 for
+    /// the X6). Device info can arrive just after the socket connects, so
+    /// this waits up to 3 s for it. Empty if none arrives.
+    private static func connectedCameraName() async -> String {
+        for attempt in 1...12 {
+            let name = await MainActor.run {
+                INSCameraManager.shared().currentCamera?.name ?? ""
+            }
+            if !name.isEmpty || attempt == 12 { return name }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return ""
     }
 
     func retryConnection() async {
@@ -376,7 +403,9 @@ final class Insta360CaptureManager: ObservableObject {
 
     func awaitWarmup() async {
         if let task = warmupTask {
-            onLogMessage?("waiting for the live preview to start…")
+            onLogMessage?(
+                "waiting for the camera setup (X6: live preview start)…"
+            )
             await task.value
             warmupTask = nil
         }
@@ -405,10 +434,13 @@ final class Insta360CaptureManager: ObservableObject {
         )
     }
 
+    /// `onCommand` goes to each camera's capture, which calls it as its
+    /// takePicture goes out (CameraInstance.capture).
     func captureWith(
         cameras: [CameraInstance],
         arkitTimestamp: Double, scanIndex: Int, timeout: Double = 8,
-        skipPreChecks: Bool = false
+        skipPreChecks: Bool = false,
+        onCommand: (@MainActor @Sendable (Double) -> Void)? = nil
     ) async -> [Insta360CaptureResult] {
         guard !cameras.isEmpty, !Task.isCancelled else { return [] }
 
@@ -423,7 +455,8 @@ final class Insta360CaptureManager: ObservableObject {
                         arkitTimestamp: arkitTimestamp,
                         scanIndex: scanIndex,
                         timeout: timeout,
-                        skipPreChecks: skipPreChecks
+                        skipPreChecks: skipPreChecks,
+                        onCommand: onCommand
                     )
                 }
             }

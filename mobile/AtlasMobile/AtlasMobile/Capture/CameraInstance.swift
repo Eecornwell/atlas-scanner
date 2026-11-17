@@ -58,14 +58,44 @@ final class CameraInstance: NSObject, Identifiable {
     private var _captureReplyTs: Double?
     /// The camera's photo list read just before the next takePicture
     /// (prepareShot). A shot whose URI comes in neither the reply nor
-    /// the push finds its photo as the new entry in a later list.
+    /// the push finds its photo in a later list (shotPhoto).
     private var _photoListBeforeShot: Set<String>?
+    /// syncCameraClock ran on this connection, whatever its result.
+    /// Cleared when the connection drops. Under `lock`.
+    private var _clockSyncTried = false
     /// setAppid and PureShot have been sent on this connection.
     /// Cleared when the connection drops, so a reconnect sends them again.
-    private var isPureShotSet = false
+    /// Kept under `lock`, like the other state here: shots, SDK callbacks
+    /// and the disconnect handler use it from different threads.
+    private var _isPureShotSet = false
+    private var isPureShotSet: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _isPureShotSet
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _isPureShotSet = newValue
+        }
+    }
     /// The app's own photo mode settings were accepted on this connection
-    /// (switchToPhotoMode). Cleared when the connection drops.
-    private(set) var isPhotoModeSet = false
+    /// (switchToPhotoMode). Cleared when the connection drops. Under
+    /// `lock`, as isPureShotSet.
+    private var _isPhotoModeSet = false
+    private(set) var isPhotoModeSet: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return _isPhotoModeSet
+        }
+        set {
+            lock.lock()
+            defer { lock.unlock() }
+            _isPhotoModeSet = newValue
+        }
+    }
     /// The camera settings run in progress (applyCameraSettings). A shot
     /// taken meanwhile waits for it instead of sending the settings twice.
     private var settingsTask: Task<Void, Never>?
@@ -424,15 +454,164 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
+    // MARK: - Camera clock
+
+    /// Sets the camera's clock to the phone's, once per connection. The
+    /// camera names photos by its clock and the photo-list fallback
+    /// compares those names (shotPhoto); a camera whose clock was never
+    /// set names new photos with an old date. prepareShot calls this
+    /// right after setAppid + PureShot: the sample says the camera takes
+    /// settings only after setAppid, and sent at connect, before it, the
+    /// X5 answered error 400. Logs the camera's time and time zone before
+    /// and after where the camera reports them (the X5 doesn't). The time
+    /// zone is left as it is.
+    private func syncCameraClock() async {
+        lock.lock()
+        let tried = _clockSyncTried
+        _clockSyncTried = true
+        lock.unlock()
+        guard !tried else { return }
+        let before = await readCameraClock()
+        onStatusUpdate?("[\(id)] camera clock: \(before)")
+        guard let reportedMs = await setCameraClock() else { return }
+        let after = await readCameraClock()
+        onStatusUpdate?(
+            "[\(id)] camera clock set from the phone"
+            + " (SDK reports \(reportedMs) ms): \(after)"
+        )
+    }
+
+    /// syncTimeMsToCamera as calibrateClockOffset sends it; it sets the
+    /// camera's clock. Returns the time difference the SDK reports, in
+    /// ms, or nil if it failed.
+    private func setCameraClock() async -> UInt? {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<UInt?, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            // Ends once. A failure is logged before the caller resumes,
+            // so it stays in order in the log.
+            func finish(_ value: UInt?, failure: String? = nil) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                guard first else { return }
+                if let failure {
+                    self.onStatusUpdate?(
+                        "[\(self.id)] camera clock not set: \(failure)")
+                }
+                cont.resume(returning: value)
+            }
+
+            DispatchQueue.main.async {
+                INSCameraManager.shared().commandManager
+                    .syncTimeMsToCamera(
+                        withTryCount: 1, dTimeMsMax: 500
+                    ) { dTimeMs, error in
+                        if let error {
+                            finish(nil, failure: "\(error)")
+                        } else {
+                            finish(dTimeMs)
+                        }
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                finish(nil, failure: "no reply in 5 s")
+            }
+        }
+    }
+
+    /// The camera's clock and time zone as text for the log.
+    private func readCameraClock() async -> String {
+        await withCheckedContinuation {
+            (cont: CheckedContinuation<String, Never>) in
+            let done = NSLock()
+            var finished = false
+
+            func finish(_ value: String) {
+                done.lock()
+                let first = !finished
+                finished = true
+                done.unlock()
+                if first { cont.resume(returning: value) }
+            }
+
+            DispatchQueue.main.async {
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType.localTime.rawValue
+                    ),
+                    NSNumber(
+                        value: INSCameraOptionsType.timeZone.rawValue
+                    ),
+                ]
+                INSCameraManager.shared().commandManager
+                    .getOptionsWithTypes(types) { error, options, _ in
+                        guard let options else {
+                            finish(
+                                "read failed: "
+                                + (error.map { "\($0)" } ?? "no options")
+                            )
+                            return
+                        }
+                        finish(Self.clockText(
+                            localTime: options.localTime,
+                            zoneSeconds: options.timeZoneSecondsFromGMT))
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                finish("read timeout")
+            }
+        }
+    }
+
+    private static let clockFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        return fmt
+    }()
+
+    /// INSCameraOptions.localTime, read as seconds since 1970 (or
+    /// milliseconds if it is that large), next to the phone's time, and
+    /// timeZoneSecondsFromGMT as an offset.
+    private static func clockText(
+        localTime: UInt64, zoneSeconds: Int
+    ) -> String {
+        func two(_ v: UInt) -> String { v < 10 ? "0\(v)" : "\(v)" }
+        let a = zoneSeconds.magnitude
+        let sign = zoneSeconds < 0 ? "-" : "+"
+        let zone = "UTC\(sign)\(two(a / 3600)):\(two(a % 3600 / 60))"
+        let phone = clockFormatter.string(from: Date())
+        guard localTime > 0 else {
+            return "not reported (localTime 0, time zone \(zone));"
+                + " phone \(phone) UTC"
+        }
+        // Seconds would put 10^11 after the year 5000.
+        let sec = localTime > 100_000_000_000
+            ? Double(localTime) / 1000 : Double(localTime)
+        let cam = clockFormatter.string(
+            from: Date(timeIntervalSince1970: sec))
+        return "localTime \(localTime) = \(cam) UTC"
+            + " (phone \(phone) UTC), time zone \(zone)"
+    }
+
     // MARK: - Capture
 
     // A shot follows the SDK sample's take-picture page
     // (CameraConfigByJsonController.swift, opened with "Record new"):
-    // its live preview runs, and "X5 Take Picture" sends setAppid, then
-    // PureShot, then takePicture. On top of that, the camera has the
-    // original app's own settings (applyCameraSettings) and takePicture
-    // carries the original app's exposure value (takePictureOptions);
-    // the sample sends neither. Like the sample, no warmup photo is taken.
+    // "X5 Take Picture" sends setAppid, then PureShot, then takePicture,
+    // and the page's live preview runs (here on the X6 only; see
+    // Insta360CaptureManager.startLivePreview). On top of that, the camera
+    // has the original app's own settings (applyCameraSettings) and
+    // takePicture carries the original app's exposure value
+    // (takePictureOptions); the sample sends neither. Like the sample, no
+    // warmup photo is taken.
 
     /// Everything a shot does before takePicture. Calibration calls this
     /// first and then fires with skipPreChecks, so takePicture follows
@@ -445,11 +624,17 @@ final class CameraInstance: NSObject, Identifiable {
         return true
     }
 
+    /// Takes one photo. `onCommand` runs on the main actor with the
+    /// systemUptime of takePicture, just before the command is sent, so a
+    /// caller can time what follows the shot from the command itself
+    /// rather than from the start of prepareShot. It isn't called when
+    /// the shot ends before takePicture.
     func capture(
         arkitTimestamp: Double,
         scanIndex: Int,
         timeout: Double = 45,
-        skipPreChecks: Bool = false
+        skipPreChecks: Bool = false,
+        onCommand: (@MainActor @Sendable (Double) -> Void)? = nil
     ) async -> Insta360CaptureResult? {
         guard !Task.isCancelled else { return nil }
 
@@ -484,6 +669,11 @@ final class CameraInstance: NSObject, Identifiable {
         // One takePicture per shot, as the sample sends one per press.
         // The old retry after a missed reply took a second photo.
         let commandTs = ProcessInfo.processInfo.systemUptime
+        // Awaited, so the caller's windows have started before the
+        // command goes out and before this capture returns.
+        if let onCommand {
+            await onCommand(commandTs)
+        }
         let captureResult = await attemptTakePicture(
             timeout: timeout,
             photoListBefore: photoListBefore
@@ -547,19 +737,23 @@ final class CameraInstance: NSObject, Identifiable {
     }
 
     /// Brings the camera to where the sample's page is when its button
-    /// sends takePicture: the live preview runs, and setAppid and PureShot
-    /// have just been sent.
+    /// sends takePicture: setAppid and PureShot have been sent, and on the
+    /// X6 the live preview runs.
     private func prepareShot() async {
         // The original app's camera settings: waits for them if they're
         // still being sent at connect, and resends them if they failed.
         await ensurePhotoMode()
         // Doesn't wait for the preview to restart after the last shot:
         // the stream restarts on its own, and waiting delayed every shot.
-        // The sample keeps it running while you take pictures.
-        let previewRunning = await MainActor.run {
-            Insta360LivePreview.shared.isRunning
+        // The sample keeps it running while you take pictures. Only the
+        // X6 runs a preview, so this logs nothing for other cameras.
+        let (previewOn, previewRunning) = await MainActor.run {
+            (
+                Insta360LivePreview.shared.isActive,
+                Insta360LivePreview.shared.isRunning
+            )
         }
-        if !previewRunning {
+        if previewOn, !previewRunning {
             onStatusUpdate?(
                 "[\(id)] live preview restarting — not waiting for it"
             )
@@ -576,14 +770,34 @@ final class CameraInstance: NSObject, Identifiable {
                 )
             }
         }
+        // Once per connection, after setAppid (see syncCameraClock).
+        await syncCameraClock()
         // Read last, so the list is as close to the shot as possible.
         let list = await fetchPhotoURIs()
         lock.lock()
         _photoListBeforeShot = list
         lock.unlock()
+        // The newest name shows the camera clock's date in the log.
+        let count = list.map { "\($0.count) photos" } ?? "read failed"
+        var dated = ""
+        if let list {
+            let (newest, future) = Self.newestFile(
+                list, notAfter: Self.latestPlausibleStamp())
+            if let newest {
+                dated += ", newest "
+                    + (newest.uri as NSString).lastPathComponent
+            }
+            if !future.isEmpty {
+                let names = future.prefix(3).map {
+                    ($0 as NSString).lastPathComponent
+                }.joined(separator: ", ")
+                let more = future.count > 3
+                    ? " and \(future.count - 3) more" : ""
+                dated += "; dated after today, ignored: \(names)\(more)"
+            }
+        }
         onStatusUpdate?(
-            "[\(id)] photo list before shot: "
-            + (list.map { "\($0.count) photos" } ?? "read failed")
+            "[\(id)] photo list before shot: \(count)\(dated)"
         )
     }
 
@@ -591,13 +805,15 @@ final class CameraInstance: NSObject, Identifiable {
 
     // Restored from the original app (Eecornwell/atlas-scanner, mobile
     // branch, CameraInstance.swift): single photo mode on both sensors,
-    // then FlowState and horizon leveling off. Insta360CaptureManager
-    // sends them when the camera connects, before the live preview starts,
-    // so the preview uses the sensors they set. Before a shot they're sent
-    // again only if they failed (ensurePhotoMode), as in the original.
+    // then FlowState and horizon leveling off. In-camera stitching off
+    // comes last. Insta360CaptureManager sends them when the camera
+    // connects, before the live preview starts, so the preview uses the
+    // sensors they set. Before a shot they're sent again only if they
+    // failed (ensurePhotoMode), as in the original.
 
-    /// Sends switchToPhotoMode, then disableStabilization. A call while a
-    /// run is in progress waits for that run instead of starting another.
+    /// Sends switchToPhotoMode, disableStabilization, then
+    /// disableInCameraStitching. A call while a run is in progress waits
+    /// for that run instead of starting another.
     func applyCameraSettings() async {
         lock.lock()
         let task: Task<Void, Never>
@@ -607,6 +823,7 @@ final class CameraInstance: NSObject, Identifiable {
             task = Task { [weak self] in
                 await self?.switchToPhotoMode()
                 await self?.disableStabilization()
+                await self?.disableInCameraStitching()
             }
             settingsTask = task
         }
@@ -881,6 +1098,67 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
+    /// Turns in-camera stitching off, so photos stay dual-fisheye INSP.
+    /// With it on, the X5 saves stitched JPGs instead (Insta360's X5 file
+    /// format docs), and the export treats any 2:1 image as dual fisheye.
+    /// The X6 live preview needs it off too: the preview stitches in the
+    /// app, and the SDK sample's comment says the seams look wrong and
+    /// parts of the image repeat otherwise (disableInternalSplicingForPreview).
+    /// Sent for every camera, so it no longer depends on the preview.
+    func disableInCameraStitching() async {
+        await withCheckedContinuation {
+            (continuation: CheckedContinuation<Void, Never>)
+                in
+            let resumed = NSLock()
+            var didResume = false
+
+            func finish() {
+                resumed.lock()
+                defer { resumed.unlock() }
+                guard !didResume else { return }
+                didResume = true
+                continuation.resume()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                let opts = INSCameraOptions()
+                opts.enableInternalSplicing = false
+                let types: [NSNumber] = [
+                    NSNumber(
+                        value: INSCameraOptionsType
+                            .internalSplicing.rawValue
+                    ),
+                ]
+                INSCameraManager.shared()
+                    .commandManager
+                    .setOptions(
+                        opts,
+                        forTypes: types
+                    ) { [weak self] error, _ in
+                        if let error {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "in-camera stitching off err: "
+                                + "\(error)"
+                            )
+                        } else {
+                            self?.onStatusUpdate?(
+                                "[\(self?.id ?? "?")] "
+                                + "in-camera stitching off"
+                            )
+                        }
+                        finish()
+                    }
+            }
+
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 5
+            ) {
+                finish()
+            }
+        }
+    }
+
     // MARK: - Storage and photo list (API doc, X6 dual storage)
 
     /// The X6 (SDK name C9) has internal storage and an SD card. The API
@@ -1053,16 +1331,121 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// The new photo among `uris`: a .insp or .jpg file if there is one
-    /// (PureShot writes no DNG, but a DNG would come with the photo), and
-    /// of those the last by name, which is the newest (the camera names
-    /// files by date and time; the SDK sample sorts its list this way).
-    private static func newestPhoto(_ uris: Set<String>) -> String? {
-        let images = uris.filter {
-            let ext = ($0 as NSString).pathExtension.lowercased()
-            return ext == "insp" || ext == "jpg" || ext == "jpeg"
+    /// Date and time (YYYYMMDDHHMMSS) and sequence number from a camera
+    /// file name, compared in that order.
+    private struct FileStamp: Comparable {
+        let time: Int64
+        let seq: Int
+
+        static func < (a: FileStamp, b: FileStamp) -> Bool {
+            a.time != b.time ? a.time < b.time : a.seq < b.seq
         }
-        return (images.isEmpty ? uris : images).max()
+    }
+
+    /// The date, time and sequence number in a camera file name such as
+    /// IMG_20261115_135444_00_829.insp: prefix, YYYYMMDD, HHMMSS, lens
+    /// field, sequence number. The date and time are the camera clock's.
+    /// Nil for a name in another form.
+    private static func fileStamp(_ uri: String) -> FileStamp? {
+        let name = ((uri as NSString).lastPathComponent as NSString)
+            .deletingPathExtension
+        let f = name.split(separator: "_", omittingEmptySubsequences: false)
+        guard f.count >= 5, f[1].count == 8, f[2].count == 6,
+              let date = Int64(f[1]), let time = Int64(f[2]),
+              let seq = Int(f[4])
+        else { return nil }
+        return FileStamp(time: date * 1_000_000 + time, seq: seq)
+    }
+
+    /// The latest date a photo's name can honestly have: the phone's
+    /// local time plus a day (camera names carry the camera's local time;
+    /// the day covers a camera set to another time zone). A later name
+    /// was written while the camera's clock was wrong: an X5 card held
+    /// IMG_20851108_185409_00_279.insp, which every new photo would
+    /// otherwise have to be newer than.
+    private static func latestPlausibleStamp() -> FileStamp {
+        let text = stampFormatter.string(
+            from: Date().addingTimeInterval(86_400))
+        return FileStamp(time: Int64(text) ?? .max, seq: .max)
+    }
+
+    private static let stampFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyyMMddHHmmss"
+        return fmt
+    }()
+
+    /// The file in a photo list with the latest fileStamp up to `limit`
+    /// (latestPlausibleStamp), or nil if no name has one, and the names
+    /// dated after `limit`, sorted. Of equal stamps the larger URI wins,
+    /// so the result doesn't depend on the set's order.
+    private static func newestFile(
+        _ uris: Set<String>, notAfter limit: FileStamp
+    ) -> (newest: (uri: String, stamp: FileStamp)?, future: [String]) {
+        var best: (uri: String, stamp: FileStamp)?
+        var future: [String] = []
+        for u in uris {
+            guard let s = fileStamp(u) else { continue }
+            if s > limit {
+                future.append(u)
+                continue
+            }
+            if let b = best, s < b.stamp || (s == b.stamp && u < b.uri) {
+                continue
+            }
+            best = (u, s)
+        }
+        return (best, future.sorted())
+    }
+
+    /// The shot's photo among `added`, the files that weren't in the
+    /// list before the shot. Only an INSP counts, and only one whose
+    /// name's date, time and sequence number are later than
+    /// `newestBefore`, the newest file that list had, and not after
+    /// `limit`; of several, the latest. That keeps an older photo out if
+    /// the list before the shot missed some files. If no INSP qualifies
+    /// but exactly one is new, it still counts, with a note: one new INSP
+    /// means the list before was complete, so it is the shot, and the
+    /// camera's clock is off (never set, for example). Nil while nothing
+    /// qualifies; `note` says why, for the log.
+    private static func shotPhoto(
+        added: Set<String>,
+        newestBefore: (uri: String, stamp: FileStamp)?,
+        notAfter limit: FileStamp
+    ) -> (uri: String?, note: String?) {
+        let insp = added.filter(isINSP)
+        guard !insp.isEmpty else { return (nil, nil) }
+        var later: [(uri: String, stamp: FileStamp)] = []
+        for u in insp {
+            guard let s = fileStamp(u), s <= limit else { continue }
+            if let b = newestBefore, s <= b.stamp { continue }
+            later.append((u, s))
+        }
+        let newest = newestBefore.map {
+            ($0.uri as NSString).lastPathComponent
+        } ?? "no dated file"
+        if let pick = later.max(by: { $0.stamp < $1.stamp }) {
+            let note = later.count > 1
+                ? "\(later.count) new INSPs after \(newest), took the latest"
+                : nil
+            return (pick.uri, note)
+        }
+        if insp.count == 1, let only = insp.first {
+            let note: String
+            if let s = fileStamp(only) {
+                note = s > limit
+                    ? "dated after today; is the camera clock ahead?"
+                    : "not dated after \(newest), the newest file already"
+                        + " on the camera; is the camera clock behind?"
+            } else {
+                note = "its name has no date and time"
+            }
+            return (only, note)
+        }
+        return (nil, "\(insp.count) new INSPs, none dated after \(newest)")
     }
 
     func waitForCommandReady(
@@ -1320,7 +1703,9 @@ final class CameraInstance: NSObject, Identifiable {
                         ) { error, photoInfo in
                             let cbTs = ProcessInfo
                                 .processInfo.systemUptime
-                            let uri = Self.photoURI(photoInfo)
+                            // Only an INSP is the shot's photo. A reply
+                            // with just a DNG waits like one without a URI.
+                            let (uri, others) = Self.photoURI(photoInfo)
                             let hdr = photoInfo?.hdrUris?.count ?? 0
                             let burst = photoInfo?.burstUris?.count
                                 ?? 0
@@ -1329,6 +1714,10 @@ final class CameraInstance: NSObject, Identifiable {
                                 + " uri=\(uri ?? "nil")"
                             if hdr > 0 { note += " hdr=\(hdr)" }
                             if burst > 0 { note += " burst=\(burst)" }
+                            if !others.isEmpty {
+                                note += " not INSP, ignored: "
+                                    + others.joined(separator: ", ")
+                            }
                             if let error {
                                 note += " err=\(error)"
                             } else if uri == nil {
@@ -1391,17 +1780,20 @@ final class CameraInstance: NSObject, Identifiable {
         }
     }
 
-    /// Reads the photo list every second until it has a photo that wasn't
-    /// there before the shot, then ends the shot with it. Stops when the
-    /// shot ends another way (push, timeout, cancel) or a newer shot
-    /// starts.
+    /// Reads the photo list every second until it has the shot's photo
+    /// (shotPhoto), then ends the shot with it. Stops when the shot ends
+    /// another way (push, timeout, cancel) or a newer shot starts.
     private func findNewPhoto(
         gen: UInt64,
         before: Set<String>,
         replyTs: Double,
         finish: @escaping (CaptureAck?) -> Bool
     ) async {
+        let limit = Self.latestPlausibleStamp()
+        let newestBefore = Self.newestFile(before, notAfter: limit).newest
         var reads = 0
+        var ignored = Set<String>()
+        var lastNote: String?
         while true {
             // 1 s, not 2: in the logs the photo appeared on the 2nd or
             // 3rd read, so a shorter interval finds it sooner.
@@ -1415,30 +1807,65 @@ final class CameraInstance: NSObject, Identifiable {
             reads += 1
             guard let now = await fetchPhotoURIs() else { continue }
             let added = now.subtracting(before)
-            guard let uri = Self.newestPhoto(added) else { continue }
+            // A DNG (RAW on) or any other new file isn't the photo.
+            let others = added.filter { !Self.isINSP($0) }
+                .subtracting(ignored)
+            if !others.isEmpty {
+                ignored.formUnion(others)
+                let names = others.sorted().prefix(5)
+                    .joined(separator: ", ")
+                let more = others.count > 5
+                    ? " and \(others.count - 5) more" : ""
+                onStatusUpdate?(
+                    "[\(id)] new files that aren't INSP, ignored:"
+                    + " \(names)\(more)"
+                )
+            }
+            let (found, note) = Self.shotPhoto(
+                added: added, newestBefore: newestBefore, notAfter: limit)
+            guard let uri = found else {
+                if let note, note != lastNote {
+                    lastNote = note
+                    onStatusUpdate?("[\(id)] photo list: \(note)")
+                }
+                continue
+            }
             if finish(CaptureAck(uri: uri, callbackTimestamp: replyTs)) {
                 onStatusUpdate?(
                     "[\(id)] new photo in photo list (read \(reads)):"
                     + " \(uri)"
-                    + (added.count > 1 ? " (\(added.count) new files)" : "")
+                    + (note.map { " (\($0))" } ?? "")
                 )
             }
             return
         }
     }
 
-    /// Photo URI from a takePicture reply. A single shot fills `uri`;
-    /// HDR or AEB shots fill `hdrUris` and bursts fill `burstUris`, which
-    /// the SDK sample also reads. The SDK documents HDR order as
-    /// [EV0, -EV, +EV], so the first HDR URI is the normal exposure.
+    /// The shot's photo in a takePicture reply or photo push: the first
+    /// INSP among `uri`, `hdrUris` and `burstUris`. A single shot fills
+    /// `uri`; HDR or AEB shots fill `hdrUris` and bursts fill
+    /// `burstUris`, which the SDK sample also reads. The SDK documents
+    /// HDR order as [EV0, -EV, +EV], so the first HDR URI is the normal
+    /// exposure. `others` are the URIs that aren't INSP, for the log.
     private static func photoURI(
         _ info: INSCameraPhotoInfo?
-    ) -> String? {
-        if let u = info?.uri, !u.isEmpty { return u }
-        if let u = info?.hdrUris?.first(where: { !$0.isEmpty }) {
-            return u
+    ) -> (uri: String?, others: [String]) {
+        var all: [String] = []
+        if let u = info?.uri { all.append(u) }
+        all += info?.hdrUris ?? []
+        all += info?.burstUris ?? []
+        var others: [String] = []
+        for u in all where !u.isEmpty && !isINSP(u) && !others.contains(u) {
+            others.append(u)
         }
-        return info?.burstUris?.first(where: { !$0.isEmpty })
+        return (all.first(where: isINSP), others)
+    }
+
+    /// Whether a camera file is an INSP, the 360 photo. Nothing else the
+    /// camera writes for a shot is the shot's photo: with RAW on
+    /// (PureShot not applied) it also writes a DNG.
+    private static func isINSP(_ uri: String) -> Bool {
+        (uri as NSString).pathExtension.lowercased() == "insp"
     }
 
     // MARK: - Photo URI push
@@ -1484,11 +1911,16 @@ final class CameraInstance: NSObject, Identifiable {
 
     /// userInfo["photo"] is an INSCameraPhotoInfo. The push goes to the
     /// takePicture in flight; with none in flight it is ignored (for
-    /// example a photo taken with the camera's own button).
+    /// example a photo taken with the camera's own button). Only an INSP
+    /// in it counts (photoURI).
     private func handlePhotoPush(_ note: Notification) {
         let info = note.userInfo?["photo"] as? INSCameraPhotoInfo
-        guard let uri = Self.photoURI(info) else {
-            onStatusUpdate?("[\(id)] photo push without a URI")
+        let (insp, others) = Self.photoURI(info)
+        let ignored = others.isEmpty ? ""
+            : " (not INSP, ignored: " + others.joined(separator: ", ")
+                + ")"
+        guard let uri = insp else {
+            onStatusUpdate?("[\(id)] photo push without an INSP" + ignored)
             return
         }
         lock.lock()
@@ -1499,7 +1931,7 @@ final class CameraInstance: NSObject, Identifiable {
         ) ?? false
         onStatusUpdate?(
             "[\(id)] photo push: uri=\(uri)"
-            + (used ? "" : " (no shot waiting, ignored)")
+            + (used ? "" : " (no shot waiting, ignored)") + ignored
         )
     }
 
@@ -1587,17 +2019,17 @@ final class CameraInstance: NSObject, Identifiable {
         _clockCont = nil
         _captureCont = nil
         _downloadCont = nil
+        // A new connection needs the camera settings, setAppid,
+        // PureShot and the clock again.
+        _isPureShotSet = false
+        _isPhotoModeSet = false
+        _clockSyncTried = false
         lock.unlock()
 
         connectCont?.resume(returning: false)
         clockCont?.resume(returning: fallback)
         captureCont?.resume(returning: nil)
         downloadCont?.resume(returning: nil)
-
-        // A new connection needs the camera settings, setAppid and
-        // PureShot again.
-        isPureShotSet = false
-        isPhotoModeSet = false
     }
 
     private func downloadOne(
@@ -1678,6 +2110,34 @@ final class CameraInstance: NSObject, Identifiable {
                             }
                             return
                         }
+                        // A file cut short (the camera still writing it,
+                        // or a transfer that ended early) is deleted and
+                        // counts as a failed download, so downloadPending
+                        // queues it again. Only the current download
+                        // deletes: a late reply from one given up on
+                        // mustn't touch the next download's file.
+                        guard Self.isCompletePhoto(destURL) else {
+                            let bytes = (try? FileManager.default
+                                .attributesOfItem(
+                                    atPath: destURL.path
+                                )[.size] as? Int) ?? 0
+                            self.lock.lock()
+                            let current = gen == self._downloadGen
+                                && self._downloadCont != nil
+                            self.lock.unlock()
+                            if current {
+                                try? FileManager.default
+                                    .removeItem(at: destURL)
+                            }
+                            if finish(nil) {
+                                self.onStatusUpdate?(
+                                    "[\(cameraId)] download incomplete:"
+                                    + " \(uri) (\(bytes) bytes, no INSP"
+                                    + " trailer or JPEG end)"
+                                )
+                            }
+                            return
+                        }
                         let exifTs = Self
                             .extractExifTimestamp(
                                 from: destURL
@@ -1747,6 +2207,22 @@ final class CameraInstance: NSObject, Identifiable {
             }
             watchDownload()
         }
+    }
+
+    /// Whether a downloaded photo is complete: it ends with the Insta360
+    /// trailer, as a complete INSP does, or, for a file without one,
+    /// with the JPEG end-of-image marker (FF D9).
+    private static func isCompletePhoto(_ url: URL) -> Bool {
+        if InstaLensCalibration.hasTrailer(url: url) { return true }
+        guard let fh = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? fh.close() }
+        guard let size = try? fh.seekToEnd(), size >= 2,
+              (try? fh.seek(toOffset: size - 2)) != nil,
+              let end = try? fh.read(upToCount: 2)
+        else { return false }
+        return [UInt8](end) == [0xFF, 0xD9]
     }
 
     private static let disconnectStates:

@@ -38,6 +38,9 @@ final class CaptureSessionManager: ObservableObject {
 
     /// Last downloaded Insta360 ERP — exposed for CalibrationView.
     @Published var lastInstaERP: UIImage?
+    /// File of the last image downloadLastInsta360Image() returned, so
+    /// stitching can read the photo's factory lens calibration.
+    private(set) var lastInsta360ImageURL: URL?
     /// Thumbnail of the last captured iPhone RGB frame.
     @Published var lastCapturedThumbnail: UIImage?
     /// Triggers a brief flash animation on capture.
@@ -58,6 +61,12 @@ final class CaptureSessionManager: ObservableObject {
     @Published var freeSpaceGB: Double = 0
     @Published var x5HoldSteady = false
     private var x5HoldTask: Task<Void, Never>?
+    /// Motion windows of 360 shots whose takePicture has gone out, by
+    /// scan, until the shot's capture returns (x5CommandSent,
+    /// finishX5Motion).
+    private var x5MotionTasks: [
+        Int: Task<(peakDps: Double, meanDps: Double)?, Never>
+    ] = [:]
     private var connectTask: Task<Void, Never>?
     private var diskSpaceTimer: Timer?
 
@@ -80,15 +89,63 @@ final class CaptureSessionManager: ObservableObject {
         updateFreeSpace()
     }
 
-    private func startX5HoldWindow() {
-        x5HoldSteady = true
+    /// Shows "Hold still" from the start of a 360 shot until 1.5 s after
+    /// its takePicture goes out (x5CommandSent), or until the shot ends
+    /// without one (finishX5Motion). The shot's preparation (settings
+    /// check, photo list) comes before takePicture and can take seconds,
+    /// so a fixed 1.5 s from here could end before the photo was taken.
+    private func beginX5Hold() {
         x5HoldTask?.cancel()
+        x5HoldTask = nil
+        x5HoldSteady = true
+    }
+
+    /// Ends "Hold still" after `seconds`, or at once if `seconds` <= 0.
+    private func endX5Hold(after seconds: Double) {
+        x5HoldTask?.cancel()
+        guard seconds > 0 else {
+            x5HoldTask = nil
+            x5HoldSteady = false
+            return
+        }
         x5HoldTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(1.5))
+            try? await Task.sleep(for: .seconds(seconds))
             if !Task.isCancelled {
                 x5HoldSteady = false
             }
         }
+    }
+
+    /// CameraInstance.capture's onCommand: takePicture for `scanIndex`
+    /// goes out at `commandTs` (systemUptime). Ends "Hold still" 1.5 s
+    /// later and starts the shot's motion window at the command, so the
+    /// export's motion filter (COLMAPExporter.x5MaxMeanDps) measures the
+    /// shot itself. Another camera's command for the same scan moves the
+    /// end of the hold but keeps the first window.
+    private func x5CommandSent(scanIndex: Int, at commandTs: Double) {
+        let now = ProcessInfo.processInfo.systemUptime
+        endX5Hold(after: commandTs + 1.5 - now)
+        guard x5MotionTasks[scanIndex] == nil else { return }
+        x5MotionTasks[scanIndex] = Task { @MainActor [weak self] in
+            await self?.recordMotionWindow(
+                scanIndex: scanIndex,
+                startTime: commandTs
+            )
+        }
+    }
+
+    /// The motion window of `scanIndex`'s shot, once its 1.5 s have
+    /// passed. Nil if takePicture never went out; "Hold still" then ends
+    /// at once.
+    private func finishX5Motion(
+        scanIndex: Int
+    ) async -> (peakDps: Double, meanDps: Double)? {
+        guard let task = x5MotionTasks.removeValue(forKey: scanIndex)
+        else {
+            endX5Hold(after: 0)
+            return nil
+        }
+        return await task.value
     }
 
     private func recordMotionWindow(
@@ -340,7 +397,7 @@ final class CaptureSessionManager: ObservableObject {
                 insta360CommandCount += 1
                 let cmdNum = insta360CommandCount
                 sent360 = true
-                startX5HoldWindow()
+                beginX5Hold()
                 let manager = insta360Manager
                 let scan = currentScan
                 let cams = activeCams
@@ -351,26 +408,25 @@ final class CaptureSessionManager: ObservableObject {
                     // same camera while this one runs (they share one
                     // download continuation in CameraInstance).
                     defer { self?.isInsta360Busy = false }
-                    let cmdTime = ProcessInfo.processInfo
-                        .systemUptime
                     let captureStart = ContinuousClock.now
                     let arkitTs = CACurrentMediaTime()
-                    let motionTask = Task {
-                        @MainActor [weak self] in
-                        await self?.recordMotionWindow(
-                            scanIndex: scan,
-                            startTime: cmdTime
-                        )
-                    }
                     // 60 s, not 30: a reply that arrives after the
                     // timeout is dropped and its photo never downloaded.
                     // The longer wait leaves room for 120 MP X6 photos.
+                    // The motion window starts when takePicture goes
+                    // out (onCommand), not here before the preparation.
                     let captureResults = await manager
                         .captureWith(
                             cameras: cams,
                             arkitTimestamp: arkitTs,
                             scanIndex: scan,
-                            timeout: 60
+                            timeout: 60,
+                            onCommand: { [weak self] commandTs in
+                                self?.x5CommandSent(
+                                    scanIndex: scan,
+                                    at: commandTs
+                                )
+                            }
                         )
                     let capComp = (ContinuousClock.now
                         - captureStart).components
@@ -379,7 +435,9 @@ final class CaptureSessionManager: ObservableObject {
                             capComp.attoseconds
                                 / 1_000_000_000_000_000
                         )
-                    let motion = await motionTask.value
+                    let motion = await self?.finishX5Motion(
+                        scanIndex: scan
+                    )
                     self?.logMessage(String(
                         format: "360#%d scan#%d"
                             + " ack=%dms"
@@ -484,28 +542,27 @@ final class CaptureSessionManager: ObservableObject {
                         ))
                     }
                 }
-                startX5HoldWindow()
-                let cmdTime = ProcessInfo.processInfo
-                    .systemUptime
-                let motionTask = Task {
-                    @MainActor [weak self] in
-                    await self?.recordMotionWindow(
-                        scanIndex: currentScan,
-                        startTime: cmdTime
-                    )
-                }
+                beginX5Hold()
                 // 60 s, as in auto capture: the X6 can send the photo
                 // URI in a push well after the takePicture reply, and a
-                // push after the timeout is dropped.
+                // push after the timeout is dropped. As in auto capture,
+                // the motion window starts when takePicture goes out.
                 insta360Results = await insta360Manager
                     .captureWith(
                         cameras: manualCams,
                         arkitTimestamp: arkitFrame.timestamp,
                         scanIndex: currentScan,
-                        timeout: 60
+                        timeout: 60,
+                        onCommand: { [weak self] commandTs in
+                            self?.x5CommandSent(
+                                scanIndex: currentScan,
+                                at: commandTs
+                            )
+                        }
                     )
-                let motion = await motionTask.value
-                    ?? (peakDps: 0, meanDps: 0)
+                let motion = await finishX5Motion(
+                    scanIndex: currentScan
+                ) ?? (peakDps: 0, meanDps: 0)
                 manualMotion = motion
                 logMessage(String(
                     format: "X5 scan#%d"
@@ -804,12 +861,16 @@ final class CaptureSessionManager: ObservableObject {
                     .connectedCamerasCopy().first?.model ?? ""
                 let roll = DualFisheyeStitcher
                     .rollCorrection(forModel: camModel)
+                let srcURL = lastInsta360ImageURL
                 erpImage = await Task.detached(
                     priority: .userInitiated
                 ) {
                     DualFisheyeStitcher.stitch(
                         src, outputWidth: 2048,
-                        rollDeg: roll
+                        rollDeg: roll,
+                        calibration: srcURL.flatMap {
+                            InstaLensCalibration.load(url: $0)
+                        }
                     )
                 }.value
             } else {
@@ -968,6 +1029,7 @@ final class CaptureSessionManager: ObservableObject {
             print("[Insta360] download failed or timed out")
             return nil
         }
+        lastInsta360ImageURL = first.localURL
         let maxW = 1024.0
         if img.size.width > maxW {
             let scale = maxW / img.size.width

@@ -787,11 +787,15 @@ struct CalibrationView: View {
                         })?.model ?? ""
                 let roll = DualFisheyeStitcher
                     .rollCorrection(forModel: camModel)
+                let srcURL = sessionManager.lastInsta360ImageURL
                 let stitched = await Task.detached(
                     priority: .userInitiated
                 ) {
                     DualFisheyeStitcher.stitch(
-                        src, outputWidth: 2048, rollDeg: roll
+                        src, outputWidth: 2048, rollDeg: roll,
+                        calibration: srcURL.flatMap {
+                            InstaLensCalibration.load(url: $0)
+                        }
                     )
                 }.value
                 instaERP = stitched

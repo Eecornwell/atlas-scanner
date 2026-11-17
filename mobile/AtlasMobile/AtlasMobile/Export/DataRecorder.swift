@@ -1,6 +1,7 @@
 import Foundation
 import CoreImage
 import CoreVideo
+import ImageIO
 import simd
 
 /// Records capture data to disk following the atlas-mobile directory structure.
@@ -30,7 +31,9 @@ final class DataRecorder {
         try? FileManager.default.createDirectory(at: scanDir, withIntermediateDirectories: true)
 
         autoreleasepool {
-            savePixelBufferAsJPEG(arkitFrame.capturedImage, to: scanDir.appendingPathComponent("rgb.jpg"))
+            savePixelBufferAsJPEG(
+                arkitFrame.capturedImage, exif: arkitFrame.exif,
+                to: scanDir.appendingPathComponent("rgb.jpg"))
             saveDepthMap(arkitFrame.depthMap, to: scanDir.appendingPathComponent("depth.bin"))
             saveConfidenceMap(arkitFrame.confidenceMap, to: scanDir.appendingPathComponent("confidence.bin"))
             if let smoothed = arkitFrame.smoothedDepthMap {
@@ -254,15 +257,27 @@ final class DataRecorder {
         try? data.write(to: url)
     }
 
-    private func savePixelBufferAsJPEG(_ pixelBuffer: CVPixelBuffer, to url: URL) {
+    /// The JPEG carries the frame's exposure EXIF (ExposureMetadata), so a
+    /// trainer can read each iPhone image's exposure; the export copies
+    /// this file into colmap/images/face_iphone. ImageIO writes the Exif
+    /// dictionary given to it; before, CIContext.jpegRepresentation wrote
+    /// none of it. Quality 0.9.
+    private func savePixelBufferAsJPEG(
+        _ pixelBuffer: CVPixelBuffer, exif: [String: Any], to url: URL
+    ) {
         // ARKit's capturedImage is always landscape (native sensor).
         // Rotate 90° CW so the saved JPEG matches portrait phone orientation.
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-        guard let data = ciContext.jpegRepresentation(
-            of: ciImage,
-            colorSpace: CGColorSpaceCreateDeviceRGB()
-        ) else { return }
-        try? data.write(to: url)
+        guard let cg = ciContext.createCGImage(
+                  ciImage, from: ciImage.extent, format: .RGBA8,
+                  colorSpace: CGColorSpaceCreateDeviceRGB()),
+              let dest = CGImageDestinationCreateWithURL(
+                  url as CFURL, "public.jpeg" as CFString, 1, nil)
+        else { return }
+        CGImageDestinationAddImage(
+            dest, cg,
+            ExposureMetadata.jpegProperties(quality: 0.9, exif: exif))
+        CGImageDestinationFinalize(dest)
     }
 
     private func matrixToArray(_ m: simd_float4x4) -> [[Float]] {

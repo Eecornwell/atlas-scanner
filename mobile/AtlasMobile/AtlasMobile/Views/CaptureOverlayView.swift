@@ -249,8 +249,10 @@ struct CaptureOverlayView: View {
                 Spacer()
 
                 // Insta360 live preview, as on the SDK sample's
-                // take-picture page
-                if !sessionManager.connectedCamerasList.isEmpty {
+                // take-picture page. It runs for the X6 only.
+                if livePreview.isActive,
+                   !sessionManager.connectedCamerasList.isEmpty
+                {
                     HStack {
                         Insta360PreviewTile(preview: livePreview)
                         Spacer()

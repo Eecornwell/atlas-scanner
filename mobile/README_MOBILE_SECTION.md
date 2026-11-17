@@ -679,6 +679,74 @@ If you don't have a Mac, you can build on an EC2 Mac Dedicated Host. **Expect ~$
       --query "Hosts[0].AllocationTime"
     ```
 
+#### GitHub Actions Build
+
+`.github/workflows/ios-build.yml` builds the same signed ad hoc IPA on a GitHub-hosted Mac. It is a second way to package the app; the EC2 Mac build above is unchanged.
+
+- **Runs on** pushes to `mobile` that change `mobile/AtlasMobile/**`, and on manual runs.
+- **Toolchain:** `macos-15` runner with Xcode 16.2 (16C5032a), the version the EC2 builds use.
+- **Steps:** XcodeGen 2.46.0 and OpenCV 5.0.0 (both pinned by SHA-256), then `setup_ios.sh` (Insta360 SDK 1.11.3 from `s3://<BUCKET>/code/iOS-SDK-V1.11.3.zip`, project generation), then the same `xcodebuild archive` and `-exportArchive` commands as on EC2.
+- **Output:** `s3://<BUCKET>/code/builds/github/<run>-<commit>/` gets the IPA, the dSYM zip and `build-info.txt` (commit, app binary UUID, Xcode version). A manual run with **publish** on also replaces `code/AtlasMobile.ipa`, the file the install page serves, and invalidates it in CloudFront.
+- **Public repo:** the IPA is not kept as a workflow artifact and the Insta360 SDK is not cached. Anyone signed in to GitHub can download a public repo's artifacts, and pull requests can restore their base branch's caches. The workflow doesn't run on pull requests, and fork pull requests get no secrets.
+
+One-time setup:
+
+0. Upload the Insta360 SDK zip that `setup_ios.sh` installs. The SDK is proprietary, so it stays out of this public repo:
+    ```bash
+    aws s3 cp iOS-SDK-V1.11.3.zip s3://<BUCKET>/code/iOS-SDK-V1.11.3.zip
+    ```
+
+1. Add GitHub's OIDC provider to IAM:
+    ```bash
+    aws iam create-open-id-connect-provider \
+      --url https://token.actions.githubusercontent.com \
+      --client-id-list sts.amazonaws.com
+    ```
+
+2. Create a role that only this repository's `mobile` branch can assume:
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [{
+        "Effect": "Allow",
+        "Principal": {"Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"},
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {"StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:sub": "repo:Eecornwell/atlas-scanner:ref:refs/heads/mobile"
+        }}
+      }]
+    }
+    ```
+    Give it only:
+    - `s3:GetObject` on `code/iOS-SDK-V1.11.3.zip` (the zip named in `setup_ios.sh`; update this when the SDK version changes) and `code/AtlasMobile_Ad_Hoc.mobileprovision`
+    - `s3:PutObject` and `s3:AbortMultipartUpload` on `code/builds/github/*`, `code/AtlasMobile.ipa` and `code/AtlasMobile.app.dSYM.zip`
+    - `cloudfront:CreateInvalidation` on the install page's distribution (optional)
+
+3. On the Mac that holds the signing identity, export it as a .p12:
+    ```bash
+    security find-identity -v -p codesigning   # expect "Apple Distribution: ... (Z89R76ZA8G)"
+    security export -k ~/Library/Keychains/login.keychain-db -t identities \
+      -f pkcs12 -P '<p12 password>' -o ~/dist.p12
+    base64 -i ~/dist.p12 | tr -d '\n'          # value for IOS_DIST_P12_BASE64
+    rm ~/dist.p12
+    ```
+    `-t identities` exports every identity in that keychain. If the private key exists as a file instead, build the .p12 with `openssl pkcs12 -export -legacy -inkey <key> -in <cert.pem> -out dist.p12`.
+
+4. Add repository secrets (Settings > Secrets and variables > Actions):
+
+    | Secret | Value |
+    |---|---|
+    | `AWS_ROLE_ARN` | ARN of the role from step 2 |
+    | `ATLAS_S3_BUCKET` | Bucket that holds `code/` |
+    | `IOS_DIST_P12_BASE64` | Base64 of the .p12 from step 3 |
+    | `IOS_DIST_P12_PASSWORD` | Its password |
+    | `ATLAS_CLOUDFRONT_DISTRIBUTION_ID` | Optional: the install page's distribution |
+
+    The workflow reads the provisioning profile from `code/AtlasMobile_Ad_Hoc.mobileprovision`, the same profile the EC2 builds use. After adding a device, upload the new profile there.
+
+Run it manually with `gh workflow run ios-build.yml --ref mobile -f publish=true` once it has run at least once. GitHub shows the **Run workflow** button only when the workflow file is also on the default branch (`main`).
+
 #### Offline Pipeline (macOS/Linux/Windows)
 
 1. **Prerequisites**

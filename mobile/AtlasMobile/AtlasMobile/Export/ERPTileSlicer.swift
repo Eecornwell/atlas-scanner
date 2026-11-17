@@ -3,9 +3,60 @@ import CoreGraphics
 import UIKit
 import simd
 
+/// One view of the 360 tile layout, in the panorama frame (the front lens's
+/// frame: x right, y down, z forward). Yaw is positive to the right, pitch
+/// positive up.
+struct InstaTileView {
+    let yawDeg: Float
+    let pitchDeg: Float
+    /// The lens the tile is rendered from. Each tile uses one lens only,
+    /// so no tile contains the stitch seam.
+    let rearLens: Bool
+}
+
+/// The 360 tile layout of the COLMAP export, the rig calibration and the
+/// tile masks. Six 90 deg views around the horizon, three per lens (yaw 0
+/// and +-50 from each lens axis, as rooster-vehicle's capture_export
+/// renders X6 video), plus one 90 deg view up from each lens for ceilings.
+/// Every pixel of every 90 deg view is within 95.3 deg of its lens's axis,
+/// inside the lens circle; the front and rear views overlap by about
+/// 10 deg at the sides. Together they cover elevations -38 to +90 deg all
+/// round. No view looks down: the rig and the operator's hands are there.
+///
+/// The old layout was eight 65 deg tiles every 45 deg at the horizon; two
+/// of them sat on the seam and blended both lenses.
+enum InstaTileLayout {
+    static let fovDeg: Float = 90
+
+    static let views: [InstaTileView] = [
+        InstaTileView(yawDeg: 0, pitchDeg: 0, rearLens: false),
+        InstaTileView(yawDeg: 50, pitchDeg: 0, rearLens: false),
+        InstaTileView(yawDeg: 130, pitchDeg: 0, rearLens: true),
+        InstaTileView(yawDeg: 180, pitchDeg: 0, rearLens: true),
+        InstaTileView(yawDeg: 230, pitchDeg: 0, rearLens: true),
+        InstaTileView(yawDeg: 310, pitchDeg: 0, rearLens: false),
+        InstaTileView(yawDeg: 0, pitchDeg: 50, rearLens: false),
+        InstaTileView(yawDeg: 180, pitchDeg: 50, rearLens: true),
+    ]
+
+    static var count: Int { views.count }
+
+    /// cam_from_pano of a view: pano_from_cam = Ry(yaw) Rx(pitch), with
+    /// Rx(pitch) tilting the camera's z axis up (towards -y).
+    static func camFromPano(_ v: InstaTileView) -> simd_float3x3 {
+        let yaw = v.yawDeg * .pi / 180
+        let pitch = v.pitchDeg * .pi / 180
+        let rx = simd_float3x3(
+            simd_quatf(angle: -pitch, axis: SIMD3(1, 0, 0)))
+        let ry = simd_float3x3(
+            simd_quatf(angle: -yaw, axis: SIMD3(0, 1, 0)))
+        return rx * ry
+    }
+}
+
 /// Slices equirectangular panoramas into perspective face tiles on-device.
-/// Face layout and rotation math match atlas-scanner's panorama_sfm_colmap.py
-/// and COLMAPExporter.computeFaceRotations exactly.
+/// Face layout: InstaTileLayout (the desktop panorama_sfm_colmap.py keeps
+/// its own eight-tile layout).
 final class ERPTileSlicer {
     let tileSize: Int
     let tileFovDeg: Float
@@ -23,7 +74,7 @@ final class ERPTileSlicer {
     private var cachedW: Int = 0
     private var cachedH: Int = 0
 
-    init(tileSize: Int = 1024, tileFovDeg: Float = 65.0) {
+    init(tileSize: Int = 1024, tileFovDeg: Float = InstaTileLayout.fovDeg) {
         self.tileSize = tileSize
         self.tileFovDeg = tileFovDeg
         self.faceRotations = Self.computeFaceRotations()
@@ -88,15 +139,11 @@ final class ERPTileSlicer {
 
     // MARK: - Face rotations
 
-    /// 8 equatorial face rotations (cam_from_pano) at 45° yaw steps.
+    /// Face rotations (cam_from_pano) of InstaTileLayout, in its order.
     /// DualFisheyeStitcher produces standard ERP: lon=0 at center,
     /// v=0 at zenith, equator at v=H/2.
     static func computeFaceRotations() -> [simd_float3x3] {
-        (0..<8).map { i in
-            let yawRad = Float(i) * .pi / 4.0
-            let faceQuat = simd_quatf(angle: -yawRad, axis: SIMD3(0, 1, 0))
-            return simd_float3x3(faceQuat)
-        }
+        InstaTileLayout.views.map(InstaTileLayout.camFromPano)
     }
 
     // MARK: - Sampling map construction

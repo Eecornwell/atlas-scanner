@@ -7,13 +7,17 @@ import INSCoreMedia
 /// ported from INSCameraSDKSample-bluetooth/src/
 /// CameraConfigByJsonController.swift (the page "Record new" opens). On
 /// that page the preview runs while "X5 Take Picture" is pressed, and the
-/// X6 takes photos there, so CameraInstance waits for it before a shot.
+/// X6 takes photos there. The app runs it for the X6 only
+/// (Insta360CaptureManager.startLivePreview), and a shot doesn't wait for
+/// it (CameraInstance.prepareShot).
 ///
 /// The page's steps:
 /// - viewDidLoad (setupRenderView): create an INSCameraSessionPlayer.
 /// - viewWillAppear: fetchOptions, then disableInternalSplicingForPreview,
 ///   then runMediaSession, which starts the player and requests an
-///   I-frame.
+///   I-frame. Here in-camera stitching is already off: the camera
+///   settings turn it off for every camera before start()
+///   (CameraInstance.disableInCameraStitching).
 /// - cameraState KVO: .connected runs runMediaSession; a lost connection
 ///   stops the stream.
 /// - INSCameraCurrentCaptureStatus: at .notCapture (the camera is idle
@@ -54,8 +58,9 @@ final class Insta360LivePreview: NSObject, ObservableObject {
     /// ignored.
     private var startAttempt = 0
     /// A restart after a shot is queued but hasn't reached
-    /// runMediaSession yet. The sample's page blocks its buttons while
-    /// the preview restarts, so shots wait for this too.
+    /// runMediaSession yet, so another status push doesn't queue a second
+    /// one. The sample's page blocks its buttons while the preview
+    /// restarts; shots here don't wait for it.
     private var isRestartPending = false
     private var startWaiters: [(Bool) -> Void] = []
     private var stateToken: NSKeyValueObservation?
@@ -81,8 +86,10 @@ final class Insta360LivePreview: NSObject, ObservableObject {
 
     // MARK: - Control
 
-    /// Starts the preview the way the sample's page does when it opens.
-    /// Returns whether the stream runs. Does nothing if it already runs.
+    /// Starts the preview the way the sample's page does when it opens,
+    /// without its disableInternalSplicingForPreview step: the camera
+    /// settings have turned in-camera stitching off already. Returns
+    /// whether the stream runs. Does nothing if it already runs.
     func start() async -> Bool {
         await awaitOnMain(timeout: 30, fallback: false) { finish in
             self.makePlayerIfNeeded()
@@ -93,9 +100,7 @@ final class Insta360LivePreview: NSObject, ObservableObject {
                 return
             }
             self.fetchOptions {
-                self.disableInternalSplicing {
-                    self.runMediaSession(completion: finish)
-                }
+                self.runMediaSession(completion: finish)
             }
         }
     }
@@ -126,39 +131,6 @@ final class Insta360LivePreview: NSObject, ObservableObject {
                     finish(true)
                 }
             }
-        }
-    }
-
-    /// Waits until the stream runs: in the sample, the preview is on when
-    /// the take-picture button is pressed. If the stream is neither
-    /// running nor starting, starts it once. Returns false when that start
-    /// fails, at the timeout, or at once before start().
-    func waitUntilRunning(timeout: Double) async -> Bool {
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        var restarted = false
-        while true {
-            let (active, running, busy) = await MainActor.run {
-                (
-                    self.isActive,
-                    self.isRunning,
-                    self.isStarting || self.isRestartPending
-                )
-            }
-            if running { return true }
-            if !active { return false }
-            if !busy {
-                if restarted { return false }
-                restarted = true
-                await MainActor.run {
-                    self.log("live preview not running — starting it")
-                    self.runMediaSession { _ in }
-                }
-                continue
-            }
-            if ProcessInfo.processInfo.systemUptime >= deadline {
-                return false
-            }
-            try? await Task.sleep(for: .milliseconds(250))
         }
     }
 
@@ -226,30 +198,6 @@ final class Insta360LivePreview: NSObject, ObservableObject {
                         "camera options read failed: "
                         + (error.map { "\($0)" } ?? "no options")
                     )
-                }
-                completion()
-            }
-        }
-    }
-
-    /// disableInternalSplicingForPreview: the preview stitches the two
-    /// fisheye images in the app, so the sample turns in-camera
-    /// stitching off first. Its comment: with in-camera stitching on,
-    /// the seams look wrong and parts of the image repeat.
-    private func disableInternalSplicing(
-        _ completion: @escaping () -> Void
-    ) {
-        let cameraOptions = INSCameraOptions()
-        cameraOptions.enableInternalSplicing = false
-        let optionTypes = [
-            NSNumber(value: INSCameraOptionsType.internalSplicing.rawValue),
-        ]
-        INSCameraManager.shared().commandManager.setOptions(
-            cameraOptions, forTypes: optionTypes
-        ) { [weak self] error, _ in
-            DispatchQueue.main.async {
-                if let error {
-                    self?.log("in-camera stitching off failed: \(error)")
                 }
                 completion()
             }

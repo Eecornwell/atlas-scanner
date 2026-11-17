@@ -85,7 +85,8 @@ final class ARKitCapture: NSObject, ObservableObject {
             confidenceMap: confidenceMap,
             smoothedDepthMap: smoothedDepth,
             trackingState: Self.trackingLabel(
-                frame.camera.trackingState)
+                frame.camera.trackingState),
+            exif: ExposureMetadata.subset(frame.exifData)
         )
     }
 

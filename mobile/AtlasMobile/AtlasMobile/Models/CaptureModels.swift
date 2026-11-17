@@ -14,6 +14,9 @@ struct ARKitFrameData {
     /// ARKit tracking state when the frame was taken: "normal",
     /// "limited:<reason>" or "notAvailable".
     let trackingState: String
+    /// The frame's exposure EXIF (ExposureMetadata.subset of
+    /// ARFrame.exifData), written into rgb.jpg.
+    let exif: [String: Any]
 }
 
 struct Insta360CaptureResult {

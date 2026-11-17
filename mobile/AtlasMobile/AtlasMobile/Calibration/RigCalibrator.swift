@@ -34,6 +34,9 @@ final class RigCalibrator {
     struct Config {
         var maxWidth: Int = 512
         var tileExtractSize: Int = 512
+        /// Field of view of the calibration tiles. They look the same
+        /// ways as the export's (InstaTileLayout) but narrower, so each
+        /// stays within 84 deg of its lens's axis and keeps ~7 px/deg.
         var tileFovDeg: Float = 65.0
         var matchRatio: Float = 0.75
         var matchWindowIphone: Int = 3
@@ -331,6 +334,13 @@ final class RigCalibrator {
                 continue
             }
             x5Loaded += 1
+            // Tiles go through the photo's factory lens calibration,
+            // each from its layout lens, as the export renders them.
+            let lensCalib = InstaLensCalibration.load(url: srcURL)
+            if x5Loaded == 1 {
+                log("lens model: " + (lensCalib?.summary
+                    ?? "no factory calibration, nominal model"))
+            }
 
             for fi in 0..<nFaces {
                 autoreleasepool {
@@ -341,7 +351,10 @@ final class RigCalibrator {
                             tileSize: tileSide,
                             faceRotation: faceRots[fi],
                             tileFovDeg: config.tileFovDeg,
-                            rollDeg: rollDeg)
+                            rollDeg: rollDeg,
+                            calibration: lensCalib,
+                            rearLens: InstaTileLayout.views[fi]
+                                .rearLens)
                     else { return }
 
                     let id = nextId; nextId += 1

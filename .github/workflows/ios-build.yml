@@ -1,0 +1,246 @@
+# Builds, signs and exports the AtlasMobile ad hoc IPA on a GitHub-hosted Mac.
+# This is the second way to package the app. The EC2 Mac build (S3 sync,
+# xcodegen, xcodebuild) is unchanged and still works.
+# One-time setup (AWS role, repository secrets) is described in
+# mobile/README_MOBILE_SECTION.md, "GitHub Actions Build".
+name: iOS ad hoc build
+
+on:
+  push:
+    branches: [mobile]
+    paths:
+      - "mobile/AtlasMobile/**"
+      - ".github/workflows/ios-build.yml"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Also replace code/AtlasMobile.ipa, the IPA the install page serves"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for the AWS role
+
+concurrency:
+  group: ios-build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Same toolchain as the EC2 builds: Xcode 16.2 (16C5032a), iOS 18.2 SDK.
+    # If the runner image drops Xcode 16.2, pick another from
+    # https://github.com/actions/runner-images/blob/main/images/macos/macos-15-arm64-Readme.md
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+      TEAM_ID: Z89R76ZA8G
+      PROFILE_NAME: AtlasMobile Ad Hoc
+      SIGN_IDENTITY: Apple Distribution
+      S3_BUCKET: ${{ secrets.ATLAS_S3_BUCKET }}
+      # Third-party downloads, pinned by SHA-256.
+      XCODEGEN_VERSION: "2.46.0"
+      XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+      OPENCV_VERSION: "5.0.0"
+      OPENCV_SHA256: c844d3466f7999b6e920d4ee53c71310c4cdd34b13f1547f373723834e308b0e
+      WWDR_G3_SHA256: dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f
+    defaults:
+      run:
+        shell: bash
+        working-directory: mobile/AtlasMobile
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check secrets
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          missing=""
+          [ -n "$AWS_ROLE_ARN" ] || missing="$missing AWS_ROLE_ARN"
+          [ -n "$S3_BUCKET" ] || missing="$missing ATLAS_S3_BUCKET"
+          [ -n "$P12_BASE64" ] || missing="$missing IOS_DIST_P12_BASE64"
+          [ -n "$P12_PASSWORD" ] || missing="$missing IOS_DIST_P12_PASSWORD"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing"
+            exit 1
+          fi
+
+      - name: Xcode
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # Downloads and project generation run before the signing key is on
+      # the runner.
+      - name: XcodeGen and OpenCV
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/xcodegen.zip" \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/$XCODEGEN_VERSION/xcodegen.zip"
+          echo "$XCODEGEN_SHA256  $RUNNER_TEMP/xcodegen.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/xcodegen.zip" -d "$HOME"
+          mkdir -p Frameworks
+          curl -fsSL -o "$RUNNER_TEMP/opencv.zip" \
+            "https://github.com/opencv/opencv/releases/download/$OPENCV_VERSION/opencv-$OPENCV_VERSION-ios-framework.zip"
+          echo "$OPENCV_SHA256  $RUNNER_TEMP/opencv.zip" | shasum -a 256 -c -
+          unzip -q -o "$RUNNER_TEMP/opencv.zip" -d Frameworks
+
+      # setup_ios.sh skips XcodeGen and OpenCV (installed above), downloads the
+      # Insta360 SDK zip it names (iOS-SDK-V1.11.3.zip) from s3://<bucket>/code/,
+      # generates the project and removes opencv2 from Embed Frameworks. Same
+      # script as for the EC2 Mac. The AWS role must allow reading that zip.
+      - name: Insta360 SDK and Xcode project
+        env:
+          ATLAS_S3_BUCKET: ${{ secrets.ATLAS_S3_BUCKET }}
+        run: bash setup_ios.sh
+
+      - name: Signing certificate and profile
+        env:
+          P12_BASE64: ${{ secrets.IOS_DIST_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          # Temporary keychain with the distribution identity and Apple's
+          # WWDR G3 intermediate, which issued the distribution certificate.
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          rm -f "$RUNNER_TEMP/dist.p12"
+          curl -fsSL -o "$RUNNER_TEMP/AppleWWDRCAG3.cer" \
+            https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+          echo "$WWDR_G3_SHA256  $RUNNER_TEMP/AppleWWDRCAG3.cer" | shasum -a 256 -c -
+          security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$KEYCHAIN" \
+            || echo "WWDR G3 not imported (already in the keychain?)"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          # Ad hoc profile from S3: the file the EC2 builds embed. Copied to
+          # both folders Xcode reads profiles from.
+          PROFILE="$RUNNER_TEMP/AtlasMobile_Ad_Hoc.mobileprovision"
+          aws s3 cp "s3://$S3_BUCKET/code/AtlasMobile_Ad_Hoc.mobileprovision" "$PROFILE" --only-show-errors
+          security cms -D -i "$PROFILE" > "$RUNNER_TEMP/profile.plist"
+          PB=/usr/libexec/PlistBuddy
+          UUID="$($PB -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          echo "profile: $($PB -c 'Print :Name' "$RUNNER_TEMP/profile.plist"), $UUID," \
+            "expires $($PB -c 'Print :ExpirationDate' "$RUNNER_TEMP/profile.plist")"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$PROFILE" "$dir/$UUID.mobileprovision"
+          done
+          echo "PROFILE_UUID=$UUID" >> "$GITHUB_ENV"
+
+      # The same archive and export commands as on the EC2 Mac.
+      - name: Archive
+        run: |
+          xcodebuild archive -project AtlasMobile.xcodeproj -scheme AtlasMobile -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/AtlasMobile.xcarchive" \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGNING_REQUIRED=YES CODE_SIGNING_ALLOWED=YES \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
+            | tee "$RUNNER_TEMP/archive.log" | xcbeautify --renderer github-actions
+
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/AtlasMobile.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" -exportOptionsPlist ExportOptionsAdHoc.plist \
+            | tee "$RUNNER_TEMP/export.log" | xcbeautify --renderer github-actions
+
+      - name: Check the signature and record the binary UUID
+        run: |
+          rm -rf "$RUNNER_TEMP/ipa"
+          unzip -q "$RUNNER_TEMP/export/AtlasMobile.ipa" -d "$RUNNER_TEMP/ipa"
+          APP="$RUNNER_TEMP/ipa/Payload/AtlasMobile.app"
+          codesign --verify --deep --strict "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -E '^(Authority=Apple Distribution|TeamIdentifier=)'
+          APP_UUID="$(xcrun dwarfdump --uuid "$APP/AtlasMobile" | awk '/UUID:/ {print $2; exit}')"
+          echo "app binary UUID $APP_UUID (export_trace.log shows it as 'app image ... uuid')"
+          echo "APP_UUID=$APP_UUID" >> "$GITHUB_ENV"
+
+      - name: Upload to S3
+        env:
+          PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+          CLOUDFRONT_ID: ${{ secrets.ATLAS_CLOUDFRONT_DISTRIBUTION_ID }}
+        run: |
+          KEY="code/builds/github/${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}"
+          ARCHIVE="$RUNNER_TEMP/AtlasMobile.xcarchive"
+          ditto -c -k --keepParent "$ARCHIVE/dSYMs/AtlasMobile.app.dSYM" "$RUNNER_TEMP/AtlasMobile.app.dSYM.zip"
+          {
+            echo "commit $GITHUB_SHA"
+            echo "run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "app binary UUID $APP_UUID"
+            echo "provisioning profile $PROFILE_UUID"
+            echo "Insta360 SDK $(cat Frameworks/.insta360-sdk-version 2>/dev/null || echo unknown)"
+            xcodebuild -version
+          } > "$RUNNER_TEMP/build-info.txt"
+          for f in export/AtlasMobile.ipa AtlasMobile.app.dSYM.zip build-info.txt; do
+            aws s3 cp "$RUNNER_TEMP/$f" "s3://$S3_BUCKET/$KEY/$(basename "$f")" --only-show-errors
+          done
+
+          published=no
+          if [ "$PUBLISH" = "true" ]; then
+            # no-cache: CloudFront then keeps the install-page IPA for its
+            # 1 s minimum instead of its 24 h default.
+            aws s3 cp "$RUNNER_TEMP/export/AtlasMobile.ipa" "s3://$S3_BUCKET/code/AtlasMobile.ipa" \
+              --cache-control no-cache --only-show-errors
+            aws s3 cp "$RUNNER_TEMP/AtlasMobile.app.dSYM.zip" "s3://$S3_BUCKET/code/AtlasMobile.app.dSYM.zip" \
+              --only-show-errors
+            if [ -n "$CLOUDFRONT_ID" ]; then
+              aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_ID" \
+                --paths /code/AtlasMobile.ipa --query Invalidation.Id --output text
+            fi
+            published=yes
+          fi
+
+          {
+            echo "### AtlasMobile ad hoc IPA"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| App binary UUID | \`$APP_UUID\` |"
+            echo "| S3 folder | \`$KEY/\` |"
+            echo "| Replaced \`code/AtlasMobile.ipa\` | $published |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the end of the xcodebuild logs
+        if: failure()
+        working-directory: ${{ github.workspace }}
+        run: |
+          for f in "$RUNNER_TEMP/archive.log" "$RUNNER_TEMP/export.log"; do
+            if [ -f "$f" ]; then
+              echo "== $f"
+              tail -n 200 "$f"
+            fi
+          done
+
+      - name: Remove the keychain and profile
+        if: always()
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision" \
+                  "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi

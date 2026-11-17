@@ -8,9 +8,10 @@ import UIKit
 
 /// How to export Insta360 images in the COLMAP model.
 enum CameraExportMode: String, CaseIterable {
-    /// ERP → 8 perspective tiles (SIMPLE_PINHOLE). Works with all pipelines.
+    /// Dual fisheye → perspective tiles of InstaTileLayout (SIMPLE_PINHOLE),
+    /// each from one lens. Works with all pipelines.
     case pinholeTiles
-    /// ERP → 2 equidistant fisheye lens images (OPENCV_FISHEYE). Native FOV, needs 3DGUT.
+    /// Dual fisheye → 2 equidistant fisheye lens images (OPENCV_FISHEYE). Native FOV, needs 3DGUT.
     case nativeFisheye
 }
 
@@ -26,7 +27,8 @@ final class COLMAPExporter {
         case opencvFisheye = 5  // fx, fy, cx, cy, k1, k2, k3, k4
     }
 
-    // Fisheye lens constants — match DualFisheyeStitcher's equidistant model
+    // The ideal equidistant fisheye the nativeFisheye images are rendered
+    // as (DualFisheyeStitcher.reprojectToFisheye) and declared with.
     private static let fisheyeSize = 2048
     private static let fisheyeHalfFovRad: Float = 100 * .pi / 180
     private static let fisheyeRadiusFrac: Float = 0.47
@@ -78,7 +80,7 @@ final class COLMAPExporter {
     }
 
     static let tileSize = 2048
-    static let tileFovDeg: Float = 65.0
+    static let tileFovDeg: Float = InstaTileLayout.fovDeg
     static let blurThreshold: Float = 300.0
     /// X5 shots scoring below min(x5BlurThreshold, x5BlurMedianFraction
     /// x session median) are dropped. 1000 dropped 9 of 13 sharp shots
@@ -235,7 +237,7 @@ final class COLMAPExporter {
         let c_tile = Float(tileSize) / 2.0
 
         let iphoneCameraId: UInt32 = 1
-        let faceCount = 8
+        let faceCount = InstaTileLayout.count
 
         onStage?("checking sharpness (\(Self.memorySummary()))")
 
@@ -1267,7 +1269,7 @@ final class COLMAPExporter {
                         }
                     }
                 } else {
-                    for faceIdx in 0..<8 {
+                    for faceIdx in 0..<InstaTileLayout.count {
                         autoreleasepool {
                             if let tile = slicer.sliceTile(
                                 at: faceIdx,
@@ -1312,6 +1314,36 @@ final class COLMAPExporter {
             try fm.createDirectory(at: backMaskDir, withIntermediateDirectories: true)
         }
 
+        // The factory lens calibration of each 360 photo, from its INSP
+        // trailer. The trace records the first one, so an export shows
+        // which lens model its 360 images were rendered with.
+        var lensNoted = false
+        func lensCalibration(_ url: URL) -> InstaLensCalibration? {
+            let calib = InstaLensCalibration.load(url: url)
+            if !lensNoted {
+                lensNoted = true
+                let line = "360 lens model: " + (calib?.summary
+                    ?? "no factory calibration in"
+                    + " \(url.lastPathComponent), nominal model")
+                print("[Export] \(line)")
+                ExportTrace.note(line)
+            }
+            return calib
+        }
+
+        // Every image keeps the exposure EXIF of the photo it comes from
+        // (ExposureMetadata), for PPISP. The trace records the first
+        // iPhone and 360 values, so an export shows whether they're there.
+        var iphoneExposureNoted = false
+        var insta360ExposureNoted = false
+        func noteExposure(_ what: String, _ exif: [String: Any],
+                          _ scanName: String) {
+            let line = "\(what) exposure EXIF: "
+                + ExposureMetadata.summary(exif) + " (\(scanName))"
+            print("[Export] \(line)")
+            ExportTrace.note(line)
+        }
+
         var scanIdx = 0
         for scan in scans { autoreleasepool {
             let mem = Self.memoryMB()
@@ -1340,6 +1372,12 @@ final class COLMAPExporter {
                     "\(scan.scanName).jpg"
                 )
                 try? fm.copyItem(at: src, to: dst)
+                if !iphoneExposureNoted {
+                    iphoneExposureNoted = true
+                    noteExposure(
+                        "iPhone", ExposureMetadata.subset(fileAt: src),
+                        scan.scanName)
+                }
 
                 if hasInsta360 {
                     Self.writeWhiteMask(
@@ -1365,6 +1403,12 @@ final class COLMAPExporter {
             }
             for (camId, erpURL) in scan.insta360ImageURLs {
                 let camTiles = precomputedMaskTiles[camId]
+                // Written into every tile and fisheye image of this photo.
+                let exposureExif = ExposureMetadata.subset(fileAt: erpURL)
+                if !insta360ExposureNoted {
+                    insta360ExposureNoted = true
+                    noteExposure("360", exposureExif, scan.scanName)
+                }
 
                 // Stitch to raw pixels — never creates a
                 // UIImage for the ERP, saving ~134 MB peak.
@@ -1483,6 +1527,7 @@ final class COLMAPExporter {
                             }
                         guard let src = srcPx
                         else { continue }
+                        let calib = lensCalibration(erpURL)
 
                         for isFront in [true, false] {
                             autoreleasepool {
@@ -1501,7 +1546,8 @@ final class COLMAPExporter {
                                             fisheyeRadiusFrac:
                                                 Self.fisheyeRadiusFrac,
                                             isFrontLens: isFront,
-                                            rollDeg: roll)
+                                            rollDeg: roll,
+                                            calibration: calib)
                                 else { return }
 
                                 if let cp = colorProfile {
@@ -1523,6 +1569,7 @@ final class COLMAPExporter {
                                     width: feSize,
                                     height: feSize,
                                     quality: 0.92,
+                                    exif: exposureExif,
                                     to: imgDst)
 
                                 let mskDst = masksDir
@@ -1569,6 +1616,7 @@ final class COLMAPExporter {
                                     width: feSize,
                                     height: feSize,
                                     quality: 0.92,
+                                    exif: exposureExif,
                                     to: imgDst)
 
                                 let mskDst = masksDir
@@ -1651,8 +1699,11 @@ final class COLMAPExporter {
                                 .computeFaceRotations()
                         let ts = slicer.tileSize
                         let fov = slicer.tileFovDeg
+                        // Each tile from its layout lens, through the
+                        // photo's factory calibration.
+                        let calib = lensCalibration(erpURL)
 
-                        for faceIdx in 0..<8 {
+                        for faceIdx in 0..<InstaTileLayout.count {
                             autoreleasepool {
                                 let faceDir = imagesDir
                                     .appendingPathComponent(
@@ -1680,7 +1731,11 @@ final class COLMAPExporter {
                                                 faceRots[
                                                     faceIdx],
                                             tileFovDeg: fov,
-                                            rollDeg: roll)
+                                            rollDeg: roll,
+                                            calibration: calib,
+                                            rearLens: InstaTileLayout
+                                                .views[faceIdx]
+                                                .rearLens)
                                 {
                                     if let cp =
                                         colorProfile
@@ -1696,6 +1751,7 @@ final class COLMAPExporter {
                                         width: ts,
                                         height: ts,
                                         quality: 0.92,
+                                        exif: exposureExif,
                                         to: dst)
                                 }
 
@@ -1730,7 +1786,7 @@ final class COLMAPExporter {
                         // Pre-stitched ERP — use remap
                         guard let erp = buildERPPixels()
                         else { continue }
-                        for faceIdx in 0..<8 {
+                        for faceIdx in 0..<InstaTileLayout.count {
                             autoreleasepool {
                                 let faceDir = imagesDir
                                     .appendingPathComponent(
@@ -1752,13 +1808,11 @@ final class COLMAPExporter {
                                         srcPx: erp.px,
                                         srcW: erp.w,
                                         srcH: erp.h),
-                                    let jpegData =
-                                        tile.jpegData(
-                                            compressionQuality:
-                                                0.92)
+                                    let cg = tile.cgImage
                                 {
-                                    try? jpegData.write(
-                                        to: dst)
+                                    Self.writeJPEG(
+                                        cg, quality: 0.92,
+                                        exif: exposureExif, to: dst)
                                 }
 
                                 let maskFaceDir = masksDir
@@ -1871,10 +1925,11 @@ final class COLMAPExporter {
         }
     }
 
+    /// `exif` is the source photo's exposure EXIF (ExposureMetadata).
     private static func writeJPEGFromPixels(
         _ px: inout [UInt8],
         width: Int, height: Int,
-        quality: CGFloat, to url: URL
+        quality: CGFloat, exif: [String: Any] = [:], to url: URL
     ) {
         guard let ctx = CGContext(
             data: &px, width: width, height: height,
@@ -1884,6 +1939,12 @@ final class COLMAPExporter {
             bitmapInfo: CGImageAlphaInfo
                 .noneSkipLast.rawValue
         ), let cg = ctx.makeImage() else { return }
+        writeJPEG(cg, quality: quality, exif: exif, to: url)
+    }
+
+    private static func writeJPEG(
+        _ cg: CGImage, quality: CGFloat, exif: [String: Any], to url: URL
+    ) {
         let data = NSMutableData()
         guard let dest =
             CGImageDestinationCreateWithData(
@@ -1893,8 +1954,7 @@ final class COLMAPExporter {
         else { return }
         CGImageDestinationAddImage(
             dest, cg,
-            [kCGImageDestinationLossyCompressionQuality:
-                quality] as CFDictionary
+            ExposureMetadata.jpegProperties(quality: quality, exif: exif)
         )
         guard CGImageDestinationFinalize(dest)
         else { return }
@@ -2362,7 +2422,7 @@ final class COLMAPExporter {
         let insta360ImagesPerScan: Int
         switch cameraExportMode {
         case .nativeFisheye: insta360ImagesPerScan = cameraConfig.cameras.count * 2
-        case .pinholeTiles:  insta360ImagesPerScan = cameraConfig.cameras.count * 8
+        case .pinholeTiles:  insta360ImagesPerScan = cameraConfig.cameras.count * InstaTileLayout.count
         }
 
         // Portrait intrinsics (matches cameras.bin)
@@ -2440,9 +2500,9 @@ final class COLMAPExporter {
 
             imageId += 1
             if !scan.insta360ImageURLs.isEmpty {
-                let tileCamCount = cameraConfig
-                    .cameras.count * 8
-                imageId += UInt32(tileCamCount)
+                // Same count as the skip above, so image ids match
+                // images.bin in both export modes.
+                imageId += UInt32(insta360ImagesPerScan)
             }
         }
 
@@ -2573,7 +2633,7 @@ final class COLMAPExporter {
     ) throws {
         let faceRotations = Self.computeFaceRotations()
         let iphoneCameraId: UInt32 = 1
-        let faceCount = 8
+        let faceCount = InstaTileLayout.count
         let hasInsta360 = scans.contains {
             !$0.insta360ImageURLs.isEmpty
         }
@@ -2773,14 +2833,10 @@ final class COLMAPExporter {
         return [q.real * sign, q.imag.x * sign, q.imag.y * sign, q.imag.z * sign]
     }
 
-    /// 8 equatorial face rotations (cam_from_pano) at 45° yaw steps.
-    /// Must match ERPTileSlicer.computeFaceRotations exactly.
+    /// Face rotations (cam_from_pano) of InstaTileLayout, the same as the
+    /// tiles are rendered with.
     static func computeFaceRotations() -> [simd_float3x3] {
-        (0..<8).map { i in
-            let yawRad = Float(i) * .pi / 4.0
-            let faceQuat = simd_quatf(angle: -yawRad, axis: SIMD3(0, 1, 0))
-            return simd_float3x3(faceQuat)
-        }
+        ERPTileSlicer.computeFaceRotations()
     }
 
     // MARK: - Trajectory interpolation
