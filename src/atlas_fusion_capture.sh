@@ -32,6 +32,7 @@ DOWNSAMPLE_VOXEL_SIZE=0.03        # Merged point cloud voxel downsample in metre
 COLMAP_LIDAR_VOXEL_SIZE=0.05      # LiDAR downsample before COLMAP merge in metres (0 = skip)
 FILTER_BLURRY_FRAMES=true         # remove bottom 20% of scans by sharpness before merge/ICP/COLMAP
 CALIBRATE_RIG=false               # run calibrate_rig.py after COLMAP export to correct extrinsic error
+COLMAP_BUNDLE_ADJUSTMENT=false    # refine COLMAP poses with rig-aware bundle adjustment (runs full SfM, slower)
 USE_AI_STITCH=false                # use AIFLOW stitching (better seam quality, requires model); false = OPTFLOW (best seam quality, no model needed)
 
 # Allow CLI overrides: atlas_fusion_capture.sh [--camera dual_fisheye|single_fisheye] [--capture stationary|continuous]
@@ -51,6 +52,8 @@ while [[ $# -gt 0 ]]; do
         --no-colmap) EXPORT_COLMAP=false; shift ;;
         --calibrate-rig) CALIBRATE_RIG=true; shift ;;
         --no-calibrate-rig) CALIBRATE_RIG=false; shift ;;
+        --bundle-adjustment) COLMAP_BUNDLE_ADJUSTMENT=true; shift ;;
+        --no-bundle-adjustment) COLMAP_BUNDLE_ADJUSTMENT=false; shift ;;
         --lidar-voxel-size) COLMAP_LIDAR_VOXEL_SIZE="$2"; shift 2 ;;
         --camera-hw) CAMERA_HW="$2"; shift 2 ;;
         --num-cameras) NUM_CAMERAS="$2"; shift 2 ;;
@@ -615,7 +618,12 @@ print(d.get('cameras',{}).get(f'cam_{sys.argv[1]}',{}).get('camera_hw',''))
             echo "Exporting session to COLMAP format (panorama SfM)..."
             _colmap_args=""
             [ "${COLMAP_LIDAR_VOXEL_SIZE:-0}" != "0" ] && _colmap_args="--lidar-voxel-size ${COLMAP_LIDAR_VOXEL_SIZE}"
-            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" --no-bundle-adjustment $_colmap_args
+            if [ "$COLMAP_BUNDLE_ADJUSTMENT" = "true" ]; then
+                _colmap_args="$_colmap_args --bundle-adjustment"
+            else
+                _colmap_args="$_colmap_args --no-bundle-adjustment"
+            fi
+            python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/panorama_sfm_colmap.py" "$SCAN_DIR" $_colmap_args
             if [ "$CALIBRATE_RIG" = "true" ]; then
                 echo "Running rig calibration (LiDAR-referenced extrinsic correction)..."
                 python3 "$ROS_WS_DIR/src/atlas-scanner/src/post_processing/calibrate_rig.py" "$SCAN_DIR"

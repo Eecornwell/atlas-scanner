@@ -4,9 +4,9 @@
 # Copyright (c) 2026 Orion. All rights reserved.
 #
 # Description: Generates uint16 depth images (mm) for every perspective tile in
-# the COLMAP model. Uses the non-downsampled sensor_colored_exact.ply from each
-# scan, transformed to each tile's exact camera frame via the BA-refined pose
-# from images.bin and the T_camera_lidar calibration.
+# the COLMAP model. Projects colmap/sparse/merged.ply (ERP sessions) or each
+# scan's sensor_lidar.ply (OAK-1 sessions, or without merged.ply) into each
+# image with its images.bin pose and camera. Pixels its mask leaves out get 0.
 #
 # Output: colmap/depth_images/face_XX/pano_NNN.png  (uint16, mm, same size as tiles)
 #
@@ -47,6 +47,13 @@ def _safe_src(p) -> Path:
 # Binary readers
 # ---------------------------------------------------------------------------
 
+# Number of parameters of each COLMAP camera model id, and the models whose
+# parameters start with fx, fy, cx, cy (the others start with f, cx, cy).
+_NUM_PARAMS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5,
+               10: 12, 11: 16}
+_FX_FY_MODELS = {1, 4, 5, 6, 7, 10, 11}
+
+
 def _read_cameras(path):
     cameras = {}
     with open(path, 'rb') as f:
@@ -55,10 +62,22 @@ def _read_cameras(path):
             cam_id = struct.unpack('I', f.read(4))[0]
             model  = struct.unpack('i', f.read(4))[0]
             w, h   = struct.unpack('QQ', f.read(16))
-            nparams = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 8, 7: 0}.get(model, 0)
+            nparams = _NUM_PARAMS.get(model)
+            if nparams is None:
+                raise ValueError(f'{path}: unknown camera model id {model}')
             params = list(struct.unpack(f'{nparams}d', f.read(8 * nparams)))
-            cameras[cam_id] = {'w': int(w), 'h': int(h), 'params': params}
+            cameras[cam_id] = {'w': int(w), 'h': int(h), 'model': model,
+                               'params': params}
     return cameras
+
+
+def _pinhole_intrinsics(cam):
+    """(fx, fy, cx, cy) of a camera from _read_cameras. Distortion terms are
+    ignored: the pipeline only writes SIMPLE_PINHOLE and PINHOLE cameras."""
+    p = cam['params']
+    if cam['model'] in _FX_FY_MODELS:
+        return p[0], p[1], p[2], p[3]
+    return p[0], p[0], p[1], p[2]
 
 
 def _read_images(path):
@@ -304,7 +323,7 @@ _SPLAT_RADIUS_MAX = 12                       # cap to avoid blurring thin struct
 
 
 def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
-                  rgb_guide=None):
+                  rgb_guide=None, fy=None):
     """
     Project pts_world (N,3) into the camera using sub-pixel splatting.
     Each point is projected to its exact floating-point (u,v) coordinate
@@ -312,7 +331,10 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
     eliminating the staircase jagging caused by hard integer rounding.
     A depth-adaptive Gaussian disc then fills the scan-line gap around each
     sub-pixel centre. Returns uint16 depth map in mm.
+    f_px is fx; fy defaults to it (SIMPLE_PINHOLE).
     """
+    fx = f_px
+    fy = f_px if fy is None else fy
     pts_cam = (R_w2c @ pts_world.T).T + t_w2c
 
     valid = (pts_cam[:, 2] > 0.1) & (pts_cam[:, 2] < 100.0)
@@ -323,9 +345,9 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
     # FOV cone filter: reject points outside the camera's actual field of view.
     # Without this, 360° LiDAR points from outside the FOV project into the
     # image at wrong depths, causing the depth to read too close.
-    # Half-diagonal FOV from intrinsics: angle = atan2(half_diag_px, f_px)
-    _half_diag = np.sqrt((w / 2.0) ** 2 + (h / 2.0) ** 2)
-    _max_cos = f_px / np.sqrt(f_px ** 2 + _half_diag ** 2)
+    # Half-diagonal FOV from intrinsics: tan = |(w/2 / fx, h/2 / fy)|
+    _tan_half_diag = np.hypot((w / 2.0) / fx, (h / 2.0) / fy)
+    _max_cos = 1.0 / np.sqrt(1.0 + _tan_half_diag ** 2)
     _cos_angle = pts_cam[:, 2] / np.maximum(np.linalg.norm(pts_cam, axis=1), 1e-6)
     pts_cam = pts_cam[_cos_angle >= _max_cos]
     if len(pts_cam) == 0:
@@ -333,14 +355,14 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
 
     z  = pts_cam[:, 2]
     # Exact sub-pixel projection — do NOT round yet
-    uf = pts_cam[:, 0] / z * f_px + cx
-    vf = pts_cam[:, 1] / z * f_px + cy  # f_px = fx = fy for square pixels
+    uf = pts_cam[:, 0] / z * fx + cx
+    vf = pts_cam[:, 1] / z * fy + cy
 
     in_bounds = (uf >= 0) & (uf < w) & (vf >= 0) & (vf < h)
     uf, vf, z = uf[in_bounds], vf[in_bounds], z[in_bounds]
 
     splat_r = np.clip(
-        np.round(f_px * _LIDAR_ANGULAR_GAP_RAD / z).astype(np.int32),
+        np.round(0.5 * (fx + fy) * _LIDAR_ANGULAR_GAP_RAD / z).astype(np.int32),
         _SPLAT_RADIUS_MIN, _SPLAT_RADIUS_MAX
     )
 
@@ -354,10 +376,13 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
     order = np.argsort(z)[::-1]   # far -> near
     uf, vf, z, splat_r = uf[order], vf[order], z[order], splat_r[order]
 
-    u0 = np.floor(uf).astype(np.int32)
-    v0 = np.floor(vf).astype(np.int32)
-    du = (uf - u0).astype(np.float32)
-    dv = (vf - v0).astype(np.float32)
+    # The 2x2 block (u0, u0 + 1) must straddle the projection. Pixel k spans
+    # [k, k + 1) with its centre at k + 0.5 (COLMAP), so u0 = floor(u - 0.5);
+    # floor(u) put every footprint half a pixel right of and below the point.
+    u0 = np.floor(uf - 0.5).astype(np.int32)
+    v0 = np.floor(vf - 0.5).astype(np.int32)
+    du = (uf - 0.5 - u0).astype(np.float32)
+    dv = (vf - 0.5 - v0).astype(np.float32)
 
     for r in np.unique(splat_r):
         mask = splat_r == r
@@ -381,7 +406,9 @@ def _render_depth(pts_world, R_w2c, t_w2c, f_px, cx, cy, w, h, radius=3,
                 for bdu, bdv, bw in bilinear_r:
                     vj = np.clip(v0_r + dy + bdv, 0, h - 1)
                     uj = np.clip(u0_r + dx + bdu, 0, w - 1)
-                    tw = bw  # no Gaussian weight — hard disc
+                    # No Gaussian weight — hard disc. A zero weight (point
+                    # exactly on a pixel centre) would mark the pixel empty.
+                    tw = np.maximum(bw, 1e-6)
 
                     existing = np.where(
                         weight_acc[vj, uj] > 0,
@@ -524,11 +551,13 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
             print('  ⚠ No merged.ply found, falling back to per-scan sensor_lidar.ply')
         merged_pts_colmap = None
 
+    # Same scan filter as panorama_sfm_colmap.py (camera_hw.iter_scan_dirs).
     scan_dirs = {int(d.name.split('_')[-1]): d
                  for d in sorted(session.glob('fusion_scan_*'))
                  if d.is_dir()
                  and not (d / '.blur_skip').exists()
-                 and not (d / '.corrupt_bag').exists()}
+                 and not (d / '.corrupt_bag').exists()
+                 and not (d / '.slam_diverged').exists()}
 
     by_pano = {}
     for img in images.values():
@@ -537,6 +566,7 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
             by_pano.setdefault(pi, []).append(img)
 
     n_written = 0
+    n_masked = 0
 
     for pi, img_list in sorted(by_pano.items()):
         if use_merged:
@@ -576,17 +606,11 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
         for img in img_list:
             cam   = cameras[img['camera_id']]
             w, h  = cam['w'], cam['h']
-            f_px  = cam['params'][0]  # fx for all models
             # PINHOLE (model=1): [fx, fy, cx, cy]
             # SIMPLE_PINHOLE (model=0): [f, cx, cy]
-            if len(cam['params']) >= 4:  # PINHOLE
-                cx = cam['params'][2]
-                cy = cam['params'][3]
-            else:  # SIMPLE_PINHOLE
-                cx = cam['params'][1]
-                cy = cam['params'][2]
+            fx, fy, cx, cy = _pinhole_intrinsics(cam)
 
-            # w2c from images.bin (BA-refined)
+            # w2c from images.bin
             qvec = img['qvec']   # [qw, qx, qy, qz]
             R_w2c = Rotation.from_quat(
                 [qvec[1], qvec[2], qvec[3], qvec[0]]).as_matrix()
@@ -595,11 +619,22 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
             # OAK-1: use radius=1 (single pixel, no splatting) to avoid
             # near-point area bias. Large splat radii cause near points to
             # cover more pixels than far points, pulling mean depth too close.
-            rel = img['name']  # e.g. face_00/pano_001.png
+            rel = img['name']  # e.g. face_00/pano_001.jpg
             _is_oak1_img = (w != h)  # OAK-1 is non-square (1920x1080)
             _render_radius = 1 if _is_oak1_img else radius
-            depth_img = _render_depth(pts_colmap, R_w2c, t_w2c, f_px, cx, cy, w, h,
-                                      radius=_render_radius)
+            depth_img = _render_depth(pts_colmap, R_w2c, t_w2c, fx, cx, cy, w, h,
+                                      radius=_render_radius, fy=fy)
+            # Pixels the image's mask leaves out (scanner body, padding, the
+            # OAK-1 undistortion border) get no depth, as they get no colour.
+            # panorama_sfm_colmap.py writes masks/<image name>.png, 0 = masked.
+            _mask_file = session / 'colmap' / 'masks' / (rel + '.png')
+            if _mask_file.exists():
+                _mask = cv2.imread(str(_mask_file), cv2.IMREAD_GRAYSCALE)
+                if _mask is not None and _mask.shape == depth_img.shape:
+                    depth_img[_mask < 128] = 0
+                    n_masked += 1
+                else:
+                    print(f'  ⚠ {rel}: mask size does not match the depth image, not applied')
             # Only pad/resize if this is an ERP tile that needs to match the
             # canonical square size. OAK-1 pinhole images (w != h) are written
             # at their native resolution — padding them to a square squashes
@@ -621,7 +656,9 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
                 pad_y = (canonical_size - src_h) // 2
                 canvas[pad_y:pad_y + src_h, pad_x:pad_x + src_w] = depth_img
                 depth_img = canvas
-            out   = depth_root / rel
+            # 16-bit PNG named after the image stem (face_00/pano_001.png),
+            # whatever the image format.
+            out   = (depth_root / rel).with_suffix('.png')
             out.parent.mkdir(parents=True, exist_ok=True)
             try:
                 _safe_data(out)
@@ -632,7 +669,8 @@ def generate_depth_images(session_dir, sparse_subdir='colmap/sparse/0', radius=3
 
         print(f'    wrote {len(img_list)} depth tiles')
 
-    print(f'\n✓ {n_written} depth images -> {depth_root}')
+    print(f'\n✓ {n_written} depth images -> {depth_root} '
+          f'({n_masked} with masked pixels cleared)')
 
 
 if __name__ == '__main__':

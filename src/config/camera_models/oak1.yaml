@@ -11,3 +11,6 @@ image_height: 1080
 # No lidar_mask_dual — the OAK-1 has no scanner body in its field of view.
 # Display name
 display_name: "Luxonis OAK-1"
+# Lens f-number, written to the EXIF of the COLMAP images. The OAK-1 doesn't
+# report it; set it from the camera module's datasheet, e.g. f_number: 1.8
+# f_number:

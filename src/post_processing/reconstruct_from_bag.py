@@ -198,6 +198,45 @@ def interp_pose(all_odom, target_stamp):
     return t_interp, q_interp
 
 
+def imu_motion_score(imu_msgs):
+    """Function t -> mean angular rate |w| (rad/s) of the Livox IMU over the
+    0.5 s around t (Livox clock), or None without samples there. This is the
+    trajectory.json scan_info.motion_score that filter_blurry_scans.py
+    --max-motion compares; it was never filled in, so that filter did nothing."""
+    if not imu_msgs:
+        return lambda t, window=0.5: None
+    ts = np.array([t for t, _ in imu_msgs], dtype=np.float64)
+    w = np.array([(m.angular_velocity.x, m.angular_velocity.y, m.angular_velocity.z)
+                  for _, m in imu_msgs], dtype=np.float64)
+    rates = np.sqrt((w ** 2).sum(axis=1))
+    order = np.argsort(ts, kind='stable')
+    ts, rates = ts[order], rates[order]
+
+    def score(t, window=0.5):
+        i0 = np.searchsorted(ts, t - window / 2.0, side='left')
+        i1 = np.searchsorted(ts, t + window / 2.0, side='right')
+        return float(rates[i0:i1].mean()) if i1 > i0 else None
+    return score
+
+
+def record_motion_score(scan_dir, score):
+    """Set scan_info.motion_score in an existing trajectory.json (the live
+    recorder's has none). Returns True if written."""
+    if score is None:
+        return False
+    traj_path = Path(scan_dir) / "trajectory.json"
+    tmp_path = traj_path.with_name("trajectory.json.tmp")
+    try:
+        data = json.loads(traj_path.read_text())
+        data.setdefault("scan_info", {})["motion_score"] = float(score)
+        tmp_path.write_text(json.dumps(data, indent=2))
+        os.replace(tmp_path, traj_path)
+        return True
+    except (OSError, ValueError, AttributeError) as e:
+        print(f"  ⚠ Could not record motion score in {traj_path}: {e}")
+        return False
+
+
 def write_trajectory_json(scan_dir, scan_name, capture_stamp, all_odom, motion_score=None):
     """Interpolate odometry at capture_stamp and write trajectory.json."""
     t_interp, q_interp = interp_pose(all_odom, capture_stamp)
@@ -490,6 +529,9 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
     lidar_msgs, _ = read_topic(con, topics, "/livox/lidar")
     image_msgs_raw, _ = read_topic(con, topics, "fisheye")
     odom_msgs, _ = read_topic(con, topics, "/rko_lio/odometry")
+    # Per-scan bags record /livox/imu too (atlas_fusion_capture.sh).
+    imu_msgs, _ = read_topic(con, topics, "/livox/imu")
+    motion_score_of = imu_motion_score(imu_msgs)
 
     # Estimate host→Livox clock offset from this bag so the capture_time
     # sidecar (host clock) can be converted to Livox hardware time.
@@ -668,16 +710,40 @@ def _reconstruct_one_bag(session_path, bag_dir, camera_mode, lidar_window=0.3):
                 bgr = decode_jpeg_frame(image_msgs_raw[mid_idx][1])
             if bgr is not None:
                 out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
-                cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
                 print(f"  Saved {img_out.name}")
         else:
             print(f"  fisheye image already exists, skipping")
 
     # --- Odometry: write trajectory.json centred on shutter time ---
+    _mscore = motion_score_of(centre)
     if odom_msgs and not (scan_dir / "trajectory.json").exists():
         write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs,
-                              motion_score=motion_score_at(centre) if 'motion_score_at' in dir() else None)
+                              motion_score=_mscore)
         print(f"  Saved trajectory.json (centred on shutter time)")
+    elif (scan_dir / "trajectory.json").exists() and record_motion_score(scan_dir, _mscore):
+        print(f"  Motion score {_mscore:.3f} rad/s recorded in trajectory.json")
+    if _mscore is None:
+        print(f"  ⚠ No IMU samples near the shutter time — no motion score")
+
+    # Co-located camera scans (same stop, no bag of their own, as above): the
+    # motion at each one's own shutter time, if this bag covers it.
+    if centre_host is not None:
+        for _other in sorted(session_path.glob("fusion_scan_*")):
+            if (_other == scan_dir or not _other.is_dir()
+                    or any(_other.glob("rosbag_*"))
+                    or not (_other / "trajectory.json").exists()):
+                continue
+            _ct_f = next(iter(sorted(_other.glob("*.insp.capture_time"))), None)
+            if _ct_f is None:
+                continue
+            try:
+                _other_ct = float(_ct_f.read_text().strip().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue
+            if abs(_other_ct - centre_host) <= 12.0:
+                record_motion_score(
+                    _other, motion_score_of(_other_ct - _host_to_livox_offset))
 
     return True
 
@@ -760,6 +826,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                   f"(~{len(imu_msgs)/(imu_msgs[-1][0]-imu_msgs[0][0]):.0f}Hz)")
     except (OSError, ValueError, KeyError, TypeError, RuntimeError) as e:
         print(f"  ⚠ Could not load IMU data: {e} — gyro filter disabled")
+    motion_score_of = imu_motion_score(imu_msgs)
 
     # Load IMU-derived clock offset if available (produced by imu_sync.py).
     # Only applied when confidence >= 0.7 — below that the cross-correlation
@@ -1397,7 +1464,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 bgr = decode_jpeg_frame(image_msgs_raw[img_idx][1])
             if bgr is not None:
                 out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
-                cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
                 fisheye_path = str(img_out)
         elif image_msgs_raw and img_idx is None:
             # LiDAR-fallback path: find closest image
@@ -1408,7 +1475,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 bgr = decode_jpeg_frame(img_msg_fb)
                 if bgr is not None:
                     out_img = bgr if camera_mode == "dual_fisheye" else extract_back_fisheye(bgr)
-                    cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    cv2.imwrite(str(img_out), out_img, [cv2.IMWRITE_JPEG_QUALITY, 100])
                     fisheye_path = str(img_out)
 
         # --- Odometry: write trajectory.json at camera frame stamp; save motion-compensated world cloud ---
@@ -1418,7 +1485,10 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
             dt_odom = abs(odom_stamp - centre)
             if dt_odom < 5.0:
                 # trajectory pose is interpolated at the shutter time (centre)
-                _mscore = motion_score_at(centre) if 'motion_score_at' in dir() else None
+                # motion_score_at only exists for bags with a camera stream;
+                # SDK-stitch bags have none, so use the IMU rate directly.
+                _mscore = (motion_score_at(centre) if 'motion_score_at' in dir()
+                           else motion_score_of(centre))
                 write_trajectory_json(str(scan_dir), scan_name, centre, odom_msgs,
                                       motion_score=_mscore)
                 if world_points:
@@ -1635,7 +1705,8 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
                 _odom_t1 = odom_msgs[-1][0]
                 if _odom_t0 <= _oak1_livox_t <= _odom_t1:
                     write_trajectory_json(str(_oak1_scan), _oak1_scan.name,
-                                          _oak1_livox_t, odom_msgs)
+                                          _oak1_livox_t, odom_msgs,
+                                          motion_score=motion_score_of(_oak1_livox_t))
             elif _best_x5 is not None:
                 _traj = _best_x5 / 'trajectory.json'
                 if _traj.exists() and not (_oak1_scan / 'trajectory.json').exists():
@@ -1673,7 +1744,7 @@ def reconstruct(session_dir, interval=3.0, lidar_window=2.0, camera_mode="single
         img_f[:,:,0] = np.clip(img_f[:,:,0] * scale_b, 0, 255)
         img_f[:,:,1] = np.clip(img_f[:,:,1] * scale_g, 0, 255)
         img_f[:,:,2] = np.clip(img_f[:,:,2] * scale_r, 0, 255)
-        cv2.imwrite(str(img_path), img_f.astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(img_path), img_f.astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 100])
         print(f"    WB corrected: B/R {b_mean/r_mean:.2f}\u2192{scale_b/scale_r:.2f}  ({img_path.name})")
 
     if camera_mode == "dual_fisheye" or (sdk_stitch and sdk_stitch_bin.exists()):

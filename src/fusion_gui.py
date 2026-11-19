@@ -686,9 +686,12 @@ class FusionCaptureGUI:
         self.colmap_sfm_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="  COLMAP full SfM (slow, poses-only default)",
                         variable=self.colmap_sfm_var).grid(row=10, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
+        self.colmap_ba_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(mode_frame, text="  COLMAP bundle adjustment (runs full SfM)",
+                        variable=self.colmap_ba_var).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
         self.calibrate_rig_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(mode_frame, text="  Calibrate rig after COLMAP (correct extrinsic error)",
-                        variable=self.calibrate_rig_var).grid(row=11, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
+                        variable=self.calibrate_rig_var).grid(row=12, column=0, columnspan=2, sticky=tk.W, pady=(0, 0))
         self.capture_mode_var.trace_add('write', self._on_capture_mode_changed)
 
         self.start_button = ttk.Button(control_frame, text="Start System",
@@ -796,12 +799,15 @@ class FusionCaptureGUI:
         ttk.Checkbutton(btn_frame, text="Calibrate rig after export (correct extrinsic error)",
                         variable=self.calibrate_rig_var).grid(
             row=10, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
+        ttk.Checkbutton(btn_frame, text="Bundle adjustment (runs full SfM)",
+                        variable=self.colmap_ba_var).grid(
+            row=11, column=0, columnspan=2, sticky=tk.W, padx=6, pady=(0, 2))
         # ── Viewers ───────────────────────────────────────────────────────
-        _pp_sep(11, "Viewers")
-        _pp_btn(13, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
-        _pp_btn(13, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
-        _pp_btn(14, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
-        _pp_btn(14, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
+        _pp_sep(12, "Viewers")
+        _pp_btn(14, 0, "View Point Cloud (Web)",       self._pp_web_viewer)
+        _pp_btn(14, 1, "Per-Scan Alignment Viewer",    self._pp_toggle_viewer)
+        _pp_btn(15, 0, "COLMAP Viewer",               self._pp_colmap_viewer)
+        _pp_btn(15, 1, "Depth-RGB Overlay",           self._pp_depth_overlay)
 
         # Output log for post-processing tab
         self._pp_log = scrolledtext.ScrolledText(pp_tab, font=('Consolas', 8), height=10, state='disabled')
@@ -1144,6 +1150,7 @@ class FusionCaptureGUI:
             'icp':               self.icp_var.get(),
             'colmap':            self.colmap_var.get(),
             'colmap_sfm':        self.colmap_sfm_var.get(),
+            'colmap_ba':         self.colmap_ba_var.get(),
             'calibrate_rig':     self.calibrate_rig_var.get(),
             'interval':          self.interval_var.get(),
         }
@@ -1254,6 +1261,7 @@ class FusionCaptureGUI:
             cmd += ['--interval', str(_interval)]
             cmd.append('--icp' if params['icp'] else '--no-icp')
             cmd.append('--colmap' if params['colmap'] else '--no-colmap')
+            cmd.append('--bundle-adjustment' if params['colmap_ba'] else '--no-bundle-adjustment')
             cmd.append('--calibrate-rig' if params['calibrate_rig'] else '--no-calibrate-rig')
             self.fusion_process = subprocess.Popen(
                 cmd,
@@ -2087,8 +2095,9 @@ class FusionCaptureGUI:
     def _pp_colmap(self):
         sess = self._pp_session()
         if not sess: self._pp_log_write("\n[!] No session selected.\n"); return
+        _ba = bool(getattr(self, 'colmap_ba_var', None) and self.colmap_ba_var.get())
         cmd = [sys.executable, str(self.script_dir / 'post_processing/panorama_sfm_colmap.py'), sess,
-               '--no-bundle-adjustment']
+               '--bundle-adjustment' if _ba else '--no-bundle-adjustment']
         if getattr(self, 'colmap_sfm_var', None) and self.colmap_sfm_var.get():
             cmd.append('--sfm')
         voxel = getattr(self, 'colmap_lidar_voxel_size', 0.0)
@@ -2999,6 +3008,7 @@ def main():
     default_outdoor = False
     default_interval = 5
     default_calibrate_rig = False
+    default_colmap_ba = False
     try:
         for line in script.read_text().splitlines():
             line = line.strip()
@@ -3024,6 +3034,8 @@ def main():
                 except ValueError: pass
             elif line.startswith('CALIBRATE_RIG=') and '#' not in line.split('CALIBRATE_RIG=')[0]:
                 default_calibrate_rig = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
+            elif line.startswith('COLMAP_BUNDLE_ADJUSTMENT='):
+                default_colmap_ba = line.split('=', 1)[1].split('#')[0].strip('"\' ').lower() == 'true'
             if line.startswith('while'):
                 break  # stop before the CLI override block
     except OSError:
@@ -3052,6 +3064,7 @@ def main():
     app.outdoor_var.set(default_outdoor)
     app.colmap_lidar_voxel_size = default_colmap_lidar_voxel
     app.calibrate_rig_var.set(default_calibrate_rig)
+    app.colmap_ba_var.set(default_colmap_ba)
     app.interval_var.set(str(default_interval))
     app._on_capture_mode_changed()
     root.protocol("WM_DELETE_WINDOW", app.on_closing)

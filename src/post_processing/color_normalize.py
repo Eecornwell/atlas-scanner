@@ -500,7 +500,7 @@ def normalize_session(session_dir: str):
         # so the L-channel gain doesn't re-amplify noise before writing.
         if scan_hw == 'x3':
             cv2.fastNlMeansDenoisingColored(corrected, corrected, 4.0, 4.0, 7, 21)
-        cv2.imwrite(str(erp), corrected, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(erp), corrected, [cv2.IMWRITE_JPEG_QUALITY, 100])
         (scan_dir / '.color_normalized').write_text(str(cam_idx))
         normalized += 1
 

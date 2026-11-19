@@ -21,6 +21,12 @@ import yaml
 import cv2
 from pathlib import Path
 from scipy.spatial.transform import Rotation as R
+try:
+    from jpeg_exif import read_exif, write_jpeg
+except ImportError:  # loaded by path without post_processing/ on sys.path
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from jpeg_exif import read_exif, write_jpeg
 
 _ALLOWED_DATA = Path(os.path.expanduser("~/atlas_ws/data")).resolve()
 _ALLOWED_SRC  = Path(os.path.expanduser("~/atlas_ws/src")).resolve()
@@ -65,9 +71,12 @@ NUM_FACES = len(FACES)
 REF_FACE = 0  # front is ref — must be first in cameras array for rig_configurator
 
 # Face indices for each camera mode.
-# For 180° single fisheye, exclude back-facing faces.
+# The SDK ERP has the front lens at the centre (u = W/2) and the back lens at
+# the wrap (u = 0/W). Single fisheye uses the back lens only:
+# regenerate_masked_images.py masks the front-lens half (W/4..3W/4), so the
+# front face would be fully masked and the back face is the lens centre.
 FACES_360 = list(range(NUM_FACES))
-FACES_180 = [i for i in range(NUM_FACES) if 'back' not in FACES[i]['name']]
+FACES_180 = [i for i in range(NUM_FACES) if FACES[i]['name'] != 'front']
 FOV_DEG = 90.0               # 90° FOV: matches reference panorama_sfm.py.
                              # Maximises tile overlap for better SIFT matching.
 MIN_BASELINE_M = 0.10
@@ -190,6 +199,66 @@ def _load_pose(scan_dir, T_camera_lidar):
     return R_ROS2COLMAP @ C_ros, R_ROS2COLMAP @ R_c2w_ros, R_c2w_ros
 
 
+def _erp_exif(scan_dir, erp_src=None):
+    """EXIF capture settings for a scan's ERP tiles, from the .insp the ERP
+    was stitched from (insta360_stitch re-encodes the ERP without EXIF);
+    falls back to the ERP file itself. {} if neither has any."""
+    for src in sorted(Path(scan_dir).glob('*.insp')) + ([Path(erp_src)] if erp_src else []):
+        tags = read_exif(src)
+        if tags:
+            return tags
+    return {}
+
+
+def _oak1_exif(img_src):
+    """EXIF capture settings for an OAK-1 image, from the exposure sidecar
+    that oak1_capture.py writes next to it (oak1_<time>_exposure.yaml)."""
+    tags = {'Make': 'Luxonis', 'Model': 'OAK-1'}
+    img_src = Path(img_src)
+    side = img_src.with_name(img_src.stem.replace('_undistorted', '') + '_exposure.yaml')
+    try:
+        meta = yaml.safe_load(side.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        meta = {}
+    try:
+        if meta.get('exposure_time_s'):
+            tags['ExposureTime'] = float(meta['exposure_time_s'])
+        if meta.get('iso'):
+            tags['ISOSpeedRatings'] = int(meta['iso'])
+        if 'ExposureTime' in tags:
+            # oak1_capture.py runs auto exposure and auto white balance.
+            tags.update(ExposureProgram=2, ExposureMode=0, WhiteBalance=0)
+        if meta.get('capture_time'):
+            from datetime import datetime as _dt
+            t = _dt.fromtimestamp(float(meta['capture_time']))
+            tags['DateTimeOriginal'] = t.strftime('%Y:%m:%d %H:%M:%S')
+            tags['SubsecTimeOriginal'] = f'{t.microsecond // 1000:03d}'
+    except (TypeError, ValueError, OverflowError, OSError):
+        pass
+    if _oak1_f_number():
+        tags['FNumber'] = _oak1_f_number()
+    return tags
+
+
+_OAK1_F_NUMBER = []
+
+
+def _oak1_f_number():
+    """f_number from camera_models/oak1.yaml (the OAK-1 doesn't report its
+    aperture), or None. Read once."""
+    if not _OAK1_F_NUMBER:
+        value = None
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from camera_hw import load_camera_profile
+            value = float(load_camera_profile('oak1').get('f_number') or 0) or None
+        except (OSError, ImportError, TypeError, ValueError):
+            pass
+        _OAK1_F_NUMBER.append(value)
+    return _OAK1_F_NUMBER[0]
+
+
 def _find_erp_image(scan_dir):
     """Return (rgb_path, mask_path, is_360).
     Always use the unmasked JPG for RGB to avoid hard mask edges causing
@@ -289,7 +358,8 @@ def _erp_to_perspective(erp_img, cam_from_pano_r, tile_size,
 
 def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size):
     """Add OAK-1 pinhole images from a mixed session into face_oak1/.
-    Copies undistorted PNGs directly with native intrinsics — no reprojection.
+    Writes the undistorted images as JPEG with exposure EXIF, native
+    intrinsics, no reprojection.
     Called after ERP tiling so both camera types end up in COLMAP."""
     images_dir = colmap_dir / 'images' / 'face_oak1'
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -319,8 +389,10 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
         sx, sy = iw / ci['width'], ih / ci['height']
         fx  = ci['fx'] * sx
         fy  = ci['fy'] * sy
-        cx_k = ci['cx'] * sx
-        cy_k = ci['cy'] * sy
+        # The yaml holds OpenCV intrinsics (pixel centres at integers); COLMAP
+        # puts pixel centres at +0.5, as the ERP tiles here do.
+        cx_k = (ci['cx'] + 0.5) * sx
+        cy_k = (ci['cy'] + 0.5) * sy
         f_px = (fx + fy) / 2.0
 
         T_scan = _load_calibration_for_scan(scan_dir, session_path)
@@ -330,7 +402,7 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
         C_col, R_c2w_col, R_c2w_ros = pose
 
         scan_num = int(scan_dir.name.split('_')[-1])
-        fname = f"pano_{scan_num:03d}.png"
+        fname = f"pano_{scan_num:03d}.jpg"
         dst = images_dir / fname
 
         # Pad image to canonical square size, centering content
@@ -340,6 +412,7 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             # Center crop if larger than canvas
             _img = img
             _ih, _iw = ih, iw
+            _x0 = _y0 = 0
             if _iw > _cs:
                 _x0 = (_iw - _cs) // 2
                 _img = _img[:, _x0:_x0 + _cs]
@@ -352,13 +425,16 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             _pad_y = (_cs - _ih) // 2
             canvas[_pad_y:_pad_y + _ih, _pad_x:_pad_x + _iw] = _img
             out_img = canvas
-            # Adjust principal point for padding
-            cx_k = cx_k * (_iw / iw) + _pad_x
-            cy_k = cy_k * (_ih / ih) + _pad_y
+            # Cropping and padding shift the pixels without scaling them, so
+            # the principal point moves by the same offsets and fx/fy stay.
+            # (Scaling cx by the kept width instead put the scanner's 1920 px
+            # OAK-1 images, cropped to 1536 px, about 6 px or 0.2 deg off.)
+            cx_k = cx_k - _x0 + _pad_x
+            cy_k = cy_k - _y0 + _pad_y
         else:
             out_img = img
             _pad_x, _pad_y = 0, 0
-        cv2.imwrite(str(dst), out_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        write_jpeg(dst, out_img, _oak1_exif(img_src))
 
         # Copy undistorted mask if present, also padded to canonical size
         mask_src = scan_dir / (img_src.stem.replace('_undistorted', '_undistorted_mask') + '.png')
@@ -402,9 +478,10 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
             'R_c2w': R_c2w_col,
             'R_c2w_ros': R_c2w_ros,
             'f_px': f_px,
+            'fx': fx, 'fy': fy,
             'tile_size': _cs,
             'img_w': _cs, 'img_h': _cs,
-            # cx/cy adjusted for padding
+            # cx/cy adjusted for crop and padding
             'cx': cx_k, 'cy': cy_k,
             'active_faces': [0],
             'tiles': [{
@@ -425,7 +502,7 @@ def _prepare_images_pinhole_extra(session_path, colmap_dir, scan_dirs, tile_size
 
 def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
     """Prepare COLMAP images for a pinhole (OAK-1) session.
-    Copies undistorted PNGs directly — no ERP tiling needed.
+    Writes the undistorted images as JPEG with exposure EXIF — no ERP tiling.
     Returns panorama list compatible with the rest of the pipeline."""
     images_dir = colmap_dir / 'images' / 'face_00'
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -433,7 +510,8 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
     scan_dirs = sorted(d for d in session_path.iterdir()
                        if d.is_dir() and d.name.startswith('fusion_scan_')
                        and not (d / '.blur_skip').exists()
-                       and not (d / '.corrupt_bag').exists())
+                       and not (d / '.corrupt_bag').exists()
+                       and not (d / '.slam_diverged').exists())
 
     panoramas = []
     for scan_dir in scan_dirs:
@@ -467,9 +545,11 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
         sx, sy = iw / ci['width'], ih / ci['height']
         fx = ci['fx'] * sx
         fy = ci['fy'] * sy
-        cx_k = ci['cx'] * sx
-        cy_k = ci['cy'] * sy
-        # Use mean focal length as SIMPLE_PINHOLE f
+        # OpenCV intrinsics (pixel centres at integers) to COLMAP's (+0.5).
+        cx_k = (ci['cx'] + 0.5) * sx
+        cy_k = (ci['cy'] + 0.5) * sy
+        # Mean focal length, for code that needs one value; COLMAP gets the
+        # PINHOLE camera with fx and fy.
         f_px = (fx + fy) / 2.0
 
         T_scan = _load_calibration_for_scan(scan_dir, session_path)
@@ -482,10 +562,9 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
         # map pano_NNN back to fusion_scan_NNN without ambiguity when blurry
         # scans are skipped (sequential numbering would misalign poses and depth).
         scan_num = int(scan_dir.name.split('_')[-1])
-        fname = f"pano_{scan_num:03d}.png"
+        fname = f"pano_{scan_num:03d}.jpg"
         dst = images_dir / fname
-        import shutil as _shutil
-        _shutil.copy2(str(img_src), str(dst))
+        write_jpeg(dst, img, _oak1_exif(img_src))
 
         R_w2c = R_c2w_col.T
         T_tile = -R_w2c @ C_col
@@ -500,6 +579,7 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
             'R_c2w': R_c2w_col,
             'R_c2w_ros': R_c2w_ros,
             'f_px': f_px,
+            'fx': fx, 'fy': fy,
             'tile_size': iw,      # full image width
             'cx': cx_k, 'cy': cy_k,
             'img_w': iw, 'img_h': ih,
@@ -516,7 +596,7 @@ def _prepare_images_pinhole(session_path, colmap_dir, T_camera_lidar):
         print('  No OAK-1 undistorted images found')
         return []
 
-    print(f'  OAK-1 pinhole: {len(panoramas)} images copied to face_00/')
+    print(f'  OAK-1 pinhole: {len(panoramas)} images written to face_00/')
     print(f'  f_px={panoramas[0]["f_px"]:.1f}  '
           f'cx={panoramas[0]["cx"]:.1f}  cy={panoramas[0]["cy"]:.1f}')
     return panoramas
@@ -530,9 +610,17 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
     if mask_dir.exists():
         shutil.rmtree(mask_dir)
 
+    # Scans whose odometry diverged (.slam_diverged, reconstruct_from_bag.py)
+    # have unreliable poses: merge_with_trajectory.py leaves them out, and so
+    # does the COLMAP model (camera_hw.iter_scan_dirs filter).
     scan_dirs = sorted(d for d in session_path.iterdir()
                        if d.is_dir() and d.name.startswith('fusion_scan_')
-                       and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists())
+                       and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()
+                       and not (d / '.slam_diverged').exists())
+    _diverged = sorted(d.name for d in session_path.glob('fusion_scan_*')
+                       if (d / '.slam_diverged').exists())
+    if _diverged:
+        print(f"  Leaving out {len(_diverged)} SLAM-diverged scans: {', '.join(_diverged)}")
 
     panoramas = []
     session_is_360 = None
@@ -707,22 +795,24 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
         # so each folder contains only one tile size (single_camera_per_folder).
         _face_subfolder_suffix = f'_cam{_pano_cam_idx}' if _multi_cam else ''
 
-        # Apply a seam exclusion strip to the mask. The dual-fisheye stitch seam
-        # runs vertically at the left/right ERP edges (u=0 and u=W, which wrap).
-        # DYNAMICSTITCH blending distorts features in a ~5% horizontal band on
-        # each side. Mask these out so SIFT doesn't match warped features.
+        # Apply seam exclusion strips to the mask. The SDK ERP has the front
+        # lens at the centre and the back lens at the wrap (u=0/W), so the two
+        # stitch seams run vertically at u=W/4 and u=3W/4 (yaw -90 and +90).
+        # Each lens sees about 15° past 90°, and the SDK warps and blends
+        # inside that overlap; parts of the rig that sit near a seam show up
+        # as ghosts. Mask 4% of the width on each side of both seams (±14.4°)
+        # so SIFT and the trainer don't use blended pixels.
         if erp_img is not None:
             _erp_w = erp_img.shape[1]
             _erp_h = erp_img.shape[0]
-            _seam_strip = int(_erp_w * 0.04)  # 4% on each side of the wrap seam
+            _seam_strip = int(_erp_w * 0.04)  # 4% on each side of each seam
             if erp_mask is None:
                 erp_mask = np.full(erp_img.shape[:2], 255, dtype=np.uint8)
-            erp_mask[:, :_seam_strip] = 0
-            erp_mask[:, _erp_w - _seam_strip:] = 0
-            # Single fisheye: mask the ERP poles where the Insta360 SDK stitches
-            # the back fisheye into the top/bottom of the ERP. The stitch seam
-            # at the poles creates a horizontal band of distortion/blending
-            # artifacts that degrade SIFT feature quality.
+            for _seam_u in (_erp_w // 4, 3 * _erp_w // 4):
+                erp_mask[:, _seam_u - _seam_strip:_seam_u + _seam_strip] = 0
+            # Single fisheye: also mask the ERP poles. Both poles lie on the
+            # seam circle, at the edge of the back lens's view, where the SDK
+            # fills in from the front lens.
             # 10% of ERP height (~18° from each pole) covers the worst artifacts.
             if not pano.get('is_360', True):
                 _pole_strip = int(_erp_h * 0.10)
@@ -735,6 +825,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             erp_img = cv2.addWeighted(erp_img, 1.4, _blur, -0.4, 0)
 
         R_cam_w2c_col = pano['R_c2w'].T
+        _exif = _erp_exif(pano['scan_dir'], pano['erp_src'])
         tiles = []
         for face_idx in active_faces:
             cam_from_pano_r = FACES_CAM_FROM_PANO[face_idx]
@@ -757,7 +848,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
             elif feather_mask is not None:
                 tile_mask = feather_mask
 
-            fname = f"pano_{pano['scan_num']:03d}.png"
+            fname = f"pano_{pano['scan_num']:03d}.jpg"
             _subfolder = f'face_{face_idx:02d}{_face_subfolder_suffix}'
 
             # Pad smaller tiles to the canonical size so all images in the
@@ -786,7 +877,7 @@ def prepare_images(session_path, colmap_dir, T_camera_lidar):
                     _out_mask = np.zeros((_canonical_tile_size, _canonical_tile_size), dtype=np.uint8)
                     _out_mask[_pad_y:_pad_y + tile_size, _pad_x:_pad_x + tile_size] = 255
 
-            cv2.imwrite(str(images_dir / _subfolder / fname), _out_tile)
+            write_jpeg(images_dir / _subfolder / fname, _out_tile, _exif)
             if _out_mask is not None:
                 cv2.imwrite(str(mask_dir / _subfolder / f'{fname}.png'), _out_mask)
 
@@ -924,6 +1015,8 @@ def write_rig_config(colmap_dir, panoramas):
         oak1_panos = [p for p in panoramas if 'cx' in p]
         if oak1_panos:
             oak1_fpx = oak1_panos[0]['f_px']
+            oak1_fx  = oak1_panos[0].get('fx', oak1_fpx)
+            oak1_fy  = oak1_panos[0].get('fy', oak1_fpx)
             oak1_cx  = oak1_panos[0]['cx']
             oak1_cy  = oak1_panos[0]['cy']
             # Add ERP slices as a sensor in the ERP rig — they are rendered at
@@ -941,10 +1034,11 @@ def write_rig_config(colmap_dir, panoramas):
             rigs.append({"cameras": [{
                 "image_prefix": "face_oak1/",
                 "camera_model_name": "PINHOLE",
-                "camera_params": [oak1_fpx, oak1_fpx, oak1_cx, oak1_cy],
+                "camera_params": [oak1_fx, oak1_fy, oak1_cx, oak1_cy],
                 "ref_sensor": True,
             }]})
-            print(f"  OAK-1 rig: PINHOLE f={oak1_fpx:.1f} cx={oak1_cx:.1f} cy={oak1_cy:.1f}")
+            print(f"  OAK-1 rig: PINHOLE fx={oak1_fx:.1f} fy={oak1_fy:.1f} "
+                  f"cx={oak1_cx:.1f} cy={oak1_cy:.1f}")
 
     with open(rig_config_path, 'w') as f:
         json.dump(rigs, f, indent=2)
@@ -1488,7 +1582,7 @@ def _merge_point_clouds(lidar_ply, colmap_ply, output_ply, transform_lidar=True,
 
     lidar_pts = np.asarray(lidar_pcd.points)
     lidar_cols = (np.asarray(lidar_pcd.colors) * 255).astype(int) if lidar_pcd.has_colors() \
-                 else np.zeros((len(lidar_pts), 3), int)
+                 else np.full((len(lidar_pts), 3), 128, int)
     if transform_lidar:
         lidar_pts = (R_ROS2COLMAP @ lidar_pts.T).T
 
@@ -1546,12 +1640,13 @@ def _write_merged_to_points3d(output_dir, lidar_pts_world, lidar_cols_world, lid
 
 
 def _write_oak1_list(colmap_dir):
-    """Write a text file listing face_oak1/*.png for COLMAP image_list_path."""
+    """Write a text file listing the face_oak1/ images for COLMAP image_list_path."""
     oak1_dir = colmap_dir / 'images' / 'face_oak1'
     list_path = colmap_dir / 'oak1_image_list.txt'
     with open(list_path, 'w') as f:
-        for img in sorted(oak1_dir.glob('*.png')):
-            f.write(f'face_oak1/{img.name}\n')
+        for img in sorted(oak1_dir.iterdir()):
+            if img.suffix.lower() in ('.jpg', '.jpeg', '.png'):
+                f.write(f'face_oak1/{img.name}\n')
     return list_path
 
 
@@ -1709,6 +1804,108 @@ def _strip_rig_from_db(db_path):
 
 
 
+def _read_image_poses(images_bin):
+    """Return {name: (R_w2c, t_w2c)} from a COLMAP images.bin."""
+    poses = {}
+    with open(images_bin, 'rb') as f:
+        n = struct.unpack('Q', f.read(8))[0]
+        for _ in range(n):
+            f.read(4)  # image_id
+            qw, qx, qy, qz = struct.unpack('dddd', f.read(32))
+            t = np.array(struct.unpack('ddd', f.read(24)))
+            f.read(4)  # camera_id
+            name = b''
+            while True:
+                c = f.read(1)
+                if c in (b'\x00', b''):
+                    break
+                name += c
+            npts = struct.unpack('Q', f.read(8))[0]
+            f.seek(npts * 24, 1)
+            poses[name.decode()] = (R.from_quat([qx, qy, qz, qw]).as_matrix(), t)
+    return poses
+
+
+def _colmap_has_option(command, option):
+    """True if `colmap <command> -h` lists the option."""
+    try:
+        out = subprocess.run(['colmap', command, '-h'], capture_output=True,
+                             text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return option in (out.stdout or '') + (out.stderr or '')
+
+
+def _run_rig_bundle_adjustment(colmap_dir, db_path, rig_config_path, output_dir):
+    """Refine the triangulated model with rig-aware bundle adjustment.
+
+    bundle_adjuster takes rigs and frames from the model, not the database,
+    and point_triangulator's model has one frame per image: without a rig each
+    tile would be refined on its own and the tiles of a panorama would drift
+    apart. rig_configurator with --input_path/--output_path rebuilds the
+    model's rigs and frames from rig_config.json (the known face rotations),
+    then bundle_adjuster refines one pose per frame with the face rotations
+    and intrinsics held fixed. If COLMAP fails, output_dir keeps the
+    triangulated model with the LiDAR poses. Returns True on success."""
+    before = _read_image_poses(output_dir / 'images.bin')
+    rigged_dir = colmap_dir / 'sparse_rigged'
+    if rigged_dir.exists():
+        shutil.rmtree(rigged_dir)
+    rigged_dir.mkdir(parents=True)
+    # point_triangulator's rigs/frames are one image per frame (the database
+    # rig was stripped); drop them so COLMAP reads the model as legacy and
+    # rig_configurator builds the real ones.
+    for _stale in ('rigs.bin', 'frames.bin'):
+        _p = output_dir / _stale
+        if _p.exists():
+            _p.unlink()
+    # Newer COLMAP prefixes the Ceres solver options with BundleAdjustmentCeres.
+    _iters = ('BundleAdjustmentCeres.max_num_iterations'
+              if _colmap_has_option('bundle_adjuster', 'BundleAdjustmentCeres.max_num_iterations')
+              else 'BundleAdjustment.max_num_iterations')
+    try:
+        print("7. Applying the rig to the triangulated model...")
+        subprocess.run([
+            'colmap', 'rig_configurator',
+            '--database_path', str(db_path),
+            '--rig_config_path', str(rig_config_path),
+            '--input_path', str(output_dir),
+            '--output_path', str(rigged_dir),
+        ], check=True)
+        print("8. Running rig-aware bundle adjustment...")
+        subprocess.run([
+            'colmap', 'bundle_adjuster',
+            '--input_path', str(rigged_dir),
+            '--output_path', str(output_dir),
+            '--BundleAdjustment.refine_focal_length', '0',
+            '--BundleAdjustment.refine_principal_point', '0',
+            '--BundleAdjustment.refine_extra_params', '0',
+            '--BundleAdjustment.refine_sensor_from_rig', '0',
+            '--BundleAdjustment.refine_rig_from_world', '1',
+            f'--{_iters}', '500',
+        ], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"  ⚠ colmap {e.cmd[1]} failed (exit {e.returncode}); keeping the LiDAR poses")
+        return False
+    except OSError as e:
+        print(f"  ⚠ Could not run colmap ({e}); keeping the LiDAR poses")
+        return False
+    finally:
+        shutil.rmtree(rigged_dir, ignore_errors=True)
+
+    after = _read_image_poses(output_dir / 'images.bin')
+    common = [n for n in before if n in after]
+    if common:
+        shift = np.array([np.linalg.norm(after[n][0].T @ after[n][1] - before[n][0].T @ before[n][1])
+                          for n in common])
+        turn = np.array([np.degrees(np.linalg.norm(
+            R.from_matrix(after[n][0] @ before[n][0].T).as_rotvec())) for n in common])
+        print(f"  Bundle adjustment moved {len(common)} images: centre median "
+              f"{np.median(shift) * 100:.1f} cm (max {shift.max() * 100:.1f} cm), "
+              f"rotation median {np.median(turn):.2f}° (max {turn.max():.2f}°)")
+    return True
+
+
 def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
                  lidar_voxel_size=0.0, poses_only=True):
     try:
@@ -1716,6 +1913,11 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     except ValueError as e:
         print(f"Error: {e}")
         return False
+    if bundle_adjustment and poses_only:
+        # Bundle adjustment needs feature tracks, which only the SfM path
+        # builds (the poses-only model has LiDAR points, no 2D observations).
+        print("Bundle adjustment needs feature tracks: running full SfM")
+        poses_only = False
     colmap_dir = session_path / 'colmap'
     colmap_dir.mkdir(exist_ok=True)
 
@@ -1808,7 +2010,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _face_cam_ids[_fi] = _cam_key_to_cam_id[_cam_key]  # fallback
         if _oak1_panos:
             _op = _oak1_panos[0]
-            _oak1_params = _struct.pack('dddd', _op['f_px'], _op['f_px'],
+            _oak1_params = _struct.pack('dddd', _op.get('fx', _op['f_px']),
+                                        _op.get('fy', _op['f_px']),
                                         _op['cx'], _op['cy'])
             _conn.execute('INSERT INTO cameras VALUES (?,?,?,?,?,?)',
                           (_cam_id, 1, int(_op.get('img_w', _op.get('tile_size', _tile_size_po))),
@@ -1867,9 +2070,11 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         if _is_pinhole_session and not _is_mixed:
             _cx = panoramas[0]['cx']
             _cy = panoramas[0]['cy']
+            _fx = panoramas[0].get('fx', f_px)
+            _fy = panoramas[0].get('fy', f_px)
             _cam_model = 'PINHOLE'
-            _cam_params = f'{f_px:.4f},{f_px:.4f},{_cx:.4f},{_cy:.4f}'
-            print(f"2. Extracting features (PINHOLE, fx=fy={f_px:.1f} cx={_cx:.1f} cy={_cy:.1f})...")
+            _cam_params = f'{_fx:.4f},{_fy:.4f},{_cx:.4f},{_cy:.4f}'
+            print(f"2. Extracting features (PINHOLE, fx={_fx:.1f} fy={_fy:.1f} cx={_cx:.1f} cy={_cy:.1f})...")
         else:
             _cam_model = 'SIMPLE_PINHOLE'
             _cam_params = f'{f_px:.4f},{c:.1f},{c:.1f}'
@@ -1907,9 +2112,10 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         if _is_mixed and _oak1_panos:
             _oak1_cx = _oak1_panos[0]['cx']
             _oak1_cy = _oak1_panos[0]['cy']
-            _oak1_fpx = _oak1_panos[0]['f_px']
-            _oak1_params = f'{_oak1_fpx:.4f},{_oak1_fpx:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
-            print(f"   OAK-1 pass: PINHOLE fx=fy={_oak1_fpx:.1f} cx={_oak1_cx:.1f} cy={_oak1_cy:.1f}")
+            _oak1_fx = _oak1_panos[0].get('fx', _oak1_panos[0]['f_px'])
+            _oak1_fy = _oak1_panos[0].get('fy', _oak1_panos[0]['f_px'])
+            _oak1_params = f'{_oak1_fx:.4f},{_oak1_fy:.4f},{_oak1_cx:.4f},{_oak1_cy:.4f}'
+            print(f"   OAK-1 pass: PINHOLE fx={_oak1_fx:.1f} fy={_oak1_fy:.1f} cx={_oak1_cx:.1f} cy={_oak1_cy:.1f}")
             subprocess.run([
                 'colmap', 'feature_extractor',
                 '--database_path', str(db_path),
@@ -2014,26 +2220,18 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         if _oak1_panos:
             _inject_known_pose_images(output_dir, init_sparse, _oak1_panos)
             print(f"  Injected {len(_oak1_panos)} OAK-1 images with known poses")
+            # The injected images are not in point_triangulator's frames.bin,
+            # and COLMAP refuses to read images without a frame (ReadImagesBinary
+            # _Map_base::at), which broke model_converter below. Without
+            # rigs.bin/frames.bin COLMAP reads the model as legacy (one frame
+            # per image); write_rig_bin writes the final rig files at the end.
+            for _stale in ('rigs.bin', 'frames.bin'):
+                _p = output_dir / _stale
+                if _p.exists():
+                    _p.unlink()
 
         if bundle_adjustment:
-            print("7. Restoring rig for bundle adjustment...")
-            subprocess.run([
-                'colmap', 'rig_configurator',
-                '--database_path', str(db_path),
-                '--rig_config_path', str(rig_config_path),
-            ], check=True)
-            print("8. Running rig-aware bundle adjustment...")
-            subprocess.run([
-                'colmap', 'bundle_adjuster',
-                '--input_path', str(output_dir),
-                '--output_path', str(output_dir),
-                '--BundleAdjustment.refine_focal_length', '0',
-                '--BundleAdjustment.refine_principal_point', '0',
-                '--BundleAdjustment.refine_extra_params', '0',
-                '--BundleAdjustment.refine_sensor_from_rig', '0',
-                '--BundleAdjustment.refine_rig_from_world', '1',
-                '--BundleAdjustmentCeres.max_num_iterations', '500',
-            ], check=True)
+            _run_rig_bundle_adjustment(colmap_dir, db_path, rig_config_path, output_dir)
 
         print(f"\n✓ Reconstruction complete: {output_dir}")
 
@@ -2066,7 +2264,8 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
     all_lidar_cols = []
     scan_dirs_map  = {int(d.name.split('_')[-1]): d
                       for d in sorted(session_path.glob('fusion_scan_*'))
-                      if d.is_dir() and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()}
+                      if d.is_dir() and not (d / '.blur_skip').exists() and not (d / '.corrupt_bag').exists()
+                      and not (d / '.slam_diverged').exists()}
     for pi, scan_dir in sorted(scan_dirs_map.items()):
         ply_color  = scan_dir / 'sensor_colored_exact.ply'
         ply_dense  = scan_dir / 'sensor_lidar.ply'
@@ -2103,7 +2302,9 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
         if pcd_src.has_colors() and len(pcd_src.colors) > 0:
             cols = (np.asarray(pcd_src.colors) * 255).astype(int)
         else:
-            cols = np.zeros((len(pts_s), 3), int)
+            # Grey, not black, for points without colour (as COLMAP's own
+            # fallback); black seeds dark Gaussians and reads as real colour.
+            cols = np.full((len(pts_s), 3), 128, int)
 
         all_lidar_pts.append(pts_col)
         all_lidar_cols.append(cols)
@@ -2199,7 +2400,7 @@ def run_pipeline(session_dir, exhaustive=True, bundle_adjustment=False,
             _write_merged_to_points3d(output_dir, _fb_lidar_pts,
                                       (np.asarray(_fb_lidar_pcd.colors) * 255).astype(int)
                                       if _fb_lidar_pcd.has_colors()
-                                      else np.zeros((len(_fb_lidar_pts), 3), int))
+                                      else np.full((len(_fb_lidar_pts), 3), 128, int))
 
     print("\n10. Generating depth images...")
     import importlib.util as _ilu
@@ -2238,9 +2439,13 @@ if __name__ == '__main__':
     parser.add_argument('--lidar-voxel-size', type=float, default=0.0,
                         help='Voxel downsample size for LiDAR cloud (metres, 0 = no downsampling)')
     parser.set_defaults(exhaustive=False, poses_only=True)
+    parser.add_argument('--bundle-adjustment', dest='bundle_adjustment',
+                        action='store_true',
+                        help='Refine the poses with rig-aware bundle adjustment after '
+                             'triangulation (needs feature tracks, so implies --sfm)')
     parser.add_argument('--no-bundle-adjustment', dest='bundle_adjustment',
                         action='store_false',
-                        help='Skip rig-aware bundle adjustment (SfM mode only)')
+                        help='Keep the LiDAR poses (default)')
     parser.set_defaults(bundle_adjustment=False)
     args = parser.parse_args()
 

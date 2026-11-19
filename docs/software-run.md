@@ -16,6 +16,7 @@ SAVE_E57=false                 # export E57 files
 USE_EXISTING_CALIBRATION=false # skip calibration update from calib.json
 ENABLE_ICP_ALIGNMENT=true      # ICP pose graph refinement on merged cloud
 EXPORT_COLMAP=false            # run panorama SfM (COLMAP) after session
+COLMAP_BUNDLE_ADJUSTMENT=false # rig-aware bundle adjustment of the COLMAP poses (runs full SfM)
 CLEAN_POINTCLOUD=true          # statistical outlier removal on merged cloud
 DOWNSAMPLE_VOXEL_SIZE=0.05     # voxel downsample in metres (0 = skip)
 RUN_SYNC_BENCHMARK=true        # run sync benchmark after every session
@@ -253,13 +254,18 @@ cd ~/atlas_ws/src/atlas-scanner/src/post_processing
 python3 panorama_sfm_colmap.py $SESSION
 ```
 
-This uses the colmap `panorama_sfm.py` approach: ERP images are sliced into perspective tiles (SIMPLE_PINHOLE), grouped into a rig per panorama, triangulated with known LiDAR poses, and refined with rig-aware bundle adjustment. Exhaustive matching is used by default since sessions are sparse.
+By default this builds the model from the LiDAR poses alone, with no feature matching. ERP images are cut into six 90° cube-face tiles (SIMPLE_PINHOLE, one camera per face folder). The two stitch seams, at yaw ±90° where the X5's lenses meet, are masked out, and single-fisheye sessions keep the five faces that see the back lens. OAK-1 images are added as PINHOLE images. Each image's pose comes from its scan's LiDAR pose and camera calibration, and points3D holds the coloured LiDAR points.
+
+Images are JPEG (quality 100, no chroma subsampling) with the capture settings in EXIF: exposure time, f-number, ISO and exposure bias from the X5's `.insp`, and exposure time and ISO from the `oak1_<time>_exposure.yaml` that `oak1_capture.py` writes next to each OAK-1 image. Masks are `colmap/masks/<image name>.png`. Depth images are 16-bit PNGs in `colmap/depth_images/`, named after the image (`face_01/pano_001.png`). Scans marked `.blur_skip`, `.corrupt_bag` or `.slam_diverged` are left out.
 
 Optional flags:
 ```bash
-python3 panorama_sfm_colmap.py $SESSION --sequential        # sequential matcher (faster, for large sessions)
-python3 panorama_sfm_colmap.py $SESSION --no-bundle-adjustment  # skip rig-aware bundle adjustment
+python3 panorama_sfm_colmap.py $SESSION --sfm                    # also extract and match features, then triangulate with the poses fixed
+python3 panorama_sfm_colmap.py $SESSION --sfm --exhaustive       # exhaustive matcher (the default in --sfm mode is sequential)
+python3 panorama_sfm_colmap.py $SESSION --lidar-voxel-size 0.02  # voxel size for the LiDAR points, metres
 ```
+
+Bundle adjustment is off by default. Turn it on with `--bundle-adjustment`, with `COLMAP_BUNDLE_ADJUSTMENT=true` (or `--bundle-adjustment`) in `atlas_fusion_capture.sh`, or with the *Bundle adjustment* checkbox in the GUI. It needs feature tracks, so it also turns on `--sfm`. The tiles of each panorama stay a rig with fixed face rotations and intrinsics: COLMAP refines one pose per panorama and the triangulated points, and the log prints how far the poses moved. If COLMAP fails, the LiDAR poses are kept.
 
 ### Run synchronization benchmark on a session
 ```bash

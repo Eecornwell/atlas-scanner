@@ -74,7 +74,56 @@ def load_points(ply_file):
                     except ValueError: continue
             return np.array(pts)
 
-def exact_match_calibration_tool(scan_dir):
+# Occlusion test. The LiDAR and the camera are 10-18 cm apart, so the LiDAR
+# sees surfaces the camera can't, and a point hidden from the camera behind a
+# nearer surface took that surface's colour (halos of foreground colour on the
+# background beside every depth edge). The image is divided into square
+# cells sized to hold about OCCLUSION_POINTS_PER_CELL points (0.25-2 deg); a
+# point is kept only if it is at most OCCLUSION_REL_TOL (plus
+# OCCLUSION_ABS_TOL metres) farther from the camera than the nearest point in
+# its cell. The tolerance keeps points of one surface seen at up to about
+# 84 deg incidence. On a synthetic scene (LiDAR 13 cm from the camera, 13k to
+# 87k points) this removed 88-91 % of the hidden points, and 0.2-2.5 % of the
+# visible wall and floor points (up to 6 % of a thin post at the lowest
+# density): those within a cell of a depth edge. ATLAS_OCCLUSION_TEST=0
+# turns the test off.
+OCCLUSION_POINTS_PER_CELL = 3
+OCCLUSION_CELL_DEG_RANGE = (0.25, 2.0)
+OCCLUSION_REL_TOL = 0.10
+OCCLUSION_ABS_TOL = 0.05
+
+
+def _visible_from_camera(u, v, ranges, in_image, px_per_deg):
+    """(mask of points not hidden behind a nearer point of the same image
+    cell, cell size in degrees). u, v are image coordinates, ranges the
+    distances from the camera, px_per_deg the image scale; only points with
+    in_image set take part."""
+    visible = np.zeros(len(u), dtype=bool)
+    idx = np.nonzero(in_image)[0]
+    if len(idx) == 0:
+        return visible, 0.0
+    uu, vv, rr = u[idx], v[idx], ranges[idx]
+    # Cell size from the point density over the image area the points cover
+    # (counted on a 2 deg grid).
+    coarse = 2.0 * px_per_deg
+    occupied = np.unique(np.floor(vv / coarse).astype(np.int64) * 1_000_003
+                         + np.floor(uu / coarse).astype(np.int64)).size
+    cell_deg = float(np.clip(
+        np.sqrt(OCCLUSION_POINTS_PER_CELL * occupied * 4.0 / len(idx)),
+        *OCCLUSION_CELL_DEG_RANGE))
+    cell_px = cell_deg * px_per_deg
+    cu = np.floor(uu / cell_px).astype(np.int64)
+    cv_ = np.floor(vv / cell_px).astype(np.int64)
+    cell = cv_ * (int(cu.max()) + 1) + cu
+    nearest = np.full(int(cell.max()) + 1, np.inf)
+    np.minimum.at(nearest, cell, rr)
+    visible[idx] = rr <= nearest[cell] * (1.0 + OCCLUSION_REL_TOL) + OCCLUSION_ABS_TOL
+    return visible, cell_deg
+
+
+def exact_match_calibration_tool(scan_dir, occlusion_test=None):
+    if occlusion_test is None:
+        occlusion_test = os.environ.get('ATLAS_OCCLUSION_TEST', '1') != '0'
     try:
         safe_scan = _safe_data(scan_dir)
     except ValueError as e:
@@ -284,6 +333,7 @@ def exact_match_calibration_tool(scan_dir):
         v = np.full(len(points_camera), -1.0)
         u[_valid] = _fx * points_camera[_valid, 0] / points_camera[_valid, 2] + _cx
         v[_valid] = _fy * points_camera[_valid, 1] / points_camera[_valid, 2] + _cy
+        _px_per_deg = _f_avg * np.pi / 180.0
     else:
         # Equirectangular projection (fisheye cameras)
         bearing = points_camera / cam_depths[:, np.newaxis]
@@ -291,10 +341,22 @@ def exact_match_calibration_tool(scan_dir):
         lon = np.arctan2(bearing[:, 0], bearing[:, 2])
         u = img_width  * (0.5 + lon / (2 * np.pi))
         v = img_height * (0.5 - lat / np.pi)
+        _px_per_deg = img_width / 360.0
 
     print(f"Projection range: u=[{u.min():.1f}, {u.max():.1f}], v=[{v.min():.1f}, {v.max():.1f}]")
 
     valid_pixels = (u >= 0) & (u < img_width) & (v >= 0) & (v < img_height)
+
+    # Occlusion test over every point in the image, before the scanner mask:
+    # a masked surface still hides what is behind it.
+    if occlusion_test:
+        _n_in = int(valid_pixels.sum())
+        _seen, _cell_deg = _visible_from_camera(u, v, cam_depths, valid_pixels,
+                                                _px_per_deg)
+        valid_pixels &= _seen
+        _n_hidden = _n_in - int(valid_pixels.sum())
+        print(f"Occlusion test: {_n_hidden} of {_n_in} points hidden from the "
+              f"camera behind nearer surfaces ({_cell_deg:.2f} deg cells)")
 
     if alpha_mask is not None:
         u_int = np.clip(np.round(u).astype(int), 0, img_width - 1)

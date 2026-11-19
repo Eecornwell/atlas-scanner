@@ -159,7 +159,8 @@ def fisheye_jpg_to_erp(fisheye_path, config_path, output_path, dual=False):
         remapped = cv2.remap(fisheye, bmx, bmy, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT)
         erp = np.where(back_mask[:, :, None], remapped, 0).astype(np.uint8)
 
-    cv2.imwrite(str(safe_output), erp)
+    # Quality 100 for a .jpg output (OpenCV's default is 95); ignored for .png.
+    cv2.imwrite(str(safe_output), erp, [cv2.IMWRITE_JPEG_QUALITY, 100])
     print(f"\u2713 ERP saved: {safe_output} ({out_w}x{out_h})")
     return str(safe_output)
 

@@ -172,18 +172,21 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
             sys.exit(1)
 
         def depth_to_rgb(depth_path: str) -> str:
+            # colmap/depth_images/face_XX/pano_NNN.png -> colmap/images/face_XX/
+            # pano_NNN.jpg (pano_NNN.png in exports before the JPEG switch)
             p = PurePosixPath(depth_path)
             parts = list(p.parts)
             parts[parts.index('depth_images')] = 'images'
-            return str(PurePosixPath(*parts))
+            png = PurePosixPath(*parts)
+            jpg = str(png.with_suffix('.jpg'))
+            return jpg if jpg in all_names else str(png)
 
-        def depth_to_mask(depth_path: str) -> str:
-            # colmap/depth_images/face_XX/pano_NNN.png
-            # -> colmap/masks/face_XX/pano_NNN.png.png  (COLMAP mask convention)
-            p = PurePosixPath(depth_path)
+        def rgb_to_mask(rgb_path: str) -> str:
+            # COLMAP mask convention: masks/<image name>.png
+            # (colmap/masks/face_XX/pano_NNN.jpg.png)
+            p = PurePosixPath(rgb_path)
             parts = list(p.parts)
-            parts[parts.index('depth_images')] = 'masks'
-            # COLMAP mask filenames have an extra .png suffix
+            parts[parts.index('images')] = 'masks'
             parts[-1] = parts[-1] + '.png'
             return str(PurePosixPath(*parts))
 
@@ -209,7 +212,7 @@ def enhance_colmap_zip(input_zip: Path, output_zip: Path) -> None:
 
             # Load mask if available — used to zero out scanner body / nadir
             # regions after PromptDA so it doesn't hallucinate depth there.
-            mask_name = depth_to_mask(depth_name)
+            mask_name = rgb_to_mask(rgb_name)
             mask_bytes = zin.read(mask_name) if mask_name in all_names else None
 
             try:

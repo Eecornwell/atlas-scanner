@@ -57,7 +57,7 @@ def fisheye_jpg_to_erp(input_path, output_path, erp_w=5760, erp_h=2880, dual=Fal
                     borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
     erp[~valid] = 0
 
-    cv2.imwrite(output_path, erp, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    cv2.imwrite(output_path, erp, [cv2.IMWRITE_JPEG_QUALITY, 100])
     print(f'Done (fisheye fallback) -> {output_path}')
     return True
 

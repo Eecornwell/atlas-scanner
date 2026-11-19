@@ -61,11 +61,15 @@ def _decode_img(data: bytes, flags=cv2.IMREAD_COLOR):
     return cv2.imdecode(np.frombuffer(data, np.uint8), flags)
 
 
-def _depth_to_rgb(depth_path: str) -> str:
+def _depth_to_rgb(depth_path: str, names=()) -> str:
+    """colmap/depth_images/face_XX/pano_NNN.png -> colmap/images/face_XX/
+    pano_NNN.jpg (pano_NNN.png in exports before the JPEG switch)."""
     p = PurePosixPath(depth_path)
     parts = list(p.parts)
     parts[parts.index('depth_images')] = 'images'
-    return str(PurePosixPath(*parts))
+    png = PurePosixPath(*parts)
+    jpg = str(png.with_suffix('.jpg'))
+    return jpg if jpg in names else str(png)
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +93,7 @@ def load_pairs(zip_path: Path, max_dim: int, label: str) -> dict:
 
         total = len(depth_names)
         for i, dname in enumerate(depth_names, 1):
-            rname = _depth_to_rgb(dname)
+            rname = _depth_to_rgb(dname, names)
             if rname not in names:
                 continue
 

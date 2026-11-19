@@ -74,9 +74,10 @@ def generate_overlay_viewer(session_dir, output_path=None, max_dim=768):
         sys.exit(1)
 
     pairs = []
-    for rgb_path in sorted(rgb_root.rglob('pano_*.png')):
+    for rgb_path in sorted(p for p in rgb_root.rglob('pano_*')
+                           if p.suffix.lower() in ('.jpg', '.jpeg', '.png')):
         rel      = rgb_path.relative_to(rgb_root)
-        dep_path = depth_root / rel
+        dep_path = (depth_root / rel).with_suffix('.png')
         if dep_path.exists():
             pairs.append((rel.parts[0], rel.stem, rgb_path, dep_path))
 

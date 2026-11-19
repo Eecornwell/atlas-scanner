@@ -176,15 +176,16 @@ int main(int argc, char* argv[]) {
         cv::Mat erp;
         cv::remap(fisheye, erp, map_x, map_y, cv::INTER_LINEAR,
                   cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 95};
+        std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 100};
         cv::imwrite(output_path, erp, params);
         std::cout << "Done (fisheye fallback)" << std::endl;
         return 0;
     }
 
-    // The SDK's internal JPEG encoder uses ~q60 which causes visible blocking.
-    // Re-encode the output at q95 to eliminate compression artifacts.
-    // Only applies when the output path is .jpg/.jpeg.
+    // The SDK's internal JPEG encoder uses ~q60 which causes visible blocking,
+    // and the SDK writes photos only as JPEG. Re-encoding can't undo that, but
+    // at quality 100 it adds as little loss as possible (after the optional
+    // denoise). Only applies when the output path is .jpg/.jpeg.
     std::string ext = output_path.size() >= 4 ? output_path.substr(output_path.rfind('.')) : "";
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     if (ext == ".jpg" || ext == ".jpeg") {
@@ -196,7 +197,7 @@ int main(int argc, char* argv[]) {
             } else {
                 processed = img;
             }
-            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 95};
+            std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, 100};
             cv::imwrite(output_path, processed, params);
         }
     }

@@ -198,6 +198,23 @@ def _usb_reset_oak1():
         time.sleep(3.0)
 
 
+def _frame_exposure(img_frame) -> dict:
+    """Exposure settings DepthAI reports for a frame: exposure time (s), ISO
+    and white-balance colour temperature (K). Keys are left out when the API
+    or the value is missing."""
+    meta = {}
+    for key, getter, conv in (('exposure_time_s', 'getExposureTime', lambda v: v.total_seconds()),
+                              ('iso', 'getSensitivity', int),
+                              ('color_temperature_k', 'getColorTemperature', int)):
+        try:
+            value = conv(getattr(img_frame, getter)())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            continue
+        if value:
+            meta[key] = value
+    return meta
+
+
 def _enhance_frame(frame: np.ndarray, alpha: float = 1.0, beta: int = 0) -> np.ndarray:
     """Simple global contrast/brightness adjustment. alpha>1 increases contrast, beta shifts brightness."""
     import cv2
@@ -468,6 +485,7 @@ def main():
             trigger_time = time.time()
             frame = None
             frame_ts = None
+            frame_meta = {}
             try:
                 # Flush all frames captured before the trigger arrived,
                 # then wait for the first frame captured after the trigger.
@@ -494,6 +512,7 @@ def main():
                         except (OSError, FileNotFoundError):
                             pass
                         frame = f.getCvFrame()
+                        frame_meta = _frame_exposure(f)
                         try:
                             # Use getTimestamp(MIDDLE) which is synced to the
                             # host clock and refers to the exposure midpoint —
@@ -551,6 +570,11 @@ def main():
                 undist_path = _safe(target_dir / f"oak1_{timestamp}_undistorted.png")
                 _undistort_and_save(frame, info, undist_path)
                 print(f"✓ Undistorted: {undist_path.name}", flush=True)
+                # Exposure for the COLMAP export's JPEG EXIF
+                # (panorama_sfm_colmap._oak1_exif reads this file).
+                _safe(target_dir / f"oak1_{timestamp}_exposure.yaml").write_text(yaml.dump(
+                    dict(frame_meta, capture_time=round(float(capture_ts), 6)),
+                    default_flow_style=False))
                 _safe(target_dir / "capture_0.shutter_event").write_text(
                     f"{capture_ts:.6f} {cam_index}\n")
                 _safe(target_dir / ".cam_index").write_text(f"{cam_index}\n")
