@@ -10,6 +10,8 @@
 
 ## Technical Approach
 
+![ATLAS Mobile App](assets/media/IMG_5563.png "ATLAS Mobile App")
+
 ![ATLAS Scanner](assets/media/splat-handheld-scanner.gif "ATLAS Mobile Scanner")
 
 ![ATLAS Scanner](assets/media/atlas-splat.gif "ATLAS Scanner")
