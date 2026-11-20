@@ -4,6 +4,8 @@
 
 > **Branch:** This app lives in the `mobile/` subdirectory on the `mobile` branch. The desktop Atlas scanner remains on `main`.
 
+![ATLAS Mobile App](assets/media/IMG_5563.png "ATLAS Mobile App")
+
 ### Motivation
 
 - The desktop Atlas scanner requires a full compute unit, Livox Mid-360, and tethered Insta360 — ideal for high-quality terrestrial scanning but not portable for quick captures
